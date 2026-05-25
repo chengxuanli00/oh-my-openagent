@@ -1,0 +1,657 @@
+From ccfc54ab384a0e8e1349735642ae6ff983162576 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 5 Apr 2026 14:59:03 +0900
+Subject: [PATCH 3940/5749] feat(atlas): add background task session tracking
+ with retry scheduling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add background-launch-session-tracking.ts to persist delegated sessions
+- Add task-context.ts for task context resolution utilities
+- Modify idle-event.ts to schedule retries when background tasks are running
+- Update tool-execute-after.ts to integrate session tracking
+- Add comprehensive tests for background task retry behavior
+
+🤖 Generated with assistance of OhMyOpenCode
+---
+ .../background-launch-session-tracking.ts     |  63 +++++
+ src/hooks/atlas/background-task-retry.test.ts | 225 ++++++++++++++++++
+ src/hooks/atlas/idle-event.ts                 |   6 +-
+ src/hooks/atlas/task-context.ts               |  45 ++++
+ ...ol-execute-after-background-launch.test.ts | 110 ++++++++-
+ src/hooks/atlas/tool-execute-after.ts         |  58 +----
+ 6 files changed, 454 insertions(+), 53 deletions(-)
+ create mode 100644 src/hooks/atlas/background-launch-session-tracking.ts
+ create mode 100644 src/hooks/atlas/background-task-retry.test.ts
+ create mode 100644 src/hooks/atlas/task-context.ts
+
+diff --git a/src/hooks/atlas/background-launch-session-tracking.ts b/src/hooks/atlas/background-launch-session-tracking.ts
+new file mode 100644
+index 00000000..0e7289ef
+--- /dev/null
++++ b/src/hooks/atlas/background-launch-session-tracking.ts
+@@ -0,0 +1,63 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { appendSessionId, type BoulderState, upsertTaskSessionState } from "../../features/boulder-state"
++import { log } from "../../shared/logger"
++import { HOOK_NAME } from "./hook-name"
++import { extractSessionIdFromOutput, validateSubagentSessionId } from "./subagent-session-id"
++import { resolveTaskContext } from "./task-context"
++import type { PendingTaskRef, ToolExecuteAfterInput, ToolExecuteAfterOutput } from "./types"
++
++export async function syncBackgroundLaunchSessionTracking(input: {
++  ctx: PluginInput
++  boulderState: BoulderState | null
++  toolInput: ToolExecuteAfterInput
++  toolOutput: ToolExecuteAfterOutput
++  pendingTaskRef: PendingTaskRef | undefined
++  metadataSessionId?: string
++}): Promise<void> {
++  const { ctx, boulderState, toolInput, toolOutput, pendingTaskRef, metadataSessionId } = input
++  if (!boulderState) {
++    return
++  }
++
++  if (toolInput.sessionID && !boulderState.session_ids.includes(toolInput.sessionID)) {
++    appendSessionId(ctx.directory, toolInput.sessionID)
++  }
++
++  const extractedSessionId = metadataSessionId ?? extractSessionIdFromOutput(toolOutput.output)
++  const lineageSessionIDs = toolInput.sessionID && !boulderState.session_ids.includes(toolInput.sessionID)
++    ? [...boulderState.session_ids, toolInput.sessionID]
++    : boulderState.session_ids
++  const subagentSessionId = await validateSubagentSessionId({
++    client: ctx.client,
++    sessionID: extractedSessionId,
++    lineageSessionIDs,
++  })
++
++  if (!subagentSessionId) {
++    return
++  }
++
++  appendSessionId(ctx.directory, subagentSessionId)
++
++  const { currentTask, shouldSkipTaskSessionUpdate } = resolveTaskContext(
++    pendingTaskRef,
++    boulderState.active_plan,
++  )
++
++  if (currentTask && !shouldSkipTaskSessionUpdate) {
++    upsertTaskSessionState(ctx.directory, {
++      taskKey: currentTask.key,
++      taskLabel: currentTask.label,
++      taskTitle: currentTask.title,
++      sessionId: subagentSessionId,
++      agent: typeof toolOutput.metadata?.agent === "string" ? toolOutput.metadata.agent : undefined,
++      category: typeof toolOutput.metadata?.category === "string" ? toolOutput.metadata.category : undefined,
++    })
++  }
++
++  log(`[${HOOK_NAME}] Background launch session tracked`, {
++    sessionID: toolInput.sessionID,
++    subagentSessionId,
++    taskKey: currentTask?.key,
++  })
++}
+diff --git a/src/hooks/atlas/background-task-retry.test.ts b/src/hooks/atlas/background-task-retry.test.ts
+new file mode 100644
+index 00000000..3e90b083
+--- /dev/null
++++ b/src/hooks/atlas/background-task-retry.test.ts
+@@ -0,0 +1,225 @@
++import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { randomUUID } from "node:crypto"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { createAtlasHook } from "./atlas-hook"
++import { clearBoulderState, writeBoulderState } from "../../features/boulder-state"
++import { _resetForTesting, registerAgentName } from "../../features/claude-code-session-state"
++
++type LongTimerCallback = (...args: unknown[]) => void | Promise<void>
++
++describe("atlas background task retry", () => {
++  let testDir: string
++  const sessionID = "main-session-123"
++  const capturedTimers = new Map<number, { callback: () => Promise<void> | void; cleared: boolean }>()
++  let nextFakeTimerId = 1000
++  const originalSetTimeout = globalThis.setTimeout
++  const originalClearTimeout = globalThis.clearTimeout
++
++  async function flushMicrotasks(): Promise<void> {
++    await Promise.resolve()
++    await Promise.resolve()
++  }
++
++  async function firePendingTimers(): Promise<void> {
++    const entries = [...capturedTimers.entries()]
++    for (const [id, entry] of entries) {
++      if (entry.cleared) {
++        continue
++      }
++
++      capturedTimers.delete(id)
++      await entry.callback()
++    }
++    await flushMicrotasks()
++  }
++
++  beforeEach(() => {
++    _resetForTesting()
++    registerAgentName("atlas")
++    registerAgentName("sisyphus")
++
++    testDir = join(tmpdir(), `atlas-background-retry-${randomUUID()}`)
++    mkdirSync(testDir, { recursive: true })
++
++    capturedTimers.clear()
++    nextFakeTimerId = 1000
++
++    globalThis.setTimeout = ((callback: Parameters<typeof setTimeout>[0], delay?: number, ...args: unknown[]) => {
++      const normalizedDelay = typeof delay === "number" ? delay : 0
++      if (typeof callback !== "function") {
++        return originalSetTimeout(callback, delay, ...args)
++      }
++
++      if (normalizedDelay >= 5000) {
++        const id = nextFakeTimerId++
++        capturedTimers.set(id, {
++          callback: () => (callback as LongTimerCallback)(...args),
++          cleared: false,
++        })
++        return id as unknown as ReturnType<typeof setTimeout>
++      }
++
++      return originalSetTimeout(callback, delay, ...args)
++    }) as typeof setTimeout
++
++    globalThis.clearTimeout = ((id?: number | ReturnType<typeof setTimeout>) => {
++      if (typeof id === "number" && capturedTimers.has(id)) {
++        capturedTimers.get(id)!.cleared = true
++        capturedTimers.delete(id)
++        return
++      }
++
++      originalClearTimeout(id as Parameters<typeof clearTimeout>[0])
++    }) as typeof clearTimeout
++  })
++
++  afterEach(() => {
++    globalThis.setTimeout = originalSetTimeout
++    globalThis.clearTimeout = originalClearTimeout
++    _resetForTesting()
++    clearBoulderState(testDir)
++    if (existsSync(testDir)) {
++      rmSync(testDir, { recursive: true, force: true })
++    }
++  })
++
++  test("#given background tasks are still running #when retry fires before they finish #then atlas keeps retrying until continuation can resume", async () => {
++    // given
++    const planPath = join(testDir, "test-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++    writeBoulderState(testDir, {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [sessionID],
++      plan_name: "test-plan",
++      agent: "atlas",
++    })
++
++    let backgroundRunning = true
++    const promptMock = mock(async () => ({}))
++    const hook = createAtlasHook({
++      directory: testDir,
++      client: {
++        session: {
++          promptAsync: promptMock,
++          messages: async () => ({ data: [] }),
++        },
++      },
++    } as unknown as PluginInput, {
++      directory: testDir,
++      backgroundManager: {
++        getTasksByParentSession: () => backgroundRunning ? [{ status: "running" }] : [],
++      } as unknown as NonNullable<Parameters<typeof createAtlasHook>[1]>["backgroundManager"] & {
++        getTasksByParentSession: (sessionID: string) => Array<{ status: string }>
++      },
++    })
++
++    // when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await firePendingTimers()
++    backgroundRunning = false
++    await firePendingTimers()
++
++    // then
++    expect(promptMock).toHaveBeenCalledTimes(1)
++  })
++
++  test("#given multiple idle events arrive while background retry is already pending #when tasks are still running #then atlas keeps only one retry timer active", async () => {
++    // given
++    const planPath = join(testDir, "test-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++    writeBoulderState(testDir, {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [sessionID],
++      plan_name: "test-plan",
++      agent: "atlas",
++    })
++
++    let backgroundRunning = true
++    const promptMock = mock(async () => ({}))
++    const hook = createAtlasHook({
++      directory: testDir,
++      client: {
++        session: {
++          promptAsync: promptMock,
++          messages: async () => ({ data: [] }),
++        },
++      },
++    } as unknown as PluginInput, {
++      directory: testDir,
++      backgroundManager: {
++        getTasksByParentSession: () => backgroundRunning ? [{ status: "running" }] : [],
++      } as unknown as NonNullable<Parameters<typeof createAtlasHook>[1]>["backgroundManager"] & {
++        getTasksByParentSession: (sessionID: string) => Array<{ status: string }>
++      },
++    })
++
++    // when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++
++    // then
++    expect(capturedTimers.size).toBe(1)
++    backgroundRunning = false
++    await firePendingTimers()
++    expect(promptMock).toHaveBeenCalledTimes(1)
++  })
++
++  test("#given background tasks keep running across multiple retries #when they finally finish on a later retry #then atlas resumes exactly once", async () => {
++    // given
++    const planPath = join(testDir, "test-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++    writeBoulderState(testDir, {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [sessionID],
++      plan_name: "test-plan",
++      agent: "atlas",
++    })
++
++    let remainingRunningRetries = 2
++    const promptMock = mock(async () => ({}))
++    const hook = createAtlasHook({
++      directory: testDir,
++      client: {
++        session: {
++          promptAsync: promptMock,
++          messages: async () => ({ data: [] }),
++        },
++      },
++    } as unknown as PluginInput, {
++      directory: testDir,
++      backgroundManager: {
++        getTasksByParentSession: () => {
++          if (remainingRunningRetries > 0) {
++            remainingRunningRetries -= 1
++            return [{ status: "running" }]
++          }
++
++          return []
++        },
++      } as unknown as NonNullable<Parameters<typeof createAtlasHook>[1]>["backgroundManager"] & {
++        getTasksByParentSession: (sessionID: string) => Array<{ status: string }>
++      },
++    })
++
++    // when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    expect(capturedTimers.size).toBe(1)
++
++    await firePendingTimers()
++    expect(promptMock).toHaveBeenCalledTimes(0)
++    expect(capturedTimers.size).toBe(1)
++
++    await firePendingTimers()
++
++    // then
++    expect(promptMock).toHaveBeenCalledTimes(1)
++    expect(capturedTimers.size).toBe(0)
++  })
++})
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 55f423bc..05734e4a 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -90,7 +90,10 @@ function scheduleRetry(input: {
+     const currentProgress = getPlanProgress(currentBoulder.active_plan)
+     if (currentProgress.isComplete) return
+     if (options?.isContinuationStopped?.(sessionID)) return
+-    if (hasRunningBackgroundTasks(sessionID, options)) return
++    if (hasRunningBackgroundTasks(sessionID, options)) {
++      scheduleRetry({ ctx, sessionID, sessionState, options })
++      return
++    }
+ 
+     await injectContinuation({
+       ctx,
+@@ -194,6 +197,7 @@ export async function handleAtlasSessionIdle(input: {
+   }
+ 
+   if (hasRunningBackgroundTasks(sessionID, options)) {
++    scheduleRetry({ ctx, sessionID, sessionState, options })
+     log(`[${HOOK_NAME}] Skipped: background tasks running`, { sessionID })
+     return
+   }
+diff --git a/src/hooks/atlas/task-context.ts b/src/hooks/atlas/task-context.ts
+new file mode 100644
+index 00000000..ad83d9fe
+--- /dev/null
++++ b/src/hooks/atlas/task-context.ts
+@@ -0,0 +1,45 @@
++import { readCurrentTopLevelTask } from "../../features/boulder-state"
++import type { PendingTaskRef, TrackedTopLevelTaskRef } from "./types"
++
++export function resolvePreferredSessionId(currentSessionId?: string, trackedSessionId?: string): string {
++  return currentSessionId ?? trackedSessionId ?? "<session_id>"
++}
++
++export function resolveTaskContext(
++  pendingTaskRef: PendingTaskRef | undefined,
++  planPath: string,
++): {
++  currentTask: TrackedTopLevelTaskRef | null
++  shouldSkipTaskSessionUpdate: boolean
++  shouldIgnoreCurrentSessionId: boolean
++} {
++  if (!pendingTaskRef) {
++    return {
++      currentTask: readCurrentTopLevelTask(planPath),
++      shouldSkipTaskSessionUpdate: false,
++      shouldIgnoreCurrentSessionId: false,
++    }
++  }
++
++  if (pendingTaskRef.kind === "track") {
++    return {
++      currentTask: pendingTaskRef.task,
++      shouldSkipTaskSessionUpdate: false,
++      shouldIgnoreCurrentSessionId: false,
++    }
++  }
++
++  if (pendingTaskRef.reason === "explicit_resume") {
++    return {
++      currentTask: readCurrentTopLevelTask(planPath),
++      shouldSkipTaskSessionUpdate: true,
++      shouldIgnoreCurrentSessionId: true,
++    }
++  }
++
++  return {
++    currentTask: pendingTaskRef.task,
++    shouldSkipTaskSessionUpdate: true,
++    shouldIgnoreCurrentSessionId: true,
++  }
++}
+diff --git a/src/hooks/atlas/tool-execute-after-background-launch.test.ts b/src/hooks/atlas/tool-execute-after-background-launch.test.ts
+index 0a1182c6..f354134a 100644
+--- a/src/hooks/atlas/tool-execute-after-background-launch.test.ts
++++ b/src/hooks/atlas/tool-execute-after-background-launch.test.ts
+@@ -1,11 +1,13 @@
+ /// <reference types="bun-types" />
+ 
+-import { afterEach, beforeEach, describe, expect, it, mock, afterAll } from "bun:test"
+-import { existsSync, mkdirSync, rmSync } from "node:fs"
++import { afterEach, beforeEach, describe, expect, it, mock, afterAll, spyOn } from "bun:test"
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { createOpencodeClient, type Project } from "@opencode-ai/sdk"
++import { readBoulderState, writeBoulderState } from "../../features/boulder-state"
++import { createToolExecuteBeforeHandler } from "./tool-execute-before"
+ 
+ const isCallerOrchestratorMock = mock(async () => true)
+ const collectGitDiffStatsMock = mock(() => ({
+@@ -27,6 +29,9 @@ afterAll(() => { mock.restore() })
+ 
+ const { createToolExecuteAfterHandler } = await import("./tool-execute-after")
+ 
++type OpencodeClient = ReturnType<typeof createOpencodeClient>
++type SessionGetResult = Awaited<ReturnType<OpencodeClient["session"]["get"]>>
++
+ describe("createToolExecuteAfterHandler background launch detection", () => {
+   let testDirectory = ""
+ 
+@@ -47,17 +52,39 @@ describe("createToolExecuteAfterHandler background launch detection", () => {
+     }
+   })
+ 
+-  function createHandler() {
+-    const project = {
++  function createProject(): Project {
++    return {
+       id: "project-1",
+       worktree: testDirectory,
+       time: {
+         created: Date.now(),
+       },
+-    } satisfies Project
++    }
++  }
++
++  function createSessionGetResult(parentID: string | undefined): SessionGetResult {
++    return {
++      data: {
++        parentID,
++      },
++      error: undefined,
++      request: new Request("https://example.com/session"),
++      response: new Response(null, { status: 200 }),
++    } as SessionGetResult
++  }
++
++  function createHandler(parentSessionIDs?: Record<string, string | undefined>) {
++    const project = createProject()
++    const client = createOpencodeClient()
++
++    if (parentSessionIDs) {
++      spyOn(client.session, "get").mockImplementation((input) => Promise.resolve(
++        createSessionGetResult(parentSessionIDs[input.path.id]),
++      ) as never)
++    }
+ 
+     const ctx = {
+-      client: createOpencodeClient(),
++      client,
+       project,
+       directory: testDirectory,
+       worktree: testDirectory,
+@@ -98,5 +125,76 @@ describe("createToolExecuteAfterHandler background launch detection", () => {
+         expect(collectGitDiffStatsMock).not.toHaveBeenCalled()
+       })
+     })
++
++    describe("#when a background task launch belongs to the active boulder task", () => {
++      it("#then it should persist the delegated session without transforming the launch output", async () => {
++        const sessionID = "ses_parent"
++        const childSessionID = "ses_child123"
++        const planPath = join(testDirectory, "background-launch-plan.md")
++        const project = createProject()
++        const client = createOpencodeClient()
++
++        spyOn(client.session, "get").mockImplementation((input) => Promise.resolve(
++          createSessionGetResult(input.path.id === childSessionID ? sessionID : undefined),
++        ) as never)
++
++        writeFileSync(planPath, `# Plan
++
++## TODOs
++- [ ] 1. Implement auth flow
++`)
++
++        writeBoulderState(testDirectory, {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [sessionID],
++          plan_name: "background-launch-plan",
++        })
++
++        const pendingFilePaths = new Map<string, string>()
++        const pendingTaskRefs = new Map()
++        const ctx = {
++          client,
++          project,
++          directory: testDirectory,
++          worktree: testDirectory,
++          serverUrl: new URL("https://example.com"),
++          $: Bun.$,
++        } satisfies PluginInput
++        const beforeHandler = createToolExecuteBeforeHandler({ ctx, pendingFilePaths, pendingTaskRefs })
++        const afterHandler = createToolExecuteAfterHandler({
++          ctx,
++          pendingFilePaths,
++          pendingTaskRefs,
++          autoCommit: true,
++          getState: () => ({ promptFailureCount: 0 }),
++        })
++
++        await beforeHandler(
++          { tool: "task", sessionID, callID: "call-bg-task" },
++          { args: { prompt: "Implement auth flow" } },
++        )
++
++        const output = {
++          title: "Sisyphus Task",
++          output: "Background task launched.\n\nBackground Task ID: bg_123\n\n<task_metadata>\nsession_id: ses_child123\n</task_metadata>",
++          metadata: {
++            sessionId: childSessionID,
++            agent: "sisyphus-junior",
++            category: "deep",
++          },
++        }
++
++        await afterHandler(
++          { tool: "task", sessionID, callID: "call-bg-task" },
++          output,
++        )
++
++        expect(output.output).toContain("Background task launched.")
++        expect(collectGitDiffStatsMock).not.toHaveBeenCalled()
++        expect(readBoulderState(testDirectory)?.session_ids).toContain(childSessionID)
++        expect(readBoulderState(testDirectory)?.task_sessions?.["todo:1"]?.session_id).toBe(childSessionID)
++      })
++    })
+   })
+ })
+diff --git a/src/hooks/atlas/tool-execute-after.ts b/src/hooks/atlas/tool-execute-after.ts
+index 81d88794..3fca29fe 100644
+--- a/src/hooks/atlas/tool-execute-after.ts
++++ b/src/hooks/atlas/tool-execute-after.ts
+@@ -4,16 +4,17 @@ import {
+   getPlanProgress,
+   getTaskSessionState,
+   readBoulderState,
+-  readCurrentTopLevelTask,
+   upsertTaskSessionState,
+ } from "../../features/boulder-state"
+ import { log } from "../../shared/logger"
+ import { isCallerOrchestrator } from "../../shared/session-utils"
++import { syncBackgroundLaunchSessionTracking } from "./background-launch-session-tracking"
+ import { collectGitDiffStats, formatFileChanges } from "../../shared/git-worktree"
+ import { shouldPauseForFinalWaveApproval } from "./final-wave-approval-gate"
+ import { HOOK_NAME } from "./hook-name"
+ import { DIRECT_WORK_REMINDER } from "./system-reminder-templates"
+ import { isSisyphusPath } from "./sisyphus-path"
++import { resolvePreferredSessionId, resolveTaskContext } from "./task-context"
+ import { extractSessionIdFromMetadata, extractSessionIdFromOutput, validateSubagentSessionId } from "./subagent-session-id"
+ import {
+   buildCompletionGate,
+@@ -23,50 +24,7 @@ import {
+ } from "./verification-reminders"
+ import { isWriteOrEditToolName } from "./write-edit-tool-policy"
+ import type { PendingTaskRef, SessionState } from "./types"
+-import type { ToolExecuteAfterInput, ToolExecuteAfterOutput, TrackedTopLevelTaskRef } from "./types"
+-
+-function resolvePreferredSessionId(currentSessionId?: string, trackedSessionId?: string): string {
+-  return currentSessionId ?? trackedSessionId ?? "<session_id>"
+-}
+-
+-function resolveTaskContext(
+-  pendingTaskRef: PendingTaskRef | undefined,
+-  planPath: string,
+-): {
+-  currentTask: TrackedTopLevelTaskRef | null
+-  shouldSkipTaskSessionUpdate: boolean
+-  shouldIgnoreCurrentSessionId: boolean
+-} {
+-  if (!pendingTaskRef) {
+-    return {
+-      currentTask: readCurrentTopLevelTask(planPath),
+-      shouldSkipTaskSessionUpdate: false,
+-      shouldIgnoreCurrentSessionId: false,
+-    }
+-  }
+-
+-  if (pendingTaskRef.kind === "track") {
+-    return {
+-      currentTask: pendingTaskRef.task,
+-      shouldSkipTaskSessionUpdate: false,
+-      shouldIgnoreCurrentSessionId: false,
+-    }
+-  }
+-
+-  if (pendingTaskRef.reason === "explicit_resume") {
+-    return {
+-      currentTask: readCurrentTopLevelTask(planPath),
+-      shouldSkipTaskSessionUpdate: true,
+-      shouldIgnoreCurrentSessionId: true,
+-    }
+-  }
+-
+-  return {
+-    currentTask: pendingTaskRef.task,
+-    shouldSkipTaskSessionUpdate: true,
+-    shouldIgnoreCurrentSessionId: true,
+-  }
+-}
++import type { ToolExecuteAfterInput, ToolExecuteAfterOutput } from "./types"
+ 
+ export function createToolExecuteAfterHandler(input: {
+   ctx: PluginInput
+@@ -116,15 +74,23 @@ export function createToolExecuteAfterHandler(input: {
+     if (toolInput.callID) {
+       pendingTaskRefs.delete(toolInput.callID)
+     }
++    const boulderState = readBoulderState(ctx.directory)
+     const isBackgroundLaunch = outputStr.includes("Background task launched") || outputStr.includes("Background task continued")
+       || outputStr.includes("Background delegate launched")
+       || outputStr.includes("Background agent task launched")
+     if (isBackgroundLaunch) {
++      await syncBackgroundLaunchSessionTracking({
++        ctx,
++        boulderState,
++        toolInput,
++        toolOutput,
++        pendingTaskRef,
++        metadataSessionId,
++      })
+       return
+     }
+ 
+     if (toolOutput.output && typeof toolOutput.output === "string") {
+-      const boulderState = readBoulderState(ctx.directory)
+       const worktreePath = boulderState?.worktree_path?.trim()
+       const verificationDirectory = worktreePath ? worktreePath : ctx.directory
+       const gitStats = collectGitDiffStats(verificationDirectory)
+-- 
+2.39.2
+

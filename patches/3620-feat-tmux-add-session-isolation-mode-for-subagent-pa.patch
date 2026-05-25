@@ -1,0 +1,547 @@
+From a3cc2d1c955516c45b6d73ce492f86ca24551c9c Mon Sep 17 00:00:00 2001
+From: Sami Jawhar <sami@trajectorylabs.net>
+Date: Sun, 29 Mar 2026 04:04:23 +0000
+Subject: [PATCH 3620/5749] feat(tmux): add session isolation mode for subagent
+ panes
+
+---
+ assets/oh-my-opencode.schema.json           |  12 +-
+ src/config/schema/tmux.ts                   |   8 ++
+ src/features/tmux-subagent/manager.ts       |  90 ++++++++++--
+ src/index.ts                                |   1 +
+ src/plugin/types.ts                         |   1 +
+ src/shared/tmux/tmux-utils.ts               |   2 +
+ src/shared/tmux/tmux-utils/session-spawn.ts | 145 ++++++++++++++++++++
+ src/shared/tmux/tmux-utils/window-spawn.ts  |  93 +++++++++++++
+ 8 files changed, 342 insertions(+), 10 deletions(-)
+ create mode 100644 src/shared/tmux/tmux-utils/session-spawn.ts
+ create mode 100644 src/shared/tmux/tmux-utils/window-spawn.ts
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index 832de443..1d7c856c 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -4984,6 +4984,15 @@
+           "default": 40,
+           "type": "number",
+           "minimum": 20
++        },
++        "isolation": {
++          "default": "session",
++          "type": "string",
++          "enum": [
++            "inline",
++            "window",
++            "session"
++          ]
+         }
+       },
+       "required": [
+@@ -4991,7 +5000,8 @@
+         "layout",
+         "main_pane_size",
+         "main_pane_min_width",
+-        "agent_pane_min_width"
++        "agent_pane_min_width",
++        "isolation"
+       ],
+       "additionalProperties": false
+     },
+diff --git a/src/config/schema/tmux.ts b/src/config/schema/tmux.ts
+index 17685f02..77582cf4 100644
+--- a/src/config/schema/tmux.ts
++++ b/src/config/schema/tmux.ts
+@@ -8,13 +8,21 @@ export const TmuxLayoutSchema = z.enum([
+   "even-vertical", // all panes vertical stack
+ ])
+ 
++export const TmuxIsolationSchema = z.enum([
++  "inline",   // panes split in user's current window (legacy behavior)
++  "window",   // panes created in a separate tmux window (same session)
++  "session",  // panes created in a detached tmux session (full isolation)
++])
++
+ export const TmuxConfigSchema = z.object({
+   enabled: z.boolean().default(false),
+   layout: TmuxLayoutSchema.default("main-vertical"),
+   main_pane_size: z.number().min(20).max(80).default(60),
+   main_pane_min_width: z.number().min(40).default(120),
+   agent_pane_min_width: z.number().min(20).default(40),
++  isolation: TmuxIsolationSchema.default("session"),
+ })
+ 
+ export type TmuxConfig = z.infer<typeof TmuxConfigSchema>
+ export type TmuxLayout = z.infer<typeof TmuxLayoutSchema>
++export type TmuxIsolation = z.infer<typeof TmuxIsolationSchema>
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index ca329ac3..07774176 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -8,6 +8,8 @@ import {
+   POLL_INTERVAL_BACKGROUND_MS,
+   SESSION_READY_POLL_INTERVAL_MS,
+   SESSION_READY_TIMEOUT_MS,
++  spawnTmuxWindow,
++  spawnTmuxSession,
+ } from "../../shared/tmux"
+ import { queryWindowState } from "./pane-state-querier"
+ import { decideSpawnActions, decideCloseAction, type SessionMapping } from "./decision-engine"
+@@ -68,6 +70,7 @@ export class TmuxSessionManager {
+   private nullStateCount = 0
+   private deps: TmuxUtilDeps
+   private pollingManager: TmuxPollingManager
++  private isolatedWindowPaneId: string | undefined
+   constructor(ctx: PluginInput, tmuxConfig: TmuxConfig, deps: TmuxUtilDeps = defaultTmuxDeps) {
+     this.client = ctx.client
+     this.tmuxConfig = tmuxConfig
+@@ -103,6 +106,47 @@ export class TmuxSessionManager {
+     return this.tmuxConfig.enabled && this.deps.isInsideTmux()
+   }
+ 
++  private isIsolated(): boolean {
++    return this.tmuxConfig.isolation === "window" || this.tmuxConfig.isolation === "session"
++  }
++
++  private getEffectiveSourcePaneId(): string | undefined {
++    if (this.isIsolated() && this.isolatedWindowPaneId) {
++      return this.isolatedWindowPaneId
++    }
++    return this.sourcePaneId
++  }
++
++  private async spawnInIsolatedContainer(
++    sessionId: string,
++    title: string,
++  ): Promise<string | null> {
++    if (!this.isIsolated()) return null
++    if (this.isolatedWindowPaneId) {
++      const state = await queryWindowState(this.isolatedWindowPaneId).catch(() => null)
++      if (state) return null
++      this.isolatedWindowPaneId = undefined
++    }
++
++    const isolation = this.tmuxConfig.isolation
++    log("[tmux-session-manager] creating isolated tmux container", { isolation, sessionId, title })
++
++    const result = isolation === "session"
++      ? await spawnTmuxSession(sessionId, title, this.tmuxConfig, this.serverUrl, this.sourcePaneId)
++      : await spawnTmuxWindow(sessionId, title, this.tmuxConfig, this.serverUrl)
++
++    if (result.success && result.paneId) {
++      this.isolatedWindowPaneId = result.paneId
++      log("[tmux-session-manager] isolated container created", {
++        isolation,
++        paneId: result.paneId,
++      })
++      return result.paneId
++    }
++    log("[tmux-session-manager] failed to create isolated container", { isolation, sessionId })
++    return null
++  }
++
+   private getCapacityConfig(): CapacityConfig {
+     return {
+       layout: this.tmuxConfig.layout,
+@@ -141,10 +185,11 @@ export class TmuxSessionManager {
+   }
+ 
+   private async queryWindowStateSafely(): Promise<WindowState | null> {
+-    if (!this.sourcePaneId) return null
++    const paneId = this.getEffectiveSourcePaneId()
++    if (!paneId) return null
+ 
+     try {
+-      return await queryWindowState(this.sourcePaneId)
++      return await queryWindowState(paneId)
+     } catch (error) {
+       log("[tmux-session-manager] failed to query window state for close", {
+         error: String(error),
+@@ -164,7 +209,7 @@ export class TmuxSessionManager {
+           config: this.tmuxConfig,
+           serverUrl: this.serverUrl,
+           windowState: state,
+-          sourcePaneId: this.sourcePaneId,
++          sourcePaneId: this.getEffectiveSourcePaneId(),
+         }
+       )
+ 
+@@ -301,7 +346,8 @@ export class TmuxSessionManager {
+   }
+ 
+   private async tryAttachDeferredSession(): Promise<void> {
+-    if (!this.sourcePaneId) return
++    const effectiveSourcePaneId = this.getEffectiveSourcePaneId()
++    if (!effectiveSourcePaneId) return
+     const sessionId = this.deferredQueue[0]
+     if (!sessionId) {
+       this.stopDeferredAttachLoop()
+@@ -329,7 +375,7 @@ export class TmuxSessionManager {
+       return
+     }
+ 
+-    const state = await queryWindowState(this.sourcePaneId)
++    const state = await queryWindowState(effectiveSourcePaneId)
+     if (!state) {
+       this.nullStateCount += 1
+       log("[tmux-session-manager] deferred attach window state is null", {
+@@ -365,7 +411,7 @@ export class TmuxSessionManager {
+       config: this.tmuxConfig,
+       serverUrl: this.serverUrl,
+       windowState: state,
+-      sourcePaneId: this.sourcePaneId,
++      sourcePaneId: effectiveSourcePaneId,
+     })
+ 
+     if (!result.success || !result.spawnedPaneId) {
+@@ -470,12 +516,37 @@ export class TmuxSessionManager {
+       log("[tmux-session-manager] session already tracked or pending", { sessionId })
+       return
+     }
+-    const sourcePaneId = this.sourcePaneId
+ 
+     this.pendingSessions.add(sessionId)
+ 
+     await this.enqueueSpawn(async () => {
+       try {
++        const isolatedPaneId = await this.spawnInIsolatedContainer(sessionId, title)
++        if (isolatedPaneId) {
++          const sessionReady = await this.waitForSessionReady(sessionId)
++          this.sessions.set(
++            sessionId,
++            createTrackedSession({ sessionId, paneId: isolatedPaneId, description: title }),
++          )
++          this.pollingManager.startPolling()
++          log("[tmux-session-manager] first subagent spawned in isolated window", {
++            sessionId,
++            paneId: isolatedPaneId,
++            sessionReady,
++          })
++          return
++        }
++
++        if (this.isIsolated()) {
++          log("[tmux-session-manager] isolated container failed, skipping inline fallback to preserve isolation", { sessionId })
++          return
++        }
++        const sourcePaneId = this.getEffectiveSourcePaneId()
++        if (!sourcePaneId) {
++          log("[tmux-session-manager] no effective source pane id")
++          return
++        }
++
+         const state = await queryWindowState(sourcePaneId)
+         if (!state) {
+           log("[tmux-session-manager] failed to query window state, deferring session")
+@@ -609,7 +680,7 @@ export class TmuxSessionManager {
+ 
+   async onSessionDeleted(event: { sessionID: string }): Promise<void> {
+     if (!this.isEnabled()) return
+-    if (!this.sourcePaneId) return
++    if (!this.getEffectiveSourcePaneId()) return
+ 
+     this.removeDeferredSession(event.sessionID)
+ 
+@@ -635,7 +706,7 @@ export class TmuxSessionManager {
+         config: this.tmuxConfig,
+         serverUrl: this.serverUrl,
+         windowState: state,
+-        sourcePaneId: this.sourcePaneId,
++        sourcePaneId: this.getEffectiveSourcePaneId(),
+       })
+ 
+       if (!result.success) {
+@@ -712,6 +783,7 @@ export class TmuxSessionManager {
+     }
+ 
+     await this.retryPendingCloses()
++    this.isolatedWindowPaneId = undefined
+ 
+     log("[tmux-session-manager] cleanup complete")
+   }
+diff --git a/src/index.ts b/src/index.ts
+index 69fbf60b..1a080167 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -50,6 +50,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     main_pane_size: pluginConfig.tmux?.main_pane_size ?? 60,
+     main_pane_min_width: pluginConfig.tmux?.main_pane_min_width ?? 120,
+     agent_pane_min_width: pluginConfig.tmux?.agent_pane_min_width ?? 40,
++    isolation: pluginConfig.tmux?.isolation ?? "session",
+   }
+ 
+   const modelCacheState = createModelCacheState()
+diff --git a/src/plugin/types.ts b/src/plugin/types.ts
+index 7b3a7cb3..b713781b 100644
+--- a/src/plugin/types.ts
++++ b/src/plugin/types.ts
+@@ -22,4 +22,5 @@ export type TmuxConfig = {
+   main_pane_size: number
+   main_pane_min_width: number
+   agent_pane_min_width: number
++  isolation: "inline" | "window" | "session"
+ }
+diff --git a/src/shared/tmux/tmux-utils.ts b/src/shared/tmux/tmux-utils.ts
+index fe978ead..a9aab095 100644
+--- a/src/shared/tmux/tmux-utils.ts
++++ b/src/shared/tmux/tmux-utils.ts
+@@ -9,5 +9,7 @@ export type { PaneDimensions } from "./tmux-utils/pane-dimensions"
+ export { spawnTmuxPane } from "./tmux-utils/pane-spawn"
+ export { closeTmuxPane } from "./tmux-utils/pane-close"
+ export { replaceTmuxPane } from "./tmux-utils/pane-replace"
++export { spawnTmuxWindow } from "./tmux-utils/window-spawn"
++export { spawnTmuxSession } from "./tmux-utils/session-spawn"
+ 
+ export { applyLayout, enforceMainPaneWidth } from "./tmux-utils/layout"
+diff --git a/src/shared/tmux/tmux-utils/session-spawn.ts b/src/shared/tmux/tmux-utils/session-spawn.ts
+new file mode 100644
+index 00000000..db1feee2
+--- /dev/null
++++ b/src/shared/tmux/tmux-utils/session-spawn.ts
+@@ -0,0 +1,145 @@
++import { spawn } from "bun"
++import type { TmuxConfig } from "../../../config/schema"
++import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
++import type { SpawnPaneResult } from "../types"
++import { isInsideTmux } from "./environment"
++import { isServerRunning } from "./server-health"
++import { shellEscapeForDoubleQuotedCommand } from "../../shell-env"
++
++const ISOLATED_SESSION_NAME = "omo-agents"
++
++async function getWindowDimensions(
++	tmux: string,
++	sourcePaneId: string,
++): Promise<{ width: number; height: number } | null> {
++	const proc = spawn(
++		[tmux, "display", "-p", "-t", sourcePaneId, "#{window_width},#{window_height}"],
++		{ stdout: "pipe", stderr: "pipe" },
++	)
++	const exitCode = await proc.exited
++	const stdout = await new Response(proc.stdout).text()
++
++	if (exitCode !== 0) return null
++
++	const [width, height] = stdout.trim().split(",").map(Number)
++	if (Number.isNaN(width) || Number.isNaN(height)) return null
++
++	return { width, height }
++}
++
++async function sessionExists(tmux: string, sessionName: string): Promise<boolean> {
++	const proc = spawn([tmux, "has-session", "-t", sessionName], {
++		stdout: "ignore",
++		stderr: "ignore",
++	})
++	return (await proc.exited) === 0
++}
++
++export async function spawnTmuxSession(
++	sessionId: string,
++	description: string,
++	config: TmuxConfig,
++	serverUrl: string,
++	sourcePaneId?: string,
++): Promise<SpawnPaneResult> {
++	const { log } = await import("../../logger")
++
++	log("[spawnTmuxSession] called", {
++		sessionId,
++		description,
++		serverUrl,
++		configEnabled: config.enabled,
++	})
++
++	if (!config.enabled) {
++		log("[spawnTmuxSession] SKIP: config.enabled is false")
++		return { success: false }
++	}
++	if (!isInsideTmux()) {
++		log("[spawnTmuxSession] SKIP: not inside tmux", { TMUX: process.env.TMUX })
++		return { success: false }
++	}
++
++	const serverRunning = await isServerRunning(serverUrl)
++	if (!serverRunning) {
++		log("[spawnTmuxSession] SKIP: server not running", { serverUrl })
++		return { success: false }
++	}
++
++	const tmux = await getTmuxPath()
++	if (!tmux) {
++		log("[spawnTmuxSession] SKIP: tmux not found")
++		return { success: false }
++	}
++
++	log("[spawnTmuxSession] all checks passed, creating isolated session...")
++
++	const shell = process.env.SHELL || "/bin/sh"
++	const escapedUrl = shellEscapeForDoubleQuotedCommand(serverUrl)
++	const escapedSessionId = shellEscapeForDoubleQuotedCommand(sessionId)
++	const opencodeCmd = `${shell} -c "opencode attach ${escapedUrl} --session ${escapedSessionId}"`
++
++	const sizeArgs: string[] = []
++	if (sourcePaneId) {
++		const dims = await getWindowDimensions(tmux, sourcePaneId)
++		if (dims) {
++			sizeArgs.push("-x", String(dims.width), "-y", String(dims.height))
++		}
++	}
++
++	const sessionAlreadyExists = await sessionExists(tmux, ISOLATED_SESSION_NAME)
++
++	const args = sessionAlreadyExists
++		? [
++			"new-window",
++			"-t", ISOLATED_SESSION_NAME,
++			"-P",
++			"-F", "#{pane_id}",
++			opencodeCmd,
++		]
++		: [
++			"new-session",
++			"-d",
++			"-s", ISOLATED_SESSION_NAME,
++			...sizeArgs,
++			"-P",
++			"-F", "#{pane_id}",
++			opencodeCmd,
++		]
++
++	log("[spawnTmuxSession] spawning", {
++		mode: sessionAlreadyExists ? "new-window" : "new-session",
++		sessionName: ISOLATED_SESSION_NAME,
++	})
++
++	const proc = spawn([tmux, ...args], { stdout: "pipe", stderr: "pipe" })
++	const exitCode = await proc.exited
++	const stdout = await new Response(proc.stdout).text()
++	const paneId = stdout.trim()
++
++	if (exitCode !== 0 || !paneId) {
++		const stderr = await new Response(proc.stderr).text()
++		log("[spawnTmuxSession] FAILED", { exitCode, stderr: stderr.trim() })
++		return { success: false }
++	}
++
++	const title = `omo-subagent-${description.slice(0, 20)}`
++	const titleProc = spawn([tmux, "select-pane", "-t", paneId, "-T", title], {
++		stdout: "ignore",
++		stderr: "pipe",
++	})
++	const stderrPromise = new Response(titleProc.stderr).text().catch(() => "")
++	const titleExitCode = await titleProc.exited
++	if (titleExitCode !== 0) {
++		const titleStderr = await stderrPromise
++		log("[spawnTmuxSession] WARNING: failed to set pane title", {
++			paneId,
++			title,
++			exitCode: titleExitCode,
++			stderr: titleStderr.trim(),
++		})
++	}
++
++	log("[spawnTmuxSession] SUCCESS", { paneId, sessionName: ISOLATED_SESSION_NAME })
++	return { success: true, paneId }
++}
+diff --git a/src/shared/tmux/tmux-utils/window-spawn.ts b/src/shared/tmux/tmux-utils/window-spawn.ts
+new file mode 100644
+index 00000000..45c0ee31
+--- /dev/null
++++ b/src/shared/tmux/tmux-utils/window-spawn.ts
+@@ -0,0 +1,93 @@
++import { spawn } from "bun"
++import type { TmuxConfig } from "../../../config/schema"
++import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
++import type { SpawnPaneResult } from "../types"
++import { isInsideTmux } from "./environment"
++import { isServerRunning } from "./server-health"
++import { shellEscapeForDoubleQuotedCommand } from "../../shell-env"
++
++const ISOLATED_WINDOW_NAME = "omo-agents"
++
++export async function spawnTmuxWindow(
++	sessionId: string,
++	description: string,
++	config: TmuxConfig,
++	serverUrl: string,
++): Promise<SpawnPaneResult> {
++	const { log } = await import("../../logger")
++
++	log("[spawnTmuxWindow] called", {
++		sessionId,
++		description,
++		serverUrl,
++		configEnabled: config.enabled,
++	})
++
++	if (!config.enabled) {
++		log("[spawnTmuxWindow] SKIP: config.enabled is false")
++		return { success: false }
++	}
++	if (!isInsideTmux()) {
++		log("[spawnTmuxWindow] SKIP: not inside tmux", { TMUX: process.env.TMUX })
++		return { success: false }
++	}
++
++	const serverRunning = await isServerRunning(serverUrl)
++	if (!serverRunning) {
++		log("[spawnTmuxWindow] SKIP: server not running", { serverUrl })
++		return { success: false }
++	}
++
++	const tmux = await getTmuxPath()
++	if (!tmux) {
++		log("[spawnTmuxWindow] SKIP: tmux not found")
++		return { success: false }
++	}
++
++	log("[spawnTmuxWindow] all checks passed, creating isolated window...")
++
++	const shell = process.env.SHELL || "/bin/sh"
++	const escapedUrl = shellEscapeForDoubleQuotedCommand(serverUrl)
++	const escapedSessionId = shellEscapeForDoubleQuotedCommand(sessionId)
++	const opencodeCmd = `${shell} -c "opencode attach ${escapedUrl} --session ${escapedSessionId}"`
++
++	const args = [
++		"new-window",
++		"-d",
++		"-n", ISOLATED_WINDOW_NAME,
++		"-P",
++		"-F", "#{pane_id}",
++		opencodeCmd,
++	]
++
++	const proc = spawn([tmux, ...args], { stdout: "pipe", stderr: "pipe" })
++	const exitCode = await proc.exited
++	const stdout = await new Response(proc.stdout).text()
++	const paneId = stdout.trim()
++
++	if (exitCode !== 0 || !paneId) {
++		const stderr = await new Response(proc.stderr).text()
++		log("[spawnTmuxWindow] FAILED", { exitCode, stderr: stderr.trim() })
++		return { success: false }
++	}
++
++	const title = `omo-subagent-${description.slice(0, 20)}`
++	const titleProc = spawn([tmux, "select-pane", "-t", paneId, "-T", title], {
++		stdout: "ignore",
++		stderr: "pipe",
++	})
++	const stderrPromise = new Response(titleProc.stderr).text().catch(() => "")
++	const titleExitCode = await titleProc.exited
++	if (titleExitCode !== 0) {
++		const titleStderr = await stderrPromise
++		log("[spawnTmuxWindow] WARNING: failed to set pane title", {
++			paneId,
++			title,
++			exitCode: titleExitCode,
++			stderr: titleStderr.trim(),
++		})
++	}
++
++	log("[spawnTmuxWindow] SUCCESS", { paneId, windowName: ISOLATED_WINDOW_NAME })
++	return { success: true, paneId }
++}
+-- 
+2.39.2
+

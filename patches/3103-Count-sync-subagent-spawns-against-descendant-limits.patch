@@ -1,0 +1,696 @@
+From a179ebe0b9601943645c78759107af9631bdd87d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 18:44:20 +0900
+Subject: [PATCH 3103/5749] Count sync subagent spawns against descendant
+ limits
+
+---
+ src/features/background-agent/manager.test.ts |  22 +++
+ src/features/background-agent/manager.ts      | 165 +++++++++++-------
+ .../call-omo-agent/sync-executor.test.ts      |  48 +++++
+ src/tools/call-omo-agent/sync-executor.ts     |  88 ++++++----
+ src/tools/call-omo-agent/tools.test.ts        |  35 ++--
+ src/tools/call-omo-agent/tools.ts             |   5 +-
+ src/tools/delegate-task/sync-task.test.ts     |  75 ++++++++
+ src/tools/delegate-task/sync-task.ts          |  25 ++-
+ 8 files changed, 344 insertions(+), 119 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index e1c10766..7d751ea6 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -2036,6 +2036,28 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+       // then
+       await expect(result).rejects.toThrow("background_task.maxDescendants=1")
+     })
++
++    test("should consume descendant quota for reserved sync spawns", async () => {
++      // given
++      manager.shutdown()
++      manager = new BackgroundManager(
++        {
++          client: createMockClientWithSessionChain({
++            "session-root": { directory: "/test/dir" },
++          }),
++          directory: tmpdir(),
++        } as unknown as PluginInput,
++        { maxDescendants: 1 },
++      )
++
++      await manager.reserveSubagentSpawn("session-root")
++
++      // when
++      const result = manager.assertCanSpawn("session-root")
++
++      // then
++      await expect(result).rejects.toThrow("background_task.maxDescendants=1")
++    })
+   })
+ 
+   describe("pending task can be cancelled", () => {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 64068d86..ba4ff816 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -178,12 +178,47 @@ export class BackgroundManager {
+     return spawnContext
+   }
+ 
++  async reserveSubagentSpawn(parentSessionID: string): Promise<{
++    spawnContext: SubagentSpawnContext
++    descendantCount: number
++    commit: () => number
++    rollback: () => void
++  }> {
++    const spawnContext = await this.assertCanSpawn(parentSessionID)
++    const descendantCount = this.registerRootDescendant(spawnContext.rootSessionID)
++    let settled = false
++
++    return {
++      spawnContext,
++      descendantCount,
++      commit: () => {
++        settled = true
++        return descendantCount
++      },
++      rollback: () => {
++        if (settled) return
++        settled = true
++        this.unregisterRootDescendant(spawnContext.rootSessionID)
++      },
++    }
++  }
++
+   private registerRootDescendant(rootSessionID: string): number {
+     const nextCount = (this.rootDescendantCounts.get(rootSessionID) ?? 0) + 1
+     this.rootDescendantCounts.set(rootSessionID, nextCount)
+     return nextCount
+   }
+ 
++  private unregisterRootDescendant(rootSessionID: string): void {
++    const currentCount = this.rootDescendantCounts.get(rootSessionID) ?? 0
++    if (currentCount <= 1) {
++      this.rootDescendantCounts.delete(rootSessionID)
++      return
++    }
++
++    this.rootDescendantCounts.set(rootSessionID, currentCount - 1)
++  }
++
+   async launch(input: LaunchInput): Promise<BackgroundTask> {
+     log("[background-agent] launch() called with:", {
+       agent: input.agent,
+@@ -196,73 +231,79 @@ export class BackgroundManager {
+       throw new Error("Agent parameter is required")
+     }
+ 
+-    const spawnContext = await this.assertCanSpawn(input.parentSessionID)
+-    const descendantCount = this.registerRootDescendant(spawnContext.rootSessionID)
++    const spawnReservation = await this.reserveSubagentSpawn(input.parentSessionID)
+ 
+-    log("[background-agent] spawn guard passed", {
+-      parentSessionID: input.parentSessionID,
+-      rootSessionID: spawnContext.rootSessionID,
+-      childDepth: spawnContext.childDepth,
+-      descendantCount,
+-    })
++    try {
++      log("[background-agent] spawn guard passed", {
++        parentSessionID: input.parentSessionID,
++        rootSessionID: spawnReservation.spawnContext.rootSessionID,
++        childDepth: spawnReservation.spawnContext.childDepth,
++        descendantCount: spawnReservation.descendantCount,
++      })
+ 
+-    // Create task immediately with status="pending"
+-    const task: BackgroundTask = {
+-      id: `bg_${crypto.randomUUID().slice(0, 8)}`,
+-      status: "pending",
+-      queuedAt: new Date(),
+-      rootSessionID: spawnContext.rootSessionID,
+-      // Do NOT set startedAt - will be set when running
+-      // Do NOT set sessionID - will be set when running
+-      description: input.description,
+-      prompt: input.prompt,
+-      agent: input.agent,
+-      spawnDepth: spawnContext.childDepth,
+-      parentSessionID: input.parentSessionID,
+-      parentMessageID: input.parentMessageID,
+-      parentModel: input.parentModel,
+-      parentAgent: input.parentAgent,
+-      parentTools: input.parentTools,
+-      model: input.model,
+-      fallbackChain: input.fallbackChain,
+-      attemptCount: 0,
+-      category: input.category,
+-    }
++      // Create task immediately with status="pending"
++      const task: BackgroundTask = {
++        id: `bg_${crypto.randomUUID().slice(0, 8)}`,
++        status: "pending",
++        queuedAt: new Date(),
++        rootSessionID: spawnReservation.spawnContext.rootSessionID,
++        // Do NOT set startedAt - will be set when running
++        // Do NOT set sessionID - will be set when running
++        description: input.description,
++        prompt: input.prompt,
++        agent: input.agent,
++        spawnDepth: spawnReservation.spawnContext.childDepth,
++        parentSessionID: input.parentSessionID,
++        parentMessageID: input.parentMessageID,
++        parentModel: input.parentModel,
++        parentAgent: input.parentAgent,
++        parentTools: input.parentTools,
++        model: input.model,
++        fallbackChain: input.fallbackChain,
++        attemptCount: 0,
++        category: input.category,
++      }
+ 
+-    this.tasks.set(task.id, task)
+-    this.taskHistory.record(input.parentSessionID, { id: task.id, agent: input.agent, description: input.description, status: "pending", category: input.category })
++      this.tasks.set(task.id, task)
++      this.taskHistory.record(input.parentSessionID, { id: task.id, agent: input.agent, description: input.description, status: "pending", category: input.category })
+ 
+-    // Track for batched notifications immediately (pending state)
+-    if (input.parentSessionID) {
+-      const pending = this.pendingByParent.get(input.parentSessionID) ?? new Set()
+-      pending.add(task.id)
+-      this.pendingByParent.set(input.parentSessionID, pending)
+-    }
++      // Track for batched notifications immediately (pending state)
++      if (input.parentSessionID) {
++        const pending = this.pendingByParent.get(input.parentSessionID) ?? new Set()
++        pending.add(task.id)
++        this.pendingByParent.set(input.parentSessionID, pending)
++      }
+ 
+-    // Add to queue
+-    const key = this.getConcurrencyKeyFromInput(input)
+-    const queue = this.queuesByKey.get(key) ?? []
+-    queue.push({ task, input })
+-    this.queuesByKey.set(key, queue)
++      // Add to queue
++      const key = this.getConcurrencyKeyFromInput(input)
++      const queue = this.queuesByKey.get(key) ?? []
++      queue.push({ task, input })
++      this.queuesByKey.set(key, queue)
+ 
+-    log("[background-agent] Task queued:", { taskId: task.id, key, queueLength: queue.length })
++      log("[background-agent] Task queued:", { taskId: task.id, key, queueLength: queue.length })
+ 
+-    const toastManager = getTaskToastManager()
+-    if (toastManager) {
+-      toastManager.addTask({
+-        id: task.id,
+-        description: input.description,
+-        agent: input.agent,
+-        isBackground: true,
+-        status: "queued",
+-        skills: input.skills,
+-      })
+-    }
++      const toastManager = getTaskToastManager()
++      if (toastManager) {
++        toastManager.addTask({
++          id: task.id,
++          description: input.description,
++          agent: input.agent,
++          isBackground: true,
++          status: "queued",
++          skills: input.skills,
++        })
++      }
+ 
+-    // Trigger processing (fire-and-forget)
+-    this.processKey(key)
++      spawnReservation.commit()
+ 
+-    return { ...task }
++      // Trigger processing (fire-and-forget)
++      this.processKey(key)
++
++      return { ...task }
++    } catch (error) {
++      spawnReservation.rollback()
++      throw error
++    }
+   }
+ 
+   private async processKey(key: string): Promise<void> {
+@@ -1476,14 +1517,6 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+     }
+   }
+ 
+-  private formatDuration(start: Date, end?: Date): string {
+-    return formatDuration(start, end)
+-  }
+-
+-  private isAbortedSessionError(error: unknown): boolean {
+-    return isAbortedSessionError(error)
+-  }
+-
+   private hasRunningTasks(): boolean {
+     for (const task of this.tasks.values()) {
+       if (task.status === "running") return true
+diff --git a/src/tools/call-omo-agent/sync-executor.test.ts b/src/tools/call-omo-agent/sync-executor.test.ts
+index f639ecd8..51358867 100644
+--- a/src/tools/call-omo-agent/sync-executor.test.ts
++++ b/src/tools/call-omo-agent/sync-executor.test.ts
+@@ -249,4 +249,52 @@ describe("executeSync", () => {
+     expect(deps.waitForCompletion).not.toHaveBeenCalled()
+     expect(deps.processMessages).not.toHaveBeenCalled()
+   })
++
++  test("commits reserved descendant quota after creating a new sync session", async () => {
++    //#given
++    const { executeSync } = require("./sync-executor")
++
++    const deps = {
++      createOrGetSession: mock(async () => ({ sessionID: "ses-test-789", isNew: true })),
++      waitForCompletion: mock(async () => {}),
++      processMessages: mock(async () => "agent response"),
++      setSessionFallbackChain: mock(() => {}),
++    }
++
++    const spawnReservation = {
++      commit: mock(() => 1),
++      rollback: mock(() => {}),
++    }
++
++    const args = {
++      subagent_type: "explore",
++      description: "test task",
++      prompt: "find something",
++    }
++
++    const toolContext = {
++      sessionID: "parent-session",
++      messageID: "msg-4",
++      agent: "sisyphus",
++      abort: new AbortController().signal,
++      metadata: mock(async () => {}),
++    }
++
++    const ctx = {
++      client: {
++        session: {
++          promptAsync: mock(async () => ({ data: {} })),
++        },
++      },
++    }
++
++    //#when
++    await executeSync(args, toolContext, ctx as any, deps, undefined, spawnReservation)
++
++    //#then
++    expect(spawnReservation.commit).toHaveBeenCalledTimes(1)
++    expect(spawnReservation.rollback).toHaveBeenCalledTimes(0)
++  })
+ })
++
++export {}
+diff --git a/src/tools/call-omo-agent/sync-executor.ts b/src/tools/call-omo-agent/sync-executor.ts
+index 971a9e41..72e34d5a 100644
+--- a/src/tools/call-omo-agent/sync-executor.ts
++++ b/src/tools/call-omo-agent/sync-executor.ts
+@@ -19,6 +19,11 @@ type ExecuteSyncDeps = {
+   setSessionFallbackChain: typeof setSessionFallbackChain
+ }
+ 
++type SpawnReservation = {
++  commit: () => number
++  rollback: () => void
++}
++
+ const defaultDeps: ExecuteSyncDeps = {
+   createOrGetSession,
+   waitForCompletion,
+@@ -33,54 +38,67 @@ export async function executeSync(
+     messageID: string
+     agent: string
+     abort: AbortSignal
+-    metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void
++    metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void | Promise<void>
+   },
+   ctx: PluginInput,
+   deps: ExecuteSyncDeps = defaultDeps,
+   fallbackChain?: FallbackEntry[],
++  spawnReservation?: SpawnReservation,
+ ): Promise<string> {
+-  const { sessionID } = await deps.createOrGetSession(args, toolContext, ctx)
++  let sessionID: string | undefined
+ 
+-  if (fallbackChain && fallbackChain.length > 0) {
+-    deps.setSessionFallbackChain(sessionID, fallbackChain)
+-  }
++  try {
++    const session = await deps.createOrGetSession(args, toolContext, ctx)
++    sessionID = session.sessionID
+ 
+-  await toolContext.metadata?.({
+-    title: args.description,
+-    metadata: { sessionId: sessionID },
+-  })
++    if (session.isNew) {
++      spawnReservation?.commit()
++    }
+ 
+-  log(`[call_omo_agent] Sending prompt to session ${sessionID}`)
+-  log(`[call_omo_agent] Prompt text:`, args.prompt.substring(0, 100))
++    if (fallbackChain && fallbackChain.length > 0) {
++      deps.setSessionFallbackChain(sessionID, fallbackChain)
++    }
+ 
+-  try {
+-    await (ctx.client.session as unknown as SessionWithPromptAsync).promptAsync({
+-      path: { id: sessionID },
+-      body: {
+-        agent: args.subagent_type,
+-        tools: {
+-          ...getAgentToolRestrictions(args.subagent_type),
+-          task: false,
+-          question: false,
+-        },
+-        parts: [{ type: "text", text: args.prompt }],
+-      },
++    await toolContext.metadata?.({
++      title: args.description,
++      metadata: { sessionId: sessionID },
+     })
+-  } catch (error) {
+-    const errorMessage = error instanceof Error ? error.message : String(error)
+-    log(`[call_omo_agent] Prompt error:`, errorMessage)
+-    if (errorMessage.includes("agent.name") || errorMessage.includes("undefined")) {
+-      return `Error: Agent "${args.subagent_type}" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
++
++    log(`[call_omo_agent] Sending prompt to session ${sessionID}`)
++    log(`[call_omo_agent] Prompt text:`, args.prompt.substring(0, 100))
++
++    try {
++      await (ctx.client.session as unknown as SessionWithPromptAsync).promptAsync({
++        path: { id: sessionID },
++        body: {
++          agent: args.subagent_type,
++          tools: {
++            ...getAgentToolRestrictions(args.subagent_type),
++            task: false,
++            question: false,
++          },
++          parts: [{ type: "text", text: args.prompt }],
++        },
++      })
++    } catch (error) {
++      const errorMessage = error instanceof Error ? error.message : String(error)
++      log(`[call_omo_agent] Prompt error:`, errorMessage)
++      if (errorMessage.includes("agent.name") || errorMessage.includes("undefined")) {
++        return `Error: Agent "${args.subagent_type}" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
++      }
++      return `Error: Failed to send prompt: ${errorMessage}\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+     }
+-    return `Error: Failed to send prompt: ${errorMessage}\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+-  }
+ 
+-  await deps.waitForCompletion(sessionID, toolContext, ctx)
++    await deps.waitForCompletion(sessionID, toolContext, ctx)
+ 
+-  const responseText = await deps.processMessages(sessionID, ctx)
++    const responseText = await deps.processMessages(sessionID, ctx)
+ 
+-  const output =
+-    responseText + "\n\n" + ["<task_metadata>", `session_id: ${sessionID}`, "</task_metadata>"].join("\n")
++    const output =
++      responseText + "\n\n" + ["<task_metadata>", `session_id: ${sessionID}`, "</task_metadata>"].join("\n")
+ 
+-  return output
++    return output
++  } catch (error) {
++    spawnReservation?.rollback()
++    throw error
++  }
+ }
+diff --git a/src/tools/call-omo-agent/tools.test.ts b/src/tools/call-omo-agent/tools.test.ts
+index 40ceef67..bbb21587 100644
+--- a/src/tools/call-omo-agent/tools.test.ts
++++ b/src/tools/call-omo-agent/tools.test.ts
+@@ -1,18 +1,24 @@
+-import { describe, test, expect, mock } from "bun:test"
+-import type { PluginInput } from "@opencode-ai/plugin"
+-import type { BackgroundManager } from "../../features/background-agent"
+-import type { FallbackEntry } from "../../shared/model-requirements"
+-import { createCallOmoAgent } from "./tools"
++const { beforeEach, describe, test, expect, mock } = require("bun:test")
++const { createCallOmoAgent } = require("./tools")
+ 
+ describe("createCallOmoAgent", () => {
+   const assertCanSpawnMock = mock(() => Promise.resolve(undefined))
++  const reserveCommitMock = mock(() => 1)
++  const reserveRollbackMock = mock(() => {})
++  const reserveSubagentSpawnMock = mock(() => Promise.resolve({
++    spawnContext: { rootSessionID: "root-session", parentDepth: 0, childDepth: 1 },
++    descendantCount: 1,
++    commit: reserveCommitMock,
++    rollback: reserveRollbackMock,
++  }))
+   const mockCtx = {
+     client: {},
+     directory: "/test",
+-  } as unknown as PluginInput
++  }
+ 
+   const mockBackgroundManager = {
+     assertCanSpawn: assertCanSpawnMock,
++    reserveSubagentSpawn: reserveSubagentSpawnMock,
+     launch: mock(() => Promise.resolve({
+       id: "test-task-id",
+       sessionID: null,
+@@ -20,7 +26,14 @@ describe("createCallOmoAgent", () => {
+       agent: "test-agent",
+       status: "pending",
+     })),
+-  } as unknown as BackgroundManager
++  }
++
++  beforeEach(() => {
++    assertCanSpawnMock.mockClear()
++    reserveSubagentSpawnMock.mockClear()
++    reserveCommitMock.mockClear()
++    reserveRollbackMock.mockClear()
++  })
+ 
+   test("should reject agent in disabled_agents list", async () => {
+     //#given
+@@ -105,7 +118,7 @@ describe("createCallOmoAgent", () => {
+ 
+   test("uses agent override fallback_models when launching background subagent", async () => {
+     //#given
+-    const launch = mock((_input: { fallbackChain?: FallbackEntry[] }) => Promise.resolve({
++    const launch = mock((_input: { fallbackChain?: Array<{ providers: string[]; model: string; variant?: string }> }) => Promise.resolve({
+       id: "task-fallback",
+       sessionID: "sub-session",
+       description: "Test task",
+@@ -115,7 +128,7 @@ describe("createCallOmoAgent", () => {
+     const managerWithLaunch = {
+       launch,
+       getTask: mock(() => undefined),
+-    } as unknown as BackgroundManager
++    }
+     const toolDef = createCallOmoAgent(
+       mockCtx,
+       managerWithLaunch,
+@@ -154,7 +167,7 @@ describe("createCallOmoAgent", () => {
+ 
+   test("should return a tool error when sync spawn depth validation fails", async () => {
+     //#given
+-    assertCanSpawnMock.mockRejectedValueOnce(new Error("Subagent spawn blocked: child depth 4 exceeds background_task.maxDepth=3."))
++    reserveSubagentSpawnMock.mockRejectedValueOnce(new Error("Subagent spawn blocked: child depth 4 exceeds background_task.maxDepth=3."))
+     const toolDef = createCallOmoAgent(mockCtx, mockBackgroundManager, [])
+     const executeFunc = toolDef.execute as Function
+ 
+@@ -173,3 +186,5 @@ describe("createCallOmoAgent", () => {
+     expect(result).toContain("background_task.maxDepth=3")
+   })
+ })
++
++export {}
+diff --git a/src/tools/call-omo-agent/tools.ts b/src/tools/call-omo-agent/tools.ts
+index 219954f4..14219dc2 100644
+--- a/src/tools/call-omo-agent/tools.ts
++++ b/src/tools/call-omo-agent/tools.ts
+@@ -96,9 +96,12 @@ export function createCallOmoAgent(
+       }
+ 
+       if (!args.session_id) {
++        let spawnReservation: Awaited<ReturnType<BackgroundManager["reserveSubagentSpawn"]>> | undefined
+         try {
+-          await backgroundManager.assertCanSpawn(toolCtx.sessionID)
++          spawnReservation = await backgroundManager.reserveSubagentSpawn(toolCtx.sessionID)
++          return await executeSync(args, toolCtx, ctx, undefined, fallbackChain, spawnReservation)
+         } catch (error) {
++          spawnReservation?.rollback()
+           return `Error: ${error instanceof Error ? error.message : String(error)}`
+         }
+       }
+diff --git a/src/tools/delegate-task/sync-task.test.ts b/src/tools/delegate-task/sync-task.test.ts
+index d2fac4d6..483a826b 100644
+--- a/src/tools/delegate-task/sync-task.test.ts
++++ b/src/tools/delegate-task/sync-task.test.ts
+@@ -110,6 +110,65 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     expect(deleteCalls[0]).toBe("ses_test_12345678")
+   })
+ 
++  test("rolls back reserved descendant quota when sync session creation fails", async () => {
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ses_test_12345678" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++
++    const commit = mock(() => 1)
++    const rollback = mock(() => {})
++    const reserveSubagentSpawn = mock(async () => ({
++      spawnContext: { rootSessionID: "parent-session", parentDepth: 0, childDepth: 1 },
++      descendantCount: 1,
++      commit,
++      rollback,
++    }))
++
++    const deps = {
++      createSyncSession: async () => ({ ok: false as const, error: "Failed to create session" }),
++      sendSyncPrompt: async () => null,
++      pollSyncSession: async () => null,
++      fetchSyncResult: async () => ({ ok: true as const, textContent: "Result" }),
++    }
++
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: () => {},
++    }
++
++    const mockExecutorCtx = {
++      manager: { reserveSubagentSpawn },
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    //#when
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "test-agent", undefined, undefined, undefined, undefined, deps)
++
++    //#then
++    expect(result).toBe("Failed to create session")
++    expect(reserveSubagentSpawn).toHaveBeenCalledWith("parent-session")
++    expect(commit).toHaveBeenCalledTimes(0)
++    expect(rollback).toHaveBeenCalledTimes(1)
++  })
++
+   test("cleans up toast and subagentSessions when pollSyncSession returns error", async () => {
+     const mockClient = {
+       session: {
+@@ -182,7 +241,18 @@ describe("executeSyncTask - cleanup on error paths", () => {
+       metadata: () => {},
+     }
+ 
++    const commit = mock(() => 1)
++    const rollback = mock(() => {})
++
+     const mockExecutorCtx = {
++      manager: {
++        reserveSubagentSpawn: mock(async () => ({
++          spawnContext: { rootSessionID: "parent-session", parentDepth: 0, childDepth: 1 },
++          descendantCount: 1,
++          commit,
++          rollback,
++        })),
++      },
+       client: mockClient,
+       directory: "/tmp",
+       onSyncSessionCreated: null,
+@@ -204,9 +274,14 @@ describe("executeSyncTask - cleanup on error paths", () => {
+ 
+     //#then - should complete and cleanup resources
+     expect(result).toContain("Task completed")
++    expect(mockExecutorCtx.manager.reserveSubagentSpawn).toHaveBeenCalledWith("parent-session")
++    expect(commit).toHaveBeenCalledTimes(1)
++    expect(rollback).toHaveBeenCalledTimes(0)
+     expect(removeTaskCalls.length).toBe(1)
+     expect(removeTaskCalls[0]).toBe("sync_ses_test")
+     expect(deleteCalls.length).toBe(1)
+     expect(deleteCalls[0]).toBe("ses_test_12345678")
+   })
+ })
++
++export {}
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index 400ce502..fa5fad4c 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -27,15 +27,23 @@ export async function executeSyncTask(
+   const toastManager = getTaskToastManager()
+   let taskId: string | undefined
+   let syncSessionID: string | undefined
++  let spawnReservation:
++    | Awaited<ReturnType<ExecutorContext["manager"]["reserveSubagentSpawn"]>>
++    | undefined
+ 
+   try {
+-    const spawnContext = typeof manager?.assertCanSpawn === "function"
+-      ? await manager.assertCanSpawn(parentContext.sessionID)
+-      : {
+-          rootSessionID: parentContext.sessionID,
+-          parentDepth: 0,
+-          childDepth: 1,
+-        }
++    if (typeof manager?.reserveSubagentSpawn === "function") {
++      spawnReservation = await manager.reserveSubagentSpawn(parentContext.sessionID)
++    }
++
++    const spawnContext = spawnReservation?.spawnContext
++      ?? (typeof manager?.assertCanSpawn === "function"
++        ? await manager.assertCanSpawn(parentContext.sessionID)
++        : {
++            rootSessionID: parentContext.sessionID,
++            parentDepth: 0,
++            childDepth: 1,
++          })
+ 
+     const createSessionResult = await deps.createSyncSession(client, {
+       parentSessionID: parentContext.sessionID,
+@@ -45,10 +53,12 @@ export async function executeSyncTask(
+     })
+ 
+     if (!createSessionResult.ok) {
++      spawnReservation?.rollback()
+       return createSessionResult.error
+     }
+ 
+     const sessionID = createSessionResult.sessionID
++    spawnReservation?.commit()
+     syncSessionID = sessionID
+     subagentSessions.add(sessionID)
+     syncSubagentSessions.add(sessionID)
+@@ -156,6 +166,7 @@ session_id: ${sessionID}
+       }
+     }
+   } catch (error) {
++    spawnReservation?.rollback()
+     return formatDetailedError(error, {
+       operation: "Execute task",
+       args,
+-- 
+2.39.2
+

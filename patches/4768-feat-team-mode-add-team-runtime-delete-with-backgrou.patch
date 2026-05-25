@@ -1,0 +1,246 @@
+From 62d409085e779caceddd190505e254485ed4626a Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 28 Apr 2026 10:46:52 +0900
+Subject: [PATCH 4768/5749] feat(team-mode): add team runtime delete with
+ background cancellation tests
+
+---
+ .../delete-team-bg-cancel.test.ts             |  84 +++++++++++
+ .../team-mode/team-runtime/delete-team.ts     | 134 ++++++++++++++++++
+ 2 files changed, 218 insertions(+)
+ create mode 100644 src/features/team-mode/team-runtime/delete-team-bg-cancel.test.ts
+ create mode 100644 src/features/team-mode/team-runtime/delete-team.ts
+
+diff --git a/src/features/team-mode/team-runtime/delete-team-bg-cancel.test.ts b/src/features/team-mode/team-runtime/delete-team-bg-cancel.test.ts
+new file mode 100644
+index 00000000..d29bd008
+--- /dev/null
++++ b/src/features/team-mode/team-runtime/delete-team-bg-cancel.test.ts
+@@ -0,0 +1,84 @@
++/// <reference types="bun-types" />
++
++import { afterEach, describe, expect, mock, test } from "bun:test"
++import { rm } from "node:fs/promises"
++
++import type { BackgroundManager } from "../../background-agent/manager"
++import { createFixture, updateMemberStatuses } from "./shutdown-test-fixtures"
++
++const { deleteTeam } = await import("./delete-team")
++
++describe("deleteTeam cancels only this team's background tasks", () => {
++  const temporaryDirectories: string[] = []
++
++  afterEach(async () => {
++    await Promise.all(temporaryDirectories.splice(0).map(async (directoryPath) => {
++      await rm(directoryPath, { recursive: true, force: true })
++    }))
++  })
++
++  test("uses leadSessionId as the getTasksByParentSession key", async () => {
++    // given
++    const fixture = await createFixture()
++    temporaryDirectories.push(fixture.baseDir)
++    await updateMemberStatuses(fixture.teamRunId, fixture.config, {
++      "member-a": "shutdown_approved",
++      "member-b": "shutdown_approved",
++    })
++
++    const getTasksByParentSessionMock = mock((sessionID: string) => {
++      if (sessionID !== "lead-session") return []
++      return [
++        { id: "team-task-a", sessionID: "session-a", parentMessageID: `team-create:${fixture.teamRunId}:member-a` },
++        { id: "team-task-b", sessionID: "session-b", parentMessageID: `team-create:${fixture.teamRunId}:member-b` },
++      ]
++    })
++    const cancelTaskMock = mock(async () => true)
++    const bgMgr = {
++      getTasksByParentSession: getTasksByParentSessionMock,
++      cancelTask: cancelTaskMock,
++    } as unknown as BackgroundManager
++
++    // when
++    await deleteTeam(fixture.teamRunId, fixture.config, undefined, bgMgr)
++
++    // then
++    expect(getTasksByParentSessionMock).toHaveBeenCalledTimes(1)
++    expect(getTasksByParentSessionMock).toHaveBeenCalledWith("lead-session")
++    expect(cancelTaskMock).toHaveBeenCalledTimes(2)
++    const firstCall = cancelTaskMock.mock.calls[0]
++    const secondCall = cancelTaskMock.mock.calls[1]
++    expect(firstCall?.[0]).toBe("team-task-a")
++    expect(secondCall?.[0]).toBe("team-task-b")
++  })
++
++  test("leaves unrelated sibling tasks on the same lead session alive", async () => {
++    // given
++    const fixture = await createFixture()
++    temporaryDirectories.push(fixture.baseDir)
++    await updateMemberStatuses(fixture.teamRunId, fixture.config, {
++      "member-a": "shutdown_approved",
++      "member-b": "shutdown_approved",
++    })
++
++    const getTasksByParentSessionMock = mock(() => [
++      { id: "team-task-a", sessionID: "session-a", parentMessageID: `team-create:${fixture.teamRunId}:member-a` },
++      { id: "delegate-task-x", sessionID: "session-x", parentMessageID: "delegate-task:plan-refactor" },
++      { id: "background-task-y", sessionID: "session-y", parentMessageID: undefined },
++      { id: "team-task-other", sessionID: "session-other", parentMessageID: "team-create:other-team-id:member-a" },
++    ])
++    const cancelTaskMock = mock(async () => true)
++    const bgMgr = {
++      getTasksByParentSession: getTasksByParentSessionMock,
++      cancelTask: cancelTaskMock,
++    } as unknown as BackgroundManager
++
++    // when
++    await deleteTeam(fixture.teamRunId, fixture.config, undefined, bgMgr)
++
++    // then
++    expect(cancelTaskMock).toHaveBeenCalledTimes(1)
++    const cancelledTaskId = cancelTaskMock.mock.calls[0]?.[0]
++    expect(cancelledTaskId).toBe("team-task-a")
++  })
++})
+diff --git a/src/features/team-mode/team-runtime/delete-team.ts b/src/features/team-mode/team-runtime/delete-team.ts
+new file mode 100644
+index 00000000..385e90a3
+--- /dev/null
++++ b/src/features/team-mode/team-runtime/delete-team.ts
+@@ -0,0 +1,134 @@
++import type { TeamModeConfig } from "../../../config/schema/team-mode"
++import { log } from "../../../shared/logger"
++import type { BackgroundManager } from "../../background-agent/manager"
++import type { TmuxSessionManager } from "../../tmux-subagent/manager"
++import { canVisualize, removeTeamLayout } from "../team-layout-tmux/layout"
++import { sweepStaleTeamSessions } from "../team-layout-tmux/sweep-stale-team-sessions"
++import { getRuntimeStateDir, resolveBaseDir } from "../team-registry/paths"
++import { unregisterTeamSessionsByTeam } from "../team-session-registry"
++import { listActiveTeams, loadRuntimeState, saveRuntimeState, transitionRuntimeState } from "../team-state-store/store"
++import type { RuntimeState } from "../types"
++import { DELETABLE_MEMBER_STATUSES, removeWorktrees } from "./shutdown-helpers"
++
++const DELETABLE_TEAM_STATUSES = new Set<RuntimeState["status"]>([
++  "active",
++  "shutdown_requested",
++  "deleting",
++  "deleted",
++])
++
++const FORCE_DELETABLE_TEAM_STATUSES = new Set<RuntimeState["status"]>([
++  ...DELETABLE_TEAM_STATUSES,
++  "creating",
++  "orphaned",
++])
++
++const FORCE_COMPLETABLE_MEMBER_STATUSES = new Set<RuntimeState["members"][number]["status"]>([
++  "pending",
++  "running",
++  "idle",
++])
++
++const FORCE_BYPASS_DELETING_STATUSES = new Set<RuntimeState["status"]>(["creating", "orphaned"])
++
++export async function deleteTeam(
++  teamRunId: string,
++  config: TeamModeConfig,
++  tmuxMgr?: TmuxSessionManager,
++  bgMgr?: BackgroundManager,
++  options?: { force?: boolean },
++): Promise<{ removedWorktrees: string[]; removedLayout: boolean }> {
++  const runtimeState = await loadRuntimeState(teamRunId, config)
++  const nonLeadMembers = runtimeState.members.filter((member) => member.agentType !== "leader")
++
++  if (bgMgr && runtimeState.leadSessionId) {
++    const teamMessageMarkerPrefix = `team-create:${teamRunId}:`
++    const teamTasks = bgMgr.getTasksByParentSession(runtimeState.leadSessionId)
++      .filter((task) => task.teamRunId === teamRunId || task.parentMessageID?.startsWith(teamMessageMarkerPrefix))
++    await Promise.all(teamTasks.map((task) => bgMgr.cancelTask(task.id, {
++      source: "team-mode-delete",
++      reason: `delete team ${teamRunId}`,
++    })))
++  }
++
++  if (options?.force === true) {
++    await transitionRuntimeState(teamRunId, (currentRuntimeState) => ({
++      ...currentRuntimeState,
++      members: currentRuntimeState.members.map((member) => (
++        member.agentType === "leader" || !FORCE_COMPLETABLE_MEMBER_STATUSES.has(member.status)
++          ? member
++          : { ...member, status: "completed" }
++      )),
++    }), config)
++  } else if (nonLeadMembers.some((member) => !DELETABLE_MEMBER_STATUSES.has(member.status))) {
++    throw new Error("members still active")
++  }
++
++  const deletableTeamStatuses = options?.force === true
++    ? FORCE_DELETABLE_TEAM_STATUSES
++    : DELETABLE_TEAM_STATUSES
++  if (!deletableTeamStatuses.has(runtimeState.status)) {
++    throw new Error(`team cannot be deleted from '${runtimeState.status}'`)
++  }
++
++  if (runtimeState.status !== "deleting" && runtimeState.status !== "deleted") {
++    if (options?.force === true && FORCE_BYPASS_DELETING_STATUSES.has(runtimeState.status)) {
++      const currentRuntimeState = await loadRuntimeState(teamRunId, config)
++      if (currentRuntimeState.status !== "deleting" && currentRuntimeState.status !== "deleted") {
++        await saveRuntimeState({ ...currentRuntimeState, status: "deleting" }, config)
++      }
++    } else {
++      await transitionRuntimeState(teamRunId, (currentRuntimeState) => (
++        currentRuntimeState.status === "deleting"
++          ? currentRuntimeState
++          : { ...currentRuntimeState, status: "deleting" }
++      ), config)
++    }
++  }
++
++  const removedLayout = tmuxMgr !== undefined && canVisualize()
++  if (removedLayout) {
++    const memberPaneIds = runtimeState.members
++      .filter((member) => member.agentType !== "leader" && member.tmuxPaneId)
++      .map((member) => member.tmuxPaneId!)
++
++    const cleanupTarget = runtimeState.tmuxLayout
++      ? {
++          ...runtimeState.tmuxLayout,
++          paneIds: memberPaneIds.length > 0 ? memberPaneIds : undefined,
++        }
++      : undefined
++
++    if (options?.force === true) {
++      try {
++        await removeTeamLayout(teamRunId, cleanupTarget, tmuxMgr)
++      } catch (error) {
++        log("team delete layout cleanup failed", {
++          teamRunId,
++          error: error instanceof Error ? error.message : String(error),
++        })
++      }
++    } else {
++      await removeTeamLayout(teamRunId, cleanupTarget, tmuxMgr)
++    }
++  }
++
++  const removedWorktrees = await removeWorktrees(runtimeState.members.map((member) => member.worktreePath))
++
++  if (runtimeState.status !== "deleted") {
++    await transitionRuntimeState(teamRunId, (currentRuntimeState) => (
++      currentRuntimeState.status === "deleted"
++        ? currentRuntimeState
++        : { ...currentRuntimeState, status: "deleted" }
++    ), config)
++  }
++
++  await removeWorktrees([getRuntimeStateDir(resolveBaseDir(config), teamRunId)])
++
++  unregisterTeamSessionsByTeam(teamRunId)
++
++  const activeTeams = await listActiveTeams(config)
++  sweepStaleTeamSessions(new Set(activeTeams.map((team) => team.teamRunId))).catch(() => {})
++
++  return { removedWorktrees, removedLayout }
++}
+-- 
+2.39.2
+

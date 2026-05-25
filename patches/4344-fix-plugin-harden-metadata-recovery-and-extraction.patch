@@ -1,0 +1,415 @@
+From 4da300579778b93338573316ecabb70b030b174a Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 16 Apr 2026 13:52:12 +0900
+Subject: [PATCH 4344/5749] fix(plugin): harden metadata recovery and
+ extraction
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/hooks/atlas/subagent-session-id.test.ts   | 11 +++
+ src/hooks/atlas/subagent-session-id.ts        | 22 ++---
+ .../oracle-verification-detector.ts           | 15 +---
+ src/hooks/task-resume-info/hook.ts            | 19 +---
+ src/hooks/task-resume-info/index.test.ts      | 18 ++++
+ src/plugin/tool-execute-after.test.ts         | 62 ++++++++++++-
+ src/plugin/tool-execute-after.ts              | 86 ++++++++++++-------
+ 7 files changed, 158 insertions(+), 75 deletions(-)
+
+diff --git a/src/hooks/atlas/subagent-session-id.test.ts b/src/hooks/atlas/subagent-session-id.test.ts
+index b73a0c75..3b8c6875 100644
+--- a/src/hooks/atlas/subagent-session-id.test.ts
++++ b/src/hooks/atlas/subagent-session-id.test.ts
+@@ -90,6 +90,17 @@ describe("extractSessionIdFromMetadata", () => {
+     expect(result).toBe("ses_plugin_abc123")
+   })
+ 
++  test("extracts legacy session aliases from tool metadata object", () => {
++    // given
++    const metadata = { sessionID: "ses_plugin_alias_123" }
++
++    // when
++    const result = extractSessionIdFromMetadata(metadata)
++
++    // then
++    expect(result).toBe("ses_plugin_alias_123")
++  })
++
+   test("returns undefined for metadata without sessionId", () => {
+     // given
+     const metadata = { title: "some task" }
+diff --git a/src/hooks/atlas/subagent-session-id.ts b/src/hooks/atlas/subagent-session-id.ts
+index 95aef2ae..cc52deb8 100644
+--- a/src/hooks/atlas/subagent-session-id.ts
++++ b/src/hooks/atlas/subagent-session-id.ts
+@@ -1,30 +1,20 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
++import { extractTaskLink } from "../../features/tool-metadata-store"
+ import { log } from "../../shared/logger"
+ import { isSessionInBoulderLineage } from "./boulder-session-lineage"
+ import { HOOK_NAME } from "./hook-name"
+ 
+ export function extractSessionIdFromMetadata(metadata: unknown): string | undefined {
+-  if (metadata && typeof metadata === "object" && "sessionId" in metadata) {
+-    const value = (metadata as Record<string, unknown>).sessionId
+-    if (typeof value === "string" && value.startsWith("ses_")) {
+-      return value
+-    }
++  const sessionId = extractTaskLink(metadata, "").sessionId
++  if (typeof sessionId === "string" && sessionId.startsWith("ses_")) {
++    return sessionId
+   }
++
+   return undefined
+ }
+ 
+ export function extractSessionIdFromOutput(output: string): string | undefined {
+-  const taskMetadataBlocks = [...output.matchAll(/<task_metadata>([\s\S]*?)<\/task_metadata>/gi)]
+-  const lastTaskMetadataBlock = taskMetadataBlocks.at(-1)?.[1]
+-  if (lastTaskMetadataBlock) {
+-    const taskMetadataSessionMatch = lastTaskMetadataBlock.match(/session_id:\s*(ses_[a-zA-Z0-9_-]+)/i)
+-    if (taskMetadataSessionMatch) {
+-      return taskMetadataSessionMatch[1]
+-    }
+-  }
+-
+-  const explicitSessionMatches = [...output.matchAll(/Session ID:\s*(ses_[a-zA-Z0-9_-]+)/g)]
+-  return explicitSessionMatches.at(-1)?.[1]
++  return extractTaskLink(undefined, output).sessionId
+ }
+ 
+ export async function validateSubagentSessionId(input: {
+diff --git a/src/hooks/ralph-loop/oracle-verification-detector.ts b/src/hooks/ralph-loop/oracle-verification-detector.ts
+index 9d360282..277ef1fe 100644
+--- a/src/hooks/ralph-loop/oracle-verification-detector.ts
++++ b/src/hooks/ralph-loop/oracle-verification-detector.ts
+@@ -1,3 +1,4 @@
++import { extractTaskLink } from "../../features/tool-metadata-store"
+ import { stripInvisibleAgentCharacters } from "../../shared/agent-display-names"
+ import { ULTRAWORK_VERIFICATION_PROMISE } from "./constants"
+ 
+@@ -9,8 +10,6 @@ export interface OracleVerificationEvidence {
+ 
+ const AGENT_LINE_PATTERN = /^Agent:[ \t]*(\S+)$/im
+ const PROMISE_TAG_PATTERN = /<promise>[ \t]*(\S+?)[ \t]*<\/promise>/is
+-const TASK_METADATA_PATTERN = /<task_metadata>[ \t]*([\s\S]*?)[ \t]*<\/task_metadata>/is
+-const SESSION_ID_LINE_PATTERN = /^session_id:[ \t]*(\S+)$/im
+ 
+ export function parseOracleVerificationEvidence(text: string): OracleVerificationEvidence | undefined {
+ 	const trimmedText = text.trim()
+@@ -36,17 +35,9 @@ export function parseOracleVerificationEvidence(text: string): OracleVerificatio
+ 		return undefined
+ 	}
+ 
+-	const metadataMatch = trimmedText.match(TASK_METADATA_PATTERN)
+-	let sessionID: string | undefined
+-	if (metadataMatch) {
+-		const metadataContent = metadataMatch[1]
+-		const sessionIDMatch = metadataContent.match(SESSION_ID_LINE_PATTERN)
+-		if (sessionIDMatch) {
+-			sessionID = sessionIDMatch[1]?.trim()
+-		}
+-	}
++  const sessionID = extractTaskLink(undefined, trimmedText).sessionId
+ 
+-	return { agent, promise, sessionID }
++  return { agent, promise, sessionID }
+ }
+ 
+ export function isOracleVerified(text: string): boolean {
+diff --git a/src/hooks/task-resume-info/hook.ts b/src/hooks/task-resume-info/hook.ts
+index 1774aef6..392fc876 100644
+--- a/src/hooks/task-resume-info/hook.ts
++++ b/src/hooks/task-resume-info/hook.ts
+@@ -1,19 +1,6 @@
+-const TARGET_TOOLS = ["task", "Task", "task_tool", "call_omo_agent"]
+-
+-const SESSION_ID_PATTERNS = [
+-  /Session ID: (ses_[a-zA-Z0-9_-]+)/,
+-  /session_id: (ses_[a-zA-Z0-9_-]+)/,
+-  /<task_metadata>\s*session_id: (ses_[a-zA-Z0-9_-]+)/,
+-  /sessionId: (ses_[a-zA-Z0-9_-]+)/,
+-]
++import { extractTaskLink } from "../../features/tool-metadata-store"
+ 
+-function extractSessionId(output: string): string | null {
+-  for (const pattern of SESSION_ID_PATTERNS) {
+-    const match = output.match(pattern)
+-    if (match) return match[1] ?? null
+-  }
+-  return null
+-}
++const TARGET_TOOLS = ["task", "Task", "task_tool", "call_omo_agent"]
+ 
+ export function createTaskResumeInfoHook() {
+   const toolExecuteAfter = async (
+@@ -25,7 +12,7 @@ export function createTaskResumeInfoHook() {
+     if (outputText.startsWith("Error:") || outputText.startsWith("Failed")) return
+     if (outputText.includes("\nto continue:")) return
+ 
+-    const sessionId = extractSessionId(outputText)
++    const sessionId = extractTaskLink(output.metadata, outputText).sessionId
+     if (!sessionId) return
+ 
+     output.output =
+diff --git a/src/hooks/task-resume-info/index.test.ts b/src/hooks/task-resume-info/index.test.ts
+index 2d10ef75..c592bd7c 100644
+--- a/src/hooks/task-resume-info/index.test.ts
++++ b/src/hooks/task-resume-info/index.test.ts
+@@ -78,6 +78,24 @@ describe("createTaskResumeInfoHook", () => {
+     })
+   })
+ 
++  describe("#given target tool with session metadata object", () => {
++    describe("#when output text omits session ID but metadata includes it", () => {
++      it("#then should append resume info from metadata", async () => {
++        const input = createInput("task")
++        const output = {
++          title: "task",
++          output: "Task completed successfully",
++          metadata: { sessionID: "ses_meta_123" },
++        }
++
++        await afterHook(input, output)
++
++        expect(output.output).toContain("to continue:")
++        expect(output.output).toContain("ses_meta_123")
++      })
++    })
++  })
++
+   describe("#given target tool with error output", () => {
+     describe("#when output starts with Error:", () => {
+       it("#then should not modify output", async () => {
+diff --git a/src/plugin/tool-execute-after.test.ts b/src/plugin/tool-execute-after.test.ts
+index cb70a91f..7c8e9d87 100644
+--- a/src/plugin/tool-execute-after.test.ts
++++ b/src/plugin/tool-execute-after.test.ts
+@@ -1,7 +1,13 @@
+-import { describe, expect, it } from "bun:test"
++import { beforeEach, describe, expect, it } from "bun:test"
++
++import { clearPendingStore, storeToolMetadata } from "../features/tool-metadata-store"
+ import { createToolExecuteAfterHandler } from "./tool-execute-after"
+ 
+ describe("createToolExecuteAfterHandler", () => {
++  beforeEach(() => {
++    clearPendingStore()
++  })
++
+   it("#given truncator changes output #when tool.execute.after runs #then claudeCodeHooks receives truncated output", async () => {
+     const callOrder: string[] = []
+     let claudeSawOutput = ""
+@@ -32,4 +38,58 @@ describe("createToolExecuteAfterHandler", () => {
+     expect(callOrder).toEqual(["truncator", "claude"])
+     expect(claudeSawOutput).toBe("truncated output")
+   })
++
++  it("#given stored metadata with legacy call id casing #when tool.execute.after runs #then it restores the stored metadata", async () => {
++    // given
++    storeToolMetadata("ses_parent", "call_legacy", {
++      title: "stored title",
++      metadata: { sessionId: "ses_child", agent: "oracle" },
++    })
++
++    const handler = createToolExecuteAfterHandler({
++      ctx: { directory: "/repo" } as never,
++      hooks: {} as never,
++    })
++
++    const output = { title: "result", output: "original output", metadata: { truncated: true } }
++
++    // when
++    await handler(
++      { tool: "hashline_edit", sessionID: "ses_parent", callId: " call_legacy " },
++      output
++    )
++
++    // then
++    expect(output.title).toBe("stored title")
++    expect(output.metadata).toEqual({ truncated: true, sessionId: "ses_child", agent: "oracle" })
++  })
++
++  it("#given native session metadata #when stored metadata exists #then stored metadata does not overwrite native session linkage", async () => {
++    // given
++    storeToolMetadata("ses_parent", "call_native", {
++      title: "stored title",
++      metadata: { sessionId: "ses_stored", agent: "oracle" },
++    })
++
++    const handler = createToolExecuteAfterHandler({
++      ctx: { directory: "/repo" } as never,
++      hooks: {} as never,
++    })
++
++    const output = {
++      title: "result",
++      output: "original output",
++      metadata: { sessionId: "ses_native", agent: "hephaestus" },
++    }
++
++    // when
++    await handler(
++      { tool: "hashline_edit", sessionID: "ses_parent", callID: "call_native" },
++      output
++    )
++
++    // then
++    expect(output.title).toBe("stored title")
++    expect(output.metadata).toEqual({ sessionId: "ses_native", agent: "hephaestus" })
++  })
+ })
+diff --git a/src/plugin/tool-execute-after.ts b/src/plugin/tool-execute-after.ts
+index b0c31bb4..19bb724d 100644
+--- a/src/plugin/tool-execute-after.ts
++++ b/src/plugin/tool-execute-after.ts
+@@ -1,9 +1,8 @@
+-import { consumeToolMetadata } from "../features/tool-metadata-store"
++import { recoverToolMetadata } from "../features/tool-metadata-store"
+ import type { CreatedHooks } from "../create-hooks"
+-import { log } from "../shared"
++import { log } from "../shared/logger"
+ import { stripInvisibleAgentCharacters } from "../shared/agent-display-names"
+ import type { PluginContext } from "./types"
+-import { readState, writeState } from "../hooks/ralph-loop/storage"
+ 
+ const VERIFICATION_ATTEMPT_PATTERN = /<ulw_verification_attempt_id>(.*?)<\/ulw_verification_attempt_id>/i
+ 
+@@ -37,20 +36,45 @@ export function createToolExecuteAfterHandler(args: {
+ ) => Promise<void> {
+   const { ctx, hooks } = args
+ 
++  // OpenCode injects tool call ids into execute() context and after-hook input via undocumented runtime fields.
++  // We must treat their identity as a best-effort correlation key, not a guaranteed public contract.
++
+   return async (
+-    input: { tool: string; sessionID: string; callID: string },
++    input: { tool: string; sessionID: string; callID?: string; callId?: string; call_id?: string },
+     output: { title: string; output: string; metadata: Record<string, unknown> } | undefined,
+   ): Promise<void> => {
+     if (!output) return
+ 
+-    const stored = consumeToolMetadata(input.sessionID, input.callID)
++    const hookInput = {
++      tool: input.tool,
++      sessionID: input.sessionID,
++      callID: input.callID ?? input.callId ?? input.call_id ?? "",
++    }
++
++    const nativeSessionId = getMetadataString(output.metadata, ["sessionId", "sessionID", "session_id"])
++    const stored = recoverToolMetadata(input.sessionID, input)
+     if (stored) {
+       if (stored.title) {
+         output.title = stored.title
+       }
+       if (stored.metadata) {
+-        output.metadata = { ...output.metadata, ...stored.metadata }
++        if (nativeSessionId) {
++          log("[tool-execute-after] Native output metadata already includes session linkage; skipping stored metadata overwrite", {
++            tool: input.tool,
++            sessionID: input.sessionID,
++            callID: input.callID ?? input.callId ?? input.call_id,
++            nativeSessionId,
++          })
++        } else {
++          output.metadata = { ...output.metadata, ...stored.metadata }
++        }
+       }
++    } else if (!nativeSessionId) {
++      log("[tool-execute-after] Unable to recover stored metadata and no native session linkage was present", {
++        tool: input.tool,
++        sessionID: input.sessionID,
++        callID: input.callID ?? input.callId ?? input.call_id,
++      })
+     }
+ 
+     if (input.tool === "task") {
+@@ -59,7 +83,9 @@ export function createToolExecuteAfterHandler(args: {
+       const agent = getMetadataString(output.metadata, ["agent"])
+       const prompt = getMetadataString(output.metadata, ["prompt"])
+       const verificationAttemptId = prompt?.match(VERIFICATION_ATTEMPT_PATTERN)?.[1]?.trim()
+-      const loopState = directory ? readState(directory) : null
++      const loopState = directory
++        ? (await import("../hooks/ralph-loop/storage")).readState(directory)
++        : null
+       const isVerificationContext =
+         (agent ? stripInvisibleAgentCharacters(agent) : agent) === "oracle"
+         && !!sessionId
+@@ -83,7 +109,7 @@ export function createToolExecuteAfterHandler(args: {
+         && verificationAttemptId
+         && loopState.verification_attempt_id === verificationAttemptId
+       ) {
+-        writeState(directory, {
++        ;(await import("../hooks/ralph-loop/storage")).writeState(directory, {
+           ...loopState,
+           verification_session_id: sessionId,
+         })
+@@ -93,7 +119,7 @@ export function createToolExecuteAfterHandler(args: {
+           verificationAttemptId,
+         })
+       } else if (isVerificationContext && !verificationAttemptId) {
+-        writeState(directory, {
++        ;(await import("../hooks/ralph-loop/storage")).writeState(directory, {
+           ...loopState,
+           verification_session_id: sessionId,
+         })
+@@ -108,26 +134,26 @@ export function createToolExecuteAfterHandler(args: {
+     }
+ 
+     const runToolExecuteAfterHooks = async (): Promise<void> => {
+-      await hooks.toolOutputTruncator?.["tool.execute.after"]?.(input, output)
+-      await hooks.claudeCodeHooks?.["tool.execute.after"]?.(input, output)
+-      await hooks.preemptiveCompaction?.["tool.execute.after"]?.(input, output)
+-      await hooks.contextWindowMonitor?.["tool.execute.after"]?.(input, output)
+-      await hooks.commentChecker?.["tool.execute.after"]?.(input, output)
+-      await hooks.directoryAgentsInjector?.["tool.execute.after"]?.(input, output)
+-      await hooks.directoryReadmeInjector?.["tool.execute.after"]?.(input, output)
+-      await hooks.rulesInjector?.["tool.execute.after"]?.(input, output)
+-      await hooks.emptyTaskResponseDetector?.["tool.execute.after"]?.(input, output)
+-      await hooks.agentUsageReminder?.["tool.execute.after"]?.(input, output)
+-      await hooks.categorySkillReminder?.["tool.execute.after"]?.(input, output)
+-      await hooks.interactiveBashSession?.["tool.execute.after"]?.(input, output)
+-      await hooks.editErrorRecovery?.["tool.execute.after"]?.(input, output)
+-      await hooks.delegateTaskRetry?.["tool.execute.after"]?.(input, output)
+-      await hooks.atlasHook?.["tool.execute.after"]?.(input, output)
+-      await hooks.taskResumeInfo?.["tool.execute.after"]?.(input, output)
+-      await hooks.readImageResizer?.["tool.execute.after"]?.(input, output)
+-      await hooks.hashlineReadEnhancer?.["tool.execute.after"]?.(input, output)
+-      await hooks.webfetchRedirectGuard?.["tool.execute.after"]?.(input, output)
+-      await hooks.jsonErrorRecovery?.["tool.execute.after"]?.(input, output)
++      await hooks.toolOutputTruncator?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.claudeCodeHooks?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.preemptiveCompaction?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.contextWindowMonitor?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.commentChecker?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.directoryAgentsInjector?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.directoryReadmeInjector?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.rulesInjector?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.emptyTaskResponseDetector?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.agentUsageReminder?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.categorySkillReminder?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.interactiveBashSession?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.editErrorRecovery?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.delegateTaskRetry?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.atlasHook?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.taskResumeInfo?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.readImageResizer?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.hashlineReadEnhancer?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.webfetchRedirectGuard?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.jsonErrorRecovery?.["tool.execute.after"]?.(hookInput, output)
+     }
+ 
+     if (input.tool === "extract" || input.tool === "discard") {
+@@ -146,7 +172,7 @@ export function createToolExecuteAfterHandler(args: {
+         log("[tool-execute-after] Failed to process extract/discard hooks", {
+           tool: input.tool,
+           sessionID: input.sessionID,
+-          callID: input.callID,
++          callID: input.callID ?? input.callId ?? input.call_id,
+           error,
+         })
+       }
+-- 
+2.39.2
+

@@ -1,0 +1,967 @@
+From c580b8f2ce114278700ab59edb8bae55eab22b47 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 23:16:05 +0900
+Subject: [PATCH 5248/5749] fix(session): ignore internal synthetic turns
+
+---
+ .../context-injector/injector.test.ts         | 84 ++++++++++++++++++-
+ src/features/context-injector/injector.ts     | 33 +++++---
+ src/hooks/auto-slash-command/detector.test.ts | 52 +++++++++++-
+ src/hooks/auto-slash-command/detector.ts      | 18 ++--
+ src/hooks/auto-slash-command/index.test.ts    | 28 +++++--
+ src/hooks/keyword-detector/detector.ts        |  7 +-
+ src/hooks/keyword-detector/hook.ts            | 17 ++--
+ src/hooks/keyword-detector/index.test.ts      | 32 +++++--
+ .../team-mode-status-injector/hook.test.ts    | 30 ++++++-
+ src/hooks/team-mode-status-injector/hook.ts   |  9 +-
+ src/plugin/chat-message.test.ts               | 64 ++++++++++++--
+ src/plugin/chat-message.ts                    | 41 +++++----
+ src/shared/internal-initiator-marker.test.ts  | 68 ++++++++++++++-
+ src/shared/internal-initiator-marker.ts       | 59 +++++++++++++
+ 14 files changed, 463 insertions(+), 79 deletions(-)
+
+diff --git a/src/features/context-injector/injector.test.ts b/src/features/context-injector/injector.test.ts
+index c9e98c33..f4734685 100644
+--- a/src/features/context-injector/injector.test.ts
++++ b/src/features/context-injector/injector.test.ts
+@@ -1,9 +1,11 @@
+-import { describe, it, expect, beforeEach } from "bun:test"
++import { beforeEach, describe, expect, it } from "bun:test"
++import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
+ import { ContextCollector } from "./collector"
+ import {
++  createContextInjectorHook,
+   createContextInjectorMessagesTransformHook,
+ } from "./injector"
+-import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
+ 
+ describe("createContextInjectorMessagesTransformHook", () => {
+   let collector: ContextCollector
+@@ -15,7 +17,8 @@ describe("createContextInjectorMessagesTransformHook", () => {
+   const createMockMessage = (
+     role: "user" | "assistant",
+     text: string,
+-    sessionID: string
++    sessionID: string,
++    options?: { synthetic?: boolean }
+   ) => ({
+     info: {
+       id: `msg_${Date.now()}_${Math.random()}`,
+@@ -33,6 +36,7 @@ describe("createContextInjectorMessagesTransformHook", () => {
+         messageID: `msg_${Date.now()}`,
+         type: "text" as const,
+         text,
++        ...(options?.synthetic === true ? { synthetic: true } : {}),
+       },
+     ],
+   })
+@@ -146,6 +150,80 @@ describe("createContextInjectorMessagesTransformHook", () => {
+     expect(collector.hasPending(sessionID)).toBe(true)
+   })
+ 
++  it("does not consume pending context through chat.message when the only text part is synthetic", async () => {
++    // given
++    const hook = createContextInjectorHook(collector)
++    const sessionID = "ses_chat_message_synthetic"
++    collector.register(sessionID, {
++      id: "ctx",
++      source: "keyword-detector",
++      content: "Context",
++    })
++    const output = {
++      message: {},
++      parts: [{ type: "text", text: "Synthetic hook message", synthetic: true }],
++    }
++
++    // when
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then
++    expect(output.parts[0]?.text).toBe("Synthetic hook message")
++    expect(collector.hasPending(sessionID)).toBe(true)
++  })
++
++  it("does not consume pending context when the latest user message is synthetic", async () => {
++    // given
++    const hook = createContextInjectorMessagesTransformHook(collector)
++    const sessionID = "ses_transform_synthetic_latest"
++    collector.register(sessionID, {
++      id: "ctx",
++      source: "keyword-detector",
++      content: "Context",
++    })
++    const messages = [
++      createMockMessage("user", "Real user message", sessionID),
++      createMockMessage("user", "Synthetic hook message", sessionID, { synthetic: true }),
++    ]
++    const originalMessages = structuredClone(messages)
++    const output = unsafeTestValue({ messages })
++
++    // when
++    await hook["experimental.chat.messages.transform"]!({}, output)
++
++    // then
++    expect(output.messages).toEqual(originalMessages)
++    expect(collector.hasPending(sessionID)).toBe(true)
++  })
++
++  it("does not consume pending context when the latest user message is internally marked", async () => {
++    // given
++    const hook = createContextInjectorMessagesTransformHook(collector)
++    const sessionID = "ses_transform_internal_latest"
++    collector.register(sessionID, {
++      id: "ctx",
++      source: "keyword-detector",
++      content: "Context",
++    })
++    const messages = [
++      createMockMessage("user", "Real user message", sessionID),
++      createMockMessage(
++        "user",
++        `Internal prompt\n${OMO_INTERNAL_INITIATOR_MARKER}`,
++        sessionID,
++      ),
++    ]
++    const originalMessages = structuredClone(messages)
++    const output = unsafeTestValue({ messages })
++
++    // when
++    await hook["experimental.chat.messages.transform"]!({}, output)
++
++    // then
++    expect(output.messages).toEqual(originalMessages)
++    expect(collector.hasPending(sessionID)).toBe(true)
++  })
++
+   it("consumes context after injection", async () => {
+     // given
+     const hook = createContextInjectorMessagesTransformHook(collector)
+diff --git a/src/features/context-injector/injector.ts b/src/features/context-injector/injector.ts
+index eff4faae..2b170b1f 100644
+--- a/src/features/context-injector/injector.ts
++++ b/src/features/context-injector/injector.ts
+@@ -1,7 +1,7 @@
+-import type { ContextCollector } from "./collector"
+ import type { Message, Part } from "@opencode-ai/sdk"
+-import { log } from "../../shared"
++import { isRealUserMessage, isRealUserTextPart, log } from "../../shared"
+ import { getMainSessionID } from "../claude-code-session-state"
++import type { ContextCollector } from "./collector"
+ 
+ interface OutputPart {
+   type: string
+@@ -23,7 +23,7 @@ export function injectPendingContext(
+     return { injected: false, contextLength: 0 }
+   }
+ 
+-  const textPartIndex = parts.findIndex((p) => p.type === "text" && p.text !== undefined)
++  const textPartIndex = parts.findIndex(isRealUserTextPart)
+   if (textPartIndex === -1) {
+     return { injected: false, contextLength: 0 }
+   }
+@@ -102,7 +102,8 @@ export function createContextInjectorMessagesTransformHook(
+ 
+       let lastUserMessageIndex = -1
+       for (let i = messages.length - 1; i >= 0; i--) {
+-        if (messages[i].info.role === "user") {
++        const message = messages[i]
++        if (message?.info.role === "user") {
+           lastUserMessageIndex = i
+           break
+         }
+@@ -114,6 +115,15 @@ export function createContextInjectorMessagesTransformHook(
+       }
+ 
+       const lastUserMessage = messages[lastUserMessageIndex]
++      if (lastUserMessage === undefined) {
++        return
++      }
++      if (!isRealUserMessage(lastUserMessage)) {
++        log("[context-injector] Latest user message is synthetic/internal, skipping injection", {
++          sessionID: getSessionIDFromMessageInfo(lastUserMessage.info) ?? getMainSessionID(),
++        })
++        return
++      }
+       const messageSessionID = getSessionIDFromMessageInfo(lastUserMessage.info)
+       const sessionID = messageSessionID ?? getMainSessionID()
+       log("[DEBUG] Extracted sessionID", {
+@@ -136,13 +146,8 @@ export function createContextInjectorMessagesTransformHook(
+         return
+       }
+ 
+-      const pending = collector.consume(sessionID)
+-      if (!pending.hasContent) {
+-        return
+-      }
+-
+       const textPartIndex = lastUserMessage.parts.findIndex(
+-        (p) => p.type === "text" && hasText(p)
++        (p) => isRealUserTextPart(p) && hasText(p)
+       )
+ 
+       if (textPartIndex === -1) {
+@@ -153,14 +158,18 @@ export function createContextInjectorMessagesTransformHook(
+         return
+       }
+ 
+-      // synthetic part pattern (minimal fields)
++      const pending = collector.consume(sessionID)
++      if (!pending.hasContent) {
++        return
++      }
++
+       const syntheticPart = {
+         id: `synthetic_hook_${sessionID}`,
+         messageID: lastUserMessage.info.id,
+         sessionID: messageSessionID ?? "",
+         type: "text" as const,
+         text: pending.merged,
+-        synthetic: true,  // hidden in UI
++        synthetic: true,
+       }
+ 
+       lastUserMessage.parts.splice(textPartIndex, 0, syntheticPart as Part)
+diff --git a/src/hooks/auto-slash-command/detector.test.ts b/src/hooks/auto-slash-command/detector.test.ts
+index 36eb8bc6..ef461ed6 100644
+--- a/src/hooks/auto-slash-command/detector.test.ts
++++ b/src/hooks/auto-slash-command/detector.test.ts
+@@ -1,10 +1,12 @@
+ import { describe, expect, it } from "bun:test"
++import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
+ import {
+-  parseSlashCommand,
+   detectSlashCommand,
++  extractPromptText,
++  findSlashCommandPartIndex,
+   isExcludedCommand,
++  parseSlashCommand,
+   removeCodeBlocks,
+-  extractPromptText,
+ } from "./detector"
+ 
+ describe("auto-slash-command detector", () => {
+@@ -305,5 +307,51 @@ After`
+       // then should return empty string
+       expect(result).toBe("")
+     })
++
++    it("ignores synthetic and internal slash text when extracting prompt text", () => {
++      // given
++      const parts = [
++        { type: "text", text: "/commit from synthetic", synthetic: true },
++        { type: "text", text: `/commit from marker\n${OMO_INTERNAL_INITIATOR_MARKER}` },
++        { type: "text", text: "real request" },
++      ]
++
++      // when
++      const result = extractPromptText(parts)
++
++      // then
++      expect(result).toBe("real request")
++    })
++  })
++
++  describe("findSlashCommandPartIndex", () => {
++    it("does not select synthetic or internal slash command parts", () => {
++      // given
++      const parts = [
++        { type: "text", text: "/commit synthetic", synthetic: true },
++        { type: "text", text: `/plan internal\n${OMO_INTERNAL_INITIATOR_MARKER}` },
++        { type: "text", text: "/real-command" },
++      ]
++
++      // when
++      const result = findSlashCommandPartIndex(parts)
++
++      // then
++      expect(result).toBe(2)
++    })
++
++    it("returns minus one when every slash command part is synthetic or internal", () => {
++      // given
++      const parts = [
++        { type: "text", text: "/commit synthetic", synthetic: true },
++        { type: "text", text: `/plan internal\n${OMO_INTERNAL_INITIATOR_MARKER}` },
++      ]
++
++      // when
++      const result = findSlashCommandPartIndex(parts)
++
++      // then
++      expect(result).toBe(-1)
++    })
+   })
+ })
+diff --git a/src/hooks/auto-slash-command/detector.ts b/src/hooks/auto-slash-command/detector.ts
+index c4b8107a..bda956e0 100644
+--- a/src/hooks/auto-slash-command/detector.ts
++++ b/src/hooks/auto-slash-command/detector.ts
+@@ -1,6 +1,7 @@
++import { isRealUserTextPart } from "../../shared/internal-initiator-marker"
+ import {
+-  SLASH_COMMAND_PATTERN,
+   EXCLUDED_COMMANDS,
++  SLASH_COMMAND_PATTERN,
+ } from "./constants"
+ import type { ParsedSlashCommand } from "./types"
+ 
+@@ -56,30 +57,23 @@ export function detectSlashCommand(text: string): ParsedSlashCommand | null {
+ }
+ 
+ export function extractPromptText(
+-  parts: Array<{ type: string; text?: string }>
++  parts: Array<{ type: string; text?: string; synthetic?: boolean }>
+ ): string {
+-  const textParts = parts.filter((p) => p.type === "text")
++  const textParts = parts.filter(isRealUserTextPart)
+   const slashPart = textParts.find((p) => (p.text ?? "").trim().startsWith("/"))
+   if (slashPart?.text) {
+     return slashPart.text
+   }
+ 
+-  const nonSyntheticParts = textParts.filter(
+-    (p) => !(p as { synthetic?: boolean }).synthetic
+-  )
+-  if (nonSyntheticParts.length > 0) {
+-    return nonSyntheticParts.map((p) => p.text || "").join(" ")
+-  }
+-
+   return textParts.map((p) => p.text || "").join(" ")
+ }
+ 
+ export function findSlashCommandPartIndex(
+-  parts: Array<{ type: string; text?: string }>
++  parts: Array<{ type: string; text?: string; synthetic?: boolean }>
+ ): number {
+   for (let idx = 0; idx < parts.length; idx += 1) {
+     const part = parts[idx]
+-    if (part.type !== "text") continue
++    if (!isRealUserTextPart(part)) continue
+     if ((part.text ?? "").trim().startsWith("/")) {
+       return idx
+     }
+diff --git a/src/hooks/auto-slash-command/index.test.ts b/src/hooks/auto-slash-command/index.test.ts
+index cda63bf8..56d6dbbe 100644
+--- a/src/hooks/auto-slash-command/index.test.ts
++++ b/src/hooks/auto-slash-command/index.test.ts
+@@ -1,9 +1,11 @@
+-import { describe, expect, it, beforeEach, afterEach, spyOn, mock } from "bun:test"
+-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ import { clearCommandLoaderCache } from "../../features/claude-code-command-loader"
+ import type { LoadedSkill } from "../../features/opencode-skill-loader/types"
++// Import real shared module to avoid mock leaking to other test files
++import * as shared from "../../shared"
+ import type {
+   AutoSlashCommandHookInput,
+   AutoSlashCommandHookOutput,
+@@ -11,9 +13,6 @@ import type {
+   CommandExecuteBeforeOutput,
+ } from "./types"
+ 
+-// Import real shared module to avoid mock leaking to other test files
+-import * as shared from "../../shared"
+-
+ type AutoSlashCommandModule = typeof import("./hook")
+ 
+ function createMockInput(sessionID: string, messageID?: string): AutoSlashCommandHookInput {
+@@ -423,6 +422,25 @@ describe("createAutoSlashCommandHook", () => {
+       expect(output.parts[0].text).toContain("This is the skill template content")
+     })
+ 
++    it("does not replace synthetic slash text with a skill template", async () => {
++      // given
++      const skill = createTestSkill("my-test-skill", "This is the skill template content")
++      const hook = createAutoSlashCommandHook({ skills: [skill] })
++      const sessionID = `test-session-skill-synthetic-${Date.now()}`
++      const input = createMockInput(sessionID)
++      const output: AutoSlashCommandHookOutput = {
++        message: {},
++        parts: [{ type: "text", text: "/my-test-skill some arguments", synthetic: true }],
++      }
++      const originalText = output.parts[0].text
++
++      // when
++      await hook["chat.message"](input, output)
++
++      // then
++      expect(output.parts[0].text).toBe(originalText)
++    })
++
+     it("should inject skill template via command.execute.before", async () => {
+       // given a hook with a skill
+       const skill = createTestSkill("my-test-skill", "Skill template for command execute")
+diff --git a/src/hooks/keyword-detector/detector.ts b/src/hooks/keyword-detector/detector.ts
+index 99a9e2ee..649b9364 100644
+--- a/src/hooks/keyword-detector/detector.ts
++++ b/src/hooks/keyword-detector/detector.ts
+@@ -1,8 +1,9 @@
+ import type { KeywordType } from "../../config/schema/keyword-detector"
++import { isRealUserTextPart } from "../../shared/internal-initiator-marker"
+ import {
+-  KEYWORD_DETECTORS,
+   CODE_BLOCK_PATTERN,
+   INLINE_CODE_PATTERN,
++  KEYWORD_DETECTORS,
+ } from "./constants"
+ 
+ export interface DetectedKeyword {
+@@ -61,10 +62,10 @@ export function detectKeywordsWithType(
+ }
+ 
+ export function extractPromptText(
+-  parts: Array<{ type: string; text?: string }>
++  parts: Array<{ type: string; text?: string; synthetic?: boolean }>
+ ): string {
+   return parts
+-    .filter((p) => p.type === "text")
++    .filter(isRealUserTextPart)
+     .map((p) => p.text || "")
+     .join(" ")
+ }
+diff --git a/src/hooks/keyword-detector/hook.ts b/src/hooks/keyword-detector/hook.ts
+index 60166f69..83494c4f 100644
+--- a/src/hooks/keyword-detector/hook.ts
++++ b/src/hooks/keyword-detector/hook.ts
+@@ -6,7 +6,11 @@ import {
+   subagentSessions,
+ } from "../../features/claude-code-session-state"
+ import type { ContextCollector } from "../../features/context-injector"
+-import { log } from "../../shared"
++import {
++  isRealUserTextPart,
++  isSyntheticOrInternalOnlyTextParts,
++  log,
++} from "../../shared"
+ import {
+   isSystemDirective,
+   removeSystemReminders,
+@@ -22,11 +26,6 @@ function suppressComboStandalones(detected: DetectedKeyword[]): DetectedKeyword[
+   return detected.filter((k) => k.type !== "ultrawork" && k.type !== "hyperplan")
+ }
+ 
+-function isSyntheticTextMessage(parts: Array<{ type: string; text?: string; [key: string]: unknown }>): boolean {
+-  const textParts = parts.filter((part) => part.type === "text" && part.text !== undefined)
+-  return textParts.length > 0 && textParts.every((part) => part.synthetic === true)
+-}
+-
+ export function createKeywordDetectorHook(
+   ctx: PluginInput,
+   _collector?: ContextCollector,
+@@ -56,8 +55,8 @@ export function createKeywordDetectorHook(
+         parts: Array<{ type: string; text?: string; [key: string]: unknown }>
+       }
+     ): Promise<void> => {
+-      if (isSyntheticTextMessage(output.parts)) {
+-        log(`[keyword-detector] Skipping synthetic text message`, { sessionID: input.sessionID })
++      if (isSyntheticOrInternalOnlyTextParts(output.parts)) {
++        log(`[keyword-detector] Skipping synthetic/internal text message`, { sessionID: input.sessionID })
+         return
+       }
+ 
+@@ -191,7 +190,7 @@ export function createKeywordDetectorHook(
+           .catch((err) => log(`[keyword-detector] Failed to show toast`, { error: err, sessionID: input.sessionID }))
+       }
+ 
+-      const textPartIndex = output.parts.findIndex((p) => p.type === "text" && p.text !== undefined)
++      const textPartIndex = output.parts.findIndex(isRealUserTextPart)
+       if (textPartIndex === -1) {
+         log(`[keyword-detector] No text part found, skipping injection`, { sessionID: input.sessionID })
+         return
+diff --git a/src/hooks/keyword-detector/index.test.ts b/src/hooks/keyword-detector/index.test.ts
+index 38f3b3be..f755194e 100644
+--- a/src/hooks/keyword-detector/index.test.ts
++++ b/src/hooks/keyword-detector/index.test.ts
+@@ -1,13 +1,14 @@
+ /// <reference types="bun-types" />
+ 
+-import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test"
++import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
+ import type { PluginInput } from "@opencode-ai/plugin"
+-import { createKeywordDetectorHook } from "./index"
+-import { setMainSession, updateSessionAgent, clearSessionAgent, _resetForTesting } from "../../features/claude-code-session-state"
++import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import * as sessionState from "../../features/claude-code-session-state"
++import { _resetForTesting, clearSessionAgent, setMainSession, updateSessionAgent } from "../../features/claude-code-session-state"
+ import { ContextCollector } from "../../features/context-injector"
+ import * as sharedModule from "../../shared"
+-import * as sessionState from "../../features/claude-code-session-state"
+-import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
++import { createKeywordDetectorHook } from "./index"
+ 
+ type ToastOptions = { body: { title: string } }
+ 
+@@ -159,6 +160,27 @@ describe("keyword-detector message transform", () => {
+     expect(textPart?.text).toBe('<peer_message from="researcher">search the issue thread and report findings</peer_message>')
+     expect(textPart?.text).not.toContain("[search-mode]")
+   })
++
++  test("should not prepend mode instructions to internally marked peer messages", async () => {
++    // given - an internal peer message contains a search keyword but is not user intent
++    const collector = new ContextCollector()
++    const sessionID = "internal-peer-message-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
++    const peerText = `<peer_message from="researcher">search the issue thread</peer_message>\n${OMO_INTERNAL_INITIATOR_MARKER}`
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: peerText }],
++    }
++
++    // when
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then
++    const textPart = output.parts.find((part) => part.type === "text")
++    expect(textPart?.text).toBe(peerText)
++    expect(textPart?.text).not.toContain("[search-mode]")
++  })
+ })
+ 
+ describe("keyword-detector session filtering", () => {
+diff --git a/src/hooks/team-mode-status-injector/hook.test.ts b/src/hooks/team-mode-status-injector/hook.test.ts
+index 4bd33c1c..376b4236 100644
+--- a/src/hooks/team-mode-status-injector/hook.test.ts
++++ b/src/hooks/team-mode-status-injector/hook.test.ts
+@@ -3,7 +3,11 @@ import { describe, expect, it } from "bun:test"
+ import { TeamModeConfigSchema } from "../../config/schema/team-mode"
+ import { createTeamModeStatusInjector } from "./hook"
+ 
+-function createOutput(sessionID: string, text = "original message"): {
++function createOutput(
++  sessionID: string,
++  text = "original message",
++  options?: { synthetic?: boolean }
++): {
+   messages: Array<{
+     info: { role: string; sessionID: string }
+     parts: Array<{ type: string; text?: string; synthetic?: boolean }>
+@@ -16,7 +20,13 @@ function createOutput(sessionID: string, text = "original message"): {
+           role: "user",
+           sessionID,
+         },
+-        parts: [{ type: "text", text }],
++        parts: [
++          {
++            type: "text",
++            text,
++            ...(options?.synthetic === true ? { synthetic: true } : {}),
++          },
++        ],
+       },
+     ],
+   }
+@@ -111,6 +121,22 @@ describe("createTeamModeStatusInjector", () => {
+     expect(output.messages[0]?.parts[0]?.text).toBe(".")
+   })
+ 
++  it("does not inject team mode status for synthetic team prompts", async () => {
++    // given
++    const hook = createTeamModeStatusInjector(TeamModeConfigSchema.parse({ enabled: true }))
++    const output = createOutput("session-team-mode", "team mode please", { synthetic: true })
++
++    // when
++    await hook["experimental.chat.messages.transform"]?.(
++      { sessionID: "session-team-mode" },
++      output,
++    )
++
++    // then
++    expect(output.messages).toHaveLength(1)
++    expect(output.messages[0]?.parts[0]?.text).toBe("team mode please")
++  })
++
+   it("does not inject team mode status when the team keyword is disabled", async () => {
+     // given
+     const hook = createTeamModeStatusInjector(
+diff --git a/src/hooks/team-mode-status-injector/hook.ts b/src/hooks/team-mode-status-injector/hook.ts
+index 6bb29142..d7c9ad3f 100644
+--- a/src/hooks/team-mode-status-injector/hook.ts
++++ b/src/hooks/team-mode-status-injector/hook.ts
+@@ -1,5 +1,6 @@
+-import type { TeamModeConfig } from "../../config/schema/team-mode"
+ import type { KeywordDetectorConfig } from "../../config/schema/keyword-detector"
++import type { TeamModeConfig } from "../../config/schema/team-mode"
++import { isRealUserMessage } from "../../shared/internal-initiator-marker"
+ import { detectKeywordsWithType, extractPromptText } from "../keyword-detector/detector"
+ 
+ type TransformPart = {
+@@ -58,7 +59,8 @@ function resolveSessionID(
+ 
+ function findLastUserMessageIndex(messages: MessageWithParts[]): number {
+   for (let index = messages.length - 1; index >= 0; index -= 1) {
+-    if (messages[index]?.info.role === "user") {
++    const message = messages[index]
++    if (message?.info.role === "user") {
+       return index
+     }
+   }
+@@ -83,6 +85,9 @@ function latestUserMessageRequestsTeamMode(
+   if (message === undefined) {
+     return false
+   }
++  if (!isRealUserMessage(message)) {
++    return false
++  }
+ 
+   const promptText = extractPromptText(message.parts)
+   return detectKeywordsWithType(
+diff --git a/src/plugin/chat-message.test.ts b/src/plugin/chat-message.test.ts
+index 1957700f..6e4eca08 100644
+--- a/src/plugin/chat-message.test.ts
++++ b/src/plugin/chat-message.test.ts
+@@ -1,19 +1,19 @@
+-import { afterEach, beforeEach, describe, test, expect } from "bun:test"
++import { afterEach, beforeEach, describe, expect, test } from "bun:test"
++import { randomUUID } from "node:crypto"
+ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+-import { randomUUID } from "node:crypto"
+-
+-import { createChatMessageHandler } from "./chat-message"
++import { unsafeTestValue } from "../../test-support/unsafe-test-value"
++import { readBoulderState } from "../features/boulder-state"
++import { _resetForTesting, getSessionAgent, registerAgentName, setMainSession, subagentSessions, updateSessionAgent } from "../features/claude-code-session-state"
+ import { createAutoSlashCommandHook } from "../hooks/auto-slash-command"
+ import { createKeywordDetectorHook } from "../hooks/keyword-detector"
+ import { createStartWorkHook } from "../hooks/start-work"
+-import { readBoulderState } from "../features/boulder-state"
+-import { _resetForTesting, setMainSession, subagentSessions, registerAgentName, updateSessionAgent, getSessionAgent } from "../features/claude-code-session-state"
+ import { getAgentListDisplayName } from "../shared/agent-display-names"
+ import { getOmoOpenCodeCacheDir, getOpenCodeCacheDir } from "../shared/data-path"
++import { OMO_INTERNAL_INITIATOR_MARKER } from "../shared/internal-initiator-marker"
+ import { clearSessionModel, getSessionModel, setSessionModel } from "../shared/session-model-state"
+-import { unsafeTestValue } from "../../test-support/unsafe-test-value"
++import { createChatMessageHandler } from "./chat-message"
+ 
+ type ChatMessagePart = { type: string; text?: string; [key: string]: unknown }
+ type ChatMessageHandlerOutput = { message: Record<string, unknown>; parts: ChatMessagePart[] }
+@@ -83,6 +83,56 @@ afterEach(() => {
+   clearSessionModel("subagent-session")
+ })
+ 
++describe("createChatMessageHandler - synthetic/internal messages", () => {
++  test("skips synthetic-only user messages before session state and hooks mutate", async () => {
++    // given
++    const hookCalls: string[] = []
++    const args = createMockHandlerArgs({ shouldOverride: true })
++    args.hooks.keywordDetector = {
++      "chat.message": async () => {
++        hookCalls.push("keywordDetector")
++      },
++    }
++    const handler = createChatMessageHandler(args)
++    const output: ChatMessageHandlerOutput = {
++      message: {},
++      parts: [{ type: "text", text: "synthetic prompt", synthetic: true }],
++    }
++
++    // when
++    await handler(createMockInput("sisyphus"), output)
++
++    // then
++    expect(args._appliedSessions).toEqual([])
++    expect(hookCalls).toEqual([])
++    expect(getSessionAgent("test-session")).toBeUndefined()
++  })
++
++  test("skips internally marked user messages before first-message gate is consumed", async () => {
++    // given
++    const hookCalls: string[] = []
++    const args = createMockHandlerArgs({ shouldOverride: true })
++    args.hooks.autoSlashCommand = {
++      "chat.message": async () => {
++        hookCalls.push("autoSlashCommand")
++      },
++    }
++    const handler = createChatMessageHandler(args)
++    const output: ChatMessageHandlerOutput = {
++      message: {},
++      parts: [{ type: "text", text: `/commit\n${OMO_INTERNAL_INITIATOR_MARKER}` }],
++    }
++
++    // when
++    await handler(createMockInput("sisyphus"), output)
++
++    // then
++    expect(args._appliedSessions).toEqual([])
++    expect(hookCalls).toEqual([])
++    expect(getSessionAgent("test-session")).toBeUndefined()
++  })
++})
++
+ describe("createChatMessageHandler - cache warning behavior", () => {
+   let cacheRoot = ""
+   let originalXdgCacheHome: string | undefined
+diff --git a/src/plugin/chat-message.ts b/src/plugin/chat-message.ts
+index 82abb873..ca8577d8 100644
+--- a/src/plugin/chat-message.ts
++++ b/src/plugin/chat-message.ts
+@@ -1,15 +1,19 @@
+ import type { OhMyOpenCodeConfig } from "../config"
+-import type { PluginContext } from "./types"
++import type { CreatedHooks } from "../create-hooks"
+ 
+-import { isModelCacheAvailable, log } from "../shared"
++import { getMainSessionID, setSessionAgent, subagentSessions } from "../features/claude-code-session-state"
++import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
++import {
++  isModelCacheAvailable,
++  isRealUserTextPart,
++  isSyntheticOrInternalOnlyTextParts,
++  log,
++} from "../shared"
+ import { getAgentConfigKey } from "../shared/agent-display-names"
+ import { getSessionModel, setSessionModel } from "../shared/session-model-state"
+-import { getMainSessionID, setSessionAgent, subagentSessions } from "../features/claude-code-session-state"
+-import { applyUltraworkModelOverrideOnMessage } from "./ultrawork-model-override"
+ import { NATIVE_LOOP_TRIGGERED_FLAG } from "./command-execute-before"
+-import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
+-
+-import type { CreatedHooks } from "../create-hooks"
++import type { PluginContext } from "./types"
++import { applyUltraworkModelOverrideOnMessage } from "./ultrawork-model-override"
+ 
+ type FirstMessageVariantGate = {
+   shouldOverride: (sessionID: string) => boolean
+@@ -35,12 +39,12 @@ type RawLoopCommand =
+ function isStartWorkHookOutput(value: unknown): value is StartWorkHookOutput {
+   if (typeof value !== "object" || value === null) return false
+   const record = value as Record<string, unknown>
+-  const partsValue = record["parts"]
++  const partsValue = record.parts
+   if (!Array.isArray(partsValue)) return false
+   return partsValue.every((part) => {
+     if (typeof part !== "object" || part === null) return false
+     const partRecord = part as Record<string, unknown>
+-    return typeof partRecord["type"] === "string"
++    return typeof partRecord.type === "string"
+   })
+ }
+ 
+@@ -62,8 +66,7 @@ function hasExplicitAgentModelOverride(
+ function getStoredMainSessionModel(
+   input: ChatMessageInput,
+   pluginConfig: OhMyOpenCodeConfig,
+-  isFirstMessage: boolean,
+-  output: ChatMessageHandlerOutput
++  isFirstMessage: boolean
+ ): SessionModelOverride | undefined {
+   if (isFirstMessage) {
+     return undefined
+@@ -81,7 +84,7 @@ function getStoredMainSessionModel(
+     return undefined
+   }
+ 
+-  // Removed: `output.message["model"] !== undefined` guard was unreachable.
++  // Removed: `output.message.model !== undefined` guard was unreachable.
+   // OpenCode always populates output.message.model before triggering chat.message,
+   // so the guard short-circuited every time, preventing session model recovery.
+ 
+@@ -129,7 +132,7 @@ function parseRawLoopSlashCommand(promptText: string): RawLoopCommand | null {
+ function extractPromptText(parts: ChatMessagePart[]): string {
+   return (
+     parts
+-      ?.filter((part) => part.type === "text" && part.text)
++      ?.filter(isRealUserTextPart)
+       .map((part) => part.text)
+       .join("\n")
+       .trim() || ""
+@@ -192,6 +195,13 @@ export function createChatMessageHandler(args: {
+     input: ChatMessageInput,
+     output: ChatMessageHandlerOutput
+   ): Promise<void> => {
++    if (isSyntheticOrInternalOnlyTextParts(output.parts)) {
++      log("[chat-message] Skipping synthetic/internal-only message", {
++        sessionID: input.sessionID,
++      })
++      return
++    }
++
+     if (input.agent) {
+       setSessionAgent(input.sessionID, input.agent)
+     }
+@@ -205,16 +215,15 @@ export function createChatMessageHandler(args: {
+       input,
+       pluginConfig,
+       isFirstMessage,
+-      output,
+     )
+     if (storedMainSessionModel) {
+-      output.message["model"] = storedMainSessionModel
++      output.message.model = storedMainSessionModel
+     }
+ 
+     if (!isRuntimeFallbackEnabled) {
+       await hooks.modelFallback?.["chat.message"]?.(input, output)
+     }
+-    const modelOverride = output.message["model"]
++    const modelOverride = output.message.model
+     if (
+       modelOverride &&
+       typeof modelOverride === "object" &&
+diff --git a/src/shared/internal-initiator-marker.test.ts b/src/shared/internal-initiator-marker.test.ts
+index 8ea765c2..06a97fdc 100644
+--- a/src/shared/internal-initiator-marker.test.ts
++++ b/src/shared/internal-initiator-marker.test.ts
+@@ -1,8 +1,13 @@
+ import { describe, expect, test } from "bun:test"
+ import {
+-  OMO_INTERNAL_INITIATOR_MARKER,
+   createInternalAgentContinuationTextPart,
+   createInternalAgentTextPart,
++  hasInternalInitiatorMarker,
++  isRealUserMessage,
++  isRealUserTextPart,
++  isSyntheticOrInternalOnlyTextParts,
++  isSyntheticOrInternalUserMessage,
++  OMO_INTERNAL_INITIATOR_MARKER,
+   stripInternalInitiatorMarkers,
+ } from "./internal-initiator-marker"
+ 
+@@ -145,4 +150,65 @@ describe("internal-initiator-marker", () => {
+       expect(result).toBe("")
+     })
+   })
++
++  describe("internal message guards", () => {
++    test("#given whitespace-normalized marker text #when checking marker presence #then detects it", () => {
++      // given
++      const text = "notice\n<!--   OMO_INTERNAL_INITIATOR   -->"
++
++      // when
++      const result = hasInternalInitiatorMarker(text)
++
++      // then
++      expect(result).toBe(true)
++    })
++
++    test("#given synthetic and marker-only user parts #when classifying text parts #then treats them as internal-only", () => {
++      // given
++      const parts = [
++        { type: "text", text: "hidden", synthetic: true },
++        { type: "text", text: `reminder\n${OMO_INTERNAL_INITIATOR_MARKER}` },
++      ]
++
++      // when
++      const result = isSyntheticOrInternalOnlyTextParts(parts)
++
++      // then
++      expect(result).toBe(true)
++      expect(parts.some(isRealUserTextPart)).toBe(false)
++    })
++
++    test("#given mixed real and internal user parts #when classifying #then keeps the message real", () => {
++      // given
++      const message = {
++        info: { role: "user" },
++        parts: [
++          { type: "text", text: `reminder\n${OMO_INTERNAL_INITIATOR_MARKER}` },
++          { type: "text", text: "actual user request" },
++        ],
++      }
++
++      // when
++      const isInternal = isSyntheticOrInternalUserMessage(message)
++
++      // then
++      expect(isInternal).toBe(false)
++      expect(isRealUserMessage(message)).toBe(true)
++    })
++
++    test("#given user message with only a marker-tagged text part #when classifying #then rejects it as real user input", () => {
++      // given
++      const message = {
++        role: "user",
++        parts: [{ type: "text", text: `wake up\n${OMO_INTERNAL_INITIATOR_MARKER}` }],
++      }
++
++      // when
++      const result = isRealUserMessage(message)
++
++      // then
++      expect(result).toBe(false)
++      expect(isSyntheticOrInternalUserMessage(message)).toBe(true)
++    })
++  })
+ })
+diff --git a/src/shared/internal-initiator-marker.ts b/src/shared/internal-initiator-marker.ts
+index e37a4ef8..5f1f7ce2 100644
+--- a/src/shared/internal-initiator-marker.ts
++++ b/src/shared/internal-initiator-marker.ts
+@@ -1,7 +1,66 @@
+ export const OMO_INTERNAL_INITIATOR_MARKER = "<!-- OMO_INTERNAL_INITIATOR -->"
+ 
++const INTERNAL_INITIATOR_MARKER_DETECT_PATTERN = /<!--\s*OMO_INTERNAL_INITIATOR\s*-->/
+ const INTERNAL_INITIATOR_MARKER_PATTERN = /\n*<!--\s*OMO_INTERNAL_INITIATOR\s*-->\s*/g
+ 
++export type InternalInitiatorTextPartLike = {
++  type?: string
++  text?: string
++  synthetic?: boolean
++}
++
++export type InternalInitiatorMessageLike = {
++  role?: string
++  info?: { role?: string }
++  parts?: readonly InternalInitiatorTextPartLike[]
++}
++
++export function hasInternalInitiatorMarker(text: string): boolean {
++  return INTERNAL_INITIATOR_MARKER_DETECT_PATTERN.test(text)
++}
++
++export function isTextPartLike(
++  part: InternalInitiatorTextPartLike
++): part is InternalInitiatorTextPartLike & { type: "text"; text: string } {
++  return part.type === "text" && typeof part.text === "string"
++}
++
++export function isSyntheticOrInternalTextPart(
++  part: InternalInitiatorTextPartLike
++): boolean {
++  return (
++    isTextPartLike(part) &&
++    (part.synthetic === true || hasInternalInitiatorMarker(part.text))
++  )
++}
++
++export function isRealUserTextPart(
++  part: InternalInitiatorTextPartLike
++): part is InternalInitiatorTextPartLike & { type: "text"; text: string } {
++  return isTextPartLike(part) && !isSyntheticOrInternalTextPart(part)
++}
++
++export function isSyntheticOrInternalOnlyTextParts(
++  parts: readonly InternalInitiatorTextPartLike[] | undefined
++): boolean {
++  const textParts = (parts ?? []).filter(isTextPartLike)
++  return textParts.length > 0 && textParts.every(isSyntheticOrInternalTextPart)
++}
++
++export function isSyntheticOrInternalUserMessage(
++  message: InternalInitiatorMessageLike
++): boolean {
++  const role = message.info?.role ?? message.role
++  return role === "user" && isSyntheticOrInternalOnlyTextParts(message.parts)
++}
++
++export function isRealUserMessage(
++  message: InternalInitiatorMessageLike
++): boolean {
++  const role = message.info?.role ?? message.role
++  return role === "user" && !isSyntheticOrInternalUserMessage(message)
++}
++
+ export function stripInternalInitiatorMarkers(text: string): string {
+   return text.replace(INTERNAL_INITIATOR_MARKER_PATTERN, "").trimEnd()
+ }
+-- 
+2.39.2
+

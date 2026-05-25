@@ -1,0 +1,281 @@
+From dc1a05ac3e86786e8fd9b8a3452e3b7304d9d5d2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 17 Mar 2026 16:31:11 +0900
+Subject: [PATCH 3334/5749] feat(background-agent): add loop detector helpers
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/features/background-agent/constants.ts    |   3 +
+ .../background-agent/loop-detector.test.ts    | 117 ++++++++++++++++++
+ .../background-agent/loop-detector.ts         |  96 ++++++++++++++
+ src/features/background-agent/types.ts        |   8 ++
+ 4 files changed, 224 insertions(+)
+ create mode 100644 src/features/background-agent/loop-detector.test.ts
+ create mode 100644 src/features/background-agent/loop-detector.ts
+
+diff --git a/src/features/background-agent/constants.ts b/src/features/background-agent/constants.ts
+index bfd4b7ee..9aec3230 100644
+--- a/src/features/background-agent/constants.ts
++++ b/src/features/background-agent/constants.ts
+@@ -5,6 +5,9 @@ export const TASK_TTL_MS = 30 * 60 * 1000
+ export const MIN_STABILITY_TIME_MS = 10 * 1000
+ export const DEFAULT_STALE_TIMEOUT_MS = 180_000
+ export const DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS = 1_800_000
++export const DEFAULT_MAX_TOOL_CALLS = 200
++export const DEFAULT_CIRCUIT_BREAKER_WINDOW_SIZE = 20
++export const DEFAULT_CIRCUIT_BREAKER_REPETITION_THRESHOLD_PERCENT = 80
+ export const MIN_RUNTIME_BEFORE_STALE_MS = 30_000
+ export const MIN_IDLE_TIME_MS = 5000
+ export const POLLING_INTERVAL_MS = 3000
+diff --git a/src/features/background-agent/loop-detector.test.ts b/src/features/background-agent/loop-detector.test.ts
+new file mode 100644
+index 00000000..b3d5de80
+--- /dev/null
++++ b/src/features/background-agent/loop-detector.test.ts
+@@ -0,0 +1,117 @@
++import { describe, expect, test } from "bun:test"
++import {
++  detectRepetitiveToolUse,
++  recordToolCall,
++  resolveCircuitBreakerSettings,
++} from "./loop-detector"
++
++function buildWindow(
++  toolNames: string[],
++  override?: Parameters<typeof resolveCircuitBreakerSettings>[0]
++) {
++  const settings = resolveCircuitBreakerSettings(override)
++
++  return toolNames.reduce(
++    (window, toolName) => recordToolCall(window, toolName, settings),
++    undefined as ReturnType<typeof recordToolCall> | undefined
++  )
++}
++
++describe("loop-detector", () => {
++  describe("resolveCircuitBreakerSettings", () => {
++    describe("#given nested circuit breaker config", () => {
++      test("#when resolved #then nested values override defaults", () => {
++        const result = resolveCircuitBreakerSettings({
++          maxToolCalls: 200,
++          circuitBreaker: {
++            maxToolCalls: 120,
++            windowSize: 10,
++            repetitionThresholdPercent: 70,
++          },
++        })
++
++        expect(result).toEqual({
++          maxToolCalls: 120,
++          windowSize: 10,
++          repetitionThresholdPercent: 70,
++        })
++      })
++    })
++  })
++
++  describe("detectRepetitiveToolUse", () => {
++    describe("#given recent tools are diverse", () => {
++      test("#when evaluated #then it does not trigger", () => {
++        const window = buildWindow([
++          "read",
++          "grep",
++          "edit",
++          "bash",
++          "read",
++          "glob",
++          "lsp_diagnostics",
++          "read",
++          "grep",
++          "edit",
++        ])
++
++        const result = detectRepetitiveToolUse(window)
++
++        expect(result.triggered).toBe(false)
++      })
++    })
++
++    describe("#given the same tool dominates the recent window", () => {
++      test("#when evaluated #then it triggers", () => {
++        const window = buildWindow([
++          "read",
++          "read",
++          "read",
++          "edit",
++          "read",
++          "read",
++          "read",
++          "read",
++          "grep",
++          "read",
++        ], {
++          circuitBreaker: {
++            windowSize: 10,
++            repetitionThresholdPercent: 80,
++          },
++        })
++
++        const result = detectRepetitiveToolUse(window)
++
++        expect(result).toEqual({
++          triggered: true,
++          toolName: "read",
++          repeatedCount: 8,
++          sampleSize: 10,
++          thresholdPercent: 80,
++        })
++      })
++    })
++
++    describe("#given the window is not full yet", () => {
++      test("#when the current sample crosses the threshold #then it still triggers", () => {
++        const window = buildWindow(["read", "read", "edit", "read", "read", "read", "read", "read"], {
++          circuitBreaker: {
++            windowSize: 10,
++            repetitionThresholdPercent: 80,
++          },
++        })
++
++        const result = detectRepetitiveToolUse(window)
++
++        expect(result).toEqual({
++          triggered: true,
++          toolName: "read",
++          repeatedCount: 7,
++          sampleSize: 8,
++          thresholdPercent: 80,
++        })
++      })
++    })
++  })
++})
+diff --git a/src/features/background-agent/loop-detector.ts b/src/features/background-agent/loop-detector.ts
+new file mode 100644
+index 00000000..610ddf14
+--- /dev/null
++++ b/src/features/background-agent/loop-detector.ts
+@@ -0,0 +1,96 @@
++import type { BackgroundTaskConfig } from "../../config/schema"
++import {
++  DEFAULT_CIRCUIT_BREAKER_REPETITION_THRESHOLD_PERCENT,
++  DEFAULT_CIRCUIT_BREAKER_WINDOW_SIZE,
++  DEFAULT_MAX_TOOL_CALLS,
++} from "./constants"
++import type { ToolCallWindow } from "./types"
++
++export interface CircuitBreakerSettings {
++  maxToolCalls: number
++  windowSize: number
++  repetitionThresholdPercent: number
++}
++
++export interface ToolLoopDetectionResult {
++  triggered: boolean
++  toolName?: string
++  repeatedCount?: number
++  sampleSize?: number
++  thresholdPercent?: number
++}
++
++export function resolveCircuitBreakerSettings(
++  config?: BackgroundTaskConfig
++): CircuitBreakerSettings {
++  return {
++    maxToolCalls:
++      config?.circuitBreaker?.maxToolCalls ?? config?.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS,
++    windowSize: config?.circuitBreaker?.windowSize ?? DEFAULT_CIRCUIT_BREAKER_WINDOW_SIZE,
++    repetitionThresholdPercent:
++      config?.circuitBreaker?.repetitionThresholdPercent ??
++      DEFAULT_CIRCUIT_BREAKER_REPETITION_THRESHOLD_PERCENT,
++  }
++}
++
++export function recordToolCall(
++  window: ToolCallWindow | undefined,
++  toolName: string,
++  settings: CircuitBreakerSettings
++): ToolCallWindow {
++  const previous = window?.toolNames ?? []
++  const toolNames = [...previous, toolName].slice(-settings.windowSize)
++
++  return {
++    toolNames,
++    windowSize: settings.windowSize,
++    thresholdPercent: settings.repetitionThresholdPercent,
++  }
++}
++
++export function detectRepetitiveToolUse(
++  window: ToolCallWindow | undefined
++): ToolLoopDetectionResult {
++  if (!window || window.toolNames.length === 0) {
++    return { triggered: false }
++  }
++
++  const counts = new Map<string, number>()
++  for (const toolName of window.toolNames) {
++    counts.set(toolName, (counts.get(toolName) ?? 0) + 1)
++  }
++
++  let repeatedTool: string | undefined
++  let repeatedCount = 0
++
++  for (const [toolName, count] of counts.entries()) {
++    if (count > repeatedCount) {
++      repeatedTool = toolName
++      repeatedCount = count
++    }
++  }
++
++  const sampleSize = window.toolNames.length
++  const minimumSampleSize = Math.min(
++    window.windowSize,
++    Math.ceil((window.windowSize * window.thresholdPercent) / 100)
++  )
++
++  if (sampleSize < minimumSampleSize) {
++    return { triggered: false }
++  }
++
++  const thresholdCount = Math.ceil((sampleSize * window.thresholdPercent) / 100)
++
++  if (!repeatedTool || repeatedCount < thresholdCount) {
++    return { triggered: false }
++  }
++
++  return {
++    triggered: true,
++    toolName: repeatedTool,
++    repeatedCount,
++    sampleSize,
++    thresholdPercent: window.thresholdPercent,
++  }
++}
+diff --git a/src/features/background-agent/types.ts b/src/features/background-agent/types.ts
+index 73ae8a00..7129aa2f 100644
+--- a/src/features/background-agent/types.ts
++++ b/src/features/background-agent/types.ts
+@@ -9,9 +9,17 @@ export type BackgroundTaskStatus =
+   | "cancelled"
+   | "interrupt"
+ 
++export interface ToolCallWindow {
++  toolNames: string[]
++  windowSize: number
++  thresholdPercent: number
++}
++
+ export interface TaskProgress {
+   toolCalls: number
+   lastTool?: string
++  toolCallWindow?: ToolCallWindow
++  countedToolPartIDs?: string[]
+   lastUpdate: Date
+   lastMessage?: string
+   lastMessageAt?: Date
+-- 
+2.39.2
+

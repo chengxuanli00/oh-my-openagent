@@ -1,0 +1,222 @@
+From b2fdd728d0d0c5bb4479b90750a2479e44b3cd3c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 11:29:42 +0900
+Subject: [PATCH 5174/5749] fix(prompt-async): add session idle gate
+
+---
+ src/hooks/shared/prompt-async-gate.test.ts |  84 ++++++++++++++++
+ src/hooks/shared/prompt-async-gate.ts      | 111 +++++++++++++++++++++
+ 2 files changed, 195 insertions(+)
+ create mode 100644 src/hooks/shared/prompt-async-gate.test.ts
+ create mode 100644 src/hooks/shared/prompt-async-gate.ts
+
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+new file mode 100644
+index 00000000..6df4a189
+--- /dev/null
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -0,0 +1,84 @@
++import { afterEach, describe, expect, test } from "bun:test"
++
++import {
++  promptAsyncAfterSessionIdle,
++  releaseAllPromptAsyncReservationsForTesting,
++} from "./prompt-async-gate"
++
++describe("promptAsyncAfterSessionIdle", () => {
++  afterEach(() => {
++    // then
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
++  test("#given two internal promptAsync calls race for one idle session #when they dispatch concurrently #then only one prompt is accepted", async () => {
++    // given
++    let promptCalls = 0
++    let releasePrompt: (() => void) | undefined
++    const promptGate = new Promise<void>((resolve) => {
++      releasePrompt = resolve
++    })
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_race: { type: "idle" } } }),
++        promptAsync: async () => {
++          promptCalls += 1
++          await promptGate
++        },
++      },
++    }
++
++    // when
++    const first = promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_race",
++      input: { path: { id: "ses_race" }, body: { parts: [] } },
++      source: "test:first",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++    await Promise.resolve()
++    const second = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_race",
++      input: { path: { id: "ses_race" }, body: { parts: [] } },
++      source: "test:second",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++    releasePrompt?.()
++    const firstResult = await first
++
++    // then
++    expect(firstResult.status).toBe("dispatched")
++    expect(second.status).toBe("reserved")
++    expect(promptCalls).toBe(1)
++  })
++
++  test("#given session.status reports busy #when an internal promptAsync is requested #then no prompt is sent", async () => {
++    // given
++    let promptCalls = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_busy: { type: "busy" } } }),
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++
++    // when
++    const result = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_busy",
++      input: { path: { id: "ses_busy" }, body: { parts: [] } },
++      source: "test:busy",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(result.status).toBe("active")
++    expect(promptCalls).toBe(0)
++  })
++})
+diff --git a/src/hooks/shared/prompt-async-gate.ts b/src/hooks/shared/prompt-async-gate.ts
+new file mode 100644
+index 00000000..f037d18b
+--- /dev/null
++++ b/src/hooks/shared/prompt-async-gate.ts
+@@ -0,0 +1,111 @@
++import { log } from "../../shared/logger"
++import {
++  DEFAULT_SESSION_IDLE_SETTLE_MS,
++  isSessionActive,
++  settleAfterSessionIdle,
++} from "./session-idle-settle"
++
++export const DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS = 250
++
++type PromptAsyncInput = {
++  path?: { id?: string }
++  body?: unknown
++  query?: unknown
++  signal?: unknown
++  [key: string]: unknown
++}
++
++type PromptAsyncClient<TInput> = {
++  session?: {
++    status?: () => Promise<unknown>
++    promptAsync?: (input: TInput) => Promise<unknown>
++  }
++}
++
++type PromptAsyncReservation = {
++  source: string
++  reservedAt: number
++  token: symbol
++}
++
++export type PromptAsyncGateResult =
++  | { status: "dispatched"; response: unknown }
++  | { status: "active" }
++  | { status: "reserved"; reservedBy: string }
++  | { status: "unavailable" }
++  | { status: "failed"; error: unknown }
++
++const promptAsyncReservations = new Map<string, PromptAsyncReservation>()
++
++export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(args: {
++  client: PromptAsyncClient<TInput>
++  sessionID: string
++  input: TInput
++  source: string
++  settleMs?: number
++  postDispatchHoldMs?: number
++}): Promise<PromptAsyncGateResult> {
++  const {
++    client,
++    sessionID,
++    input,
++    source,
++    settleMs = DEFAULT_SESSION_IDLE_SETTLE_MS,
++  } = args
++  const postDispatchHoldMs = args.postDispatchHoldMs ?? (
++    settleMs > 0 ? DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS : 0
++  )
++
++  if (typeof client.session?.promptAsync !== "function") {
++    log("[prompt-async-gate] promptAsync unavailable", { sessionID, source })
++    return { status: "unavailable" }
++  }
++
++  const existing = promptAsyncReservations.get(sessionID)
++  if (existing) {
++    log("[prompt-async-gate] promptAsync skipped because session is reserved", {
++      sessionID,
++      source,
++      reservedBy: existing.source,
++      reservedAgeMs: Date.now() - existing.reservedAt,
++    })
++    return { status: "reserved", reservedBy: existing.source }
++  }
++
++  const reservation: PromptAsyncReservation = {
++    source,
++    reservedAt: Date.now(),
++    token: Symbol(source),
++  }
++  promptAsyncReservations.set(sessionID, reservation)
++
++  try {
++    const canReadStatus = typeof client.session?.status === "function"
++    await settleAfterSessionIdle(settleMs)
++
++    if (canReadStatus && await isSessionActive(client, sessionID)) {
++      log("[prompt-async-gate] promptAsync skipped because session is active", { sessionID, source })
++      return { status: "active" }
++    }
++
++    log("[prompt-async-gate] promptAsync dispatching", { sessionID, source })
++    const response = await client.session.promptAsync(input)
++    if (canReadStatus) {
++      await settleAfterSessionIdle(postDispatchHoldMs)
++    }
++    log("[prompt-async-gate] promptAsync dispatched", { sessionID, source })
++    return { status: "dispatched", response }
++  } catch (error) {
++    log("[prompt-async-gate] promptAsync failed", { sessionID, source, error: String(error) })
++    return { status: "failed", error }
++  } finally {
++    const current = promptAsyncReservations.get(sessionID)
++    if (current?.token === reservation.token) {
++      promptAsyncReservations.delete(sessionID)
++    }
++  }
++}
++
++export function releaseAllPromptAsyncReservationsForTesting(): void {
++  promptAsyncReservations.clear()
++}
+-- 
+2.39.2
+

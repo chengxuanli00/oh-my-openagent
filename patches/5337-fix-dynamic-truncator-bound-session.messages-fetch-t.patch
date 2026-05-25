@@ -1,0 +1,289 @@
+From 67ead7bf6dcf6eb9275b5f795054f2a2ed50ab79 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 03:51:56 +0900
+Subject: [PATCH 5337/5749] fix(dynamic-truncator): bound session.messages
+ fetch to stop forever-hang on Read (#4086)
+
+Root cause: `getContextWindowUsage` caches the *promise* of
+`fetchContextWindowUsage` in a per-session WeakMap keyed by client. When
+`ctx.client.session.messages({ path: { id: sessionID } })` never settles
+(observed once `service=session.processor ... error=Aborted process`
+takes hold), the cached pending promise wedges every concurrent and
+later caller in the same session. The five hooks that share one
+`createDynamicTruncator(ctx)` -- directory-agents-injector,
+directory-readme-injector, rules-injector, tool-output-truncator, plus
+indirect callers -- all await that same poisoned promise on every Read,
+so the user-facing tool chain hangs forever and ESC cannot break it.
+Reporters in #4086 land on this path consistently when reading AGENTS.md
+files (which trigger directory-agents-injector via the directory walk).
+
+Fix: race the underlying `session.messages` call against a 5s timeout
+through a new `withFetchTimeout` helper. On timeout the catch block logs
+the failure and returns `null`, which `dynamicTruncate` already treats
+as the "context usage unavailable" signal and falls back to the static
+truncation budget. Successful responses still cache as before. The
+`message.updated finish=true` invalidation hook still clears poisoned
+caches on the next completed turn so retries are clean.
+
+Tests:
+- Add a never-settling `session.messages` mock with a 50 ms override via
+  the new `_setContextWindowUsageFetchTimeoutMsForTesting` hook (matches
+  the established `_setXxxForTesting` pattern in `opencode-http-api.ts`
+  and `prompt-async-gate.ts`).
+- Three new BDD cases pin the fix: (1) single caller returns null fast,
+  (2) parallel concurrent callers all unblock on the same cached promise
+  instead of hanging, (3) invalidate + retry rehydrates cleanly.
+- All 8 pre-existing tests in the file still pass (happy paths, cache
+  reuse, invalidation, env/model fallback).
+
+Verification:
+- `bun test src/shared/dynamic-truncator.test.ts` -- 11 pass.
+- `bun test src/shared/prompt-async-route-audit.test.ts` -- 6 pass
+  (added log import, no raw prompt route added).
+- `bun test` (full suite) -- 7009 pass, 1 skip, 1 pre-existing flake in
+  `closeTmuxPane` mock.module test (reproduces on dev without this
+  change; isolated run passes).
+- `bun run typecheck` -- clean.
+- `bun run build` -- clean (esm bundle + tsc + schema).
+- Manual harness `.debugging/manual-qa.ts` (uncommitted) drives the same
+  shape as the real hook chain and resolves the hang scenario in 51 ms.
+---
+ src/shared/dynamic-truncator.test.ts | 114 ++++++++++++++++++++++++++-
+ src/shared/dynamic-truncator.ts      |  58 +++++++++++++-
+ 2 files changed, 167 insertions(+), 5 deletions(-)
+
+diff --git a/src/shared/dynamic-truncator.test.ts b/src/shared/dynamic-truncator.test.ts
+index d090dd26..aae20aed 100644
+--- a/src/shared/dynamic-truncator.test.ts
++++ b/src/shared/dynamic-truncator.test.ts
+@@ -2,7 +2,11 @@
+ 
+ import { describe, expect, it, afterEach } from "bun:test"
+ 
+-import { getContextWindowUsage, invalidateContextWindowUsageCache } from "./dynamic-truncator"
++import {
++  _setContextWindowUsageFetchTimeoutMsForTesting,
++  getContextWindowUsage,
++  invalidateContextWindowUsageCache,
++} from "./dynamic-truncator"
+ 
+ const ANTHROPIC_CONTEXT_ENV_KEY = "ANTHROPIC_1M_CONTEXT"
+ const VERTEX_CONTEXT_ENV_KEY = "VERTEX_ANTHROPIC_1M_CONTEXT"
+@@ -89,6 +93,114 @@ function createCountingContextUsageMockContext(inputTokens: number) {
+ describe("getContextWindowUsage", () => {
+   afterEach(() => {
+     resetContextLimitEnv()
++    _setContextWindowUsageFetchTimeoutMsForTesting(undefined)
++  })
++
++  describe("#given client.session.messages never settles", () => {
++    describe("#when getContextWindowUsage is called with a fast fetch timeout", () => {
++      it("#then returns null instead of hanging forever", async () => {
++        // given
++        _setContextWindowUsageFetchTimeoutMsForTesting(50)
++        const ctx = {
++          client: {
++            session: {
++              messages: () => new Promise<never>(() => {}),
++            },
++          },
++        }
++
++        // when
++        const start = Date.now()
++        const usage = await getContextWindowUsage(ctx as never, "ses_hang_messages", {
++          anthropicContext1MEnabled: false,
++        })
++        const elapsed = Date.now() - start
++
++        // then
++        expect(usage).toBeNull()
++        expect(elapsed).toBeLessThan(2000)
++      })
++
++      it("#then a parallel concurrent caller also resolves to null instead of hanging on the cached promise", async () => {
++        // given
++        _setContextWindowUsageFetchTimeoutMsForTesting(50)
++        const ctx = {
++          client: {
++            session: {
++              messages: () => new Promise<never>(() => {}),
++            },
++          },
++        }
++
++        // when
++        const start = Date.now()
++        const [first, second] = await Promise.all([
++          getContextWindowUsage(ctx as never, "ses_hang_messages_parallel", {
++            anthropicContext1MEnabled: false,
++          }),
++          getContextWindowUsage(ctx as never, "ses_hang_messages_parallel", {
++            anthropicContext1MEnabled: false,
++          }),
++        ])
++        const elapsed = Date.now() - start
++
++        // then
++        expect(first).toBeNull()
++        expect(second).toBeNull()
++        expect(elapsed).toBeLessThan(2000)
++      })
++
++      it("#then a follow-up call after invalidation retries fresh instead of being poisoned by the timeout", async () => {
++        // given
++        _setContextWindowUsageFetchTimeoutMsForTesting(50)
++        let messagesCalls = 0
++        let shouldHang = true
++        const ctx = {
++          client: {
++            session: {
++              messages: () => {
++                messagesCalls += 1
++                if (shouldHang) {
++                  return new Promise<never>(() => {})
++                }
++                return Promise.resolve({
++                  data: [
++                    {
++                      info: {
++                        role: "assistant",
++                        providerID: "anthropic",
++                        modelID: "claude-sonnet-4-5",
++                        tokens: {
++                          input: 100000,
++                          output: 0,
++                          reasoning: 0,
++                          cache: { read: 0, write: 0 },
++                        },
++                      },
++                    },
++                  ],
++                })
++              },
++            },
++          },
++        }
++
++        // when
++        const firstUsage = await getContextWindowUsage(ctx as never, "ses_hang_then_recover", {
++          anthropicContext1MEnabled: false,
++        })
++        invalidateContextWindowUsageCache(ctx as never, "ses_hang_then_recover")
++        shouldHang = false
++        const secondUsage = await getContextWindowUsage(ctx as never, "ses_hang_then_recover", {
++          anthropicContext1MEnabled: false,
++        })
++
++        // then
++        expect(firstUsage).toBeNull()
++        expect(secondUsage?.remainingTokens).toBe(100000)
++        expect(messagesCalls).toBe(2)
++      })
++    })
+   })
+ 
+   it("uses 1M limit when model cache flag is enabled", async () => {
+diff --git a/src/shared/dynamic-truncator.ts b/src/shared/dynamic-truncator.ts
+index 504f1a73..59cbc81c 100644
+--- a/src/shared/dynamic-truncator.ts
++++ b/src/shared/dynamic-truncator.ts
+@@ -3,10 +3,20 @@ import {
+ 	resolveActualContextLimit,
+ 	type ContextLimitModelCacheState,
+ } from "./context-limit-resolver"
++import { log } from "./logger"
+ import { normalizeSDKResponse } from "./normalize-sdk-response"
+ 
+ const CHARS_PER_TOKEN_ESTIMATE = 4;
+ const DEFAULT_TARGET_MAX_TOKENS = 50_000;
++// Hard ceiling on how long `session.messages()` is allowed to block inside
++// `fetchContextWindowUsage`. Without it, a stuck OpenCode RPC (observed when
++// `session.processor` enters an "Aborted process" loop) would leave the cached
++// promise pending forever and every hook that calls `truncator.truncate(...)`
++// would hang on it (issue #4086).
++export const DEFAULT_CONTEXT_WINDOW_USAGE_FETCH_TIMEOUT_MS = 5_000;
++
++declare function setTimeout(callback: () => void, delay?: number): ReturnType<typeof globalThis.setTimeout>
++declare function clearTimeout(timeout: ReturnType<typeof globalThis.setTimeout>): void
+ 
+ interface AssistantMessageInfo {
+ 	role: "assistant";
+@@ -34,6 +44,16 @@ type ContextWindowUsageClient = Pick<PluginInput["client"], "session">
+ 
+ const usageCacheByClient = new WeakMap<object, Map<string, Map<string, Promise<ContextWindowUsage | null>>>>()
+ 
++// Test-only override for the fetch timeout used by `fetchContextWindowUsage`.
++// `undefined` means "use the production default".
++let contextWindowUsageFetchTimeoutMsForTesting: number | undefined = undefined
++
++export function _setContextWindowUsageFetchTimeoutMsForTesting(
++	ms: number | undefined,
++): void {
++	contextWindowUsageFetchTimeoutMsForTesting = ms
++}
++
+ function createModelCacheKey(modelCacheState?: ContextLimitModelCacheState): string {
+ 	if (!modelCacheState) {
+ 		return "default"
+@@ -184,15 +204,41 @@ export async function getContextWindowUsage(
+ 	return usagePromise
+ }
+ 
++function withFetchTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
++	if (timeoutMs <= 0) {
++		return operation
++	}
++	let timeoutID: ReturnType<typeof globalThis.setTimeout> | undefined
++	const timeoutPromise = new Promise<never>((_, reject) => {
++		timeoutID = setTimeout(
++			() =>
++				reject(
++					new Error(
++						`[dynamic-truncator] session.messages timed out after ${timeoutMs}ms`,
++					),
++				),
++			timeoutMs,
++		)
++	})
++	return Promise.race([operation, timeoutPromise]).finally(() => {
++		if (timeoutID !== undefined) clearTimeout(timeoutID)
++	})
++}
++
+ async function fetchContextWindowUsage(
+ 	ctx: PluginInput,
+ 	sessionID: string,
+ 	modelCacheState?: ContextLimitModelCacheState,
+ ): Promise<ContextWindowUsage | null> {
++	const fetchTimeoutMs =
++		contextWindowUsageFetchTimeoutMsForTesting ?? DEFAULT_CONTEXT_WINDOW_USAGE_FETCH_TIMEOUT_MS
+ 	try {
+-		const response = await ctx.client.session.messages({
+-			path: { id: sessionID },
+-		});
++		const response = await withFetchTimeout(
++			ctx.client.session.messages({
++				path: { id: sessionID },
++			}),
++			fetchTimeoutMs,
++		);
+ 
+ 		const messages = normalizeSDKResponse(response, [] as MessageWrapper[], { preferResponseOnMissingData: true })
+ 
+@@ -228,7 +274,11 @@ async function fetchContextWindowUsage(
+ 			remainingTokens,
+ 			usagePercentage: usedTokens / actualLimit,
+ 		};
+-	} catch {
++	} catch (error) {
++		log("[dynamic-truncator] fetchContextWindowUsage failed; falling back to null", {
++			sessionID,
++			error: error instanceof Error ? error.message : String(error),
++		})
+ 		return null;
+ 	}
+ }
+-- 
+2.39.2
+

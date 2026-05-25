@@ -1,0 +1,249 @@
+From 36468b118df552406c2f6e899e62c4409f644649 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 03:40:17 +0900
+Subject: [PATCH 5334/5749] fix(shared): add timeout to isSessionActive to
+ prevent infinite hang
+
+The SDK client disables fetch timeout (req.timeout = false). When the
+opencode server is slow or unresponsive, client.session.status() hangs
+forever, blocking the entire dispatchToHooks chain (sequential await)
+and deadlocking the plugin.
+
+Add a 5s timeout wrapper around the status call in isSessionActive().
+On timeout, the catch block returns false (treat as inactive), letting
+the caller proceed instead of hanging indefinitely.
+
+The timeout parameter is exposed for testing to avoid 5s test delays.
+
+Refs: .debugging/status-timeout-hang.md
+---
+ .debugging/status-timeout-hang.md            | 100 +++++++++++++++++++
+ src/hooks/shared/prompt-async-gate.test.ts   |  28 ++++++
+ src/hooks/shared/session-idle-settle.test.ts |  16 +++
+ src/shared/session-idle-settle.ts            |  26 ++++-
+ 4 files changed, 168 insertions(+), 2 deletions(-)
+ create mode 100644 .debugging/status-timeout-hang.md
+
+diff --git a/.debugging/status-timeout-hang.md b/.debugging/status-timeout-hang.md
+new file mode 100644
+index 00000000..e98ed4d6
+--- /dev/null
++++ b/.debugging/status-timeout-hang.md
+@@ -0,0 +1,100 @@
++# Debugging Journal: session.status() Infinite Hang
++
++**Date:** 2026-05-16
++**Branch:** fix/status-timeout-hang
++**Worktree:** mimo v2.5 pro
++**Severity:** Critical — deadlocks entire plugin event chain
++
++---
++
++## Phase 0 — Environment
++
++- **Runtime:** Bun 1.3.x (TypeScript, strict mode)
++- **Host:** OpenCode plugin system (`oh-my-opencode`)
++- **Symptom:** Plugin hangs forever during prompting — no hooks fire, no events processed, system becomes unresponsive
++- **Reporter:** User reports "갑자기 프롬프팅하다가 뻗어버리는" (suddenly hangs while prompting)
++
++---
++
++## Phase 1 — Hypotheses
++
++### H1: `isSessionActive()` has no timeout — CONFIRMED
++
++`isSessionActive()` in `src/shared/session-idle-settle.ts` calls `client.session.status()` with NO timeout wrapper. The SDK client (`packages/sdk/js/src/client.ts`) explicitly disables fetch timeout:
++
++```typescript
++const customFetch: any = (req: any) => {
++  req.timeout = false  // DISABLES TIMEOUT
++  return fetch(req)
++}
++```
++
++If the opencode server is slow or unresponsive, this call hangs forever.
++
++### H2: Sequential `await` in `dispatchToHooks` propagates hang — CONFIRMED
++
++`src/plugin/event.ts` calls hooks sequentially:
++
++```typescript
++const dispatchToHooks = async (input: EventInput): Promise<void> => {
++  await runEventHookSafely("todoContinuationEnforcer", ...)
++  await runEventHookSafely("runtimeFallback", ...)
++  await runEventHookSafely("atlasHook", ...)
++  // ... 20+ hooks, ALL sequential await
++}
++```
++
++`runEventHookSafely` catches errors but has NO timeout. If any hook hangs, the entire chain is blocked.
++
++### H3: Reservation deadlock — CONFIRMED (secondary effect)
++
++In `dispatchAfterSessionIdle()`:
++1. Reservation is set BEFORE `isSessionActive()` call
++2. If `isSessionActive()` hangs, the `finally` block never runs
++3. Reservation is never released
++4. All subsequent calls for the same sessionID return "reserved"
++
++### H4: Multiple hooks trigger same hang path — CONFIRMED
++
++At least 6 hooks call `promptAsyncAfterSessionIdle` or `shouldPromptAfterSessionIdle`:
++- `todoContinuationEnforcer` (main session continuation)
++- `atlasHook` (boulder session continuation)
++- `ralphLoop` (ralph loop continuation)
++- `runtimeFallback` (error recovery)
++- `sessionRecovery` (session resume)
++- `teamIdleWakeHint` (team mode wake)
++
++---
++
++## Root Cause
++
++`isSessionActive()` in `session-idle-settle.ts` has no timeout on `client.session.status()`. The SDK client disables fetch timeout. When opencode server is slow/unresponsive:
++
++1. `isSessionActive()` hangs forever
++2. `dispatchAfterSessionIdle()` hangs (reservation never released)
++3. `dispatchToHooks()` hangs (sequential await blocks all subsequent hooks)
++4. Plugin becomes completely unresponsive
++
++---
++
++## Fix Plan
++
++Add timeout wrapper to `isSessionActive()`. If status call exceeds threshold (5s), treat session as inactive (return false). This is safe because:
++- If the server is unresponsive, we can't trust the status anyway
++- Returning false lets the caller proceed (dispatch or skip)
++- The reservation mechanism prevents duplicate dispatches even with false negatives
++
++**Files to change:**
++- `src/shared/session-idle-settle.ts` — add timeout to `isSessionActive()`
++- `src/hooks/shared/session-idle-settle.test.ts` — add timeout behavior test
++- `src/hooks/shared/prompt-async-gate.test.ts` — add status-timeout recovery test
++
++---
++
++## Verification
++
++- [ ] Existing tests pass (no behavioral change for normal flow)
++- [ ] New test: `isSessionActive` returns false when status call hangs
++- [ ] New test: `dispatchAfterSessionIdle` recovers from status timeout
++- [ ] `bun test` green
++- [ ] `bun run typecheck` green
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+index 450b70de..67970013 100644
+--- a/src/hooks/shared/prompt-async-gate.test.ts
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -505,4 +505,32 @@ describe("promptAsyncAfterSessionIdle", () => {
+       response: { accepted: true, sessionID: "ses_bound_prompt" },
+     })
+   })
++
++  test("#given session.status hangs forever #when promptAsync gate checks activity #then it dispatches after status timeout", { timeout: 10_000 }, async () => {
++    // given
++    let promptCalls = 0
++    const neverSettles = new Promise<never>(() => {})
++    const client = {
++      session: {
++        status: () => neverSettles,
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++
++    // when
++    const result = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_status_timeout",
++      input: { path: { id: "ses_status_timeout" }, body: { parts: [] } },
++      source: "test:status-timeout",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(result.status).toBe("dispatched")
++    expect(promptCalls).toBe(1)
++  })
+ })
+diff --git a/src/hooks/shared/session-idle-settle.test.ts b/src/hooks/shared/session-idle-settle.test.ts
+index a5b2058a..d17c44c6 100644
+--- a/src/hooks/shared/session-idle-settle.test.ts
++++ b/src/hooks/shared/session-idle-settle.test.ts
+@@ -52,4 +52,20 @@ describe("session idle prompt guard", () => {
+     // then
+     expect(shouldPrompt).toBe(true)
+   })
++
++  test("#given session.status hangs forever #when checking active session #then it returns false after timeout", async () => {
++    // given
++    const neverSettles = new Promise<never>(() => {})
++    const client = {
++      session: {
++        status: () => neverSettles,
++      },
++    }
++
++    // when
++    const active = await isSessionActive(client, "ses-hang", 50)
++
++    // then
++    expect(active).toBe(false)
++  })
+ })
+diff --git a/src/shared/session-idle-settle.ts b/src/shared/session-idle-settle.ts
+index 2fd5a2b0..e4e9e176 100644
+--- a/src/shared/session-idle-settle.ts
++++ b/src/shared/session-idle-settle.ts
+@@ -1,9 +1,24 @@
+ export const DEFAULT_SESSION_IDLE_SETTLE_MS = 150
++export const DEFAULT_SESSION_STATUS_TIMEOUT_MS = 5_000
+ 
+ export function settleAfterSessionIdle(ms = DEFAULT_SESSION_IDLE_SETTLE_MS): Promise<void> {
+   return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve()
+ }
+ 
++function withStatusTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
++  let timeoutID: ReturnType<typeof setTimeout> | undefined
++  const timeoutPromise = new Promise<T>((_resolve, reject) => {
++    timeoutID = setTimeout(() => {
++      reject(new Error(`session.status() timed out after ${timeoutMs}ms`))
++    }, timeoutMs)
++  })
++  return Promise.race([promise, timeoutPromise]).finally(() => {
++    if (timeoutID !== undefined) {
++      clearTimeout(timeoutID)
++    }
++  })
++}
++
+ type SessionStatusClient = {
+   session?: {
+     status?: () => Promise<unknown>
+@@ -32,13 +47,20 @@ export function isActiveSessionStatusType(statusType: string): boolean {
+   return ACTIVE_SESSION_STATUSES.has(statusType)
+ }
+ 
+-export async function isSessionActive(client: SessionStatusClient, sessionID: string): Promise<boolean> {
++export async function isSessionActive(
++  client: SessionStatusClient,
++  sessionID: string,
++  statusTimeoutMs: number = DEFAULT_SESSION_STATUS_TIMEOUT_MS,
++): Promise<boolean> {
+   if (typeof client.session?.status !== "function") {
+     return false
+   }
+ 
+   try {
+-    const statusResult = await client.session.status()
++    const statusResult = await withStatusTimeout(
++      client.session.status(),
++      statusTimeoutMs,
++    )
+     const status = getSessionStatusPayload(statusResult)[sessionID]
+     if (!isRecord(status)) {
+       return false
+-- 
+2.39.2
+

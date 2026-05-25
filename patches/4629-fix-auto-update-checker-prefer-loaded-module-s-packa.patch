@@ -1,0 +1,140 @@
+From 5291ee7d3df0c81f7386f851c44829d9e56852ea Mon Sep 17 00:00:00 2001
+From: Ivan Smetanin <smetanin23@yandex.ru>
+Date: Wed, 29 Apr 2026 09:17:21 +0100
+Subject: [PATCH 4629/5749] fix(auto-update-checker): prefer loaded module's
+ package.json over flat-install candidates
+
+The startup toast and `omo --version` were reading from the legacy flat install
+at <CACHE_DIR>/node_modules/<pkg>/package.json, but OpenCode actually loads
+plugins from a per-plugin sandbox at <CACHE_DIR>/<plugin-entry>/node_modules/
+<pkg>/package.json. The two install layers can drift independently when bun
+re-resolves "latest" against the flat install while the sandbox's package.json
+stays pinned to a literal version baked in at first install.
+
+In practice this means the toast can announce a version the runtime is not
+running. Concrete reproduction: with `"oh-my-openagent@latest"` in the plugin
+list, the sandbox stayed on 3.17.5 while the parallel flat install advanced to
+3.17.6, so the startup toast confidently reported v3.17.6 even though the
+loaded plugin code was 3.17.5.
+
+Walking up from `import.meta.url` always reflects the actually-loaded module,
+so reorder `getCachedVersion()` to try that first and fall back to the flat-
+install candidates and execPath walk-up as before. The fallback chain is
+preserved for bundled environments where the module-relative lookup may fail.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ .../checker/cached-version.test.ts            | 28 +++++++++++++++++--
+ .../checker/cached-version.ts                 | 26 ++++++++++-------
+ 2 files changed, 42 insertions(+), 12 deletions(-)
+
+diff --git a/src/hooks/auto-update-checker/checker/cached-version.test.ts b/src/hooks/auto-update-checker/checker/cached-version.test.ts
+index 6a679013..352de6d1 100644
+--- a/src/hooks/auto-update-checker/checker/cached-version.test.ts
++++ b/src/hooks/auto-update-checker/checker/cached-version.test.ts
+@@ -4,7 +4,10 @@ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ 
+ // Hold mutable mock state so beforeEach can swap the cache root for each test.
+-const mockState: { candidates: string[] } = { candidates: [] }
++const mockState: { candidates: string[]; walkUpResult: string | null } = {
++  candidates: [],
++  walkUpResult: null,
++}
+ 
+ mock.module("../constants", () => ({
+   INSTALLED_PACKAGE_JSON_CANDIDATES: new Proxy([], {
+@@ -22,7 +25,7 @@ mock.module("../constants", () => ({
+ }))
+ 
+ mock.module("./package-json-locator", () => ({
+-  findPackageJsonUp: () => null,
++  findPackageJsonUp: () => mockState.walkUpResult,
+ }))
+ 
+ import { getCachedVersion } from "./cached-version"
+@@ -36,11 +39,13 @@ describe("getCachedVersion (GH-3257)", () => {
+       join(cacheRoot, "node_modules", "oh-my-opencode", "package.json"),
+       join(cacheRoot, "node_modules", "oh-my-openagent", "package.json"),
+     ]
++    mockState.walkUpResult = null
+   })
+ 
+   afterEach(() => {
+     rmSync(cacheRoot, { recursive: true, force: true })
+     mockState.candidates = []
++    mockState.walkUpResult = null
+   })
+ 
+   it("returns the version when the package is installed under oh-my-opencode", () => {
+@@ -77,4 +82,23 @@ describe("getCachedVersion (GH-3257)", () => {
+   it("returns null when neither candidate exists and fallbacks find nothing", () => {
+     expect(getCachedVersion()).toBeNull()
+   })
++
++  it("prefers the loaded module's package.json over flat-install candidates", () => {
++    // OpenCode loads plugins from a per-plugin sandbox at
++    // <CACHE_DIR>/<plugin-entry>/node_modules/<pkg>/, while a parallel flat
++    // install at <CACHE_DIR>/node_modules/<pkg>/ can drift independently when
++    // bun re-resolves "latest". The flat install must NOT take precedence,
++    // because that's the path the user is actually running.
++    const sandboxDir = join(cacheRoot, "oh-my-openagent@latest", "node_modules", "oh-my-openagent")
++    mkdirSync(sandboxDir, { recursive: true })
++    const sandboxPkgJson = join(sandboxDir, "package.json")
++    writeFileSync(sandboxPkgJson, JSON.stringify({ name: "oh-my-openagent", version: "3.17.5" }))
++    mockState.walkUpResult = sandboxPkgJson
++
++    const flatDir = join(cacheRoot, "node_modules", "oh-my-opencode")
++    mkdirSync(flatDir, { recursive: true })
++    writeFileSync(join(flatDir, "package.json"), JSON.stringify({ name: "oh-my-opencode", version: "3.17.6" }))
++
++    expect(getCachedVersion()).toBe("3.17.5")
++  })
+ })
+diff --git a/src/hooks/auto-update-checker/checker/cached-version.ts b/src/hooks/auto-update-checker/checker/cached-version.ts
+index 4cf6ebc1..59886a17 100644
+--- a/src/hooks/auto-update-checker/checker/cached-version.ts
++++ b/src/hooks/auto-update-checker/checker/cached-version.ts
+@@ -13,16 +13,12 @@ function readPackageVersion(packageJsonPath: string): string | null {
+ }
+ 
+ export function getCachedVersion(): string | null {
+-  for (const candidate of INSTALLED_PACKAGE_JSON_CANDIDATES) {
+-    try {
+-      if (fs.existsSync(candidate)) {
+-        return readPackageVersion(candidate)
+-      }
+-    } catch {
+-      // ignore; try next candidate
+-    }
+-  }
+-
++  // Walk up from the loaded module first. OpenCode loads plugins from a
++  // per-plugin sandbox at <CACHE_DIR>/<plugin-entry>/node_modules/<pkg>/, while
++  // a parallel flat install at <CACHE_DIR>/node_modules/<pkg>/ can drift
++  // independently when bun re-resolves "latest". Reading the flat install
++  // first means the toast can announce a version the runtime isn't running.
++  // The module-relative walk-up always reflects what is actually loaded.
+   try {
+     const currentDir = path.dirname(fileURLToPath(import.meta.url))
+     const pkgPath = findPackageJsonUp(currentDir)
+@@ -33,6 +29,16 @@ export function getCachedVersion(): string | null {
+     log("[auto-update-checker] Failed to resolve version from current directory:", err)
+   }
+ 
++  for (const candidate of INSTALLED_PACKAGE_JSON_CANDIDATES) {
++    try {
++      if (fs.existsSync(candidate)) {
++        return readPackageVersion(candidate)
++      }
++    } catch {
++      // ignore; try next candidate
++    }
++  }
++
+   try {
+     const execDir = path.dirname(fs.realpathSync(process.execPath))
+     const pkgPath = findPackageJsonUp(execDir)
+-- 
+2.39.2
+

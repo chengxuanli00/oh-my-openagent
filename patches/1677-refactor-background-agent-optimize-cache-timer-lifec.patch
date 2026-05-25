@@ -1,0 +1,204 @@
+From 159fccddcf6cdf7ed8a4ae82f0cca3ff2f4f233e Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 2 Feb 2026 20:00:15 +0900
+Subject: [PATCH 1677/5749] refactor(background-agent): optimize cache timer
+ lifecycle and result handling
+
+Improve cache timer management in background agent manager and update result handler to properly handle cache state transitions
+---
+ src/features/background-agent/manager.test.ts | 61 +++++++++++++++++++
+ src/features/background-agent/manager.ts      | 33 ++++++----
+ .../background-agent/result-handler.ts        | 29 +++++----
+ 3 files changed, 101 insertions(+), 22 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 5807cb22..e93d2669 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -2157,6 +2157,67 @@ describe("BackgroundManager.completionTimers - Memory Leak Fix", () => {
+     manager.shutdown()
+   })
+ 
++  test("should start cleanup timers only after all tasks complete", async () => {
++    // given
++    const client = {
++      session: {
++        prompt: async () => ({}),
++        abort: async () => ({}),
++        messages: async () => ({ data: [] }),
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    const taskA: BackgroundTask = {
++      id: "task-timer-a",
++      sessionID: "session-timer-a",
++      parentSessionID: "parent-session",
++      parentMessageID: "msg-a",
++      description: "Task A",
++      prompt: "test",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(),
++      completedAt: new Date(),
++    }
++    const taskB: BackgroundTask = {
++      id: "task-timer-b",
++      sessionID: "session-timer-b",
++      parentSessionID: "parent-session",
++      parentMessageID: "msg-b",
++      description: "Task B",
++      prompt: "test",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(),
++      completedAt: new Date(),
++    }
++    getTaskMap(manager).set(taskA.id, taskA)
++    getTaskMap(manager).set(taskB.id, taskB)
++    ;(manager as unknown as { pendingByParent: Map<string, Set<string>> }).pendingByParent.set(
++      "parent-session",
++      new Set([taskA.id, taskB.id])
++    )
++
++    // when
++    await (manager as unknown as { notifyParentSession: (task: BackgroundTask) => Promise<void> })
++      .notifyParentSession(taskA)
++
++    // then
++    const completionTimers = getCompletionTimers(manager)
++    expect(completionTimers.size).toBe(0)
++
++    // when
++    await (manager as unknown as { notifyParentSession: (task: BackgroundTask) => Promise<void> })
++      .notifyParentSession(taskB)
++
++    // then
++    expect(completionTimers.size).toBe(2)
++    expect(completionTimers.has(taskA.id)).toBe(true)
++    expect(completionTimers.has(taskB.id)).toBe(true)
++
++    manager.shutdown()
++  })
++
+   test("should clear all completion timers on shutdown", () => {
+     // given
+     const manager = createBackgroundManager()
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 28b5b6e4..c659d866 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -1013,9 +1013,11 @@ export class BackgroundManager {
+     const errorInfo = task.error ? `\n**Error:** ${task.error}` : ""
+     
+     let notification: string
++    let completedTasks: BackgroundTask[] = []
+     if (allComplete) {
+-      const completedTasks = Array.from(this.tasks.values())
++      completedTasks = Array.from(this.tasks.values())
+         .filter(t => t.parentSessionID === task.parentSessionID && t.status !== "running" && t.status !== "pending")
++      const completedTasksText = completedTasks
+         .map(t => `- \`${t.id}\`: ${t.description}`)
+         .join("\n")
+ 
+@@ -1023,7 +1025,7 @@ export class BackgroundManager {
+ [ALL BACKGROUND TASKS COMPLETE]
+ 
+ **Completed:**
+-${completedTasks || `- \`${task.id}\`: ${task.description}`}
++${completedTasksText || `- \`${task.id}\`: ${task.description}`}
+ 
+ Use \`background_output(task_id="<id>")\` to retrieve each result.
+ </system-reminder>`
+@@ -1092,16 +1094,25 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+       log("[background-agent] Failed to send notification:", error)
+     }
+ 
+-    const taskId = task.id
+-    const timer = setTimeout(() => {
+-      this.completionTimers.delete(taskId)
+-      if (this.tasks.has(taskId)) {
+-        this.clearNotificationsForTask(taskId)
+-        this.tasks.delete(taskId)
+-        log("[background-agent] Removed completed task from memory:", taskId)
++    if (allComplete) {
++      for (const completedTask of completedTasks) {
++        const taskId = completedTask.id
++        const existingTimer = this.completionTimers.get(taskId)
++        if (existingTimer) {
++          clearTimeout(existingTimer)
++          this.completionTimers.delete(taskId)
++        }
++        const timer = setTimeout(() => {
++          this.completionTimers.delete(taskId)
++          if (this.tasks.has(taskId)) {
++            this.clearNotificationsForTask(taskId)
++            this.tasks.delete(taskId)
++            log("[background-agent] Removed completed task from memory:", taskId)
++          }
++        }, TASK_CLEANUP_DELAY_MS)
++        this.completionTimers.set(taskId, timer)
+       }
+-    }, TASK_CLEANUP_DELAY_MS)
+-    this.completionTimers.set(taskId, timer)
++    }
+   }
+ 
+   private formatDuration(start: Date, end?: Date): string {
+diff --git a/src/features/background-agent/result-handler.ts b/src/features/background-agent/result-handler.ts
+index 7569dd5f..3fca4091 100644
+--- a/src/features/background-agent/result-handler.ts
++++ b/src/features/background-agent/result-handler.ts
+@@ -174,9 +174,11 @@ export async function notifyParentSession(
+   const errorInfo = task.error ? `\n**Error:** ${task.error}` : ""
+   
+   let notification: string
++  let completedTasks: BackgroundTask[] = []
+   if (allComplete) {
+-    const completedTasks = Array.from(state.tasks.values())
++    completedTasks = Array.from(state.tasks.values())
+       .filter(t => t.parentSessionID === task.parentSessionID && t.status !== "running" && t.status !== "pending")
++    const completedTasksText = completedTasks
+       .map(t => `- \`${t.id}\`: ${t.description}`)
+       .join("\n")
+ 
+@@ -184,7 +186,7 @@ export async function notifyParentSession(
+ [ALL BACKGROUND TASKS COMPLETE]
+ 
+ **Completed:**
+-${completedTasks || `- \`${task.id}\`: ${task.description}`}
++${completedTasksText || `- \`${task.id}\`: ${task.description}`}
+ 
+ Use \`background_output(task_id="<id>")\` to retrieve each result.
+ </system-reminder>`
+@@ -256,14 +258,19 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+     log("[background-agent] Failed to send notification:", error)
+   }
+ 
+-  const taskId = task.id
+-  const timer = setTimeout(() => {
+-    state.completionTimers.delete(taskId)
+-    if (state.tasks.has(taskId)) {
+-      state.clearNotificationsForTask(taskId)
+-      state.tasks.delete(taskId)
+-      log("[background-agent] Removed completed task from memory:", taskId)
++  if (allComplete) {
++    for (const completedTask of completedTasks) {
++      const taskId = completedTask.id
++      state.clearCompletionTimer(taskId)
++      const timer = setTimeout(() => {
++        state.completionTimers.delete(taskId)
++        if (state.tasks.has(taskId)) {
++          state.clearNotificationsForTask(taskId)
++          state.tasks.delete(taskId)
++          log("[background-agent] Removed completed task from memory:", taskId)
++        }
++      }, TASK_CLEANUP_DELAY_MS)
++      state.setCompletionTimer(taskId, timer)
+     }
+-  }, TASK_CLEANUP_DELAY_MS)
+-  state.setCompletionTimer(taskId, timer)
++  }
+ }
+-- 
+2.39.2
+

@@ -1,0 +1,650 @@
+From a010de1db2424bbaf574a858cf0914c02fa73d13 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 6 Mar 2026 22:00:14 +0900
+Subject: [PATCH 2949/5749] feat(ulw-loop): require Oracle verification before
+ completion
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/features/builtin-commands/commands.ts     | 12 ++--
+ .../builtin-commands/templates/ralph-loop.ts  | 28 +++++++++
+ src/hooks/ralph-loop/completion-handler.ts    | 61 +++++++++++++++++++
+ .../ralph-loop/completion-promise-detector.ts |  4 +-
+ src/hooks/ralph-loop/constants.ts             |  1 +
+ .../ralph-loop/continuation-prompt-builder.ts | 25 +++++++-
+ src/hooks/ralph-loop/loop-state-controller.ts | 36 ++++++++---
+ .../ralph-loop/ralph-loop-event-handler.ts    | 56 +++++++----------
+ src/hooks/ralph-loop/session-event-handler.ts | 56 +++++++++++++++++
+ src/hooks/ralph-loop/storage.ts               | 37 +++++++++--
+ src/hooks/ralph-loop/types.ts                 |  4 +-
+ src/plugin/chat-message.ts                    |  6 +-
+ src/plugin/tool-execute-before.ts             | 18 ++++++
+ 13 files changed, 286 insertions(+), 58 deletions(-)
+ create mode 100644 src/hooks/ralph-loop/completion-handler.ts
+ create mode 100644 src/hooks/ralph-loop/session-event-handler.ts
+
+diff --git a/src/features/builtin-commands/commands.ts b/src/features/builtin-commands/commands.ts
+index 092c07d4..0802eb9a 100644
+--- a/src/features/builtin-commands/commands.ts
++++ b/src/features/builtin-commands/commands.ts
+@@ -1,7 +1,7 @@
+ import type { CommandDefinition } from "../claude-code-command-loader"
+ import type { BuiltinCommandName, BuiltinCommands } from "./types"
+ import { INIT_DEEP_TEMPLATE } from "./templates/init-deep"
+-import { RALPH_LOOP_TEMPLATE, CANCEL_RALPH_TEMPLATE } from "./templates/ralph-loop"
++import { RALPH_LOOP_TEMPLATE, ULW_LOOP_TEMPLATE, CANCEL_RALPH_TEMPLATE } from "./templates/ralph-loop"
+ import { STOP_CONTINUATION_TEMPLATE } from "./templates/stop-continuation"
+ import { REFACTOR_TEMPLATE } from "./templates/refactor"
+ import { START_WORK_TEMPLATE } from "./templates/start-work"
+@@ -31,16 +31,16 @@ $ARGUMENTS
+      argumentHint: '"task description" [--completion-promise=TEXT] [--max-iterations=N] [--strategy=reset|continue]',
+    },
+    "ulw-loop": {
+-     description: "(builtin) Start ultrawork loop - continues until completion with ultrawork mode",
+-     template: `<command-instruction>
+-${RALPH_LOOP_TEMPLATE}
++      description: "(builtin) Start ultrawork loop - continues until completion with ultrawork mode",
++      template: `<command-instruction>
++${ULW_LOOP_TEMPLATE}
+ </command-instruction>
+ 
+ <user-task>
+ $ARGUMENTS
+ </user-task>`,
+-     argumentHint: '"task description" [--completion-promise=TEXT] [--max-iterations=N] [--strategy=reset|continue]',
+-   },
++      argumentHint: '"task description" [--completion-promise=TEXT] [--strategy=reset|continue]',
++    },
+   "cancel-ralph": {
+     description: "(builtin) Cancel active Ralph Loop",
+     template: `<command-instruction>
+diff --git a/src/features/builtin-commands/templates/ralph-loop.ts b/src/features/builtin-commands/templates/ralph-loop.ts
+index 9798e0f6..1540aea8 100644
+--- a/src/features/builtin-commands/templates/ralph-loop.ts
++++ b/src/features/builtin-commands/templates/ralph-loop.ts
+@@ -28,6 +28,34 @@ Parse the arguments below and begin working on the task. The format is:
+ 
+ Default completion promise is "DONE" and default max iterations is 100.`
+ 
++export const ULW_LOOP_TEMPLATE = `You are starting an ULTRAWORK Loop - a self-referential development loop that runs until verified completion.
++
++## How ULTRAWORK Loop Works
++
++1. You will work on the task continuously
++2. When you believe the work is complete, output: \`<promise>{{COMPLETION_PROMISE}}</promise>\`
++3. That does NOT finish the loop yet. The system will require Oracle verification
++4. The loop only ends after Oracle verifies the result with \`<promise>VERIFIED</promise>\`
++5. There is no iteration limit
++
++## Rules
++
++- Focus on finishing the task completely
++- After you emit the completion promise, run Oracle verification when instructed
++- Do not treat DONE as final completion until Oracle verifies it
++
++## Exit Conditions
++
++1. **Verified Completion**: Oracle returns \`<promise>VERIFIED</promise>\`
++2. **Cancel**: User runs \`/cancel-ralph\`
++
++## Your Task
++
++Parse the arguments below and begin working on the task. The format is:
++\`"task description" [--completion-promise=TEXT] [--strategy=reset|continue]\`
++
++Default completion promise is "DONE".`
++
+ export const CANCEL_RALPH_TEMPLATE = `Cancel the currently active Ralph Loop.
+ 
+ This will:
+diff --git a/src/hooks/ralph-loop/completion-handler.ts b/src/hooks/ralph-loop/completion-handler.ts
+new file mode 100644
+index 00000000..71887d6e
+--- /dev/null
++++ b/src/hooks/ralph-loop/completion-handler.ts
+@@ -0,0 +1,61 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared/logger"
++import { buildContinuationPrompt } from "./continuation-prompt-builder"
++import { HOOK_NAME } from "./constants"
++import { injectContinuationPrompt } from "./continuation-prompt-injector"
++import type { RalphLoopState } from "./types"
++
++type LoopStateController = {
++	clear: () => boolean
++	markVerificationPending: (sessionID: string) => RalphLoopState | null
++}
++
++export async function handleDetectedCompletion(
++	ctx: PluginInput,
++	input: {
++		sessionID: string
++		state: RalphLoopState
++		loopState: LoopStateController
++		directory: string
++		apiTimeoutMs: number
++	},
++): Promise<void> {
++	const { sessionID, state, loopState, directory, apiTimeoutMs } = input
++
++	if (state.ultrawork && !state.verification_pending) {
++		const verificationState = loopState.markVerificationPending(sessionID)
++		if (!verificationState) {
++			log(`[${HOOK_NAME}] Failed to transition ultrawork loop to verification`, {
++				sessionID,
++			})
++			return
++		}
++
++		await injectContinuationPrompt(ctx, {
++			sessionID,
++			prompt: buildContinuationPrompt(verificationState),
++			directory,
++			apiTimeoutMs,
++		})
++
++		await ctx.client.tui?.showToast?.({
++			body: {
++				title: "ULTRAWORK LOOP",
++				message: "DONE detected. Oracle verification is now required.",
++				variant: "info",
++				duration: 5000,
++			},
++		}).catch(() => {})
++		return
++	}
++
++	loopState.clear()
++
++	const title = state.ultrawork ? "ULTRAWORK LOOP COMPLETE!" : "Ralph Loop Complete!"
++	const message = state.ultrawork
++		? `JUST ULW ULW! Task completed after ${state.iteration} iteration(s)`
++		: `Task completed after ${state.iteration} iteration(s)`
++	await ctx.client.tui?.showToast?.({
++		body: { title, message, variant: "success", duration: 5000 },
++	}).catch(() => {})
++}
+diff --git a/src/hooks/ralph-loop/completion-promise-detector.ts b/src/hooks/ralph-loop/completion-promise-detector.ts
+index 91409153..81f061ba 100644
+--- a/src/hooks/ralph-loop/completion-promise-detector.ts
++++ b/src/hooks/ralph-loop/completion-promise-detector.ts
+@@ -20,6 +20,7 @@ function buildPromisePattern(promise: string): RegExp {
+ export function detectCompletionInTranscript(
+ 	transcriptPath: string | undefined,
+ 	promise: string,
++	startedAt?: string,
+ ): boolean {
+ 	if (!transcriptPath) return false
+ 
+@@ -32,8 +33,9 @@ export function detectCompletionInTranscript(
+ 
+ 		for (const line of lines) {
+ 			try {
+-				const entry = JSON.parse(line) as { type?: string }
++				const entry = JSON.parse(line) as { type?: string; timestamp?: string }
+ 				if (entry.type === "user") continue
++				if (startedAt && entry.timestamp && entry.timestamp < startedAt) continue
+ 				if (pattern.test(line)) return true
+ 			} catch {
+ 				continue
+diff --git a/src/hooks/ralph-loop/constants.ts b/src/hooks/ralph-loop/constants.ts
+index 20e835ff..c0a44283 100644
+--- a/src/hooks/ralph-loop/constants.ts
++++ b/src/hooks/ralph-loop/constants.ts
+@@ -3,3 +3,4 @@ export const DEFAULT_STATE_FILE = ".sisyphus/ralph-loop.local.md"
+ export const COMPLETION_TAG_PATTERN = /<promise>(.*?)<\/promise>/is
+ export const DEFAULT_MAX_ITERATIONS = 100
+ export const DEFAULT_COMPLETION_PROMISE = "DONE"
++export const ULTRAWORK_VERIFICATION_PROMISE = "VERIFIED"
+diff --git a/src/hooks/ralph-loop/continuation-prompt-builder.ts b/src/hooks/ralph-loop/continuation-prompt-builder.ts
+index b2727b8f..60b1cf24 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-builder.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-builder.ts
+@@ -1,6 +1,10 @@
+ import { SYSTEM_DIRECTIVE_PREFIX } from "../../shared/system-directive"
+ import type { RalphLoopState } from "./types"
+ 
++function getMaxIterationsLabel(state: RalphLoopState): string {
++	return typeof state.max_iterations === "number" ? String(state.max_iterations) : "unbounded"
++}
++
+ const CONTINUATION_PROMPT = `${SYSTEM_DIRECTIVE_PREFIX} - RALPH LOOP {{ITERATION}}/{{MAX}}]
+ 
+ Your previous attempt did not output the completion promise. Continue working on the task.
+@@ -14,12 +18,29 @@ IMPORTANT:
+ Original task:
+ {{PROMPT}}`
+ 
++const ULTRAWORK_VERIFICATION_PROMPT = `${SYSTEM_DIRECTIVE_PREFIX} - ULTRAWORK LOOP VERIFICATION {{ITERATION}}/{{MAX}}]
++
++You already emitted <promise>{{INITIAL_PROMISE}}</promise>. This does NOT finish the loop yet.
++
++REQUIRED NOW:
++- Call Oracle using task(subagent_type="oracle", load_skills=[], run_in_background=false, ...)
++- Ask Oracle to verify whether the original task is actually complete
++- The loop only finishes when Oracle returns <promise>{{PROMISE}}</promise>
++- If Oracle does not verify, continue fixing the task and do not consider it complete
++
++Original task:
++{{PROMPT}}`
++
+ export function buildContinuationPrompt(state: RalphLoopState): string {
+-	const continuationPrompt = CONTINUATION_PROMPT.replace(
++	const template = state.verification_pending
++		? ULTRAWORK_VERIFICATION_PROMPT
++		: CONTINUATION_PROMPT
++	const continuationPrompt = template.replace(
+ 		"{{ITERATION}}",
+ 		String(state.iteration),
+ 	)
+-		.replace("{{MAX}}", String(state.max_iterations))
++		.replace("{{MAX}}", getMaxIterationsLabel(state))
++		.replace("{{INITIAL_PROMISE}}", state.initial_completion_promise ?? state.completion_promise)
+ 		.replace("{{PROMISE}}", state.completion_promise)
+ 		.replace("{{PROMPT}}", state.prompt)
+ 
+diff --git a/src/hooks/ralph-loop/loop-state-controller.ts b/src/hooks/ralph-loop/loop-state-controller.ts
+index 6e6602df..93045cf9 100644
+--- a/src/hooks/ralph-loop/loop-state-controller.ts
++++ b/src/hooks/ralph-loop/loop-state-controller.ts
+@@ -3,6 +3,7 @@ import {
+ 	DEFAULT_COMPLETION_PROMISE,
+ 	DEFAULT_MAX_ITERATIONS,
+ 	HOOK_NAME,
++	ULTRAWORK_VERIFICATION_PROMISE,
+ } from "./constants"
+ import { clearState, incrementIteration, readState, writeState } from "./storage"
+ import { log } from "../../shared/logger"
+@@ -28,18 +29,22 @@ export function createLoopStateController(options: {
+ 				strategy?: "reset" | "continue"
+ 			},
+ 		): boolean {
++			const initialCompletionPromise =
++				loopOptions?.completionPromise ??
++				DEFAULT_COMPLETION_PROMISE
+ 			const state: RalphLoopState = {
+ 				active: true,
+ 				iteration: 1,
+-				max_iterations:
+-					loopOptions?.maxIterations ??
+-					config?.default_max_iterations ??
+-					DEFAULT_MAX_ITERATIONS,
++				max_iterations: loopOptions?.ultrawork
++					? undefined
++					: loopOptions?.maxIterations ??
++						config?.default_max_iterations ??
++						DEFAULT_MAX_ITERATIONS,
+ 				message_count_at_start: loopOptions?.messageCountAtStart,
+-				completion_promise:
+-					loopOptions?.completionPromise ??
+-					DEFAULT_COMPLETION_PROMISE,
++				completion_promise: initialCompletionPromise,
++				initial_completion_promise: initialCompletionPromise,
+ 				ultrawork: loopOptions?.ultrawork,
++				verification_pending: undefined,
+ 				strategy: loopOptions?.strategy ?? config?.default_strategy ?? "continue",
+ 				started_at: new Date().toISOString(),
+ 				prompt,
+@@ -109,5 +114,22 @@ export function createLoopStateController(options: {
+ 
+ 			return state
+ 		},
++
++		markVerificationPending(sessionID: string): RalphLoopState | null {
++			const state = readState(directory, stateDir)
++			if (!state || state.session_id !== sessionID || !state.ultrawork) {
++				return null
++			}
++
++			state.verification_pending = true
++			state.completion_promise = ULTRAWORK_VERIFICATION_PROMISE
++			state.initial_completion_promise ??= DEFAULT_COMPLETION_PROMISE
++
++			if (!writeState(directory, state, stateDir)) {
++				return null
++			}
++
++			return state
++		},
+ 	}
+ }
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index bca4cb34..8eefb6b9 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -2,11 +2,13 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { log } from "../../shared/logger"
+ import type { RalphLoopOptions, RalphLoopState } from "./types"
+ import { HOOK_NAME } from "./constants"
++import { handleDetectedCompletion } from "./completion-handler"
+ import {
+ 	detectCompletionInSessionMessages,
+ 	detectCompletionInTranscript,
+ } from "./completion-promise-detector"
+ import { continueIteration } from "./iteration-continuation"
++import { handleDeletedLoopSession, handleErroredLoopSession } from "./session-event-handler"
+ 
+ type SessionRecovery = {
+ 	isRecovering: (sessionID: string) => boolean
+@@ -18,6 +20,7 @@ type LoopStateController = {
+ 	clear: () => boolean
+ 	incrementIteration: () => RalphLoopState | null
+ 	setSessionID: (sessionID: string) => RalphLoopState | null
++	markVerificationPending: (sessionID: string) => RalphLoopState | null
+ }
+ type RalphLoopEventHandlerOptions = { directory: string; apiTimeoutMs: number; getTranscriptPath: (sessionID: string) => string | undefined; checkSessionExists?: RalphLoopOptions["checkSessionExists"]; sessionRecovery: SessionRecovery; loopState: LoopStateController }
+ 
+@@ -76,7 +79,11 @@ export function createRalphLoopEventHandler(
+ 				}
+ 
+ 				const transcriptPath = options.getTranscriptPath(sessionID)
+-				const completionViaTranscript = detectCompletionInTranscript(transcriptPath, state.completion_promise)
++				const completionViaTranscript = detectCompletionInTranscript(
++					transcriptPath,
++					state.completion_promise,
++					state.started_at,
++				)
+ 				const completionViaApi = completionViaTranscript
+ 					? false
+ 					: await detectCompletionInSessionMessages(ctx, {
+@@ -96,15 +103,20 @@ export function createRalphLoopEventHandler(
+ 							? "transcript_file"
+ 							: "session_messages_api",
+ 					})
+-					options.loopState.clear()
+-
+-					const title = state.ultrawork ? "ULTRAWORK LOOP COMPLETE!" : "Ralph Loop Complete!"
+-					const message = state.ultrawork ? `JUST ULW ULW! Task completed after ${state.iteration} iteration(s)` : `Task completed after ${state.iteration} iteration(s)`
+-					await ctx.client.tui?.showToast?.({ body: { title, message, variant: "success", duration: 5000 } }).catch(() => {})
++					await handleDetectedCompletion(ctx, {
++						sessionID,
++						state,
++						loopState: options.loopState,
++						directory: options.directory,
++						apiTimeoutMs: options.apiTimeoutMs,
++					})
+ 					return
+ 				}
+ 
+-				if (state.iteration >= state.max_iterations) {
++				if (
++					typeof state.max_iterations === "number"
++					&& state.iteration >= state.max_iterations
++				) {
+ 					log(`[${HOOK_NAME}] Max iterations reached`, {
+ 						sessionID,
+ 						iteration: state.iteration,
+@@ -133,7 +145,7 @@ export function createRalphLoopEventHandler(
+ 				await ctx.client.tui?.showToast?.({
+ 					body: {
+ 						title: "Ralph Loop",
+-						message: `Iteration ${newState.iteration}/${newState.max_iterations}`,
++						message: `Iteration ${newState.iteration}/${typeof newState.max_iterations === "number" ? newState.max_iterations : "unbounded"}`,
+ 						variant: "info",
+ 						duration: 2000,
+ 					},
+@@ -159,36 +171,12 @@ export function createRalphLoopEventHandler(
+ 		}
+ 
+ 		if (event.type === "session.deleted") {
+-			const sessionInfo = props?.info as { id?: string } | undefined
+-			if (!sessionInfo?.id) return
+-			const state = options.loopState.getState()
+-			if (state?.session_id === sessionInfo.id) {
+-				options.loopState.clear()
+-				log(`[${HOOK_NAME}] Session deleted, loop cleared`, { sessionID: sessionInfo.id })
+-			}
+-			options.sessionRecovery.clear(sessionInfo.id)
++			if (!handleDeletedLoopSession(props, options.loopState, options.sessionRecovery)) return
+ 			return
+ 		}
+ 
+ 		if (event.type === "session.error") {
+-			const sessionID = props?.sessionID as string | undefined
+-			const error = props?.error as { name?: string } | undefined
+-
+-			if (error?.name === "MessageAbortedError") {
+-				if (sessionID) {
+-					const state = options.loopState.getState()
+-					if (state?.session_id === sessionID) {
+-						options.loopState.clear()
+-						log(`[${HOOK_NAME}] User aborted, loop cleared`, { sessionID })
+-					}
+-					options.sessionRecovery.clear(sessionID)
+-				}
+-				return
+-			}
+-
+-			if (sessionID) {
+-				options.sessionRecovery.markRecovering(sessionID)
+-			}
++			handleErroredLoopSession(props, options.loopState, options.sessionRecovery)
+ 		}
+ 	}
+ }
+diff --git a/src/hooks/ralph-loop/session-event-handler.ts b/src/hooks/ralph-loop/session-event-handler.ts
+new file mode 100644
+index 00000000..427b89ce
+--- /dev/null
++++ b/src/hooks/ralph-loop/session-event-handler.ts
+@@ -0,0 +1,56 @@
++import { log } from "../../shared/logger"
++import { HOOK_NAME } from "./constants"
++import type { RalphLoopState } from "./types"
++
++type LoopStateController = {
++	getState: () => RalphLoopState | null
++	clear: () => boolean
++}
++
++type SessionRecovery = {
++	clear: (sessionID: string) => void
++	markRecovering: (sessionID: string) => void
++}
++
++export function handleDeletedLoopSession(
++	props: Record<string, unknown> | undefined,
++	loopState: LoopStateController,
++	sessionRecovery: SessionRecovery,
++): boolean {
++	const sessionInfo = props?.info as { id?: string } | undefined
++	if (!sessionInfo?.id) return false
++
++	const state = loopState.getState()
++	if (state?.session_id === sessionInfo.id) {
++		loopState.clear()
++		log(`[${HOOK_NAME}] Session deleted, loop cleared`, { sessionID: sessionInfo.id })
++	}
++	sessionRecovery.clear(sessionInfo.id)
++	return true
++}
++
++export function handleErroredLoopSession(
++	props: Record<string, unknown> | undefined,
++	loopState: LoopStateController,
++	sessionRecovery: SessionRecovery,
++): boolean {
++	const sessionID = props?.sessionID as string | undefined
++	const error = props?.error as { name?: string } | undefined
++
++	if (error?.name === "MessageAbortedError") {
++		if (sessionID) {
++			const state = loopState.getState()
++			if (state?.session_id === sessionID) {
++				loopState.clear()
++				log(`[${HOOK_NAME}] User aborted, loop cleared`, { sessionID })
++			}
++			sessionRecovery.clear(sessionID)
++		}
++		return true
++	}
++
++	if (sessionID) {
++		sessionRecovery.markRecovering(sessionID)
++	}
++	return true
++}
+diff --git a/src/hooks/ralph-loop/storage.ts b/src/hooks/ralph-loop/storage.ts
+index c9ef6b6c..824b6ecb 100644
+--- a/src/hooks/ralph-loop/storage.ts
++++ b/src/hooks/ralph-loop/storage.ts
+@@ -40,10 +40,18 @@ export function readState(directory: string, customPath?: string): RalphLoopStat
+       return str.replace(/^["']|["']$/g, "")
+     }
+ 
++    const ultrawork = data.ultrawork === true || data.ultrawork === "true" ? true : undefined
++    const maxIterations =
++      data.max_iterations === undefined || data.max_iterations === ""
++        ? ultrawork
++          ? undefined
++          : DEFAULT_MAX_ITERATIONS
++        : Number(data.max_iterations) || DEFAULT_MAX_ITERATIONS
++
+     return {
+       active: isActive,
+       iteration: iterationNum,
+-      max_iterations: Number(data.max_iterations) || DEFAULT_MAX_ITERATIONS,
++      max_iterations: maxIterations,
+       message_count_at_start:
+         typeof data.message_count_at_start === "number"
+           ? data.message_count_at_start
+@@ -51,10 +59,17 @@ export function readState(directory: string, customPath?: string): RalphLoopStat
+             ? Number(data.message_count_at_start)
+             : undefined,
+       completion_promise: stripQuotes(data.completion_promise) || DEFAULT_COMPLETION_PROMISE,
++      initial_completion_promise: data.initial_completion_promise
++        ? stripQuotes(data.initial_completion_promise)
++        : undefined,
+       started_at: stripQuotes(data.started_at) || new Date().toISOString(),
+       prompt: body.trim(),
+       session_id: data.session_id ? stripQuotes(data.session_id) : undefined,
+-      ultrawork: data.ultrawork === true || data.ultrawork === "true" ? true : undefined,
++      ultrawork,
++      verification_pending:
++        data.verification_pending === true || data.verification_pending === "true"
++          ? true
++          : undefined,
+       strategy: data.strategy === "reset" || data.strategy === "continue" ? data.strategy : undefined,
+     }
+   } catch {
+@@ -77,18 +92,28 @@ export function writeState(
+ 
+     const sessionIdLine = state.session_id ? `session_id: "${state.session_id}"\n` : ""
+     const ultraworkLine = state.ultrawork !== undefined ? `ultrawork: ${state.ultrawork}\n` : ""
++    const verificationPendingLine =
++      state.verification_pending !== undefined
++        ? `verification_pending: ${state.verification_pending}\n`
++        : ""
+     const strategyLine = state.strategy ? `strategy: "${state.strategy}"\n` : ""
++    const initialCompletionPromiseLine = state.initial_completion_promise
++      ? `initial_completion_promise: "${state.initial_completion_promise}"\n`
++      : ""
+     const messageCountAtStartLine =
+       typeof state.message_count_at_start === "number"
+         ? `message_count_at_start: ${state.message_count_at_start}\n`
+         : ""
++    const maxIterationsLine =
++      typeof state.max_iterations === "number"
++        ? `max_iterations: ${state.max_iterations}\n`
++        : ""
+     const content = `---
+ active: ${state.active}
+ iteration: ${state.iteration}
+-max_iterations: ${state.max_iterations}
+-completion_promise: "${state.completion_promise}"
+-started_at: "${state.started_at}"
+-${sessionIdLine}${ultraworkLine}${strategyLine}${messageCountAtStartLine}---
++${maxIterationsLine}completion_promise: "${state.completion_promise}"
++${initialCompletionPromiseLine}started_at: "${state.started_at}"
++${sessionIdLine}${ultraworkLine}${verificationPendingLine}${strategyLine}${messageCountAtStartLine}---
+ ${state.prompt}
+ `
+ 
+diff --git a/src/hooks/ralph-loop/types.ts b/src/hooks/ralph-loop/types.ts
+index 9e32c48a..42a5fc69 100644
+--- a/src/hooks/ralph-loop/types.ts
++++ b/src/hooks/ralph-loop/types.ts
+@@ -3,13 +3,15 @@ import type { RalphLoopConfig } from "../../config"
+ export interface RalphLoopState {
+   active: boolean
+   iteration: number
+-  max_iterations: number
++  max_iterations?: number
+   message_count_at_start?: number
+   completion_promise: string
++  initial_completion_promise?: string
+   started_at: string
+   prompt: string
+   session_id?: string
+   ultrawork?: boolean
++  verification_pending?: boolean
+   strategy?: "reset" | "continue"
+ }
+ 
+diff --git a/src/plugin/chat-message.ts b/src/plugin/chat-message.ts
+index 2cc55c89..96555d02 100644
+--- a/src/plugin/chat-message.ts
++++ b/src/plugin/chat-message.ts
+@@ -135,16 +135,20 @@ export function createChatMessageHandler(args: {
+       const isRalphLoopTemplate =
+         promptText.includes("You are starting a Ralph Loop") &&
+         promptText.includes("<user-task>")
++      const isUlwLoopTemplate =
++        promptText.includes("You are starting an ULTRAWORK Loop") &&
++        promptText.includes("<user-task>")
+       const isCancelRalphTemplate = promptText.includes(
+         "Cancel the currently active Ralph Loop",
+       )
+ 
+-      if (isRalphLoopTemplate) {
++      if (isRalphLoopTemplate || isUlwLoopTemplate) {
+         const taskMatch = promptText.match(/<user-task>\s*([\s\S]*?)\s*<\/user-task>/i)
+         const rawTask = taskMatch?.[1]?.trim() || ""
+         const parsedArguments = parseRalphLoopArguments(rawTask)
+ 
+         hooks.ralphLoop.startLoop(input.sessionID, parsedArguments.prompt, {
++          ultrawork: isUlwLoopTemplate,
+           maxIterations: parsedArguments.maxIterations,
+           completionPromise: parsedArguments.completionPromise,
+           strategy: parsedArguments.strategy,
+diff --git a/src/plugin/tool-execute-before.ts b/src/plugin/tool-execute-before.ts
+index 65ebaed6..44cd2b24 100644
+--- a/src/plugin/tool-execute-before.ts
++++ b/src/plugin/tool-execute-before.ts
+@@ -5,6 +5,8 @@ import { clearBoulderState } from "../features/boulder-state"
+ import { log } from "../shared"
+ import { resolveSessionAgent } from "./session-agent-resolver"
+ import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
++import { ULTRAWORK_VERIFICATION_PROMISE } from "../hooks/ralph-loop/constants"
++import { readState } from "../hooks/ralph-loop/storage"
+ 
+ import type { CreatedHooks } from "../create-hooks"
+ 
+@@ -62,6 +64,22 @@ export function createToolExecuteBeforeHandler(args: {
+         const resolvedAgent = await resolveSessionAgent(ctx.client, sessionId)
+         argsObject.subagent_type = resolvedAgent ?? "continue"
+       }
++
++      const normalizedSubagentType =
++        typeof argsObject.subagent_type === "string" ? argsObject.subagent_type : undefined
++      const prompt = typeof argsObject.prompt === "string" ? argsObject.prompt : ""
++      const loopState = typeof ctx.directory === "string" ? readState(ctx.directory) : null
++      const shouldInjectOracleVerification =
++        normalizedSubagentType === "oracle"
++        && loopState?.active === true
++        && loopState.ultrawork === true
++        && loopState.verification_pending === true
++        && loopState.session_id === input.sessionID
++
++      if (shouldInjectOracleVerification) {
++        argsObject.run_in_background = false
++        argsObject.prompt = `${prompt ? `${prompt}\n\n` : ""}You are verifying the active ULTRAWORK loop result for this session. Review whether the original task is truly complete: ${loopState.prompt}\n\nIf the work is fully complete, end your response with <promise>${ULTRAWORK_VERIFICATION_PROMISE}</promise>. If the work is not complete, explain the blocking issues clearly and DO NOT emit that promise.`
++      }
+     }
+ 
+     if (hooks.ralphLoop && input.tool === "skill") {
+-- 
+2.39.2
+

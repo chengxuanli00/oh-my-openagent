@@ -1,0 +1,475 @@
+From 5cbef252a32dcb5addcb439258cddb5bde9797f3 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 15 Dec 2025 19:02:31 +0900
+Subject: [PATCH 0359/5749] feat(tools): add interactive_bash tool for tmux
+ session management
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a new tool for managing tmux sessions with automatic tracking and cleanup:
+
+- interactive_bash tool: Accepts tmux commands via tmux_command parameter
+- Session tracking hook: Tracks omo-* prefixed tmux sessions per OpenCode session
+- System reminder: Appends active session list after create/delete operations
+- Auto cleanup: Kills all tracked tmux sessions on OpenCode session deletion
+- Output truncation: Registered in TRUNCATABLE_TOOLS for long capture-pane outputs
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/config/schema.ts                          |   1 +
+ src/hooks/index.ts                            |   1 +
+ .../interactive-bash-session/constants.ts     |  15 ++
+ src/hooks/interactive-bash-session/index.ts   | 137 ++++++++++++++++++
+ src/hooks/interactive-bash-session/storage.ts |  59 ++++++++
+ src/hooks/interactive-bash-session/types.ts   |  11 ++
+ src/hooks/tool-output-truncator.ts            |   2 +
+ src/index.ts                                  |   6 +
+ src/tools/index.ts                            |   2 +
+ src/tools/interactive-bash/constants.ts       |  21 +++
+ src/tools/interactive-bash/index.ts           |   3 +
+ src/tools/interactive-bash/tools.ts           |  43 ++++++
+ src/tools/interactive-bash/types.ts           |   3 +
+ 13 files changed, 304 insertions(+)
+ create mode 100644 src/hooks/interactive-bash-session/constants.ts
+ create mode 100644 src/hooks/interactive-bash-session/index.ts
+ create mode 100644 src/hooks/interactive-bash-session/storage.ts
+ create mode 100644 src/hooks/interactive-bash-session/types.ts
+ create mode 100644 src/tools/interactive-bash/constants.ts
+ create mode 100644 src/tools/interactive-bash/index.ts
+ create mode 100644 src/tools/interactive-bash/tools.ts
+ create mode 100644 src/tools/interactive-bash/types.ts
+
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index be44e432..9c0464a3 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -61,6 +61,7 @@ export const HookNameSchema = z.enum([
+   "keyword-detector",
+   "agent-usage-reminder",
+   "non-interactive-env",
++  "interactive-bash-session",
+ ])
+ 
+ export const AgentOverrideConfigSchema = z.object({
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 0753ce9c..911a12a6 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -18,3 +18,4 @@ export { createAutoUpdateCheckerHook } from "./auto-update-checker";
+ export { createAgentUsageReminderHook } from "./agent-usage-reminder";
+ export { createKeywordDetectorHook } from "./keyword-detector";
+ export { createNonInteractiveEnvHook } from "./non-interactive-env";
++export { createInteractiveBashSessionHook } from "./interactive-bash-session";
+diff --git a/src/hooks/interactive-bash-session/constants.ts b/src/hooks/interactive-bash-session/constants.ts
+new file mode 100644
+index 00000000..a43f0584
+--- /dev/null
++++ b/src/hooks/interactive-bash-session/constants.ts
+@@ -0,0 +1,15 @@
++import { join } from "node:path";
++import { xdgData } from "xdg-basedir";
++
++export const OPENCODE_STORAGE = join(xdgData ?? "", "opencode", "storage");
++export const INTERACTIVE_BASH_SESSION_STORAGE = join(
++  OPENCODE_STORAGE,
++  "interactive-bash-session",
++);
++
++export const OMO_SESSION_PREFIX = "omo-";
++
++export function buildSessionReminderMessage(sessions: string[]): string {
++  if (sessions.length === 0) return "";
++  return `\n\n[System Reminder] Active omo-* tmux sessions: ${sessions.join(", ")}`;
++}
+diff --git a/src/hooks/interactive-bash-session/index.ts b/src/hooks/interactive-bash-session/index.ts
+new file mode 100644
+index 00000000..db1bac6e
+--- /dev/null
++++ b/src/hooks/interactive-bash-session/index.ts
+@@ -0,0 +1,137 @@
++import type { PluginInput } from "@opencode-ai/plugin";
++import {
++  loadInteractiveBashSessionState,
++  saveInteractiveBashSessionState,
++  clearInteractiveBashSessionState,
++} from "./storage";
++import { OMO_SESSION_PREFIX, buildSessionReminderMessage } from "./constants";
++import type { InteractiveBashSessionState } from "./types";
++
++interface ToolExecuteInput {
++  tool: string;
++  sessionID: string;
++  callID: string;
++  args?: Record<string, unknown>;
++}
++
++interface ToolExecuteOutput {
++  title: string;
++  output: string;
++  metadata: unknown;
++}
++
++interface EventInput {
++  event: {
++    type: string;
++    properties?: unknown;
++  };
++}
++
++export function createInteractiveBashSessionHook(_ctx: PluginInput) {
++  const sessionStates = new Map<string, InteractiveBashSessionState>();
++
++  function getOrCreateState(sessionID: string): InteractiveBashSessionState {
++    if (!sessionStates.has(sessionID)) {
++      const persisted = loadInteractiveBashSessionState(sessionID);
++      const state: InteractiveBashSessionState = persisted ?? {
++        sessionID,
++        tmuxSessions: new Set<string>(),
++        updatedAt: Date.now(),
++      };
++      sessionStates.set(sessionID, state);
++    }
++    return sessionStates.get(sessionID)!;
++  }
++
++  function extractSessionNameFromFlags(tmuxCommand: string): string | null {
++    const sessionFlagMatch = tmuxCommand.match(/(?:-s|-t)\s+(\S+)/);
++    return sessionFlagMatch?.[1] ?? null;
++  }
++
++  function isOmoSession(sessionName: string | null): boolean {
++    return sessionName !== null && sessionName.startsWith(OMO_SESSION_PREFIX);
++  }
++
++  async function killAllTrackedSessions(
++    state: InteractiveBashSessionState,
++  ): Promise<void> {
++    for (const sessionName of state.tmuxSessions) {
++      try {
++        const proc = Bun.spawn(["tmux", "kill-session", "-t", sessionName], {
++          stdout: "ignore",
++          stderr: "ignore",
++        });
++        await proc.exited;
++      } catch {}
++    }
++  }
++
++  const toolExecuteAfter = async (
++    input: ToolExecuteInput,
++    output: ToolExecuteOutput,
++  ) => {
++    const { tool, sessionID, args } = input;
++    const toolLower = tool.toLowerCase();
++
++    if (toolLower !== "interactive_bash") {
++      return;
++    }
++
++    const tmuxCommand = (args?.tmux_command as string) ?? "";
++    const state = getOrCreateState(sessionID);
++    let stateChanged = false;
++
++    const hasNewSession = tmuxCommand.includes("new-session");
++    const hasKillSession = tmuxCommand.includes("kill-session");
++    const hasKillServer = tmuxCommand.includes("kill-server");
++
++    const sessionName = extractSessionNameFromFlags(tmuxCommand);
++
++    if (hasNewSession && isOmoSession(sessionName)) {
++      state.tmuxSessions.add(sessionName!);
++      stateChanged = true;
++    } else if (hasKillSession && isOmoSession(sessionName)) {
++      state.tmuxSessions.delete(sessionName!);
++      stateChanged = true;
++    } else if (hasKillServer) {
++      state.tmuxSessions.clear();
++      stateChanged = true;
++    }
++
++    if (stateChanged) {
++      state.updatedAt = Date.now();
++      saveInteractiveBashSessionState(state);
++    }
++
++    const isSessionOperation = hasNewSession || hasKillSession || hasKillServer;
++    if (isSessionOperation) {
++      const reminder = buildSessionReminderMessage(
++        Array.from(state.tmuxSessions),
++      );
++      if (reminder) {
++        output.output += reminder;
++      }
++    }
++  };
++
++  const eventHandler = async ({ event }: EventInput) => {
++    const props = event.properties as Record<string, unknown> | undefined;
++
++    if (event.type === "session.deleted") {
++      const sessionInfo = props?.info as { id?: string } | undefined;
++      const sessionID = sessionInfo?.id;
++
++      if (sessionID) {
++        const state = getOrCreateState(sessionID);
++        await killAllTrackedSessions(state);
++        sessionStates.delete(sessionID);
++        clearInteractiveBashSessionState(sessionID);
++      }
++    }
++  };
++
++  return {
++    "tool.execute.after": toolExecuteAfter,
++    event: eventHandler,
++  };
++}
+diff --git a/src/hooks/interactive-bash-session/storage.ts b/src/hooks/interactive-bash-session/storage.ts
+new file mode 100644
+index 00000000..44d1c089
+--- /dev/null
++++ b/src/hooks/interactive-bash-session/storage.ts
+@@ -0,0 +1,59 @@
++import {
++  existsSync,
++  mkdirSync,
++  readFileSync,
++  writeFileSync,
++  unlinkSync,
++} from "node:fs";
++import { join } from "node:path";
++import { INTERACTIVE_BASH_SESSION_STORAGE } from "./constants";
++import type {
++  InteractiveBashSessionState,
++  SerializedInteractiveBashSessionState,
++} from "./types";
++
++function getStoragePath(sessionID: string): string {
++  return join(INTERACTIVE_BASH_SESSION_STORAGE, `${sessionID}.json`);
++}
++
++export function loadInteractiveBashSessionState(
++  sessionID: string,
++): InteractiveBashSessionState | null {
++  const filePath = getStoragePath(sessionID);
++  if (!existsSync(filePath)) return null;
++
++  try {
++    const content = readFileSync(filePath, "utf-8");
++    const serialized = JSON.parse(content) as SerializedInteractiveBashSessionState;
++    return {
++      sessionID: serialized.sessionID,
++      tmuxSessions: new Set(serialized.tmuxSessions),
++      updatedAt: serialized.updatedAt,
++    };
++  } catch {
++    return null;
++  }
++}
++
++export function saveInteractiveBashSessionState(
++  state: InteractiveBashSessionState,
++): void {
++  if (!existsSync(INTERACTIVE_BASH_SESSION_STORAGE)) {
++    mkdirSync(INTERACTIVE_BASH_SESSION_STORAGE, { recursive: true });
++  }
++
++  const filePath = getStoragePath(state.sessionID);
++  const serialized: SerializedInteractiveBashSessionState = {
++    sessionID: state.sessionID,
++    tmuxSessions: Array.from(state.tmuxSessions),
++    updatedAt: state.updatedAt,
++  };
++  writeFileSync(filePath, JSON.stringify(serialized, null, 2));
++}
++
++export function clearInteractiveBashSessionState(sessionID: string): void {
++  const filePath = getStoragePath(sessionID);
++  if (existsSync(filePath)) {
++    unlinkSync(filePath);
++  }
++}
+diff --git a/src/hooks/interactive-bash-session/types.ts b/src/hooks/interactive-bash-session/types.ts
+new file mode 100644
+index 00000000..8cdaf7f1
+--- /dev/null
++++ b/src/hooks/interactive-bash-session/types.ts
+@@ -0,0 +1,11 @@
++export interface InteractiveBashSessionState {
++  sessionID: string;
++  tmuxSessions: Set<string>;
++  updatedAt: number;
++}
++
++export interface SerializedInteractiveBashSessionState {
++  sessionID: string;
++  tmuxSessions: string[];
++  updatedAt: number;
++}
+diff --git a/src/hooks/tool-output-truncator.ts b/src/hooks/tool-output-truncator.ts
+index 46d724af..c3a8f089 100644
+--- a/src/hooks/tool-output-truncator.ts
++++ b/src/hooks/tool-output-truncator.ts
+@@ -13,6 +13,8 @@ const TRUNCATABLE_TOOLS = [
+   "lsp_workspace_symbols",
+   "lsp_diagnostics",
+   "ast_grep_search",
++  "interactive_bash",
++  "Interactive_bash",
+ ]
+ 
+ export function createToolOutputTruncatorHook(ctx: PluginInput) {
+diff --git a/src/index.ts b/src/index.ts
+index d9e3a25b..47690868 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -19,6 +19,7 @@ import {
+   createKeywordDetectorHook,
+   createAgentUsageReminderHook,
+   createNonInteractiveEnvHook,
++  createInteractiveBashSessionHook,
+ } from "./hooks";
+ import { createGoogleAntigravityAuthPlugin } from "./auth/antigravity";
+ import {
+@@ -242,6 +243,9 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const nonInteractiveEnv = isHookEnabled("non-interactive-env")
+     ? createNonInteractiveEnvHook(ctx)
+     : null;
++  const interactiveBashSession = isHookEnabled("interactive-bash-session")
++    ? createInteractiveBashSessionHook(ctx)
++    : null;
+ 
+   updateTerminalTitle({ sessionId: "main" });
+ 
+@@ -387,6 +391,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       await anthropicAutoCompact?.event(input);
+       await keywordDetector?.event(input);
+       await agentUsageReminder?.event(input);
++      await interactiveBashSession?.event(input);
+ 
+       const { event } = input;
+       const props = event.properties as Record<string, unknown> | undefined;
+@@ -508,6 +513,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       await rulesInjector?.["tool.execute.after"](input, output);
+       await emptyTaskResponseDetector?.["tool.execute.after"](input, output);
+       await agentUsageReminder?.["tool.execute.after"](input, output);
++      await interactiveBashSession?.["tool.execute.after"](input, output);
+ 
+       if (input.sessionID === getMainSessionID()) {
+         updateTerminalTitle({
+diff --git a/src/tools/index.ts b/src/tools/index.ts
+index 73929750..33b77540 100644
+--- a/src/tools/index.ts
++++ b/src/tools/index.ts
+@@ -21,6 +21,7 @@ import { grep } from "./grep"
+ import { glob } from "./glob"
+ import { slashcommand } from "./slashcommand"
+ import { skill } from "./skill"
++import { interactive_bash } from "./interactive-bash"
+ 
+ import {
+   createBackgroundTask,
+@@ -62,4 +63,5 @@ export const builtinTools = {
+   glob,
+   slashcommand,
+   skill,
++  interactive_bash,
+ }
+diff --git a/src/tools/interactive-bash/constants.ts b/src/tools/interactive-bash/constants.ts
+new file mode 100644
+index 00000000..5055eccb
+--- /dev/null
++++ b/src/tools/interactive-bash/constants.ts
+@@ -0,0 +1,21 @@
++export const DEFAULT_TIMEOUT_MS = 60_000
++
++export const INTERACTIVE_BASH_DESCRIPTION = `Execute tmux commands for interactive terminal session management.
++
++This tool provides access to tmux for creating and managing persistent terminal sessions.
++Use it to run interactive CLI applications, maintain long-running processes, or work with multiple terminal sessions.
++
++Parameters:
++- tmux_command: The tmux command to execute (e.g., "new-session -d -s omo-dev", "send-keys -t omo-dev 'ls' Enter")
++
++Examples:
++- Create session: "new-session -d -s omo-test"
++- Send keys: "send-keys -t omo-test 'npm run dev' Enter"
++- Capture output: "capture-pane -t omo-test -p"
++- List sessions: "list-sessions"
++- Kill session: "kill-session -t omo-test"
++
++Notes:
++- Session names should follow the pattern "omo-{name}" for automatic tracking
++- Use -d flag with new-session to create detached sessions
++- Use capture-pane -p to retrieve terminal output`
+diff --git a/src/tools/interactive-bash/index.ts b/src/tools/interactive-bash/index.ts
+new file mode 100644
+index 00000000..6353035f
+--- /dev/null
++++ b/src/tools/interactive-bash/index.ts
+@@ -0,0 +1,3 @@
++import { interactive_bash } from "./tools"
++
++export { interactive_bash }
+diff --git a/src/tools/interactive-bash/tools.ts b/src/tools/interactive-bash/tools.ts
+new file mode 100644
+index 00000000..a7a57e0b
+--- /dev/null
++++ b/src/tools/interactive-bash/tools.ts
+@@ -0,0 +1,43 @@
++import { tool } from "@opencode-ai/plugin/tool"
++import { DEFAULT_TIMEOUT_MS, INTERACTIVE_BASH_DESCRIPTION } from "./constants"
++
++export const interactive_bash = tool({
++  description: INTERACTIVE_BASH_DESCRIPTION,
++  args: {
++    tmux_command: tool.schema.string().describe("The tmux command to execute (without 'tmux' prefix)"),
++  },
++  execute: async (args) => {
++    try {
++      const parts = args.tmux_command.split(/\s+/).filter((p) => p.length > 0)
++
++      if (parts.length === 0) {
++        return "Error: Empty tmux command"
++      }
++
++      const proc = Bun.spawn(["tmux", ...parts], {
++        stdout: "pipe",
++        stderr: "pipe",
++      })
++
++      const timeoutPromise = new Promise<never>((_, reject) => {
++        const id = setTimeout(() => {
++          proc.kill()
++          reject(new Error(`Timeout after ${DEFAULT_TIMEOUT_MS}ms`))
++        }, DEFAULT_TIMEOUT_MS)
++        proc.exited.then(() => clearTimeout(id))
++      })
++
++      const stdout = await Promise.race([new Response(proc.stdout).text(), timeoutPromise])
++      const stderr = await new Response(proc.stderr).text()
++      const exitCode = await proc.exited
++
++      if (exitCode !== 0 && stderr.trim()) {
++        return `Error: ${stderr.trim()}`
++      }
++
++      return stdout || "(no output)"
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
+diff --git a/src/tools/interactive-bash/types.ts b/src/tools/interactive-bash/types.ts
+new file mode 100644
+index 00000000..de90a408
+--- /dev/null
++++ b/src/tools/interactive-bash/types.ts
+@@ -0,0 +1,3 @@
++export interface InteractiveBashArgs {
++  tmux_command: string
++}
+-- 
+2.39.2
+

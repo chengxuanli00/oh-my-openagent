@@ -1,0 +1,154 @@
+From 6d15ab86ab41872506e097ba06f6672327a47f5a Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code-yeongyu@noreply.github.com>
+Date: Thu, 21 May 2026 15:50:28 +0900
+Subject: [PATCH 5643/5749] fix(background-agent): fail cancellation when abort
+ fails
+
+---
+ .../cancel-task-cleanup.test.ts               | 32 +++++++++++++++++--
+ src/features/background-agent/manager.ts      | 26 +++++++++------
+ src/tools/background-task/tools.test.ts       | 18 +++++++++++
+ 3 files changed, 64 insertions(+), 12 deletions(-)
+
+diff --git a/src/features/background-agent/cancel-task-cleanup.test.ts b/src/features/background-agent/cancel-task-cleanup.test.ts
+index 19bb0335..11e64d12 100644
+--- a/src/features/background-agent/cancel-task-cleanup.test.ts
++++ b/src/features/background-agent/cancel-task-cleanup.test.ts
+@@ -11,11 +11,14 @@ afterEach(() => {
+   while (managersToShutdown.length > 0) managersToShutdown.pop()?.shutdown()
+ })
+ 
+-function createBackgroundManager(config?: { defaultConcurrency?: number }): BackgroundManager {
++function createBackgroundManager(
++  config?: { defaultConcurrency?: number },
++  abortSession: () => Promise<unknown> = async () => ({ data: true }),
++): BackgroundManager {
+   const directory = tmpdir()
+   const client = { session: {} as PluginInput["client"]["session"] } as PluginInput["client"]
+ 
+-  Reflect.set(client.session, "abort", async () => ({ data: true }))
++  Reflect.set(client.session, "abort", abortSession)
+   Reflect.set(client.session, "create", async () => ({ data: { id: `session-${crypto.randomUUID().slice(0, 8)}` } }))
+   Reflect.set(client.session, "get", async () => ({ data: { directory } }))
+   Reflect.set(client.session, "messages", async () => ({ data: [] }))
+@@ -111,6 +114,31 @@ describe("BackgroundManager.cancelTask cleanup", () => {
+     expect(manager.getTask(task.id)?.sessionId).toBe(task.sessionId)
+   })
+ 
++  test("#given running task abort returns SDK error #when cancelTask runs #then cancellation fails and task stays running", async () => {
++    // given
++    const manager = createBackgroundManager(undefined, async () => ({ error: { message: "session still active" } }))
++    const task = createMockTask({
++      id: "task-abort-error",
++      parentSessionId: "parent-session-abort-error",
++      sessionId: "session-abort-error",
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++
++    // when
++    const cancelled = await manager.cancelTask(task.id, {
++      skipNotification: true,
++      source: "test",
++    })
++
++    // then
++    expect(cancelled).toBe(false)
++    expect(task.status).toBe("running")
++    expect(getTaskMap(manager).get(task.id)).toBe(task)
++    expect(getPendingByParent(manager).get(task.parentSessionId)).toEqual(new Set([task.id]))
++  })
++
+   test("#given a running task #when cancelTask called with skipNotification=false #then task is also eventually removed", async () => {
+     // given
+     const manager = createBackgroundManager()
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index d5fa9533..e13e58aa 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -301,14 +301,21 @@ export class BackgroundManager {
+     this.registerProcessCleanup()
+   }
+ 
+-  private async abortSessionWithLogging(sessionID: string, reason: string): Promise<void> {
++  private async abortSessionWithLogging(sessionID: string, reason: string): Promise<boolean> {
+     try {
+-      await abortWithTimeout(this.client, sessionID)
++      const aborted = await abortWithTimeout(this.client, sessionID)
++      if (!aborted) {
++        log(`[background-agent] Session abort did not complete during ${reason}:`, {
++          sessionID,
++        })
++      }
++      return aborted
+     } catch (error) {
+       log(`[background-agent] Failed to abort session during ${reason}:`, {
+         sessionID,
+         error,
+       })
++      return false
+     }
+   }
+ 
+@@ -2179,6 +2186,13 @@ The task was re-queued on a fallback model after a retryable failure.
+     }
+ 
+     const wasRunning = task.status === "running"
++    if (wasRunning && abortSession && task.sessionId) {
++      const aborted = await this.abortSessionWithLogging(task.sessionId, `task cancellation (${source})`)
++      if (!aborted) return false
++
++      clearDelegatedChildSessionBootstrap(task.sessionId)
++      SessionCategoryRegistry.remove(task.sessionId)
++    }
+     if (task.currentAttemptID) {
+       finalizeAttempt(task, task.currentAttemptID, "cancelled", reason)
+     } else {
+@@ -2210,14 +2224,6 @@ The task was re-queued on a fallback model after a retryable failure.
+       this.idleDeferralTimers.delete(task.id)
+     }
+ 
+-    if (abortSession && task.sessionId) {
+-      // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+-      await this.abortSessionWithLogging(task.sessionId, `task cancellation (${source})`)
+-
+-      clearDelegatedChildSessionBootstrap(task.sessionId)
+-      SessionCategoryRegistry.remove(task.sessionId)
+-    }
+-
+     removeTaskToastTracking(task.id)
+ 
+     // Update continuation marker for CLI run mode
+diff --git a/src/tools/background-task/tools.test.ts b/src/tools/background-task/tools.test.ts
+index 81969b43..04523062 100644
+--- a/src/tools/background-task/tools.test.ts
++++ b/src/tools/background-task/tools.test.ts
+@@ -408,6 +408,24 @@ describe("background_cancel", () => {
+     expect(output).toContain("Task cancelled successfully")
+   })
+ 
++  test("reports an error when manager cannot cancel a running task", async () => {
++    // #given
++    const task = createTask({ status: "running" })
++    const manager = unsafeTestValue<BackgroundManager>({
++      getTask: (id: string) => (id === task.id ? task : undefined),
++      getAllDescendantTasks: () => [task],
++      cancelTask: async () => false,
++    })
++    const client = { session: { abort: async () => ({}) } } as BackgroundCancelClient
++    const tool = createBackgroundCancel(manager, client)
++
++    // #when
++    const output = await tool.execute({ taskId: task.id }, mockContext)
++
++    // #then
++    expect(output).toContain(`[ERROR] Failed to cancel task: ${task.id}`)
++  })
++
+   test("cancels all running or pending tasks", async () => {
+     // #given
+     const taskA = createTask({ id: "task-a", status: "running" })
+-- 
+2.39.2
+

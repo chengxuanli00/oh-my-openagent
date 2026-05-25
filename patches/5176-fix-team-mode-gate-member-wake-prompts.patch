@@ -1,0 +1,161 @@
+From f1a62a9cd1730acef712ac80656fa50f112e8121 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 11:29:52 +0900
+Subject: [PATCH 5176/5749] fix(team-mode): gate member wake prompts
+
+---
+ .../team-mode/tools/messaging.test.ts         | 28 +++++++++++++++++
+ src/features/team-mode/tools/messaging.ts     | 30 ++++++++++++++++---
+ .../team-idle-wake-hint.ts                    | 26 +++++++++-------
+ 3 files changed, 70 insertions(+), 14 deletions(-)
+
+diff --git a/src/features/team-mode/tools/messaging.test.ts b/src/features/team-mode/tools/messaging.test.ts
+index 0faf6777..2c069d5b 100644
+--- a/src/features/team-mode/tools/messaging.test.ts
++++ b/src/features/team-mode/tools/messaging.test.ts
+@@ -282,6 +282,34 @@ describe("createTeamSendMessageTool", () => {
+     expect(calls[0]?.directory).toBe(resolveBaseDir(fixture.config))
+   })
+ 
++  test("#given recipient OpenCode session is busy #when team_send_message attempts live delivery #then it leaves the message unread without starting another reply", async () => {
++    // given
++    const fixture = await createTeamFixture()
++    let promptCalls = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { [fixture.memberTwoSessionId]: { type: "busy" } } }),
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++    const liveTool = createTeamSendMessageTool(fixture.config, client)
++
++    // when
++    await liveTool.execute({
++      teamRunId: fixture.teamRunId,
++      to: "m2",
++      body: "ping while busy",
++    }, fixture.toolContext(fixture.memberOneSessionId))
++
++    // then
++    expect(promptCalls).toBe(0)
++    const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
++    expect(unread).toHaveLength(1)
++    expect(unread[0]?.body).toBe("ping while busy")
++  })
++
+   test("live delivery pins the recipient's resolved subagent_type and model on promptAsync", async () => {
+     // given
+     const fixture = await createTeamFixture()
+diff --git a/src/features/team-mode/tools/messaging.ts b/src/features/team-mode/tools/messaging.ts
+index d0410597..d3bcb5c5 100644
+--- a/src/features/team-mode/tools/messaging.ts
++++ b/src/features/team-mode/tools/messaging.ts
+@@ -15,6 +15,7 @@ import {
+   reserveMessageForDelivery,
+ } from "../team-mailbox/reservation"
+ import { BroadcastNotPermittedError, sendMessage } from "../team-mailbox/send"
++import { promptAsyncAfterSessionIdle } from "../../../hooks/shared/prompt-async-gate"
+ 
+ import type { Message } from "../types"
+ import { MessageSchema } from "../types"
+@@ -33,6 +34,7 @@ export type LiveDeliveryClient = {
+       }
+       query?: { directory: string }
+     }): Promise<unknown>
++    status?: () => Promise<unknown>
+   }
+ }
+ 
+@@ -180,11 +182,31 @@ async function deliverLive(
+     applyMemberSessionRouting(recipientSessionId, recipientMember)
+ 
+     try {
+-      await client.session.promptAsync({
+-        path: { id: recipientSessionId },
+-        body: buildMemberPromptBody(recipientMember, envelope),
+-        query: { directory: recipientMember.worktreePath ?? directory },
++      const promptResult = await promptAsyncAfterSessionIdle({
++        client,
++        sessionID: recipientSessionId,
++        source: "team-live-delivery",
++        input: {
++          path: { id: recipientSessionId },
++          body: buildMemberPromptBody(recipientMember, envelope),
++          query: { directory: recipientMember.worktreePath ?? directory },
++        },
+       })
++      if (promptResult.status !== "dispatched") {
++        log("[team-mailbox] live delivery skipped by promptAsync gate, falling back to inbox injection", {
++          status: promptResult.status,
++          teamRunId,
++          recipient: recipientName,
++          recipientSessionId,
++          messageId: message.messageId,
++        })
++        await releaseReservationSafely(reservation, {
++          teamRunId,
++          recipient: recipientName,
++          messageId: message.messageId,
++        })
++        continue
++      }
+       await commitDeliveryReservation(reservation)
+       log("[team-mailbox] live delivery committed", {
+         teamRunId,
+diff --git a/src/hooks/team-session-events/team-idle-wake-hint.ts b/src/hooks/team-session-events/team-idle-wake-hint.ts
+index e0789891..347da7f7 100644
+--- a/src/hooks/team-session-events/team-idle-wake-hint.ts
++++ b/src/hooks/team-session-events/team-idle-wake-hint.ts
+@@ -9,7 +9,7 @@ import {
+ } from "../../features/team-mode/member-session-routing"
+ import { resolveSessionEventID } from "../../shared/event-session-id"
+ import { log } from "../../shared/logger"
+-import { shouldPromptAfterSessionIdle } from "../shared/session-idle-settle"
++import { promptAsyncAfterSessionIdle } from "../shared/prompt-async-gate"
+ 
+ type PromptAsyncInput = {
+   path: { id: string }
+@@ -100,23 +100,29 @@ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: Tea
+       }
+ 
+       applyMemberSessionRouting(sessionID, memberEntry)
+-      if (!(await shouldPromptAfterSessionIdle(ctx.client, sessionID, options?.idleSettleMs))) {
+-        log("team idle wake hint skipped because session is active", {
+-          event: "team-mode-idle-wake-hint-active-session",
++      const promptResult = await promptAsyncAfterSessionIdle({
++        client: ctx.client,
++        sessionID,
++        source: "team-idle-wake-hint",
++        settleMs: options?.idleSettleMs,
++        input: {
++          path: { id: sessionID },
++          body: buildMemberPromptBody(memberEntry, buildWakeHint(unreadMessages.length)),
++          query: { directory: ctx.directory },
++        },
++      })
++      if (promptResult.status !== "dispatched") {
++        log("team idle wake hint skipped by promptAsync gate", {
++          event: "team-mode-idle-wake-hint-gated",
+           teamRunId: runtimeState.teamRunId,
+           memberName: memberEntry.name,
+           sessionID,
+           unreadCount: unreadMessages.length,
++          status: promptResult.status,
+         })
+         return
+       }
+ 
+-      await ctx.client.session.promptAsync({
+-        path: { id: sessionID },
+-        body: buildMemberPromptBody(memberEntry, buildWakeHint(unreadMessages.length)),
+-        query: { directory: ctx.directory },
+-      })
+-
+       log("team idle wake hint sent", {
+         event: "team-mode-idle-wake-hint",
+         teamRunId: runtimeState.teamRunId,
+-- 
+2.39.2
+

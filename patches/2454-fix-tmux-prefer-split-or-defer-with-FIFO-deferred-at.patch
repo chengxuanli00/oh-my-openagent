@@ -1,0 +1,1986 @@
+From 541f0d354dd4ec5669111820fa039d8f9e930aa7 Mon Sep 17 00:00:00 2001
+From: liu-qingyuan <2981185462@qq.com>
+Date: Sun, 15 Feb 2026 03:26:39 +0800
+Subject: [PATCH 2454/5749] fix(tmux): prefer split-or-defer with FIFO deferred
+ attach
+
+---
+ src/features/tmux-subagent/action-executor.ts | 106 +++++-
+ .../tmux-subagent/decision-engine.test.ts     | 109 +++++-
+ src/features/tmux-subagent/grid-planning.ts   |  44 ++-
+ .../tmux-subagent/layout-config.test.ts       | 145 ++++++++
+ src/features/tmux-subagent/manager.test.ts    | 255 +++++++++++++-
+ src/features/tmux-subagent/manager.ts         | 322 ++++++++++++++----
+ .../tmux-subagent/pane-split-availability.ts  |  39 +--
+ .../tmux-subagent/pane-state-querier.ts       |  20 +-
+ .../tmux-subagent/spawn-action-decider.ts     |  88 +++--
+ .../tmux-subagent/spawn-target-finder.ts      |  98 ++++--
+ .../tmux-subagent/tmux-grid-constants.ts      |  47 +++
+ src/features/tmux-subagent/types.ts           |   2 +
+ src/shared/tmux/tmux-utils/layout.test.ts     |  44 +++
+ src/shared/tmux/tmux-utils/layout.ts          |  62 +++-
+ 14 files changed, 1155 insertions(+), 226 deletions(-)
+ create mode 100644 src/features/tmux-subagent/layout-config.test.ts
+ create mode 100644 src/shared/tmux/tmux-utils/layout.test.ts
+
+diff --git a/src/features/tmux-subagent/action-executor.ts b/src/features/tmux-subagent/action-executor.ts
+index 7a429110..9635ff7c 100644
+--- a/src/features/tmux-subagent/action-executor.ts
++++ b/src/features/tmux-subagent/action-executor.ts
+@@ -1,14 +1,21 @@
+-import type { PaneAction } from "./types"
+-import { applyLayout, spawnTmuxPane, closeTmuxPane, enforceMainPaneWidth, replaceTmuxPane } from "../../shared/tmux"
++import type { TmuxConfig } from "../../config/schema"
++import type { PaneAction, WindowState } from "./types"
++import {
++  applyLayout,
++  spawnTmuxPane,
++  closeTmuxPane,
++  enforceMainPaneWidth,
++  replaceTmuxPane,
++} from "../../shared/tmux"
++import { getTmuxPath } from "../../tools/interactive-bash/tmux-path-resolver"
++import { queryWindowState } from "./pane-state-querier"
+ import { log } from "../../shared"
+ import type {
+-  ActionExecutorDeps,
+   ActionResult,
+-  ExecuteContext,
++  ActionExecutorDeps,
+ } from "./action-executor-core"
+-import { executeActionWithDeps } from "./action-executor-core"
+ 
+-export type { ActionExecutorDeps, ActionResult, ExecuteContext } from "./action-executor-core"
++export type { ActionExecutorDeps, ActionResult } from "./action-executor-core"
+ 
+ export interface ExecuteActionsResult {
+   success: boolean
+@@ -16,19 +23,92 @@ export interface ExecuteActionsResult {
+   results: Array<{ action: PaneAction; result: ActionResult }>
+ }
+ 
+-const DEFAULT_DEPS: ActionExecutorDeps = {
+-  spawnTmuxPane,
+-  closeTmuxPane,
+-  replaceTmuxPane,
+-  applyLayout,
+-  enforceMainPaneWidth,
++export interface ExecuteContext {
++  config: TmuxConfig
++  serverUrl: string
++  windowState: WindowState
++  sourcePaneId?: string
++}
++
++async function enforceMainPane(
++  windowState: WindowState,
++  config: TmuxConfig,
++): Promise<void> {
++  if (!windowState.mainPane) return
++  await enforceMainPaneWidth(windowState.mainPane.paneId, windowState.windowWidth, {
++    mainPaneSize: config.main_pane_size,
++    mainPaneMinWidth: config.main_pane_min_width,
++    agentPaneMinWidth: config.agent_pane_min_width,
++  })
++}
++
++async function enforceLayoutAndMainPane(ctx: ExecuteContext): Promise<void> {
++  const sourcePaneId = ctx.sourcePaneId
++  if (!sourcePaneId) {
++    await enforceMainPane(ctx.windowState, ctx.config)
++    return
++  }
++
++  const latestState = await queryWindowState(sourcePaneId)
++  if (!latestState?.mainPane) {
++    await enforceMainPane(ctx.windowState, ctx.config)
++    return
++  }
++
++  const tmux = await getTmuxPath()
++  if (tmux) {
++    await applyLayout(tmux, ctx.config.layout, ctx.config.main_pane_size)
++  }
++
++  await enforceMainPane(latestState, ctx.config)
+ }
+ 
+ export async function executeAction(
+   action: PaneAction,
+   ctx: ExecuteContext
+ ): Promise<ActionResult> {
+-  return executeActionWithDeps(action, ctx, DEFAULT_DEPS)
++  if (action.type === "close") {
++    const success = await closeTmuxPane(action.paneId)
++    if (success) {
++      await enforceLayoutAndMainPane(ctx)
++    }
++    return { success }
++  }
++
++  if (action.type === "replace") {
++    const result = await replaceTmuxPane(
++      action.paneId,
++      action.newSessionId,
++      action.description,
++      ctx.config,
++      ctx.serverUrl
++    )
++    if (result.success) {
++      await enforceLayoutAndMainPane(ctx)
++    }
++    return {
++      success: result.success,
++      paneId: result.paneId,
++    }
++  }
++
++  const result = await spawnTmuxPane(
++    action.sessionId,
++    action.description,
++    ctx.config,
++    ctx.serverUrl,
++    action.targetPaneId,
++    action.splitDirection
++  )
++
++  if (result.success) {
++    await enforceLayoutAndMainPane(ctx)
++  }
++
++  return {
++    success: result.success,
++    paneId: result.paneId,
++  }
+ }
+ 
+ export async function executeActions(
+diff --git a/src/features/tmux-subagent/decision-engine.test.ts b/src/features/tmux-subagent/decision-engine.test.ts
+index 4e9ada98..bc7ab4bc 100644
+--- a/src/features/tmux-subagent/decision-engine.test.ts
++++ b/src/features/tmux-subagent/decision-engine.test.ts
+@@ -5,6 +5,7 @@ import {
+   canSplitPane, 
+   canSplitPaneAnyDirection,
+   getBestSplitDirection,
++  findSpawnTarget,
+   type SessionMapping 
+ } from "./decision-engine"
+ import type { WindowState, CapacityConfig, TmuxPaneInfo } from "./types"
+@@ -258,10 +259,31 @@ describe("decideSpawnActions", () => {
+       expect(result.actions[0].type).toBe("spawn")
+     })
+ 
++    it("respects configured agent min width for split decisions", () => {
++      // given
++      const state = createWindowState(240, 44, [
++        { paneId: "%1", width: 100, height: 44, left: 140, top: 0 },
++      ])
++      const mappings: SessionMapping[] = [
++        { sessionId: "old-ses", paneId: "%1", createdAt: new Date("2024-01-01") },
++      ]
++      const strictConfig: CapacityConfig = {
++        mainPaneSize: 60,
++        mainPaneMinWidth: 120,
++        agentPaneWidth: 60,
++      }
++
++      // when
++      const result = decideSpawnActions(state, "ses1", "test", strictConfig, mappings)
++
++      // then
++      expect(result.canSpawn).toBe(false)
++      expect(result.actions).toHaveLength(0)
++      expect(result.reason).toContain("defer")
++    })
++
+     it("returns canSpawn=true when 0 agent panes exist and mainPane occupies full window width", () => {
+       // given - tmux reports mainPane.width === windowWidth when no splits exist
+-      // agentAreaWidth = max(0, 252 - 252 - 1) = 0, which is < minPaneWidth
+-      // but with 0 agent panes, the early return should be skipped
+       const windowWidth = 252
+       const windowHeight = 56
+       const state: WindowState = {
+@@ -281,8 +303,7 @@ describe("decideSpawnActions", () => {
+     })
+ 
+     it("returns canSpawn=false when 0 agent panes and window genuinely too narrow to split", () => {
+-      // given - window so narrow that even splitting mainPane wouldn't work
+-      // canSplitPane requires width >= 2*minPaneWidth + DIVIDER_SIZE = 2*40+1 = 81
++      // given - window so narrow that even splitting mainPane would fail
+       const windowWidth = 70
+       const windowHeight = 56
+       const state: WindowState = {
+@@ -295,14 +316,13 @@ describe("decideSpawnActions", () => {
+       // when
+       const result = decideSpawnActions(state, "ses1", "test", defaultConfig, [])
+ 
+-      // then - should fail because mainPane itself is too small to split
++      // then
+       expect(result.canSpawn).toBe(false)
+       expect(result.reason).toContain("too small")
+     })
+ 
+     it("returns canSpawn=false when agent panes exist but agent area too small", () => {
+-      // given - 1 agent pane exists, but agent area is below minPaneWidth
+-      // this verifies the early return still works for currentCount > 0
++      // given - 1 agent pane exists, and agent area is below minPaneWidth
+       const state: WindowState = {
+         windowWidth: 180,
+         windowHeight: 44,
+@@ -313,13 +333,13 @@ describe("decideSpawnActions", () => {
+       // when
+       const result = decideSpawnActions(state, "ses1", "test", defaultConfig, [])
+ 
+-      // then - agent area = max(0, 180-160-1) = 19, which is < agentPaneWidth(40)
++      // then
+       expect(result.canSpawn).toBe(false)
+       expect(result.reason).toContain("too small")
+     })
+ 
+     it("spawns at exact minimum splittable width with 0 agent panes", () => {
+-      // given - canSplitPane requires width >= 2*agentPaneWidth + DIVIDER_SIZE = 2*40+1 = 81
++      // given
+       const exactThreshold = 2 * defaultConfig.agentPaneWidth + 1
+       const state: WindowState = {
+         windowWidth: exactThreshold,
+@@ -331,12 +351,12 @@ describe("decideSpawnActions", () => {
+       // when
+       const result = decideSpawnActions(state, "ses1", "test", defaultConfig, [])
+ 
+-      // then - exactly at threshold should succeed
++      // then
+       expect(result.canSpawn).toBe(true)
+     })
+ 
+     it("rejects spawn 1 pixel below minimum splittable width with 0 agent panes", () => {
+-      // given - 1 below exact threshold
++      // given
+       const belowThreshold = 2 * defaultConfig.agentPaneWidth
+       const state: WindowState = {
+         windowWidth: belowThreshold,
+@@ -348,11 +368,11 @@ describe("decideSpawnActions", () => {
+       // when
+       const result = decideSpawnActions(state, "ses1", "test", defaultConfig, [])
+ 
+-      // then - 1 below threshold should fail
++      // then
+       expect(result.canSpawn).toBe(false)
+     })
+ 
+-    it("replaces oldest pane when existing panes are too small to split", () => {
++    it("closes oldest pane when existing panes are too small to split", () => {
+       // given - existing pane is below minimum splittable size
+       const state = createWindowState(220, 30, [
+         { paneId: "%1", width: 50, height: 15, left: 110, top: 0 },
+@@ -366,8 +386,9 @@ describe("decideSpawnActions", () => {
+ 
+       // then
+       expect(result.canSpawn).toBe(true)
+-      expect(result.actions.length).toBe(1)
+-      expect(result.actions[0].type).toBe("replace")
++      expect(result.actions.length).toBe(2)
++      expect(result.actions[0].type).toBe("close")
++      expect(result.actions[1].type).toBe("spawn")
+     })
+ 
+     it("can spawn when existing pane is large enough to split", () => {
+@@ -429,6 +450,64 @@ describe("decideSpawnActions", () => {
+       expect(result.canSpawn).toBe(false)
+       expect(result.reason).toBe("no main pane found")
+     })
++
++    it("uses configured main pane size for split/defer decision", () => {
++      // given
++      const state = createWindowState(240, 44, [
++        { paneId: "%1", width: 90, height: 44, left: 150, top: 0 },
++      ])
++      const mappings: SessionMapping[] = [
++        { sessionId: "old-ses", paneId: "%1", createdAt: new Date("2024-01-01") },
++      ]
++      const wideMainConfig: CapacityConfig = {
++        mainPaneSize: 80,
++        mainPaneMinWidth: 120,
++        agentPaneWidth: 40,
++      }
++
++      // when
++      const result = decideSpawnActions(state, "ses1", "test", wideMainConfig, mappings)
++
++      // then
++      expect(result.canSpawn).toBe(false)
++      expect(result.actions).toHaveLength(0)
++      expect(result.reason).toContain("defer")
++    })
++  })
++})
++
++describe("findSpawnTarget", () => {
++  it("uses deterministic vertical fallback order", () => {
++    // given
++    const state: WindowState = {
++      windowWidth: 320,
++      windowHeight: 44,
++      mainPane: {
++        paneId: "%0",
++        width: 160,
++        height: 44,
++        left: 0,
++        top: 0,
++        title: "main",
++        isActive: true,
++      },
++      agentPanes: [
++        { paneId: "%1", width: 70, height: 20, left: 170, top: 0, title: "a", isActive: false },
++        { paneId: "%2", width: 120, height: 44, left: 240, top: 0, title: "b", isActive: false },
++        { paneId: "%3", width: 120, height: 22, left: 240, top: 22, title: "c", isActive: false },
++      ],
++    }
++    const config: CapacityConfig = {
++      mainPaneSize: 50,
++      mainPaneMinWidth: 120,
++      agentPaneWidth: 40,
++    }
++
++    // when
++    const target = findSpawnTarget(state, config)
++
++    // then
++    expect(target).toEqual({ targetPaneId: "%2", splitDirection: "-v" })
+   })
+ })
+ 
+diff --git a/src/features/tmux-subagent/grid-planning.ts b/src/features/tmux-subagent/grid-planning.ts
+index b6cc3948..2107b65e 100644
+--- a/src/features/tmux-subagent/grid-planning.ts
++++ b/src/features/tmux-subagent/grid-planning.ts
+@@ -1,9 +1,9 @@
+ import { MIN_PANE_HEIGHT, MIN_PANE_WIDTH } from "./types"
+-import type { TmuxPaneInfo } from "./types"
++import type { CapacityConfig, TmuxPaneInfo } from "./types"
+ import {
+ 	DIVIDER_SIZE,
+-	MAIN_PANE_RATIO,
+ 	MAX_GRID_SIZE,
++	computeAgentAreaWidth,
+ } from "./tmux-grid-constants"
+ 
+ export interface GridCapacity {
+@@ -24,16 +24,33 @@ export interface GridPlan {
+ 	slotHeight: number
+ }
+ 
++type CapacityOptions = CapacityConfig | number | undefined
++
++function resolveMinPaneWidth(options?: CapacityOptions): number {
++	if (typeof options === "number") {
++		return Math.max(1, options)
++	}
++	return MIN_PANE_WIDTH
++}
++
++function resolveAgentAreaWidth(windowWidth: number, options?: CapacityOptions): number {
++	if (typeof options === "number") {
++		return computeAgentAreaWidth(windowWidth)
++	}
++	return computeAgentAreaWidth(windowWidth, options)
++}
++
+ export function calculateCapacity(
+ 	windowWidth: number,
+ 	windowHeight: number,
+-	minPaneWidth: number = MIN_PANE_WIDTH,
++	options?: CapacityOptions,
+ 	mainPaneWidth?: number,
+ ): GridCapacity {
+ 	const availableWidth =
+-	typeof mainPaneWidth === "number"
+-		? Math.max(0, windowWidth - mainPaneWidth - DIVIDER_SIZE)
+-		: Math.floor(windowWidth * (1 - MAIN_PANE_RATIO))
++		typeof mainPaneWidth === "number"
++			? Math.max(0, windowWidth - mainPaneWidth - DIVIDER_SIZE)
++			: resolveAgentAreaWidth(windowWidth, options)
++	const minPaneWidth = resolveMinPaneWidth(options)
+ 	const cols = Math.min(
+ 		MAX_GRID_SIZE,
+ 		Math.max(
+@@ -59,15 +76,10 @@ export function computeGridPlan(
+ 	windowWidth: number,
+ 	windowHeight: number,
+ 	paneCount: number,
++	options?: CapacityOptions,
+ 	mainPaneWidth?: number,
+-	minPaneWidth?: number,
+ ): GridPlan {
+-	const capacity = calculateCapacity(
+-		windowWidth,
+-		windowHeight,
+-		minPaneWidth ?? MIN_PANE_WIDTH,
+-		mainPaneWidth,
+-	)
++	const capacity = calculateCapacity(windowWidth, windowHeight, options, mainPaneWidth)
+ 	const { cols: maxCols, rows: maxRows } = capacity
+ 
+ 	if (maxCols === 0 || maxRows === 0 || paneCount === 0) {
+@@ -91,9 +103,9 @@ export function computeGridPlan(
+ 	}
+ 
+ 	const availableWidth =
+-	typeof mainPaneWidth === "number"
+-		? Math.max(0, windowWidth - mainPaneWidth - DIVIDER_SIZE)
+-		: Math.floor(windowWidth * (1 - MAIN_PANE_RATIO))
++		typeof mainPaneWidth === "number"
++			? Math.max(0, windowWidth - mainPaneWidth - DIVIDER_SIZE)
++			: resolveAgentAreaWidth(windowWidth, options)
+ 	const slotWidth = Math.floor(availableWidth / bestCols)
+ 	const slotHeight = Math.floor(windowHeight / bestRows)
+ 
+diff --git a/src/features/tmux-subagent/layout-config.test.ts b/src/features/tmux-subagent/layout-config.test.ts
+new file mode 100644
+index 00000000..dac7979f
+--- /dev/null
++++ b/src/features/tmux-subagent/layout-config.test.ts
+@@ -0,0 +1,145 @@
++import { describe, expect, it } from "bun:test"
++import { decideSpawnActions, findSpawnTarget, type SessionMapping } from "./decision-engine"
++import type { CapacityConfig, WindowState } from "./types"
++
++function createState(
++  windowWidth: number,
++  windowHeight: number,
++  agentPanes: WindowState["agentPanes"],
++): WindowState {
++  return {
++    windowWidth,
++    windowHeight,
++    mainPane: {
++      paneId: "%0",
++      width: Math.floor(windowWidth / 2),
++      height: windowHeight,
++      left: 0,
++      top: 0,
++      title: "main",
++      isActive: true,
++    },
++    agentPanes,
++  }
++}
++
++describe("tmux layout-aware split behavior", () => {
++  it("uses -v for first spawn in main-horizontal layout", () => {
++    const config: CapacityConfig = {
++      layout: "main-horizontal",
++      mainPaneSize: 60,
++      mainPaneMinWidth: 120,
++      agentPaneWidth: 40,
++    }
++    const state = createState(220, 44, [])
++
++    const decision = decideSpawnActions(state, "ses-1", "agent", config, [])
++
++    expect(decision.canSpawn).toBe(true)
++    expect(decision.actions[0]).toMatchObject({
++      type: "spawn",
++      splitDirection: "-v",
++    })
++  })
++
++  it("uses -h for first spawn in main-vertical layout", () => {
++    const config: CapacityConfig = {
++      layout: "main-vertical",
++      mainPaneSize: 60,
++      mainPaneMinWidth: 120,
++      agentPaneWidth: 40,
++    }
++    const state = createState(220, 44, [])
++
++    const decision = decideSpawnActions(state, "ses-1", "agent", config, [])
++
++    expect(decision.canSpawn).toBe(true)
++    expect(decision.actions[0]).toMatchObject({
++      type: "spawn",
++      splitDirection: "-h",
++    })
++  })
++
++  it("prefers horizontal split target in main-horizontal layout", () => {
++    const config: CapacityConfig = {
++      layout: "main-horizontal",
++      mainPaneSize: 60,
++      mainPaneMinWidth: 120,
++      agentPaneWidth: 40,
++    }
++    const state = createState(260, 60, [
++      {
++        paneId: "%1",
++        width: 120,
++        height: 30,
++        left: 0,
++        top: 30,
++        title: "agent",
++        isActive: false,
++      },
++    ])
++
++    const target = findSpawnTarget(state, config)
++
++    expect(target).toEqual({ targetPaneId: "%1", splitDirection: "-h" })
++  })
++
++  it("defers when strict main-horizontal cannot split", () => {
++    const config: CapacityConfig = {
++      layout: "main-horizontal",
++      mainPaneSize: 60,
++      mainPaneMinWidth: 120,
++      agentPaneWidth: 40,
++    }
++    const state = createState(220, 44, [
++      {
++        paneId: "%1",
++        width: 60,
++        height: 44,
++        left: 0,
++        top: 22,
++        title: "old",
++        isActive: false,
++      },
++    ])
++    const mappings: SessionMapping[] = [
++      { sessionId: "old-ses", paneId: "%1", createdAt: new Date("2024-01-01") },
++    ]
++
++    const decision = decideSpawnActions(state, "new-ses", "agent", config, mappings)
++
++    expect(decision.canSpawn).toBe(false)
++    expect(decision.actions).toHaveLength(0)
++    expect(decision.reason).toContain("defer")
++  })
++
++  it("still spawns in narrow main-vertical when vertical split is possible", () => {
++    const config: CapacityConfig = {
++      layout: "main-vertical",
++      mainPaneSize: 60,
++      mainPaneMinWidth: 120,
++      agentPaneWidth: 40,
++    }
++    const state = createState(169, 40, [
++      {
++        paneId: "%1",
++        width: 48,
++        height: 40,
++        left: 121,
++        top: 0,
++        title: "agent",
++        isActive: false,
++      },
++    ])
++
++    const decision = decideSpawnActions(state, "new-ses", "agent", config, [])
++
++    expect(decision.canSpawn).toBe(true)
++    expect(decision.actions).toHaveLength(1)
++    expect(decision.actions[0]).toMatchObject({
++      type: "spawn",
++      targetPaneId: "%1",
++      splitDirection: "-v",
++    })
++  })
++})
+diff --git a/src/features/tmux-subagent/manager.test.ts b/src/features/tmux-subagent/manager.test.ts
+index e1bf6e51..ef3f1feb 100644
+--- a/src/features/tmux-subagent/manager.test.ts
++++ b/src/features/tmux-subagent/manager.test.ts
+@@ -156,7 +156,15 @@ describe('TmuxSessionManager', () => {
+       // given
+       mockIsInsideTmux.mockReturnValue(true)
+       const { TmuxSessionManager } = await import('./manager')
+-      const ctx = createMockContext()
++      const ctx = createMockContext({
++        sessionStatusResult: {
++          data: {
++            ses_1: { type: 'running' },
++            ses_2: { type: 'running' },
++            ses_3: { type: 'running' },
++          },
++        },
++      })
+       const config: TmuxConfig = {
+         enabled: true,
+         layout: 'main-vertical',
+@@ -176,7 +184,13 @@ describe('TmuxSessionManager', () => {
+       // given
+       mockIsInsideTmux.mockReturnValue(false)
+       const { TmuxSessionManager } = await import('./manager')
+-      const ctx = createMockContext()
++      const ctx = createMockContext({
++        sessionStatusResult: {
++          data: {
++            ses_once: { type: 'running' },
++          },
++        },
++      })
+       const config: TmuxConfig = {
+         enabled: true,
+         layout: 'main-vertical',
+@@ -386,7 +400,7 @@ describe('TmuxSessionManager', () => {
+       expect(mockExecuteActions).toHaveBeenCalledTimes(0)
+     })
+ 
+-    test('replaces oldest agent when unsplittable (small window)', async () => {
++    test('defers attach when unsplittable (small window)', async () => {
+       // given - small window where split is not possible
+       mockIsInsideTmux.mockReturnValue(true)
+       mockQueryWindowState.mockImplementation(async () =>
+@@ -423,13 +437,224 @@ describe('TmuxSessionManager', () => {
+         createSessionCreatedEvent('ses_new', 'ses_parent', 'New Task')
+       )
+ 
+-      // then - with small window, replace action is used instead of close+spawn
+-      expect(mockExecuteActions).toHaveBeenCalledTimes(1)
+-      const call = mockExecuteActions.mock.calls[0]
+-      expect(call).toBeDefined()
+-      const actionsArg = call![0]
+-      expect(actionsArg).toHaveLength(1)
+-      expect(actionsArg[0].type).toBe('replace')
++      // then - with small window, manager defers instead of replacing
++      expect(mockExecuteActions).toHaveBeenCalledTimes(0)
++      expect((manager as any).deferredQueue).toEqual(['ses_new'])
++    })
++
++    test('keeps deferred queue idempotent for duplicate session.created events', async () => {
++      // given
++      mockIsInsideTmux.mockReturnValue(true)
++      mockQueryWindowState.mockImplementation(async () =>
++        createWindowState({
++          windowWidth: 160,
++          windowHeight: 11,
++          agentPanes: [
++            {
++              paneId: '%1',
++              width: 80,
++              height: 11,
++              left: 80,
++              top: 0,
++              title: 'old',
++              isActive: false,
++            },
++          ],
++        })
++      )
++
++      const { TmuxSessionManager } = await import('./manager')
++      const ctx = createMockContext()
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 120,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      // when
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_dup', 'ses_parent', 'Duplicate Task')
++      )
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_dup', 'ses_parent', 'Duplicate Task')
++      )
++
++      // then
++      expect((manager as any).deferredQueue).toEqual(['ses_dup'])
++    })
++
++    test('auto-attaches deferred sessions in FIFO order', async () => {
++      // given
++      mockIsInsideTmux.mockReturnValue(true)
++      mockQueryWindowState.mockImplementation(async () =>
++        createWindowState({
++          windowWidth: 160,
++          windowHeight: 11,
++          agentPanes: [
++            {
++              paneId: '%1',
++              width: 80,
++              height: 11,
++              left: 80,
++              top: 0,
++              title: 'old',
++              isActive: false,
++            },
++          ],
++        })
++      )
++
++      const attachOrder: string[] = []
++      mockExecuteActions.mockImplementation(async (actions) => {
++        for (const action of actions) {
++          if (action.type === 'spawn') {
++            attachOrder.push(action.sessionId)
++            trackedSessions.add(action.sessionId)
++            return {
++              success: true,
++              spawnedPaneId: `%${action.sessionId}`,
++              results: [{ action, result: { success: true, paneId: `%${action.sessionId}` } }],
++            }
++          }
++        }
++        return { success: true, results: [] }
++      })
++
++      const { TmuxSessionManager } = await import('./manager')
++      const ctx = createMockContext()
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 120,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      await manager.onSessionCreated(createSessionCreatedEvent('ses_1', 'ses_parent', 'Task 1'))
++      await manager.onSessionCreated(createSessionCreatedEvent('ses_2', 'ses_parent', 'Task 2'))
++      await manager.onSessionCreated(createSessionCreatedEvent('ses_3', 'ses_parent', 'Task 3'))
++      expect((manager as any).deferredQueue).toEqual(['ses_1', 'ses_2', 'ses_3'])
++
++      // when
++      mockQueryWindowState.mockImplementation(async () => createWindowState())
++      await (manager as any).tryAttachDeferredSession()
++      await (manager as any).tryAttachDeferredSession()
++      await (manager as any).tryAttachDeferredSession()
++
++      // then
++      expect(attachOrder).toEqual(['ses_1', 'ses_2', 'ses_3'])
++      expect((manager as any).deferredQueue).toEqual([])
++    })
++
++    test('does not attach deferred session more than once across repeated retries', async () => {
++      // given
++      mockIsInsideTmux.mockReturnValue(true)
++      mockQueryWindowState.mockImplementation(async () =>
++        createWindowState({
++          windowWidth: 160,
++          windowHeight: 11,
++          agentPanes: [
++            {
++              paneId: '%1',
++              width: 80,
++              height: 11,
++              left: 80,
++              top: 0,
++              title: 'old',
++              isActive: false,
++            },
++          ],
++        })
++      )
++
++      let attachCount = 0
++      mockExecuteActions.mockImplementation(async (actions) => {
++        for (const action of actions) {
++          if (action.type === 'spawn') {
++            attachCount += 1
++            trackedSessions.add(action.sessionId)
++            return {
++              success: true,
++              spawnedPaneId: `%${action.sessionId}`,
++              results: [{ action, result: { success: true, paneId: `%${action.sessionId}` } }],
++            }
++          }
++        }
++        return { success: true, results: [] }
++      })
++
++      const { TmuxSessionManager } = await import('./manager')
++      const ctx = createMockContext()
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 120,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_once', 'ses_parent', 'Task Once')
++      )
++
++      // when
++      mockQueryWindowState.mockImplementation(async () => createWindowState())
++      await (manager as any).tryAttachDeferredSession()
++      await (manager as any).tryAttachDeferredSession()
++
++      // then
++      expect(attachCount).toBe(1)
++      expect((manager as any).deferredQueue).toEqual([])
++    })
++
++    test('removes deferred session when session is deleted before attach', async () => {
++      // given
++      mockIsInsideTmux.mockReturnValue(true)
++      mockQueryWindowState.mockImplementation(async () =>
++        createWindowState({
++          windowWidth: 160,
++          windowHeight: 11,
++          agentPanes: [
++            {
++              paneId: '%1',
++              width: 80,
++              height: 11,
++              left: 80,
++              top: 0,
++              title: 'old',
++              isActive: false,
++            },
++          ],
++        })
++      )
++
++      const { TmuxSessionManager } = await import('./manager')
++      const ctx = createMockContext()
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 120,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_pending', 'ses_parent', 'Pending Task')
++      )
++      expect((manager as any).deferredQueue).toEqual(['ses_pending'])
++
++      // when
++      await manager.onSessionDeleted({ sessionID: 'ses_pending' })
++
++      // then
++      expect((manager as any).deferredQueue).toEqual([])
++      expect(mockExecuteAction).toHaveBeenCalledTimes(0)
+     })
+   })
+ 
+@@ -680,7 +905,7 @@ describe('DecisionEngine', () => {
+       }
+     })
+ 
+-    test('returns replace when split not possible', async () => {
++    test('returns canSpawn=false when split not possible', async () => {
+       // given - small window where split is never possible
+       const { decideSpawnActions } = await import('./decision-engine')
+       const state: WindowState = {
+@@ -720,10 +945,10 @@ describe('DecisionEngine', () => {
+         sessionMappings
+       )
+ 
+-      // then - agent area (80) < MIN_SPLIT_WIDTH (105), so replace is used
+-      expect(decision.canSpawn).toBe(true)
+-      expect(decision.actions).toHaveLength(1)
+-      expect(decision.actions[0].type).toBe('replace')
++      // then - agent area (80) < MIN_SPLIT_WIDTH (105), so attach is deferred
++      expect(decision.canSpawn).toBe(false)
++      expect(decision.actions).toHaveLength(0)
++      expect(decision.reason).toContain('defer')
+     })
+ 
+     test('returns canSpawn=false when window too small', async () => {
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index 2c40f7c9..670a3611 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -19,6 +19,12 @@ interface SessionCreatedEvent {
+   properties?: { info?: { id?: string; parentID?: string; title?: string } }
+ }
+ 
++interface DeferredSession {
++  sessionId: string
++  title: string
++  queuedAt: Date
++}
++
+ export interface TmuxUtilDeps {
+   isInsideTmux: () => boolean
+   getCurrentPaneId: () => string | undefined
+@@ -48,6 +54,10 @@ export class TmuxSessionManager {
+   private sourcePaneId: string | undefined
+   private sessions = new Map<string, TrackedSession>()
+   private pendingSessions = new Set<string>()
++  private spawnQueue: Promise<void> = Promise.resolve()
++  private deferredSessions = new Map<string, DeferredSession>()
++  private deferredQueue: string[] = []
++  private deferredAttachInterval?: ReturnType<typeof setInterval>
+   private deps: TmuxUtilDeps
+   private pollingManager: TmuxPollingManager
+   constructor(ctx: PluginInput, tmuxConfig: TmuxConfig, deps: TmuxUtilDeps = defaultTmuxDeps) {
+@@ -75,6 +85,8 @@ export class TmuxSessionManager {
+ 
+   private getCapacityConfig(): CapacityConfig {
+     return {
++      layout: this.tmuxConfig.layout,
++      mainPaneSize: this.tmuxConfig.main_pane_size,
+       mainPaneMinWidth: this.tmuxConfig.main_pane_min_width,
+       agentPaneWidth: this.tmuxConfig.agent_pane_min_width,
+     }
+@@ -88,6 +100,129 @@ export class TmuxSessionManager {
+     }))
+   }
+ 
++  private enqueueDeferredSession(sessionId: string, title: string): void {
++    if (this.deferredSessions.has(sessionId)) return
++    this.deferredSessions.set(sessionId, {
++      sessionId,
++      title,
++      queuedAt: new Date(),
++    })
++    this.deferredQueue.push(sessionId)
++    log("[tmux-session-manager] deferred session queued", {
++      sessionId,
++      queueLength: this.deferredQueue.length,
++    })
++    this.startDeferredAttachLoop()
++  }
++
++  private removeDeferredSession(sessionId: string): void {
++    if (!this.deferredSessions.delete(sessionId)) return
++    this.deferredQueue = this.deferredQueue.filter((id) => id !== sessionId)
++    log("[tmux-session-manager] deferred session removed", {
++      sessionId,
++      queueLength: this.deferredQueue.length,
++    })
++    if (this.deferredQueue.length === 0) {
++      this.stopDeferredAttachLoop()
++    }
++  }
++
++  private startDeferredAttachLoop(): void {
++    if (this.deferredAttachInterval) return
++    this.deferredAttachInterval = setInterval(() => {
++      void this.enqueueSpawn(async () => {
++        await this.tryAttachDeferredSession()
++      })
++    }, POLL_INTERVAL_BACKGROUND_MS)
++    log("[tmux-session-manager] deferred attach polling started", {
++      intervalMs: POLL_INTERVAL_BACKGROUND_MS,
++    })
++  }
++
++  private stopDeferredAttachLoop(): void {
++    if (!this.deferredAttachInterval) return
++    clearInterval(this.deferredAttachInterval)
++    this.deferredAttachInterval = undefined
++    log("[tmux-session-manager] deferred attach polling stopped")
++  }
++
++  private async tryAttachDeferredSession(): Promise<void> {
++    if (!this.sourcePaneId) return
++    const sessionId = this.deferredQueue[0]
++    if (!sessionId) {
++      this.stopDeferredAttachLoop()
++      return
++    }
++
++    const deferred = this.deferredSessions.get(sessionId)
++    if (!deferred) {
++      this.deferredQueue.shift()
++      return
++    }
++
++    const state = await queryWindowState(this.sourcePaneId)
++    if (!state) return
++
++    const decision = decideSpawnActions(
++      state,
++      sessionId,
++      deferred.title,
++      this.getCapacityConfig(),
++      this.getSessionMappings(),
++    )
++
++    if (!decision.canSpawn || decision.actions.length === 0) {
++      log("[tmux-session-manager] deferred session still waiting for capacity", {
++        sessionId,
++        reason: decision.reason,
++      })
++      return
++    }
++
++    const result = await executeActions(decision.actions, {
++      config: this.tmuxConfig,
++      serverUrl: this.serverUrl,
++      windowState: state,
++      sourcePaneId: this.sourcePaneId,
++    })
++
++    if (!result.success || !result.spawnedPaneId) {
++      log("[tmux-session-manager] deferred session attach failed", {
++        sessionId,
++        results: result.results.map((r) => ({
++          type: r.action.type,
++          success: r.result.success,
++          error: r.result.error,
++        })),
++      })
++      return
++    }
++
++    const sessionReady = await this.waitForSessionReady(sessionId)
++    if (!sessionReady) {
++      log("[tmux-session-manager] deferred session not ready after timeout", {
++        sessionId,
++        paneId: result.spawnedPaneId,
++      })
++    }
++
++    const now = Date.now()
++    this.sessions.set(sessionId, {
++      sessionId,
++      paneId: result.spawnedPaneId,
++      description: deferred.title,
++      createdAt: new Date(now),
++      lastSeenAt: new Date(now),
++    })
++    this.removeDeferredSession(sessionId)
++    this.pollingManager.startPolling()
++    log("[tmux-session-manager] deferred session attached", {
++      sessionId,
++      paneId: result.spawnedPaneId,
++      sessionReady,
++    })
++  }
++
+   private async waitForSessionReady(sessionId: string): Promise<boolean> {
+     const startTime = Date.now()
+     
+@@ -138,7 +273,11 @@ export class TmuxSessionManager {
+     const sessionId = info.id
+     const title = info.title ?? "Subagent"
+ 
+-    if (this.sessions.has(sessionId) || this.pendingSessions.has(sessionId)) {
++    if (
++      this.sessions.has(sessionId) ||
++      this.pendingSessions.has(sessionId) ||
++      this.deferredSessions.has(sessionId)
++    ) {
+       log("[tmux-session-manager] session already tracked or pending", { sessionId })
+       return
+     }
+@@ -147,15 +286,17 @@ export class TmuxSessionManager {
+       log("[tmux-session-manager] no source pane id")
+       return
+     }
++    const sourcePaneId = this.sourcePaneId
+ 
+     this.pendingSessions.add(sessionId)
+ 
+-    try {
+-      const state = await queryWindowState(this.sourcePaneId)
+-      if (!state) {
+-        log("[tmux-session-manager] failed to query window state")
+-        return
+-      }
++    await this.enqueueSpawn(async () => {
++      try {
++        const state = await queryWindowState(sourcePaneId)
++        if (!state) {
++          log("[tmux-session-manager] failed to query window state")
++          return
++        }
+ 
+       log("[tmux-session-manager] window state queried", {
+         windowWidth: state.windowWidth,
+@@ -164,13 +305,13 @@ export class TmuxSessionManager {
+         agentPanes: state.agentPanes.map((p) => p.paneId),
+       })
+ 
+-      const decision = decideSpawnActions(
+-        state,
+-        sessionId,
+-        title,
+-        this.getCapacityConfig(),
+-        this.getSessionMappings()
+-      )
++        const decision = decideSpawnActions(
++          state,
++          sessionId,
++          title,
++          this.getCapacityConfig(),
++          this.getSessionMappings()
++        )
+ 
+       log("[tmux-session-manager] spawn decision", {
+         canSpawn: decision.canSpawn,
+@@ -183,39 +324,70 @@ export class TmuxSessionManager {
+         }),
+       })
+ 
+-      if (!decision.canSpawn) {
+-        log("[tmux-session-manager] cannot spawn", { reason: decision.reason })
+-        return
+-      }
++        if (!decision.canSpawn) {
++          log("[tmux-session-manager] cannot spawn", { reason: decision.reason })
++          this.enqueueDeferredSession(sessionId, title)
++          return
++        }
+ 
+-      const result = await executeActions(
+-        decision.actions,
+-        { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state }
+-      )
++        const result = await executeActions(
++          decision.actions,
++          {
++            config: this.tmuxConfig,
++            serverUrl: this.serverUrl,
++            windowState: state,
++            sourcePaneId,
++          }
++        )
+ 
+-      for (const { action, result: actionResult } of result.results) {
+-        if (action.type === "close" && actionResult.success) {
+-          this.sessions.delete(action.sessionId)
+-          log("[tmux-session-manager] removed closed session from cache", {
+-            sessionId: action.sessionId,
+-          })
+-        }
+-        if (action.type === "replace" && actionResult.success) {
+-          this.sessions.delete(action.oldSessionId)
+-          log("[tmux-session-manager] removed replaced session from cache", {
+-            oldSessionId: action.oldSessionId,
+-            newSessionId: action.newSessionId,
+-          })
++        for (const { action, result: actionResult } of result.results) {
++          if (action.type === "close" && actionResult.success) {
++            this.sessions.delete(action.sessionId)
++            log("[tmux-session-manager] removed closed session from cache", {
++              sessionId: action.sessionId,
++            })
++          }
++          if (action.type === "replace" && actionResult.success) {
++            this.sessions.delete(action.oldSessionId)
++            log("[tmux-session-manager] removed replaced session from cache", {
++              oldSessionId: action.oldSessionId,
++              newSessionId: action.newSessionId,
++            })
++          }
+         }
+-      }
+ 
+-      if (result.success && result.spawnedPaneId) {
+-        const sessionReady = await this.waitForSessionReady(sessionId)
+-        
+-        if (!sessionReady) {
+-          log("[tmux-session-manager] session not ready after timeout, closing spawned pane", {
++        if (result.success && result.spawnedPaneId) {
++          const sessionReady = await this.waitForSessionReady(sessionId)
++
++          if (!sessionReady) {
++            log("[tmux-session-manager] session not ready after timeout, tracking anyway", {
++              sessionId,
++              paneId: result.spawnedPaneId,
++            })
++          }
++
++          const now = Date.now()
++          this.sessions.set(sessionId, {
++            sessionId,
++            paneId: result.spawnedPaneId,
++            description: title,
++            createdAt: new Date(now),
++            lastSeenAt: new Date(now),
++          })
++          log("[tmux-session-manager] pane spawned and tracked", {
+             sessionId,
+             paneId: result.spawnedPaneId,
++            sessionReady,
++          })
++          this.pollingManager.startPolling()
++        } else {
++          log("[tmux-session-manager] spawn failed", {
++            success: result.success,
++            results: result.results.map((r) => ({
++              type: r.action.type,
++              success: r.result.success,
++              error: r.result.error,
++            })),
+           })
+ 
+           await executeAction(
+@@ -225,40 +397,30 @@ export class TmuxSessionManager {
+ 
+           return
+         }
+-        
+-        const now = Date.now()
+-        this.sessions.set(sessionId, {
+-          sessionId,
+-          paneId: result.spawnedPaneId,
+-          description: title,
+-          createdAt: new Date(now),
+-          lastSeenAt: new Date(now),
+-        })
+-        log("[tmux-session-manager] pane spawned and tracked", {
+-          sessionId,
+-          paneId: result.spawnedPaneId,
+-          sessionReady,
+-        })
+-        this.pollingManager.startPolling()
+-      } else {
+-        log("[tmux-session-manager] spawn failed", {
+-          success: result.success,
+-          results: result.results.map((r) => ({
+-            type: r.action.type,
+-            success: r.result.success,
+-            error: r.result.error,
+-          })),
+-        })
++      } finally {
++        this.pendingSessions.delete(sessionId)
+       }
+-    } finally {
+-      this.pendingSessions.delete(sessionId)
+-    }
++    })
++  }
++
++  private async enqueueSpawn(run: () => Promise<void>): Promise<void> {
++    this.spawnQueue = this.spawnQueue
++      .catch(() => undefined)
++      .then(run)
++      .catch((err) => {
++        log("[tmux-session-manager] spawn queue task failed", {
++          error: String(err),
++        })
++      })
++    await this.spawnQueue
+   }
+ 
+   async onSessionDeleted(event: { sessionID: string }): Promise<void> {
+     if (!this.isEnabled()) return
+     if (!this.sourcePaneId) return
+ 
++    this.removeDeferredSession(event.sessionID)
++
+     const tracked = this.sessions.get(event.sessionID)
+     if (!tracked) return
+ 
+@@ -272,7 +434,12 @@ export class TmuxSessionManager {
+ 
+     const closeAction = decideCloseAction(state, event.sessionID, this.getSessionMappings())
+     if (closeAction) {
+-      await executeAction(closeAction, { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state })
++      await executeAction(closeAction, {
++        config: this.tmuxConfig,
++        serverUrl: this.serverUrl,
++        windowState: state,
++        sourcePaneId: this.sourcePaneId,
++      })
+     }
+ 
+     this.sessions.delete(event.sessionID)
+@@ -296,7 +463,12 @@ export class TmuxSessionManager {
+     if (state) {
+       await executeAction(
+         { type: "close", paneId: tracked.paneId, sessionId },
+-        { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state }
++        {
++          config: this.tmuxConfig,
++          serverUrl: this.serverUrl,
++          windowState: state,
++          sourcePaneId: this.sourcePaneId,
++        }
+       )
+     }
+ 
+@@ -314,6 +486,9 @@ export class TmuxSessionManager {
+   }
+ 
+   async cleanup(): Promise<void> {
++    this.stopDeferredAttachLoop()
++    this.deferredQueue = []
++    this.deferredSessions.clear()
+     this.pollingManager.stopPolling()
+ 
+     if (this.sessions.size > 0) {
+@@ -324,7 +499,12 @@ export class TmuxSessionManager {
+         const closePromises = Array.from(this.sessions.values()).map((s) =>
+           executeAction(
+             { type: "close", paneId: s.paneId, sessionId: s.sessionId },
+-            { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state }
++            {
++              config: this.tmuxConfig,
++              serverUrl: this.serverUrl,
++              windowState: state,
++              sourcePaneId: this.sourcePaneId,
++            }
+           ).catch((err) =>
+             log("[tmux-session-manager] cleanup error for pane", {
+               paneId: s.paneId,
+diff --git a/src/features/tmux-subagent/pane-split-availability.ts b/src/features/tmux-subagent/pane-split-availability.ts
+index 572cf606..174335cf 100644
+--- a/src/features/tmux-subagent/pane-split-availability.ts
++++ b/src/features/tmux-subagent/pane-split-availability.ts
+@@ -1,14 +1,15 @@
+-import { MIN_PANE_WIDTH } from "./types"
+ import type { SplitDirection, TmuxPaneInfo } from "./types"
+ import {
+-  DIVIDER_SIZE,
+-  MAX_COLS,
+-  MAX_ROWS,
+-  MIN_SPLIT_HEIGHT,
++	DIVIDER_SIZE,
++	MAX_COLS,
++	MAX_ROWS,
++	MIN_SPLIT_HEIGHT,
+ } from "./tmux-grid-constants"
++import { MIN_PANE_WIDTH } from "./types"
+ 
+-function minSplitWidthFor(minPaneWidth: number): number {
+-	return 2 * minPaneWidth + DIVIDER_SIZE
++function getMinSplitWidth(minPaneWidth?: number): number {
++	const width = Math.max(1, minPaneWidth ?? MIN_PANE_WIDTH)
++	return 2 * width + DIVIDER_SIZE
+ }
+ 
+ export function getColumnCount(paneCount: number): number {
+@@ -25,16 +26,16 @@ export function getColumnWidth(agentAreaWidth: number, paneCount: number): numbe
+ export function isSplittableAtCount(
+ 	agentAreaWidth: number,
+ 	paneCount: number,
+-	minPaneWidth: number = MIN_PANE_WIDTH,
++	minPaneWidth?: number,
+ ): boolean {
+ 	const columnWidth = getColumnWidth(agentAreaWidth, paneCount)
+-	return columnWidth >= minSplitWidthFor(minPaneWidth)
++	return columnWidth >= getMinSplitWidth(minPaneWidth)
+ }
+ 
+ export function findMinimalEvictions(
+ 	agentAreaWidth: number,
+ 	currentCount: number,
+-	minPaneWidth: number = MIN_PANE_WIDTH,
++	minPaneWidth?: number,
+ ): number | null {
+ 	for (let k = 1; k <= currentCount; k++) {
+ 		if (isSplittableAtCount(agentAreaWidth, currentCount - k, minPaneWidth)) {
+@@ -47,30 +48,26 @@ export function findMinimalEvictions(
+ export function canSplitPane(
+ 	pane: TmuxPaneInfo,
+ 	direction: SplitDirection,
+-	minPaneWidth: number = MIN_PANE_WIDTH,
++	minPaneWidth?: number,
+ ): boolean {
+ 	if (direction === "-h") {
+-		return pane.width >= minSplitWidthFor(minPaneWidth)
++		return pane.width >= getMinSplitWidth(minPaneWidth)
+ 	}
+ 	return pane.height >= MIN_SPLIT_HEIGHT
+ }
+ 
+-export function canSplitPaneAnyDirection(pane: TmuxPaneInfo, minPaneWidth: number = MIN_PANE_WIDTH): boolean {
+-	return canSplitPaneAnyDirectionWithMinWidth(pane, minPaneWidth)
+-}
+-
+-export function canSplitPaneAnyDirectionWithMinWidth(
++export function canSplitPaneAnyDirection(
+ 	pane: TmuxPaneInfo,
+-	minPaneWidth: number = MIN_PANE_WIDTH,
++	minPaneWidth?: number,
+ ): boolean {
+-	return pane.width >= minSplitWidthFor(minPaneWidth) || pane.height >= MIN_SPLIT_HEIGHT
++	return pane.width >= getMinSplitWidth(minPaneWidth) || pane.height >= MIN_SPLIT_HEIGHT
+ }
+ 
+ export function getBestSplitDirection(
+ 	pane: TmuxPaneInfo,
+-	minPaneWidth: number = MIN_PANE_WIDTH,
++	minPaneWidth?: number,
+ ): SplitDirection | null {
+-	const canH = pane.width >= minSplitWidthFor(minPaneWidth)
++	const canH = pane.width >= getMinSplitWidth(minPaneWidth)
+ 	const canV = pane.height >= MIN_SPLIT_HEIGHT
+ 
+ 	if (!canH && !canV) return null
+diff --git a/src/features/tmux-subagent/pane-state-querier.ts b/src/features/tmux-subagent/pane-state-querier.ts
+index 988cfaf0..d5f6559d 100644
+--- a/src/features/tmux-subagent/pane-state-querier.ts
++++ b/src/features/tmux-subagent/pane-state-querier.ts
+@@ -14,7 +14,7 @@ export async function queryWindowState(sourcePaneId: string): Promise<WindowStat
+       "-t",
+       sourcePaneId,
+       "-F",
+-      "#{pane_id},#{pane_width},#{pane_height},#{pane_left},#{pane_top},#{pane_title},#{pane_active},#{window_width},#{window_height}",
++      "#{pane_id}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_top}\t#{pane_title}\t#{pane_active}\t#{window_width}\t#{window_height}",
+     ],
+     { stdout: "pipe", stderr: "pipe" }
+   )
+@@ -35,7 +35,7 @@ export async function queryWindowState(sourcePaneId: string): Promise<WindowStat
+   const panes: TmuxPaneInfo[] = []
+ 
+   for (const line of lines) {
+-    const [paneId, widthStr, heightStr, leftStr, topStr, title, activeStr, windowWidthStr, windowHeightStr] = line.split(",")
++    const [paneId, widthStr, heightStr, leftStr, topStr, title, activeStr, windowWidthStr, windowHeightStr] = line.split("\t")
+     const width = parseInt(widthStr, 10)
+     const height = parseInt(heightStr, 10)
+     const left = parseInt(leftStr, 10)
+@@ -51,9 +51,21 @@ export async function queryWindowState(sourcePaneId: string): Promise<WindowStat
+ 
+   panes.sort((a, b) => a.left - b.left || a.top - b.top)
+ 
+-  const mainPane = panes.find((p) => p.paneId === sourcePaneId)
++  const mainPane = panes.reduce<TmuxPaneInfo | null>((selected, pane) => {
++    if (!selected) return pane
++    if (pane.left !== selected.left) {
++      return pane.left < selected.left ? pane : selected
++    }
++    if (pane.width !== selected.width) {
++      return pane.width > selected.width ? pane : selected
++    }
++    if (pane.top !== selected.top) {
++      return pane.top < selected.top ? pane : selected
++    }
++    return pane.paneId === sourcePaneId ? pane : selected
++  }, null)
+   if (!mainPane) {
+-    log("[pane-state-querier] CRITICAL: sourcePaneId not found in panes", {
++    log("[pane-state-querier] CRITICAL: failed to determine main pane", {
+       sourcePaneId,
+       availablePanes: panes.map((p) => p.paneId),
+     })
+diff --git a/src/features/tmux-subagent/spawn-action-decider.ts b/src/features/tmux-subagent/spawn-action-decider.ts
+index 5106b2e8..ac611461 100644
+--- a/src/features/tmux-subagent/spawn-action-decider.ts
++++ b/src/features/tmux-subagent/spawn-action-decider.ts
+@@ -5,7 +5,7 @@ import type {
+ 	TmuxPaneInfo,
+ 	WindowState,
+ } from "./types"
+-import { DIVIDER_SIZE } from "./tmux-grid-constants"
++import { computeAgentAreaWidth } from "./tmux-grid-constants"
+ import {
+ 	canSplitPane,
+ 	findMinimalEvictions,
+@@ -14,6 +14,14 @@ import {
+ import { findSpawnTarget } from "./spawn-target-finder"
+ import { findOldestAgentPane, type SessionMapping } from "./oldest-agent-pane"
+ 
++function getInitialSplitDirection(layout?: string): "-h" | "-v" {
++	return layout === "main-horizontal" ? "-v" : "-h"
++}
++
++function isStrictMainLayout(layout?: string): boolean {
++	return layout === "main-vertical" || layout === "main-horizontal"
++}
++
+ export function decideSpawnActions(
+ 	state: WindowState,
+ 	sessionId: string,
+@@ -25,14 +33,13 @@ export function decideSpawnActions(
+ 		return { canSpawn: false, actions: [], reason: "no main pane found" }
+ 	}
+ 
+-	const minPaneWidth = config.agentPaneWidth
+-	const agentAreaWidth = Math.max(
+-		0,
+-		state.windowWidth - state.mainPane.width - DIVIDER_SIZE,
+-	)
++	const agentAreaWidth = computeAgentAreaWidth(state.windowWidth, config)
++	const minAgentPaneWidth = config.agentPaneWidth
+ 	const currentCount = state.agentPanes.length
++	const strictLayout = isStrictMainLayout(config.layout)
++	const initialSplitDirection = getInitialSplitDirection(config.layout)
+ 
+-	if (agentAreaWidth < minPaneWidth && currentCount > 0) {
++	if (agentAreaWidth < minAgentPaneWidth && currentCount > 0) {
+ 		return {
+ 			canSpawn: false,
+ 			actions: [],
+@@ -47,7 +54,7 @@ export function decideSpawnActions(
+ 
+ 	if (currentCount === 0) {
+ 		const virtualMainPane: TmuxPaneInfo = { ...state.mainPane, width: state.windowWidth }
+-		if (canSplitPane(virtualMainPane, "-h", minPaneWidth)) {
++		if (canSplitPane(virtualMainPane, initialSplitDirection, minAgentPaneWidth)) {
+ 			return {
+ 				canSpawn: true,
+ 				actions: [
+@@ -56,7 +63,7 @@ export function decideSpawnActions(
+ 						sessionId,
+ 						description,
+ 						targetPaneId: state.mainPane.paneId,
+-						splitDirection: "-h",
++						splitDirection: initialSplitDirection,
+ 					},
+ 				],
+ 			}
+@@ -64,8 +71,12 @@ export function decideSpawnActions(
+ 		return { canSpawn: false, actions: [], reason: "mainPane too small to split" }
+ 	}
+ 
+-	if (isSplittableAtCount(agentAreaWidth, currentCount, minPaneWidth)) {
+-		const spawnTarget = findSpawnTarget(state, minPaneWidth)
++	const canEvaluateSpawnTarget =
++		strictLayout ||
++		isSplittableAtCount(agentAreaWidth, currentCount, minAgentPaneWidth)
++
++	if (canEvaluateSpawnTarget) {
++		const spawnTarget = findSpawnTarget(state, config)
+ 		if (spawnTarget) {
+ 			return {
+ 				canSpawn: true,
+@@ -82,40 +93,43 @@ export function decideSpawnActions(
+ 		}
+ 	}
+ 
+-	const minEvictions = findMinimalEvictions(agentAreaWidth, currentCount, minPaneWidth)
+-	if (minEvictions === 1 && oldestPane) {
+-		return {
+-			canSpawn: true,
+-			actions: [
+-				{
+-					type: "replace",
+-					paneId: oldestPane.paneId,
+-					oldSessionId: oldestMapping?.sessionId || "",
+-					newSessionId: sessionId,
+-					description,
+-				},
+-			],
+-			reason: "replaced oldest pane to avoid split churn",
++	if (!strictLayout) {
++		const minEvictions = findMinimalEvictions(
++			agentAreaWidth,
++			currentCount,
++			minAgentPaneWidth,
++		)
++		if (minEvictions === 1 && oldestPane) {
++			return {
++				canSpawn: true,
++				actions: [
++					{
++						type: "close",
++						paneId: oldestPane.paneId,
++						sessionId: oldestMapping?.sessionId || "",
++					},
++					{
++						type: "spawn",
++						sessionId,
++						description,
++						targetPaneId: state.mainPane.paneId,
++						splitDirection: initialSplitDirection,
++					},
++				],
++				reason: "closed 1 pane to make room for split",
++			}
+ 		}
+ 	}
+ 
+ 	if (oldestPane) {
+ 		return {
+-			canSpawn: true,
+-			actions: [
+-				{
+-					type: "replace",
+-					paneId: oldestPane.paneId,
+-					oldSessionId: oldestMapping?.sessionId || "",
+-					newSessionId: sessionId,
+-					description,
+-				},
+-			],
+-			reason: "replaced oldest pane (no split possible)",
++			canSpawn: false,
++			actions: [],
++			reason: "no split target available (defer attach)",
+ 		}
+ 	}
+ 
+-	return { canSpawn: false, actions: [], reason: "no pane available to replace" }
++	return { canSpawn: false, actions: [], reason: "no split target available (defer attach)" }
+ }
+ 
+ export function decideCloseAction(
+diff --git a/src/features/tmux-subagent/spawn-target-finder.ts b/src/features/tmux-subagent/spawn-target-finder.ts
+index 0081fb01..f89b3f25 100644
+--- a/src/features/tmux-subagent/spawn-target-finder.ts
++++ b/src/features/tmux-subagent/spawn-target-finder.ts
+@@ -1,13 +1,40 @@
+-import type { SplitDirection, TmuxPaneInfo, WindowState } from "./types"
++import type { CapacityConfig, SplitDirection, TmuxPaneInfo, WindowState } from "./types"
++import { computeMainPaneWidth } from "./tmux-grid-constants"
+ import { computeGridPlan, mapPaneToSlot } from "./grid-planning"
+-import { canSplitPane, getBestSplitDirection } from "./pane-split-availability"
+-import { MIN_PANE_WIDTH } from "./types"
++import { canSplitPane } from "./pane-split-availability"
+ 
+ export interface SpawnTarget {
+ 	targetPaneId: string
+ 	splitDirection: SplitDirection
+ }
+ 
++function isStrictMainVertical(config: CapacityConfig): boolean {
++	return config.layout === "main-vertical"
++}
++
++function isStrictMainHorizontal(config: CapacityConfig): boolean {
++	return config.layout === "main-horizontal"
++}
++
++function isStrictMainLayout(config: CapacityConfig): boolean {
++	return isStrictMainVertical(config) || isStrictMainHorizontal(config)
++}
++
++function getInitialSplitDirection(config: CapacityConfig): SplitDirection {
++	return isStrictMainHorizontal(config) ? "-v" : "-h"
++}
++
++function getStrictFollowupSplitDirection(config: CapacityConfig): SplitDirection {
++	return isStrictMainHorizontal(config) ? "-h" : "-v"
++}
++
++function sortPanesForStrictLayout(panes: TmuxPaneInfo[], config: CapacityConfig): TmuxPaneInfo[] {
++	if (isStrictMainHorizontal(config)) {
++		return [...panes].sort((a, b) => a.left - b.left || a.top - b.top)
++	}
++	return [...panes].sort((a, b) => a.top - b.top || a.left - b.left)
++}
++
+ function buildOccupancy(
+ 	agentPanes: TmuxPaneInfo[],
+ 	plan: ReturnType<typeof computeGridPlan>,
+@@ -37,16 +64,29 @@ function findFirstEmptySlot(
+ 
+ function findSplittableTarget(
+ 	state: WindowState,
+-	minPaneWidth: number,
++	config: CapacityConfig,
+ 	_preferredDirection?: SplitDirection,
+ ): SpawnTarget | null {
+ 	if (!state.mainPane) return null
+ 	const existingCount = state.agentPanes.length
++	const minAgentPaneWidth = config.agentPaneWidth
++	const initialDirection = getInitialSplitDirection(config)
+ 
+ 	if (existingCount === 0) {
+ 		const virtualMainPane: TmuxPaneInfo = { ...state.mainPane, width: state.windowWidth }
+-		if (canSplitPane(virtualMainPane, "-h", minPaneWidth)) {
+-			return { targetPaneId: state.mainPane.paneId, splitDirection: "-h" }
++		if (canSplitPane(virtualMainPane, initialDirection, minAgentPaneWidth)) {
++			return { targetPaneId: state.mainPane.paneId, splitDirection: initialDirection }
++		}
++		return null
++	}
++
++	if (isStrictMainLayout(config)) {
++		const followupDirection = getStrictFollowupSplitDirection(config)
++		const panesByPriority = sortPanesForStrictLayout(state.agentPanes, config)
++		for (const pane of panesByPriority) {
++			if (canSplitPane(pane, followupDirection, minAgentPaneWidth)) {
++				return { targetPaneId: pane.paneId, splitDirection: followupDirection }
++			}
+ 		}
+ 		return null
+ 	}
+@@ -55,34 +95,44 @@ function findSplittableTarget(
+ 		state.windowWidth,
+ 		state.windowHeight,
+ 		existingCount + 1,
+-		state.mainPane.width,
+-		minPaneWidth,
++		config,
+ 	)
+-	const mainPaneWidth = state.mainPane.width
++	const mainPaneWidth = computeMainPaneWidth(state.windowWidth, config)
+ 	const occupancy = buildOccupancy(state.agentPanes, plan, mainPaneWidth)
+ 	const targetSlot = findFirstEmptySlot(occupancy, plan)
+ 
+ 	const leftPane = occupancy.get(`${targetSlot.row}:${targetSlot.col - 1}`)
+-	if (leftPane && canSplitPane(leftPane, "-h", minPaneWidth)) {
++	if (
++		!isStrictMainVertical(config) &&
++		leftPane &&
++		canSplitPane(leftPane, "-h", minAgentPaneWidth)
++	) {
+ 		return { targetPaneId: leftPane.paneId, splitDirection: "-h" }
+ 	}
+ 
+ 	const abovePane = occupancy.get(`${targetSlot.row - 1}:${targetSlot.col}`)
+-	if (abovePane && canSplitPane(abovePane, "-v", minPaneWidth)) {
++	if (abovePane && canSplitPane(abovePane, "-v", minAgentPaneWidth)) {
+ 		return { targetPaneId: abovePane.paneId, splitDirection: "-v" }
+ 	}
+ 
+-	const splittablePanes = state.agentPanes
+-		.map((pane) => ({ pane, direction: getBestSplitDirection(pane, minPaneWidth) }))
+-		.filter(
+-			(item): item is { pane: TmuxPaneInfo; direction: SplitDirection } =>
+-				item.direction !== null,
+-		)
+-		.sort((a, b) => b.pane.width * b.pane.height - a.pane.width * a.pane.height)
+-
+-	const best = splittablePanes[0]
+-	if (best) {
+-		return { targetPaneId: best.pane.paneId, splitDirection: best.direction }
++	const panesByPosition = [...state.agentPanes].sort(
++		(a, b) => a.left - b.left || a.top - b.top,
++	)
++
++	for (const pane of panesByPosition) {
++		if (canSplitPane(pane, "-v", minAgentPaneWidth)) {
++			return { targetPaneId: pane.paneId, splitDirection: "-v" }
++		}
++	}
++
++	if (isStrictMainVertical(config)) {
++		return null
++	}
++
++	for (const pane of panesByPosition) {
++		if (canSplitPane(pane, "-h", minAgentPaneWidth)) {
++			return { targetPaneId: pane.paneId, splitDirection: "-h" }
++		}
+ 	}
+ 
+ 	return null
+@@ -90,7 +140,7 @@ function findSplittableTarget(
+ 
+ export function findSpawnTarget(
+ 	state: WindowState,
+-	minPaneWidth: number = MIN_PANE_WIDTH,
++	config: CapacityConfig,
+ ): SpawnTarget | null {
+-	return findSplittableTarget(state, minPaneWidth)
++	return findSplittableTarget(state, config)
+ }
+diff --git a/src/features/tmux-subagent/tmux-grid-constants.ts b/src/features/tmux-subagent/tmux-grid-constants.ts
+index 778c5e3a..7fe92912 100644
+--- a/src/features/tmux-subagent/tmux-grid-constants.ts
++++ b/src/features/tmux-subagent/tmux-grid-constants.ts
+@@ -1,6 +1,8 @@
+ import { MIN_PANE_HEIGHT, MIN_PANE_WIDTH } from "./types"
++import type { CapacityConfig } from "./types"
+ 
+ export const MAIN_PANE_RATIO = 0.5
++const DEFAULT_MAIN_PANE_SIZE = MAIN_PANE_RATIO * 100
+ export const MAX_COLS = 2
+ export const MAX_ROWS = 3
+ export const MAX_GRID_SIZE = 4
+@@ -8,3 +10,48 @@ export const DIVIDER_SIZE = 1
+ 
+ export const MIN_SPLIT_WIDTH = 2 * MIN_PANE_WIDTH + DIVIDER_SIZE
+ export const MIN_SPLIT_HEIGHT = 2 * MIN_PANE_HEIGHT + DIVIDER_SIZE
++
++function clamp(value: number, min: number, max: number): number {
++	return Math.max(min, Math.min(max, value))
++}
++
++export function getMainPaneSizePercent(config?: CapacityConfig): number {
++	return clamp(config?.mainPaneSize ?? DEFAULT_MAIN_PANE_SIZE, 20, 80)
++}
++
++export function computeMainPaneWidth(
++	windowWidth: number,
++	config?: CapacityConfig,
++): number {
++	const safeWindowWidth = Math.max(0, windowWidth)
++	if (!config) {
++		return Math.floor(safeWindowWidth * MAIN_PANE_RATIO)
++	}
++
++	const dividerWidth = DIVIDER_SIZE
++	const minMainPaneWidth = config?.mainPaneMinWidth ?? Math.floor(safeWindowWidth * MAIN_PANE_RATIO)
++	const minAgentPaneWidth = config?.agentPaneWidth ?? MIN_PANE_WIDTH
++	const percentageMainPaneWidth = Math.floor(
++		(safeWindowWidth - dividerWidth) * (getMainPaneSizePercent(config) / 100),
++	)
++	const maxMainPaneWidth = Math.max(0, safeWindowWidth - dividerWidth - minAgentPaneWidth)
++
++	return clamp(
++		Math.max(percentageMainPaneWidth, minMainPaneWidth),
++		0,
++		maxMainPaneWidth,
++	)
++}
++
++export function computeAgentAreaWidth(
++	windowWidth: number,
++	config?: CapacityConfig,
++): number {
++	const safeWindowWidth = Math.max(0, windowWidth)
++	if (!config) {
++		return Math.floor(safeWindowWidth * (1 - MAIN_PANE_RATIO))
++	}
++
++	const mainPaneWidth = computeMainPaneWidth(safeWindowWidth, config)
++	return Math.max(0, safeWindowWidth - DIVIDER_SIZE - mainPaneWidth)
++}
+diff --git a/src/features/tmux-subagent/types.ts b/src/features/tmux-subagent/types.ts
+index 6af50393..46095f85 100644
+--- a/src/features/tmux-subagent/types.ts
++++ b/src/features/tmux-subagent/types.ts
+@@ -43,6 +43,8 @@ export interface SpawnDecision {
+ }
+ 
+ export interface CapacityConfig {
++	layout?: string
++  mainPaneSize?: number
+   mainPaneMinWidth: number
+   agentPaneWidth: number
+ }
+diff --git a/src/shared/tmux/tmux-utils/layout.test.ts b/src/shared/tmux/tmux-utils/layout.test.ts
+new file mode 100644
+index 00000000..115e16c3
+--- /dev/null
++++ b/src/shared/tmux/tmux-utils/layout.test.ts
+@@ -0,0 +1,44 @@
++import { afterEach, describe, expect, it, mock } from "bun:test"
++
++const spawnCalls: string[][] = []
++const spawnMock = mock((args: string[]) => {
++  spawnCalls.push(args)
++  return { exited: Promise.resolve(0) }
++})
++
++describe("applyLayout", () => {
++  afterEach(() => {
++    spawnCalls.length = 0
++    spawnMock.mockClear()
++  })
++
++  it("applies main-vertical with main-pane-width option", async () => {
++    const { applyLayout } = await import("./layout")
++
++    await applyLayout("tmux", "main-vertical", 60, { spawnCommand: spawnMock })
++
++    expect(spawnCalls).toEqual([
++      ["tmux", "select-layout", "main-vertical"],
++      ["tmux", "set-window-option", "main-pane-width", "60%"],
++    ])
++  })
++
++  it("applies main-horizontal with main-pane-height option", async () => {
++    const { applyLayout } = await import("./layout")
++
++    await applyLayout("tmux", "main-horizontal", 55, { spawnCommand: spawnMock })
++
++    expect(spawnCalls).toEqual([
++      ["tmux", "select-layout", "main-horizontal"],
++      ["tmux", "set-window-option", "main-pane-height", "55%"],
++    ])
++  })
++
++  it("does not set main pane option for non-main layouts", async () => {
++    const { applyLayout } = await import("./layout")
++
++    await applyLayout("tmux", "tiled", 50, { spawnCommand: spawnMock })
++
++    expect(spawnCalls).toEqual([["tmux", "select-layout", "tiled"]])
++  })
++})
+diff --git a/src/shared/tmux/tmux-utils/layout.ts b/src/shared/tmux/tmux-utils/layout.ts
+index 355b598e..5ac82ee5 100644
+--- a/src/shared/tmux/tmux-utils/layout.ts
++++ b/src/shared/tmux/tmux-utils/layout.ts
+@@ -2,14 +2,52 @@ import { spawn } from "bun"
+ import type { TmuxLayout } from "../../../config/schema"
+ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ 
++type TmuxSpawnCommand = (
++	args: string[],
++	options: { stdout: "ignore"; stderr: "ignore" },
++) => { exited: Promise<number> }
++
++interface LayoutDeps {
++	spawnCommand?: TmuxSpawnCommand
++}
++
++interface MainPaneWidthOptions {
++	mainPaneSize?: number
++	mainPaneMinWidth?: number
++	agentPaneMinWidth?: number
++}
++
++function clamp(value: number, min: number, max: number): number {
++	return Math.max(min, Math.min(max, value))
++}
++
++function calculateMainPaneWidth(
++	windowWidth: number,
++	options?: MainPaneWidthOptions,
++): number {
++	const dividerWidth = 1
++	const sizePercent = clamp(options?.mainPaneSize ?? 50, 20, 80)
++	const minMainPaneWidth = options?.mainPaneMinWidth ?? 0
++	const minAgentPaneWidth = options?.agentPaneMinWidth ?? 0
++	const desiredMainPaneWidth = Math.floor(
++		(windowWidth - dividerWidth) * (sizePercent / 100),
++	)
++	const maxMainPaneWidth = Math.max(
++		0,
++		windowWidth - dividerWidth - minAgentPaneWidth,
++	)
++
++	return clamp(Math.max(desiredMainPaneWidth, minMainPaneWidth), 0, maxMainPaneWidth)
++}
++
+ export async function applyLayout(
++	tmux: string,
+ 	layout: TmuxLayout,
+ 	mainPaneSize: number,
++	deps?: LayoutDeps,
+ ): Promise<void> {
+-	const tmux = await getTmuxPath()
+-	if (!tmux) return
+-
+-	const layoutProc = spawn([tmux, "select-layout", layout], {
++	const spawnCommand: TmuxSpawnCommand = deps?.spawnCommand ?? spawn
++	const layoutProc = spawnCommand([tmux, "select-layout", layout], {
+ 		stdout: "ignore",
+ 		stderr: "ignore",
+ 	})
+@@ -18,7 +56,7 @@ export async function applyLayout(
+ 	if (layout.startsWith("main-")) {
+ 		const dimension =
+ 			layout === "main-horizontal" ? "main-pane-height" : "main-pane-width"
+-		const sizeProc = spawn(
++		const sizeProc = spawnCommand(
+ 			[tmux, "set-window-option", dimension, `${mainPaneSize}%`],
+ 			{ stdout: "ignore", stderr: "ignore" },
+ 		)
+@@ -29,15 +67,17 @@ export async function applyLayout(
+ export async function enforceMainPaneWidth(
+ 	mainPaneId: string,
+ 	windowWidth: number,
+-	mainPaneSize: number,
++	mainPaneSizeOrOptions?: number | MainPaneWidthOptions,
+ ): Promise<void> {
+ 	const { log } = await import("../../logger")
+ 	const tmux = await getTmuxPath()
+ 	if (!tmux) return
+ 
+-	const dividerWidth = 1
+-	const boundedMainPaneSize = Math.max(20, Math.min(80, mainPaneSize))
+-	const mainWidth = Math.floor(((windowWidth - dividerWidth) * boundedMainPaneSize) / 100)
++	const options: MainPaneWidthOptions =
++		typeof mainPaneSizeOrOptions === "number"
++			? { mainPaneSize: mainPaneSizeOrOptions }
++			: mainPaneSizeOrOptions ?? {}
++	const mainWidth = calculateMainPaneWidth(windowWidth, options)
+ 
+ 	const proc = spawn([tmux, "resize-pane", "-t", mainPaneId, "-x", String(mainWidth)], {
+ 		stdout: "ignore",
+@@ -49,6 +89,8 @@ export async function enforceMainPaneWidth(
+ 		mainPaneId,
+ 		mainWidth,
+ 		windowWidth,
+-		mainPaneSize: boundedMainPaneSize,
++		mainPaneSize: options?.mainPaneSize,
++		mainPaneMinWidth: options?.mainPaneMinWidth,
++		agentPaneMinWidth: options?.agentPaneMinWidth,
+ 	})
+ }
+-- 
+2.39.2
+

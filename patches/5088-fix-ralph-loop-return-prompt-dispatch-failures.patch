@@ -1,0 +1,404 @@
+From 2c0f8e4645bc3b2b768997451e7c6bc51ab791a4 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 12 May 2026 12:37:11 +0900
+Subject: [PATCH 5088/5749] fix(ralph-loop): return prompt dispatch failures
+
+---
+ src/hooks/ralph-loop/completion-handler.ts    | 44 ++++++++----
+ .../continuation-prompt-injector.test.ts      | 57 +++++++++++++++
+ .../continuation-prompt-injector.ts           | 52 ++++++++++----
+ .../dispatch-failure-invariant.test.ts        | 70 +++++++++++++++++++
+ .../ralph-loop/iteration-continuation.ts      | 10 ++-
+ .../verification-failure-handler.ts           | 16 ++++-
+ 6 files changed, 221 insertions(+), 28 deletions(-)
+
+diff --git a/src/hooks/ralph-loop/completion-handler.ts b/src/hooks/ralph-loop/completion-handler.ts
+index 740e5969..e7bbb9ae 100644
+--- a/src/hooks/ralph-loop/completion-handler.ts
++++ b/src/hooks/ralph-loop/completion-handler.ts
+@@ -10,6 +10,16 @@ type LoopStateController = {
+ 	markVerificationPending: (sessionID: string) => RalphLoopState | null
+ }
+ 
++function showToastBestEffort(
++	ctx: PluginInput,
++	body: { title: string; message: string; variant: "error" | "info" | "success"; duration: number },
++): void {
++	try {
++		void Promise.resolve(ctx.client.tui?.showToast?.({ body })).catch(() => {})
++	} catch {
++	}
++}
++
+ export async function handleDetectedCompletion(
+ 	ctx: PluginInput,
+ 	input: {
+@@ -35,21 +45,33 @@ export async function handleDetectedCompletion(
+ 			return
+ 		}
+ 
+-		await injectContinuationPrompt(ctx, {
++		const promptResult = await injectContinuationPrompt(ctx, {
+ 			sessionID,
+ 			prompt: buildContinuationPrompt(verificationState),
+ 			directory,
+ 			apiTimeoutMs,
+ 		})
+-
+-		await ctx.client.tui?.showToast?.({
+-			body: {
+-				title: "ULTRAWORK LOOP",
+-				message: "DONE detected. Oracle verification is now required.",
+-				variant: "info",
++		if (promptResult.status === "rejected") {
++			log(`[${HOOK_NAME}] Failed to inject ultrawork verification prompt`, {
++				sessionID,
++				error: String(promptResult.error),
++			})
++			loopState.clear()
++			showToastBestEffort(ctx, {
++				title: "Ralph Loop Failed",
++				message: `Verification dispatch rejected: ${String(promptResult.error)}`,
++				variant: "error",
+ 				duration: 5000,
+-			},
+-		}).catch(() => {})
++			})
++			return
++		}
++
++		showToastBestEffort(ctx, {
++			title: "ULTRAWORK LOOP",
++			message: "DONE detected. Oracle verification is now required.",
++			variant: "info",
++			duration: 5000,
++		})
+ 		return
+ 	}
+ 
+@@ -59,7 +81,5 @@ export async function handleDetectedCompletion(
+ 	const message = state.ultrawork
+ 		? `JUST ULW ULW! Task completed after ${state.iteration} iteration(s)`
+ 		: `Task completed after ${state.iteration} iteration(s)`
+-	await ctx.client.tui?.showToast?.({
+-		body: { title, message, variant: "success", duration: 5000 },
+-	}).catch(() => {})
++	showToastBestEffort(ctx, { title, message, variant: "success", duration: 5000 })
+ }
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.test.ts b/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
+index 6455e70e..bc70c859 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
+@@ -2,6 +2,63 @@ import { describe, expect, test } from "bun:test"
+ import { injectContinuationPrompt } from "./continuation-prompt-injector"
+ 
+ describe("ralph-loop continuation prompt injector", () => {
++  test("#given promptAsync resolves SDK error #when injecting continuation prompt #then it returns rejection without throwing", async () => {
++    // given
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++          promptAsync: async () => ({
++            error: { message: "prompt rejected by OpenCode" },
++            response: { status: 400 },
++          }),
++        },
++      },
++    }
++
++    // when
++    const result = await injectContinuationPrompt(ctx as never, {
++      sessionID: "ses_rejected_fields_response",
++      prompt: "continue",
++      directory: "/tmp/test",
++      apiTimeoutMs: 50,
++    })
++
++    // then
++    expect(result.status).toBe("rejected")
++    if (result.status === "rejected") {
++      expect(String(result.error)).toContain("prompt rejected by OpenCode")
++    }
++  })
++
++  test("#given promptAsync rejects #when injecting continuation prompt #then it returns rejection without throwing", async () => {
++    // given
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++          promptAsync: async () => {
++            throw new Error("network rejected promptAsync")
++          },
++        },
++      },
++    }
++
++    // when
++    const result = await injectContinuationPrompt(ctx as never, {
++      sessionID: "ses_rejected_promise",
++      prompt: "continue",
++      directory: "/tmp/test",
++      apiTimeoutMs: 50,
++    })
++
++    // then
++    expect(result.status).toBe("rejected")
++    if (result.status === "rejected") {
++      expect(String(result.error)).toContain("network rejected promptAsync")
++    }
++  })
++
+   test("#given inherited message agent has ZWSP prefix #when injecting continuation prompt #then promptAsync receives normalized agent", async () => {
+     // given
+     let promptBody: { agent?: string } | undefined
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.ts b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+index 85c74693..4fd66c7d 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-injector.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+@@ -19,6 +19,10 @@ type MessageInfo = {
+ 	tools?: Record<string, boolean | "allow" | "deny" | "ask">
+ }
+ 
++export type ContinuationPromptResult =
++	| { status: "dispatched" }
++	| { status: "rejected"; error: Error }
++
+ function extractPromptAsyncError(response: unknown): unknown | undefined {
+ 	if (!isRecord(response) || !Object.hasOwn(response, "error")) {
+ 		return undefined
+@@ -50,6 +54,10 @@ function describePromptAsyncError(error: unknown): string {
+ 	}
+ }
+ 
++function createPromptAsyncError(prefix: string, error: unknown): Error {
++	return new Error(`${prefix}: ${describePromptAsyncError(error)}`)
++}
++
+ export async function injectContinuationPrompt(
+ 	ctx: PluginInput,
+ 	options: {
+@@ -59,7 +67,7 @@ export async function injectContinuationPrompt(
+ 		apiTimeoutMs: number
+ 		inheritFromSessionID?: string
+ 	},
+-): Promise<void> {
++): Promise<ContinuationPromptResult> {
+ 	let agent: string | undefined
+ 	let model: { providerID: string; modelID: string; variant?: string } | undefined
+ 	let tools: Record<string, boolean | "allow" | "deny" | "ask"> | undefined
+@@ -109,21 +117,39 @@ export async function injectContinuationPrompt(
+ 		: undefined
+ 	const launchVariant = model?.variant
+ 
+-	const response = await ctx.client.session.promptAsync({
+-		path: { id: options.sessionID },
+-		body: {
+-			...(cleanAgent !== undefined ? { agent: cleanAgent } : {}),
+-			...(launchModel ? { model: launchModel } : {}),
+-			...(launchVariant ? { variant: launchVariant } : {}),
+-			...(inheritedTools ? { tools: inheritedTools } : {}),
+-			parts: [createInternalAgentTextPart(options.prompt)],
+-		},
+-		query: { directory: options.directory },
+-	})
++	let response: unknown
++	try {
++		response = await ctx.client.session.promptAsync({
++			path: { id: options.sessionID },
++			body: {
++				...(cleanAgent !== undefined ? { agent: cleanAgent } : {}),
++				...(launchModel ? { model: launchModel } : {}),
++				...(launchVariant ? { variant: launchVariant } : {}),
++				...(inheritedTools ? { tools: inheritedTools } : {}),
++				parts: [createInternalAgentTextPart(options.prompt)],
++			},
++			query: { directory: options.directory },
++		})
++	} catch (error) {
++		const promptError = error instanceof Error
++			? error
++			: createPromptAsyncError("promptAsync rejected", error)
++		log("[ralph-loop] continuation prompt rejected", {
++			sessionID: options.sessionID,
++			error: String(promptError),
++		})
++		return { status: "rejected", error: promptError }
++	}
+ 	const promptError = extractPromptAsyncError(response)
+ 	if (promptError !== undefined) {
+-		throw new Error(`promptAsync returned error: ${describePromptAsyncError(promptError)}`)
++		const error = createPromptAsyncError("promptAsync returned error", promptError)
++		log("[ralph-loop] continuation prompt rejected", {
++			sessionID: options.sessionID,
++			error: String(error),
++		})
++		return { status: "rejected", error }
+ 	}
+ 
+ 	log("[ralph-loop] continuation injected", { sessionID: options.sessionID })
++	return { status: "dispatched" }
+ }
+diff --git a/src/hooks/ralph-loop/dispatch-failure-invariant.test.ts b/src/hooks/ralph-loop/dispatch-failure-invariant.test.ts
+index a932fe4c..8e8d99a1 100644
+--- a/src/hooks/ralph-loop/dispatch-failure-invariant.test.ts
++++ b/src/hooks/ralph-loop/dispatch-failure-invariant.test.ts
+@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ import { createRalphLoopHook } from "./index"
+ import { ULTRAWORK_VERIFICATION_PROMISE } from "./constants"
++import { handleDetectedCompletion } from "./completion-handler"
+ import { clearState, writeState } from "./storage"
+ import { handleFailedVerification } from "./verification-failure-handler"
+ 
+@@ -483,6 +484,75 @@ describe("ralph-loop dispatch failure invariants", () => {
+ 		).toBe(true)
+ 	})
+ 
++	test("#given ultrawork completion path #when verification prompt resolves SDK error #then oracle-required toast is not shown", async () => {
++		// given
++		let cleared = false
++		const loopState = {
++			clear: () => {
++				cleared = true
++				return true
++			},
++			markVerificationPending: (sessionID: string) => ({
++				active: true,
++				iteration: 2,
++				prompt: "Build API",
++				started_at: new Date().toISOString(),
++				session_id: sessionID,
++				completion_promise: ULTRAWORK_VERIFICATION_PROMISE,
++				verification_pending: true,
++			}),
++		}
++
++		await handleDetectedCompletion({
++			directory: testDirectory,
++			project: testDirectory,
++			worktree: testDirectory,
++			serverUrl: "http://localhost:4096",
++			$: async () => ({}),
++			client: {
++				session: {
++					messages: async () => ({ data: [] }),
++					promptAsync: async () => ({
++						error: { message: "verification prompt rejected by OpenCode" },
++						response: { status: 400 },
++					}),
++					abort: async () => ({}),
++				},
++				tui: {
++					showToast: (options: { body: { title: string; message: string; variant: string } }) => {
++						toastCalls.push(options.body)
++					},
++				},
++			},
++		} as never, {
++			sessionID: "session-123",
++			state: {
++				active: true,
++				iteration: 2,
++				prompt: "Build API",
++				started_at: new Date().toISOString(),
++				session_id: "session-123",
++				completion_promise: "DONE",
++				ultrawork: true,
++			},
++			loopState,
++			directory: testDirectory,
++			apiTimeoutMs: 5000,
++		})
++
++		// then
++		expect(cleared).toBe(true)
++		expect(toastCalls.some((toast) => toast.title === "ULTRAWORK LOOP")).toBe(false)
++		expect(
++			toastCalls.some(
++				(toast) =>
++					toast.title === "Ralph Loop Failed"
++					&& toast.message.includes("verification prompt rejected by OpenCode"),
++			),
++		).toBe(true)
++		expect(toastCalls.some((toast) => toast.title === "Ralph Loop Failed" && toast.variant === "error")).toBe(true)
++	})
++
+ 	test("#given reset strategy #when session.create throws #then dispatch failure surfaces", async () => {
+ 		// given
+ 		const hook = createRalphLoopHook({
+diff --git a/src/hooks/ralph-loop/iteration-continuation.ts b/src/hooks/ralph-loop/iteration-continuation.ts
+index af43955f..00c5c878 100644
+--- a/src/hooks/ralph-loop/iteration-continuation.ts
++++ b/src/hooks/ralph-loop/iteration-continuation.ts
+@@ -39,13 +39,16 @@ export async function continueIteration(
+     }
+ 
+     try {
+-      await injectContinuationPrompt(ctx, {
++      const promptResult = await injectContinuationPrompt(ctx, {
+         sessionID: newSessionID,
+         inheritFromSessionID: options.previousSessionID,
+         prompt: continuationPrompt,
+         directory: options.directory,
+         apiTimeoutMs: options.apiTimeoutMs,
+       })
++      if (promptResult.status === "rejected") {
++        return { status: "dispatch_rejected", error: promptResult.error }
++      }
+     } catch (error: unknown) {
+       return { status: "dispatch_rejected", error }
+     }
+@@ -65,12 +68,15 @@ export async function continueIteration(
+   }
+ 
+   try {
+-    await injectContinuationPrompt(ctx, {
++    const promptResult = await injectContinuationPrompt(ctx, {
+       sessionID: options.previousSessionID,
+       prompt: continuationPrompt,
+       directory: options.directory,
+       apiTimeoutMs: options.apiTimeoutMs,
+     })
++    if (promptResult.status === "rejected") {
++      return { status: "dispatch_rejected", error: promptResult.error }
++    }
+   } catch (error: unknown) {
+     return { status: "dispatch_rejected", error }
+   }
+diff --git a/src/hooks/ralph-loop/verification-failure-handler.ts b/src/hooks/ralph-loop/verification-failure-handler.ts
+index 89917f03..a14ccc84 100644
+--- a/src/hooks/ralph-loop/verification-failure-handler.ts
++++ b/src/hooks/ralph-loop/verification-failure-handler.ts
+@@ -98,12 +98,26 @@ export async function handleFailedVerification(
+ 	const previewState: RalphLoopState = { ...clearedState, iteration: clearedState.iteration + 1 }
+ 
+ 	try {
+-		await injectContinuationPrompt(ctx, {
++		const promptResult = await injectContinuationPrompt(ctx, {
+ 			sessionID: parentSessionID,
+ 			prompt: buildVerificationFailurePrompt(previewState),
+ 			directory,
+ 			apiTimeoutMs,
+ 		})
++		if (promptResult.status === "rejected") {
++			log(`[${HOOK_NAME}] Failed to inject verification failure prompt`, {
++				parentSessionID,
++				error: String(promptResult.error),
++			})
++			loopState.clear()
++			showToastBestEffort(ctx, {
++				title: "Ralph Loop Failed",
++				message: `Verification continuation rejected: ${String(promptResult.error)}`,
++				variant: "warning",
++				duration: 5000,
++			})
++			return false
++		}
+ 	} catch (error) {
+ 		log(`[${HOOK_NAME}] Failed to inject verification failure prompt`, {
+ 			parentSessionID,
+-- 
+2.39.2
+

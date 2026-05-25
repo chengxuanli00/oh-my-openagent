@@ -1,0 +1,133 @@
+From 688d7395e02d2c6461f1cf91783f2a9faf361435 Mon Sep 17 00:00:00 2001
+From: MoerAI <friendnt@g.skku.edu>
+Date: Tue, 19 May 2026 10:19:46 +0900
+Subject: [PATCH 5487/5749] fix(team-mode): swallow EPERM/ENOTSUP/EINVAL from
+ chmod on base dir to keep init alive (fixes #4023)
+
+ensureBaseDirs unconditionally called chmod(baseDir, 0o700) on every startup
+and on every team_create. On filesystems where the OS rejects chmod for the
+directory (network mounts, SIP-protected locations, non-owner cases on macOS
+shared by multiple GUI users), the call raises EPERM and the entire team-mode
+init aborts:
+
+  [team-mode] init failed: EPERM: operation not permitted, chmod '/Users/<u>/.omo'
+
+Wrap chmod through a small safeChmod helper that converts EPERM, ENOTSUP, and
+EINVAL into a single warning log and continues. mkdir already creates new
+directories with mode 0o700, and the existing post-creation stat-guard remains
+in place for the case where the directory pre-exists with a different mode and
+chmod is permitted, so the security envelope on supported filesystems is
+unchanged. All other error codes (ENOENT, EACCES, etc.) still propagate.
+
+Regression test mocks node:fs/promises.chmod to throw EPERM and asserts that
+ensureBaseDirs completes successfully and emits exactly the documented warning.
+---
+ .../team-mode/team-registry/paths.test.ts     | 49 +++++++++++++++++++
+ src/features/team-mode/team-registry/paths.ts | 21 +++++++-
+ 2 files changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/src/features/team-mode/team-registry/paths.test.ts b/src/features/team-mode/team-registry/paths.test.ts
+index 1fd80f4b..2cf1cc57 100644
+--- a/src/features/team-mode/team-registry/paths.test.ts
++++ b/src/features/team-mode/team-registry/paths.test.ts
+@@ -117,4 +117,53 @@ describe("paths", () => {
+       expect(directoryStat.mode & 0o777).toBe(0o700)
+     }
+   })
++
++  test("ensureBaseDirs swallows EPERM from chmod and logs a warning instead of aborting team-mode init", async () => {
++    // given: directories exist with permissive mode that chmod cannot tighten
++    // (mirrors macOS network mount / non-owner / SIP cases reported in #4023).
++    const baseDir = path.join(tmpdir(), `omo-test-eperm-${randomUUID()}`)
++    temporaryDirectories.push(baseDir)
++    await mkdir(baseDir, { recursive: true })
++    await mkdir(path.join(baseDir, "teams"), { recursive: true })
++    await mkdir(path.join(baseDir, "runtime"), { recursive: true })
++    await mkdir(path.join(baseDir, "worktrees"), { recursive: true })
++
++    const realFs = await import("node:fs/promises")
++    let chmodCalls = 0
++    mock.module("node:fs/promises", () => ({
++      ...realFs,
++      chmod: async (target: string) => {
++        chmodCalls += 1
++        const eperm = Object.assign(new Error(`EPERM: operation not permitted, chmod '${target}'`), {
++          code: "EPERM",
++          syscall: "chmod",
++          path: target,
++          errno: -1,
++        })
++        throw eperm
++      },
++    }))
++
++    const { ensureBaseDirs: ensureBaseDirsWithMockedChmod } = await import("./paths")
++    logCalls.splice(0)
++
++    // when
++    let thrown: unknown = null
++    try {
++      await ensureBaseDirsWithMockedChmod(baseDir)
++    } catch (error) {
++      thrown = error
++    }
++
++    // then: function does not throw, EPERM was reached, and one warning was logged.
++    expect(thrown).toBeNull()
++    expect(chmodCalls).toBeGreaterThan(0)
++    const warnings = logCalls.filter(([message]) =>
++      message === "team-mode: chmod refused on base directory; continuing with existing permissions"
++    )
++    expect(warnings.length).toBeGreaterThan(0)
++    const firstWarning = warnings[0]?.[1] as { code?: string; path?: string } | undefined
++    expect(firstWarning?.code).toBe("EPERM")
++    expect(firstWarning?.path).toContain(baseDir)
++  })
+ })
+diff --git a/src/features/team-mode/team-registry/paths.ts b/src/features/team-mode/team-registry/paths.ts
+index c8003257..b41b1ed7 100644
+--- a/src/features/team-mode/team-registry/paths.ts
++++ b/src/features/team-mode/team-registry/paths.ts
+@@ -100,6 +100,23 @@ export async function discoverTeamSpecs(
+   return discoveredTeamSpecs
+ }
+ 
++async function safeChmod(directoryPath: string, mode: number): Promise<void> {
++  try {
++    await chmod(directoryPath, mode)
++  } catch (error) {
++    const errnoError = error as NodeJS.ErrnoException
++    if (errnoError?.code === "EPERM" || errnoError?.code === "ENOTSUP" || errnoError?.code === "EINVAL") {
++      log("team-mode: chmod refused on base directory; continuing with existing permissions", {
++        path: directoryPath,
++        code: errnoError.code,
++        syscall: errnoError.syscall,
++      })
++      return
++    }
++    throw error
++  }
++}
++
+ export async function ensureBaseDirs(baseDir: string): Promise<void> {
+   const directories = [
+     baseDir,
+@@ -110,13 +127,13 @@ export async function ensureBaseDirs(baseDir: string): Promise<void> {
+ 
+   for (const directoryPath of directories) {
+     await mkdir(directoryPath, { recursive: true, mode: 0o700 })
+-    await chmod(directoryPath, 0o700)
++    await safeChmod(directoryPath, 0o700)
+   }
+ 
+   await Promise.all(directories.map(async (directoryPath) => {
+     const directoryStat = await stat(directoryPath)
+     if ((directoryStat.mode & 0o777) !== 0o700) {
+-      await chmod(directoryPath, 0o700)
++      await safeChmod(directoryPath, 0o700)
+     }
+   }))
+ }
+-- 
+2.39.2
+

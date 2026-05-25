@@ -1,0 +1,108 @@
+From 07064a96f5a1627aa2e6bbdd82f56934a74a14fc Mon Sep 17 00:00:00 2001
+From: MoerAI <friendnt@g.skku.edu>
+Date: Tue, 28 Apr 2026 16:51:56 +0900
+Subject: [PATCH 4612/5749] fix(context-window-monitor): clamp displayed
+ context status percentages so the directive stays trustworthy (fixes #3655)
+
+Root cause: the context-window-monitor hook computes actualUsagePercentage = (input + cache.read) / actualLimit and renders both 'X% used' and '(1 - X) * 100% remaining' inside a [SYSTEM DIRECTIVE: OH-MY-OPENCODE - CONTEXT WINDOW MONITOR] block that is appended to bash tool output. When resolveActualContextLimit() underestimates the model's real context window (for example a 1M-context Anthropic model that falls back to the 200K default per #3450), totalInputTokens > actualLimit and the rendered numbers go nonsensical (issue #3655 reproduces 144.7% used / -44.7% remaining at 289,370 / 200,000 tokens). Safety-tuned models recognize the >100% / negative-remaining pattern as a tell-tale prompt injection and refuse to follow the directive.
+
+Fix: clamp actualUsagePercentage to [0, 1] before formatting. The 70% threshold check still uses the raw value so the block continues to fire above threshold, and resolveActualContextLimit() is left untouched (the deeper resolver concern is tracked separately as #3450). When totalInputTokens exceeds actualLimit the displayed numbers now read '100.0% used / 0.0% remaining' instead of the impossible >100% / negative pair, and safety-tuned models stop flagging the block as an injection attempt.
+
+Verification: added a regression test (input 289,370, limit 200,000) that asserts usedPct in [0,100] and remainingPct in [0,100]. Test fails before the fix (Received: 144.7) and passes after. Full context-window-monitor.test.ts and context-window-monitor.model-context-limits.test.ts: 15 pass / 0 fail. Typecheck clean.
+---
+ src/hooks/context-window-monitor.test.ts | 56 ++++++++++++++++++++++++
+ src/hooks/context-window-monitor.ts      | 11 ++++-
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/src/hooks/context-window-monitor.test.ts b/src/hooks/context-window-monitor.test.ts
+index 1693e005..75453b9c 100644
+--- a/src/hooks/context-window-monitor.test.ts
++++ b/src/hooks/context-window-monitor.test.ts
+@@ -143,6 +143,62 @@ describe("context-window-monitor", () => {
+     expect(ctx.client.session.messages).not.toHaveBeenCalled()
+   })
+ 
++  // #given total input tokens exceed the resolved actualLimit (e.g. 1M-context
++  //        Anthropic model where resolveActualContextLimit falls back to the
++  //        200K default for the model family)
++  // #when tool.execute.after appends the context status block
++  // #then the displayed used% must be clamped to 100 and remaining% must not go
++  //       negative. Safety-tuned models flag the >100% / negative-remaining
++  //       block as prompt injection (issue #3655).
++  it("should clamp displayed percentages when input exceeds actualLimit (regression #3655)", async () => {
++    const hook = createContextWindowMonitorHook(ctx as never)
++    const sessionID = "ses_overflow"
++
++    // 289,370 input + 0 cache against a 200K resolved limit -> 144.7% raw,
++    // -44.7% remaining if not clamped.
++    await hook.event({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            role: "assistant",
++            sessionID,
++            providerID: "anthropic",
++            finish: true,
++            tokens: {
++              input: 289370,
++              output: 0,
++              reasoning: 0,
++              cache: { read: 0, write: 0 },
++            },
++          },
++        },
++      },
++    })
++
++    const output = { title: "", output: "original", metadata: null }
++    await hook["tool.execute.after"](
++      { tool: "bash", sessionID, callID: "call_1" },
++      output
++    )
++
++    // The block must still be emitted (we are above the 70% threshold).
++    expect(output.output).toContain("[Context Status:")
++
++    // Extract the displayed percentages and assert clamping.
++    const match = output.output.match(
++      /\[Context Status: ([\d.-]+)% used \([\d,]+\/[\d,]+ tokens\), ([\d.-]+)% remaining\]/,
++    )
++    expect(match).not.toBeNull()
++    const usedPct = Number(match![1])
++    const remainingPct = Number(match![2])
++
++    expect(usedPct).toBeLessThanOrEqual(100)
++    expect(usedPct).toBeGreaterThanOrEqual(0)
++    expect(remainingPct).toBeGreaterThanOrEqual(0)
++    expect(remainingPct).toBeLessThanOrEqual(100)
++  })
++
+   it("should append context reminder for google-vertex-anthropic provider", async () => {
+     //#given cached usage for google-vertex-anthropic above threshold
+     const hook = createContextWindowMonitorHook(ctx as never)
+diff --git a/src/hooks/context-window-monitor.ts b/src/hooks/context-window-monitor.ts
+index 3d137ae6..0f60be92 100644
+--- a/src/hooks/context-window-monitor.ts
++++ b/src/hooks/context-window-monitor.ts
+@@ -65,8 +65,15 @@ export function createContextWindowMonitorHook(
+ 
+     remindedSessions.add(sessionID)
+ 
+-    const usedPct = (actualUsagePercentage * 100).toFixed(1)
+-    const remainingPct = ((1 - actualUsagePercentage) * 100).toFixed(1)
++    // Clamp the displayed percentages so the block stays trustworthy when the
++    // resolved actualLimit underestimates the model's real context window
++    // (e.g. a 1M-context Anthropic model that falls back to the 200K default).
++    // Without clamping, the block would advertise >100% used and a negative
++    // "remaining" - safety-tuned models flag exactly that pattern as a prompt
++    // injection and refuse to follow the directive (issue #3655).
++    const clampedPercentage = Math.min(Math.max(actualUsagePercentage, 0), 1)
++    const usedPct = (clampedPercentage * 100).toFixed(1)
++    const remainingPct = ((1 - clampedPercentage) * 100).toFixed(1)
+     const usedTokens = totalInputTokens.toLocaleString()
+     const limitTokens = actualLimit.toLocaleString()
+ 
+-- 
+2.39.2
+

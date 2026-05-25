@@ -1,0 +1,507 @@
+From 51d2f8b3e989abcc20b6f0ce3ef277523c1ecb00 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 4 Apr 2026 18:48:03 +0900
+Subject: [PATCH 3863/5749] fix(tmux-subagent): avoid transcript fetches during
+ idle stability checks
+
+---
+ .../background-agent/manager.polling.test.ts  | 37 ++++++++
+ src/features/background-agent/manager.ts      | 35 ++++++-
+ src/features/tmux-subagent/manager.ts         |  4 +
+ .../tmux-subagent/polling-manager.test.ts     | 51 ++++++++++
+ src/features/tmux-subagent/polling-manager.ts | 92 ++++++++++++-------
+ .../tmux-subagent/tracked-session-state.ts    |  1 +
+ src/features/tmux-subagent/types.ts           |  2 +
+ .../background-notification/hook.test.ts      | 23 +++++
+ src/hooks/background-notification/hook.ts     |  1 +
+ src/plugin/event.test.ts                      | 38 ++++++++
+ src/plugin/event.ts                           | 11 +++
+ 11 files changed, 258 insertions(+), 37 deletions(-)
+
+diff --git a/src/features/background-agent/manager.polling.test.ts b/src/features/background-agent/manager.polling.test.ts
+index 3da72393..6b3a38f9 100644
+--- a/src/features/background-agent/manager.polling.test.ts
++++ b/src/features/background-agent/manager.polling.test.ts
+@@ -238,6 +238,43 @@ describe("BackgroundManager pollRunningTasks", () => {
+       expect(task.status).toBe("completed")
+       expect(messagesCallCount).toBe(0)
+     })
++
++    test("#when todo state was already observed from events #then it completes without fetching todos", async () => {
++      //#given
++      let todoCallCount = 0
++      const manager = createManagerWithClient({
++        status: async () => ({ data: { "ses-idle-todo-cached": { type: "idle" } } }),
++        todo: async () => {
++          todoCallCount += 1
++          return { data: [] }
++        },
++      })
++      const task = createRunningTask("ses-idle-todo-cached")
++      injectTask(manager, task)
++
++      manager.handleEvent({
++        type: "message.part.updated",
++        properties: { sessionID: "ses-idle-todo-cached", type: "text" },
++      })
++      manager.handleEvent({
++        type: "todo.updated",
++        properties: {
++          sessionID: "ses-idle-todo-cached",
++          todos: [
++            { id: "todo-1", content: "done", status: "completed", priority: "high" },
++          ],
++        },
++      })
++
++      //#when
++      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      await poll.call(manager)
++      manager.shutdown()
++
++      //#then
++      expect(task.status).toBe("completed")
++      expect(todoCallCount).toBe(0)
++    })
+   })
+ 
+   describe("#given a running task whose session status is busy", () => {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index f9ec1715..b66659ab 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -160,6 +160,7 @@ export class BackgroundManager {
+   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
+   private observedOutputSessions: Set<string> = new Set()
++  private observedIncompleteTodosBySession: Map<string, boolean> = new Map()
+   private rootDescendantCounts: Map<string, number>
+   private preStartDescendantReservations: Set<string>
+   private enableParentSessionNotifications: boolean
+@@ -882,17 +883,27 @@ export class BackgroundManager {
+   }
+ 
+   private async checkSessionTodos(sessionID: string): Promise<boolean> {
++    const observedIncompleteTodos = this.observedIncompleteTodosBySession.get(sessionID)
++    if (observedIncompleteTodos !== undefined) {
++      return observedIncompleteTodos
++    }
++
+     try {
+       const response = await this.client.session.todo({
+         path: { id: sessionID },
+       })
+       const todos = normalizeSDKResponse(response, [] as Todo[], { preferResponseOnMissingData: true })
+-      if (!todos || todos.length === 0) return false
++      if (!todos || todos.length === 0) {
++        this.observedIncompleteTodosBySession.set(sessionID, false)
++        return false
++      }
+ 
+       const incomplete = todos.filter(
+         (t) => t.status !== "completed" && t.status !== "cancelled"
+       )
+-      return incomplete.length > 0
++      const hasIncompleteTodos = incomplete.length > 0
++      this.observedIncompleteTodosBySession.set(sessionID, hasIncompleteTodos)
++      return hasIncompleteTodos
+     } catch (error) {
+       log("[background-agent] Failed to check session todos:", {
+         sessionID,
+@@ -910,6 +921,10 @@ export class BackgroundManager {
+     this.observedOutputSessions.delete(sessionID)
+   }
+ 
++  private clearSessionTodoObservation(sessionID: string): void {
++    this.observedIncompleteTodosBySession.delete(sessionID)
++  }
++
+   private hasOutputSignalFromPart(partInfo: MessagePartInfo | undefined): boolean {
+     if (!partInfo?.sessionID) return false
+     if (partInfo.tool) return true
+@@ -1047,6 +1062,20 @@ export class BackgroundManager {
+       }
+     }
+ 
++    if (event.type === "todo.updated") {
++      const sessionID = typeof props?.sessionID === "string" ? props.sessionID : undefined
++      const todos = Array.isArray(props?.todos) ? props.todos : undefined
++      if (!sessionID || !todos) return
++
++      const hasIncompleteTodos = todos.some((todo) => {
++        if (!todo || typeof todo !== "object") return false
++        const status = (todo as { status?: unknown }).status
++        return status !== "completed" && status !== "cancelled"
++      })
++      this.observedIncompleteTodosBySession.set(sessionID, hasIncompleteTodos)
++      return
++    }
++
+     if (event.type === "session.idle") {
+       if (!props || typeof props !== "object") return
+       handleSessionIdleBackgroundEvent({
+@@ -1091,6 +1120,7 @@ export class BackgroundManager {
+       if (!info || typeof info.id !== "string") return
+       const sessionID = info.id
+       this.clearSessionOutputObserved(sessionID)
++      this.clearSessionTodoObservation(sessionID)
+ 
+       const tasksToCancel = new Map<string, BackgroundTask>()
+       const directTask = this.findBySession(sessionID)
+@@ -1250,6 +1280,7 @@ export class BackgroundManager {
+     return result.then((retried) => {
+       if (retried && previousSessionID) {
+         this.clearSessionOutputObserved(previousSessionID)
++        this.clearSessionTodoObservation(previousSessionID)
+         subagentSessions.delete(previousSessionID)
+       }
+       return retried
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index 2b688d99..7bab2d21 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -923,6 +923,10 @@ export class TmuxSessionManager {
+     }
+   }
+ 
++  onEvent(event: { type: string; properties?: Record<string, unknown> }): void {
++    this.pollingManager.handleEvent(event)
++  }
++
+   createEventHandler(): (input: { event: { type: string; properties?: unknown } }) => Promise<void> {
+     return async (input) => {
+       await this.onSessionCreated(input.event as SessionCreatedEvent)
+diff --git a/src/features/tmux-subagent/polling-manager.test.ts b/src/features/tmux-subagent/polling-manager.test.ts
+index 11781d23..060ee23f 100644
+--- a/src/features/tmux-subagent/polling-manager.test.ts
++++ b/src/features/tmux-subagent/polling-manager.test.ts
+@@ -55,4 +55,55 @@ describe("TmuxPollingManager overlap", () => {
+     expect(maxActiveCalls).toBe(1)
+     expect(statusCallCount).toBe(1)
+   })
++
++  test("closes stable idle sessions without fetching full messages when activity was already observed from events", async () => {
++    //#given
++    const sessions = new Map<string, TrackedSession>()
++    sessions.set("ses-1", {
++      sessionId: "ses-1",
++      paneId: "%1",
++      description: "test",
++      createdAt: new Date(Date.now() - 15_000),
++      lastSeenAt: new Date(),
++      closePending: false,
++      closeRetryCount: 0,
++      activityVersion: 0,
++    })
++
++    let messagesCallCount = 0
++    const closedSessionIds: string[] = []
++    const client = {
++      session: {
++        status: async () => ({ data: { "ses-1": { type: "idle" } } }),
++        messages: async () => {
++          messagesCallCount += 1
++          return { data: [] }
++        },
++      },
++    }
++
++    const manager = new TmuxPollingManager(
++      client as unknown as import("../../tools/delegate-task/types").OpencodeClient,
++      sessions,
++      async (sessionId) => {
++        closedSessionIds.push(sessionId)
++      },
++    )
++
++    manager.handleEvent({
++      type: "message.part.delta",
++      properties: { sessionID: "ses-1", field: "text", delta: "done" },
++    })
++
++    //#when
++    const pollSessions = (manager as unknown as { pollSessions: () => Promise<void> }).pollSessions
++    await pollSessions.call(manager)
++    await pollSessions.call(manager)
++    await pollSessions.call(manager)
++    await pollSessions.call(manager)
++
++    //#then
++    expect(messagesCallCount).toBe(0)
++    expect(closedSessionIds).toEqual(["ses-1"])
++  })
+ })
+diff --git a/src/features/tmux-subagent/polling-manager.ts b/src/features/tmux-subagent/polling-manager.ts
+index 5cbb45b8..d7a972d4 100644
+--- a/src/features/tmux-subagent/polling-manager.ts
++++ b/src/features/tmux-subagent/polling-manager.ts
+@@ -19,6 +19,16 @@ export class TmuxPollingManager {
+     private closeSessionById: (sessionId: string) => Promise<void>
+   ) {}
+ 
++  handleEvent(event: { type: string; properties?: Record<string, unknown> }): void {
++    const sessionId = this.getEventSessionId(event)
++    if (!sessionId) return
++
++    const tracked = this.sessions.get(sessionId)
++    if (!tracked) return
++
++    tracked.activityVersion = (tracked.activityVersion ?? 0) + 1
++  }
++
+   startPolling(): void {
+     if (this.pollInterval) return
+ 
+@@ -73,42 +83,29 @@ export class TmuxPollingManager {
+         let shouldCloseViaStability = false
+ 
+         if (isIdle && elapsedMs >= MIN_STABILITY_TIME_MS) {
+-          try {
+-            const messagesResult = await this.client.session.messages({ 
+-              path: { id: sessionId } 
+-            })
+-            const currentMsgCount = Array.isArray(messagesResult.data) 
+-              ? messagesResult.data.length 
+-              : 0
+-
+-            if (tracked.lastMessageCount === currentMsgCount) {
+-              tracked.stableIdlePolls = (tracked.stableIdlePolls ?? 0) + 1
+-              
+-              if (tracked.stableIdlePolls >= STABLE_POLLS_REQUIRED) {
+-                const recheckResult = await this.client.session.status({ path: undefined })
+-                const recheckStatuses = normalizeSDKResponse(recheckResult, {} as Record<string, { type: string }>)
+-                const recheckStatus = recheckStatuses[sessionId]
+-                
+-                if (recheckStatus?.type === "idle") {
+-                  shouldCloseViaStability = true
+-                } else {
+-                  tracked.stableIdlePolls = 0
+-                  log("[tmux-session-manager] stability reached but session not idle on recheck, resetting", {
+-                    sessionId,
+-                    recheckStatus: recheckStatus?.type,
+-                  })
+-                }
++          const activityVersion = tracked.activityVersion ?? 0
++
++          if (tracked.observedIdleActivityVersion === activityVersion) {
++            tracked.stableIdlePolls = (tracked.stableIdlePolls ?? 0) + 1
++
++            if (tracked.stableIdlePolls >= STABLE_POLLS_REQUIRED) {
++              const recheckResult = await this.client.session.status({ path: undefined })
++              const recheckStatuses = normalizeSDKResponse(recheckResult, {} as Record<string, { type: string }>)
++              const recheckStatus = recheckStatuses[sessionId]
++
++              if (recheckStatus?.type === "idle") {
++                shouldCloseViaStability = true
++              } else {
++                tracked.stableIdlePolls = 0
++                log("[tmux-session-manager] stability reached but session not idle on recheck, resetting", {
++                  sessionId,
++                  recheckStatus: recheckStatus?.type,
++                })
+               }
+-            } else {
+-              tracked.stableIdlePolls = 0
+             }
+-            
+-            tracked.lastMessageCount = currentMsgCount
+-          } catch (msgErr) {
+-            log("[tmux-session-manager] failed to fetch messages for stability check", {
+-              sessionId,
+-              error: String(msgErr),
+-            })
++          } else {
++            tracked.stableIdlePolls = 0
++            tracked.observedIdleActivityVersion = activityVersion
+           }
+         } else if (!isIdle) {
+           tracked.stableIdlePolls = 0
+@@ -120,7 +117,8 @@ export class TmuxPollingManager {
+           isIdle,
+           elapsedMs,
+           stableIdlePolls: tracked.stableIdlePolls,
+-          lastMessageCount: tracked.lastMessageCount,
++          activityVersion: tracked.activityVersion,
++          observedIdleActivityVersion: tracked.observedIdleActivityVersion,
+           missingSince,
+           missingTooLong,
+           isTimedOut,
+@@ -142,4 +140,28 @@ export class TmuxPollingManager {
+       this.pollingInFlight = false
+     }
+   }
++
++  private getEventSessionId(event: { type: string; properties?: Record<string, unknown> }): string | undefined {
++    const properties = event.properties
++    if (!properties) return undefined
++
++    if (event.type === "message.updated") {
++      const info = properties.info
++      if (!info || typeof info !== "object") return undefined
++      const sessionId = (info as { sessionID?: unknown }).sessionID
++      return typeof sessionId === "string" ? sessionId : undefined
++    }
++
++    if (
++      event.type === "message.part.updated"
++      || event.type === "message.part.delta"
++      || event.type === "message.part.removed"
++      || event.type === "message.removed"
++    ) {
++      const sessionId = properties.sessionID
++      return typeof sessionId === "string" ? sessionId : undefined
++    }
++
++    return undefined
++  }
+ }
+diff --git a/src/features/tmux-subagent/tracked-session-state.ts b/src/features/tmux-subagent/tracked-session-state.ts
+index 87ba19f5..9bcf9467 100644
+--- a/src/features/tmux-subagent/tracked-session-state.ts
++++ b/src/features/tmux-subagent/tracked-session-state.ts
+@@ -16,6 +16,7 @@ export function createTrackedSession(params: {
+     lastSeenAt: now,
+     closePending: false,
+     closeRetryCount: 0,
++    activityVersion: 0,
+   }
+ }
+ 
+diff --git a/src/features/tmux-subagent/types.ts b/src/features/tmux-subagent/types.ts
+index 15d47ab8..db8f88d6 100644
+--- a/src/features/tmux-subagent/types.ts
++++ b/src/features/tmux-subagent/types.ts
+@@ -9,6 +9,8 @@ export interface TrackedSession {
+   // Stability detection fields (prevents premature closure)
+   lastMessageCount?: number
+   stableIdlePolls?: number
++  activityVersion?: number
++  observedIdleActivityVersion?: number
+ }
+ 
+ export const MIN_PANE_WIDTH = 52
+diff --git a/src/hooks/background-notification/hook.test.ts b/src/hooks/background-notification/hook.test.ts
+index c8566a39..f32ce14c 100644
+--- a/src/hooks/background-notification/hook.test.ts
++++ b/src/hooks/background-notification/hook.test.ts
+@@ -34,4 +34,27 @@ describe("createBackgroundNotificationHook", () => {
+     //#then
+     expect(handleEvent).toHaveBeenCalledWith(event)
+   })
++
++  test("#given todo.updated event #when event handler runs #then it forwards to manager", async () => {
++    //#given
++    const handleEvent = mock(() => {})
++    const hook = createBackgroundNotificationHook({
++      handleEvent,
++      injectPendingNotificationsIntoChatMessage: () => {},
++    } as never)
++
++    const event = {
++      type: "todo.updated",
++      properties: {
++        sessionID: "ses-1",
++        todos: [{ id: "todo-1", content: "done", status: "completed", priority: "high" }],
++      },
++    }
++
++    //#when
++    await hook.event({ event })
++
++    //#then
++    expect(handleEvent).toHaveBeenCalledWith(event)
++  })
+ })
+diff --git a/src/hooks/background-notification/hook.ts b/src/hooks/background-notification/hook.ts
+index e52b7beb..0e31ba36 100644
+--- a/src/hooks/background-notification/hook.ts
++++ b/src/hooks/background-notification/hook.ts
+@@ -21,6 +21,7 @@ const FORWARDED_EVENT_TYPES = new Set([
+   "message.updated",
+   "message.part.updated",
+   "message.part.delta",
++  "todo.updated",
+   "session.idle",
+   "session.error",
+   "session.deleted",
+diff --git a/src/plugin/event.test.ts b/src/plugin/event.test.ts
+index 3f8e909a..81addf3b 100644
+--- a/src/plugin/event.test.ts
++++ b/src/plugin/event.test.ts
+@@ -447,6 +447,44 @@ afterEach(() => {
+ })
+ 
+ describe("createEventHandler - event forwarding", () => {
++	it("forwards message activity events to tmux session manager", async () => {
++		//#given
++		const forwardedEvents: EventInput[] = []
++		const eventHandler = createEventHandler({
++			ctx: asEventHandlerContext({}),
++			pluginConfig: asPluginConfig({}),
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: createEventHandlerManagers({
++				skillMcpManager: {
++					disconnectSession: async () => {},
++				},
++				tmuxSessionManager: {
++					onEvent: (event: EventInput["event"]) => {
++						forwardedEvents.push({ event })
++					},
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++				},
++			}),
++			hooks: createEventHandlerHooks({}),
++		})
++
++		//#when
++		await eventHandler(asEventHandlerInput({
++			event: {
++				type: "message.part.delta",
++				properties: { sessionID: "ses_tmux_activity", field: "text", delta: "x" },
++			},
++		}))
++
++		//#then
++		expect(forwardedEvents.length).toBe(1)
++		expect(forwardedEvents[0]?.event.type).toBe("message.part.delta")
++	})
++
+ 	it("forwards session.deleted to write-existing-file-guard hook", async () => {
+ 		//#given
+ 		const forwardedEvents: EventInput[] = []
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 594f8291..f5794793 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -265,6 +265,13 @@ export function createEventHandler(args: {
+   const recentSyntheticIdles = new Map<string, number>();
+   const recentRealIdles = new Map<string, number>();
+   const DEDUP_WINDOW_MS = 500;
++  const TMUX_ACTIVITY_EVENT_TYPES = new Set([
++    "message.updated",
++    "message.part.updated",
++    "message.part.delta",
++    "message.part.removed",
++    "message.removed",
++  ]);
+ 
+   const shouldAutoRetrySession = (sessionID: string): boolean => {
+     if (syncSubagentSessions.has(sessionID)) return true;
+@@ -337,6 +344,10 @@ export function createEventHandler(args: {
+     const { event } = input;
+     const props = event.properties as Record<string, unknown> | undefined;
+ 
++    if (TMUX_ACTIVITY_EVENT_TYPES.has(event.type)) {
++      managers.tmuxSessionManager.onEvent?.(event as { type: string; properties?: Record<string, unknown> });
++    }
++
+     if (event.type === "session.created") {
+       const sessionInfo = props?.info as { id?: string; title?: string; parentID?: string } | undefined;
+ 
+-- 
+2.39.2
+

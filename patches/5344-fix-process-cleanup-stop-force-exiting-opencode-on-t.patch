@@ -1,0 +1,410 @@
+From 4d417a33b6951d3194802dcf102e6094af79e799 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 15:11:44 +0900
+Subject: [PATCH 5344/5749] fix(process-cleanup): stop force-exiting opencode
+ on transient unhandled errors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause of the user-visible `/init-deep ulw` hang (session
+`ses_1cb9c3013ffesUOy5H3QOIya4K`): the plugin's `unhandledRejection` and
+`uncaughtException` listeners were calling
+`scheduleForcedExit(handler(error), 1, true)`, which both ran the entire
+`cleanupAll()` chain (BackgroundManager shutdown, tmux pane closure,
+team-mode teardown) and then `process.exit(1)`'d the host. Under heavy
+slash commands like `/init-deep ultrafucking deep`, a single mid-stream
+error (e.g. opencode's own `session.processor` Aborted-process condition,
+or a transient socket reset) would:
+
+  1. trigger the listener,
+  2. abort the in-flight background tasks (`session.error
+     MessageAbortedError` for both child sessions in the log),
+  3. close the tmux panes the user was watching,
+  4. immediately kill the host via `process.exit(1)`.
+
+From the user's seat that looked like a frozen TUI, which is what they
+reported as "ulw 여전히 멈추는데". The error blob also logged as `{}`
+because `JSON.stringify(new Error(...))` strips non-enumerable Error
+fields, so the previous log line carried no diagnostic value.
+
+This change makes the global `uncaughtException` / `unhandledRejection`
+listeners log-only:
+
+* New `describeProcessCleanupError()` extracts `{name, message, stack}`
+  from Error instances, falls back to a structured `{raw: ...}` payload
+  for plain objects / primitives, so the log now actually says what
+  failed.
+* `registerErrorEvent()` no longer runs cleanup and no longer calls
+  `scheduleForcedExit`. It detaches itself, logs a single explanatory
+  line, and returns. Bun's default crash behaviour is already suppressed
+  for these events when a listener is present, so the host now genuinely
+  survives transient streaming errors instead of being killed by our
+  own helper.
+* Signal handlers (`SIGINT` / `SIGTERM` / `SIGBREAK` / `beforeExit` /
+  `exit`) keep their existing behaviour and still run `cleanupAll()`
+  before the host terminates — that is now the only path that tears
+  down background tasks and tmux panes.
+
+Tests are updated to lock in the new contract:
+
+* New regression `#given scheduleForcedExit enabled AND unhandledRejection
+  fires #when the listener runs #then process.exit is NOT called AND
+  process.exitCode stays 0 AND no cleanup runs` (and the
+  uncaughtException twin) re-enables `scheduleForcedExit`, spies on
+  `process.exit` plus `globalThis.setTimeout`, and asserts none of them
+  are touched. Without the fix this test failed exactly like the
+  observed hang (exit called once, exitCode set to 1).
+* The existing "manager shuts down before process exits" tests are
+  rewritten to assert the opposite: cleanup is NOT invoked from the
+  error path.
+* A complementary `'exit'` listener test pins the real shutdown
+  contract (`exit` event still triggers `cleanupAll`).
+* A new `#given describeProcessCleanupError` block covers the four
+  shapes (Error, plain object with own fields, empty object, primitive).
+* The unregister assertion is tightened to check the listener count
+  drops back to baseline (previously it relied on a side effect of the
+  old cleanup-on-error path).
+
+Manual QA: `bun /tmp/process-cleanup-smoke-test.ts` (out-of-tree smoke
+driver) emits five back-to-back unhandledRejection/uncaughtException
+events with various payload shapes and prints
+`SMOKE_TEST_OK survived 5 emissions; exitCode=0; shutdownInvocations=0`,
+confirming the host survives and no spurious cleanup runs.
+
+`bun test` runs green for the affected modules:
+  - src/features/background-agent (528 tests)
+  - src/create-managers + src/plugin (218 tests)
+  - src/hooks/{unstable-agent-babysitter,ralph-loop,keyword-detector}
+    (225 tests)
+---
+ .../background-agent/process-cleanup.test.ts  | 136 ++++++++++++++++--
+ .../background-agent/process-cleanup.ts       |  79 +++++++---
+ 2 files changed, 185 insertions(+), 30 deletions(-)
+
+diff --git a/src/features/background-agent/process-cleanup.test.ts b/src/features/background-agent/process-cleanup.test.ts
+index ebe142c4..f8d09be0 100644
+--- a/src/features/background-agent/process-cleanup.test.ts
++++ b/src/features/background-agent/process-cleanup.test.ts
+@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test }
+ 
+ import {
+   _resetForTesting,
++  describeProcessCleanupError,
+   registerManagerForCleanup,
+   unregisterManagerForCleanup,
+   __disableScheduledForcedExitForTesting,
+@@ -155,7 +156,10 @@ describe("#given process cleanup registration", () => {
+       expect(process.listeners("SIGINT")).toHaveLength(sigintListenersAfterFirstRegistration)
+     })
+ 
+-    test("#given two managers registered #when uncaughtException fires #then both shutdowns called", async () => {
++    test("#given two managers registered #when uncaughtException fires #then neither shutdown runs because the listener is log-only", async () => {
++      // Updated behavior: error events are log-only so a transient host error
++      // cannot tear down active background tasks. Real cleanup remains gated
++      // on SIGINT / SIGTERM / SIGBREAK / beforeExit / exit handlers.
+       const exitSpy = spyOn(process, "exit").mockImplementation((() => undefined) as never)
+       const shutdownOne = mock(() => {})
+       const shutdownTwo = mock(() => {})
+@@ -170,8 +174,8 @@ describe("#given process cleanup registration", () => {
+         process.emit("uncaughtException", new Error("boom"))
+         await flushMicrotasks()
+ 
+-        expect(shutdownOne).toHaveBeenCalledTimes(1)
+-        expect(shutdownTwo).toHaveBeenCalledTimes(1)
++        expect(shutdownOne).not.toHaveBeenCalled()
++        expect(shutdownTwo).not.toHaveBeenCalled()
+       } finally {
+         exitSpy.mockRestore()
+       }
+@@ -216,7 +220,7 @@ describe("#given process cleanup registration", () => {
+       expect(removedManagerShutdown).not.toHaveBeenCalled()
+     })
+ 
+-    test("#given uncaughtException handler registered #when manager is unregistered via unregisterManagerForCleanup #then subsequent events do not invoke that manager", () => {
++    test("#given uncaughtException handler registered #when manager is unregistered via unregisterManagerForCleanup #then the global listener is removed AND emits no longer reach this plugin", () => {
+       const uncaughtExceptionListenersBefore = process.listeners("uncaughtException")
+       const shutdown = mock(() => {})
+       const manager = { shutdown }
+@@ -229,8 +233,12 @@ describe("#given process cleanup registration", () => {
+ 
+       unregisterManagerForCleanup(manager)
+       registeredManagers.length = 0
+-      process.emit("uncaughtException", new Error("boom"))
+ 
++      expect(process.listeners("uncaughtException")).toHaveLength(
++        uncaughtExceptionListenersBefore.length,
++      )
++
++      process.emit("uncaughtException", new Error("boom"))
+       expect(shutdown).not.toHaveBeenCalled()
+     })
+   })
+@@ -333,7 +341,7 @@ describe("#given process cleanup registration", () => {
+   })
+ 
+   describe("#given uncaught exception and rejection cleanup", () => {
+-    test("#given manager registered AND process emits uncaughtException #when event fires #then manager shuts down before process exits", async () => {
++    test("#given manager registered AND process emits uncaughtException #when event fires #then manager shutdown is NOT invoked because the listener is log-only", async () => {
+       const exitSpy = spyOn(process, "exit").mockImplementation((() => undefined) as never)
+       const shutdown = mock(() => {})
+       const manager = { shutdown }
+@@ -345,15 +353,13 @@ describe("#given process cleanup registration", () => {
+         process.emit("uncaughtException", new Error("boom"))
+         await flushMicrotasks()
+ 
+-        expect(shutdown).toHaveBeenCalledTimes(1)
+-        // exitSpy check skipped: scheduleForcedExit is disabled in tests to prevent
+-        // process.exitCode from contaminating the bun test runner exit code.
++        expect(shutdown).not.toHaveBeenCalled()
+       } finally {
+         exitSpy.mockRestore()
+       }
+     })
+ 
+-    test("#given manager registered AND process emits unhandledRejection #when event fires #then manager shuts down before process exits", async () => {
++    test("#given manager registered AND process emits unhandledRejection #when event fires #then manager shutdown is NOT invoked because the listener is log-only", async () => {
+       const exitSpy = spyOn(process, "exit").mockImplementation((() => undefined) as never)
+       const shutdown = mock(() => {})
+       const manager = { shutdown }
+@@ -365,14 +371,83 @@ describe("#given process cleanup registration", () => {
+         process.emit("unhandledRejection", new Error("boom"), Promise.resolve())
+         await flushMicrotasks()
+ 
+-        expect(shutdown).toHaveBeenCalledTimes(1)
+-        // exitSpy check skipped: scheduleForcedExit is disabled in tests to prevent
+-        // process.exitCode from contaminating the bun test runner exit code.
++        expect(shutdown).not.toHaveBeenCalled()
+       } finally {
+         exitSpy.mockRestore()
+       }
+     })
+ 
++    test("#given scheduleForcedExit enabled AND unhandledRejection fires #when the listener runs #then process.exit is NOT called AND process.exitCode stays 0 AND no cleanup runs", async () => {
++      // Regression guard for `/init-deep ulw` hang: a transient unhandled
++      // promise rejection (e.g. opencode's own session.processor aborting
++      // mid-stream) MUST NOT force-kill the host opencode process and MUST
++      // NOT tear down active background tasks. The listener is log-only;
++      // real shutdown stays on SIGINT / SIGTERM / SIGBREAK / beforeExit /
++      // exit.
++      const exitSpy = spyOn(process, "exit").mockImplementation((() => undefined) as never)
++      const setTimeoutSpy = spyOn(globalThis, "setTimeout")
++      const shutdown = mock(() => {})
++      const manager = { shutdown }
++      registeredManagers.push(manager)
++      __enableScheduledForcedExitForTesting()
++
++      try {
++        registerManagerForCleanup(manager)
++
++        process.emit("unhandledRejection", new Error("transient streaming rejection"), Promise.resolve())
++        await flushMicrotasks()
++
++        expect(shutdown).not.toHaveBeenCalled()
++        expect(exitSpy).not.toHaveBeenCalled()
++        expect(setTimeoutSpy).not.toHaveBeenCalled()
++        expect(process.exitCode).toBe(0)
++      } finally {
++        exitSpy.mockRestore()
++        setTimeoutSpy.mockRestore()
++        __disableScheduledForcedExitForTesting()
++        process.exitCode = 0
++      }
++    })
++
++    test("#given scheduleForcedExit enabled AND uncaughtException fires #when the listener runs #then process.exit is NOT called AND process.exitCode stays 0 AND no cleanup runs", async () => {
++      const exitSpy = spyOn(process, "exit").mockImplementation((() => undefined) as never)
++      const setTimeoutSpy = spyOn(globalThis, "setTimeout")
++      const shutdown = mock(() => {})
++      const manager = { shutdown }
++      registeredManagers.push(manager)
++      __enableScheduledForcedExitForTesting()
++
++      try {
++        registerManagerForCleanup(manager)
++
++        process.emit("uncaughtException", new Error("transient stream error"))
++        await flushMicrotasks()
++
++        expect(shutdown).not.toHaveBeenCalled()
++        expect(exitSpy).not.toHaveBeenCalled()
++        expect(setTimeoutSpy).not.toHaveBeenCalled()
++        expect(process.exitCode).toBe(0)
++      } finally {
++        exitSpy.mockRestore()
++        setTimeoutSpy.mockRestore()
++        __disableScheduledForcedExitForTesting()
++        process.exitCode = 0
++      }
++    })
++
++    test("#given a manager registered AND process emits 'exit' #then cleanup still runs (signal path remains the real shutdown gate)", () => {
++      const exitListenersBefore = process.listeners("exit")
++      const shutdown = mock(() => {})
++      const manager = { shutdown }
++      registeredManagers.push(manager)
++
++      registerManagerForCleanup(manager)
++      const exitListener = getNewListener("exit", exitListenersBefore)
++      exitListener()
++
++      expect(shutdown).toHaveBeenCalledTimes(1)
++    })
++
+     test("#given _resetForTesting() called #when event fires #then no cleanup runs", () => {
+       const uncaughtExceptionListenersBefore = process.listeners("uncaughtException")
+       const shutdown = mock(() => {})
+@@ -429,4 +504,39 @@ describe("#given process cleanup registration", () => {
+       expect(reentrantShutdown.mock.calls.length).toBeLessThanOrEqual(1)
+     })
+   })
++
++  describe("#given describeProcessCleanupError", () => {
++    test("#given an Error object #when serialized #then name, message and stack are preserved", () => {
++      const error = new TypeError("transient stream failure")
++
++      const describe = describeProcessCleanupError(error)
++
++      expect(describe).toMatchObject({
++        name: "TypeError",
++        message: "transient stream failure",
++      })
++      expect(typeof describe.stack).toBe("string")
++      expect(JSON.stringify(describe)).not.toBe("{}")
++    })
++
++    test("#given a plain object with own enumerable fields #when serialized #then JSON of the object is captured", () => {
++      const error = { code: "ENOENT", path: "/tmp/missing" }
++
++      const describe = describeProcessCleanupError(error)
++
++      expect(describe).toEqual({ raw: '{"code":"ENOENT","path":"/tmp/missing"}' })
++    })
++
++    test("#given an empty plain object #when serialized #then fallback to String(error) so '{}' never disappears silently", () => {
++      const describe = describeProcessCleanupError({})
++
++      expect(describe).toEqual({ raw: "[object Object]" })
++    })
++
++    test("#given a primitive error value #when serialized #then String form is captured", () => {
++      expect(describeProcessCleanupError("oops")).toEqual({ raw: "oops" })
++      expect(describeProcessCleanupError(undefined)).toEqual({ raw: "undefined" })
++      expect(describeProcessCleanupError(null)).toEqual({ raw: "null" })
++    })
++  })
+ })
+diff --git a/src/features/background-agent/process-cleanup.ts b/src/features/background-agent/process-cleanup.ts
+index 220b6987..0008509e 100644
+--- a/src/features/background-agent/process-cleanup.ts
++++ b/src/features/background-agent/process-cleanup.ts
+@@ -4,15 +4,20 @@ type ProcessCleanupSignal = NodeJS.Signals | "beforeExit" | "exit"
+ type ProcessCleanupErrorEvent = "uncaughtException" | "unhandledRejection"
+ 
+ /**
+- * When set to a truthy value (1/true/yes/on), suppresses the global
+- * uncaughtException / unhandledRejection handlers that force-exit the host
+- * process. Use this when the plugin is installed but background-agent tasks
+- * are not actively in use, to avoid OpenCode dying on transient streaming
+- * errors propagated as unhandled rejections (see issue #3856).
++ * When set to a truthy value (1/true/yes/on), skips registering the global
++ * uncaughtException / unhandledRejection log listeners entirely.
++ *
++ * The listeners are log-only by default and no longer force-exit the host
++ * (originally a fix for issue #3856 that previously turned every transient
++ * streaming rejection into a `process.exit(1)`; reverified during the ulw
++ * `/init-deep` hang investigation that motivated the log-only rewrite).
++ * Setting this env var still makes the plugin silent on those events; leave
++ * it unset whenever you want the diagnostic line and the `name/message/stack`
++ * payload from `describeProcessCleanupError`.
+  *
+  * Signal handlers (SIGINT/SIGTERM/SIGBREAK/beforeExit/exit) remain registered
+- * because they are needed for graceful shutdown of any in-flight cleanup
+- * targets that were registered before the user noticed the issue.
++ * because they are the real shutdown path and run `cleanupAll()` before the
++ * host actually terminates.
+  */
+ const PROCESS_CLEANUP_DISABLE_ENV = "OMO_DISABLE_PROCESS_CLEANUP"
+ const TRUTHY_ENV_VALUES = new Set(["1", "true", "yes", "on"])
+@@ -67,19 +72,59 @@ function registerProcessSignal(
+   return listener
+ }
+ 
++/** @internal test-only seam: exposes the error normalizer used by registerErrorEvent. */
++export function describeProcessCleanupError(error: unknown): Record<string, unknown> {
++  if (error instanceof Error) {
++    return {
++      name: error.name,
++      message: error.message,
++      stack: error.stack,
++    }
++  }
++  if (typeof error === "object" && error !== null) {
++    try {
++      const json = JSON.stringify(error)
++      if (json !== "{}") return { raw: json }
++    } catch {
++    }
++    return { raw: String(error) }
++  }
++  return { raw: String(error) }
++}
++
+ function registerErrorEvent(
+   signal: ProcessCleanupErrorEvent,
+-  handler: (error: unknown) => void | Promise<void>
+ ): (error: unknown) => void {
++  // Log-only listener. We deliberately DO NOT run cleanup or force-exit on
++  // transient errors.
++  //
++  // History: earlier this listener invoked `scheduleForcedExit(handler(error),
++  // 1, true)` so every unhandled promise rejection ran the registered cleanup
++  // (BackgroundManager shutdown, tmux pane closure, team-mode teardown) and
++  // then `process.exit(1)`'d the host. With OpenCode bundled under Bun, our
++  // listener already suppresses the default crash behavior, so the host was
++  // surviving the error itself but we were tearing it down ourselves. During
++  // heavy slash commands like `/init-deep` running in ulw mode that turned a
++  // single transient streaming error (e.g. a mid-stream socket reset or
++  // `session.processor` Aborted-process condition) into a frozen TUI for the
++  // user.
++  //
++  // The signal handlers (SIGINT / SIGTERM / SIGBREAK / beforeExit / exit)
++  // still cover real shutdown paths and run `cleanupAll()` before process
++  // termination. `exit` in particular fires for every controlled exit
++  // regardless of cause, so cleanup is not skipped when the host genuinely
++  // dies.
++  //
++  // We still detach the listener before logging so a re-emit from inside
++  // `log()` (e.g. EPIPE while writing to a broken pipe during shutdown)
++  // cannot recurse and produce the 100+ GB log explosion that #3856-era
++  // regressions caused.
+   const listener = (error: unknown) => {
+-    // Detach before running the body so a re-emit from inside log()/handler()
+-    // (e.g. EPIPE while closing a broken pipe during shutdown) cannot recurse.
+-    // Prior behavior: the listener re-entered itself, re-logged, re-ran cleanup,
+-    // and threw EPIPE again — an unbounded loop that filled disks with 100+ GB
+-    // of log lines in minutes before the 6 s forced-exit timer could fire.
+     process.off(signal, listener)
+-    log(`[background-agent] ${signal} received during shutdown cleanup:`, error)
+-    scheduleForcedExit(handler(error), 1, true)
++    log(
++      `[background-agent] ${signal} observed; keeping host alive and skipping cleanup (signal handlers run on real shutdown)`,
++      describeProcessCleanupError(error),
++    )
+   }
+   process.on(signal, listener)
+   return listener
+@@ -145,8 +190,8 @@ export function registerManagerForCleanup(manager: CleanupTarget): void {
+     return
+   }
+ 
+-  cleanupErrorHandlers.set("uncaughtException", registerErrorEvent("uncaughtException", cleanupAll))
+-  cleanupErrorHandlers.set("unhandledRejection", registerErrorEvent("unhandledRejection", cleanupAll))
++  cleanupErrorHandlers.set("uncaughtException", registerErrorEvent("uncaughtException"))
++  cleanupErrorHandlers.set("unhandledRejection", registerErrorEvent("unhandledRejection"))
+ }
+ 
+ export function unregisterManagerForCleanup(manager: CleanupTarget): void {
+-- 
+2.39.2
+

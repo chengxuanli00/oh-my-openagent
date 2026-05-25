@@ -1,0 +1,284 @@
+From fbec112bc28808b279dbc47bcfc78ee252669c4d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 04:30:07 +0900
+Subject: [PATCH 5342/5749] fix(background-output): bound session.messages
+ fetch to stop forever-hang during /init-deep
+
+Root cause: `formatTaskResult` and `formatFullSession` both call
+`client.session.messages({ path: { id: task.sessionId } })` with no
+timeout. The OpenCode SDK explicitly disables fetch timeout
+(`req.timeout = false` in `packages/sdk/js/src/client.ts:37`), so when
+`session.processor` enters an "Aborted process" loop (same condition
+patched in #4086 for the Read hot path) every subsequent
+`session.messages` call hangs forever.
+
+User-visible impact: the parent agent running a heavy slash command
+such as `/init-deep` fires many background `task` agents in parallel
+and then calls `background_output(task_id, block=true)` for each. The
+existing `timeoutMs` (max 10min) caps only the polling loop that waits
+for the child task to transition out of `running`. Once the child is
+`completed`, the loop exits and the code falls through to
+`formatTaskResult` / `formatFullSession`. The 10min cap does not apply
+to that post-completion fetch, so a wedged `session.messages` leaves
+the tool call hanging indefinitely. The parent session appears stuck
+to the user (the symptom they report on `/init-deep ultrafucking
+deep`).
+
+Fix: race the underlying `session.messages` call against a 5s timeout
+through a new `withSdkCallTimeout` helper local to
+`src/tools/background-task/` (mirrors `withFetchTimeout` in
+`src/shared/dynamic-truncator.ts` and `withDispatchTimeout` in
+`src/shared/prompt-async-gate.ts`). On timeout the caller returns a
+clearly-marked `"Error fetching messages: ... timed out after 5000ms"`
+fallback so the agent can recognise the failure and continue instead
+of waiting forever.
+
+Tests:
+- New `sdk-call-timeout.test.ts` pins the fix with three BDD cases
+  using a never-settling mock and the new
+  `_setBackgroundOutputFetchTimeoutMsForTesting(50)` override:
+  (1) `formatTaskResult` resolves to the timeout fallback under the
+  fetch budget, (2) same for `formatFullSession`, (3) two parallel
+  callers against the wedged client both resolve cleanly.
+- All three failed (timed out) before the fix and pass in 51ms each
+  after.
+
+Verification:
+- `bun test src/tools/background-task/` -- 33 pass.
+- `bun test` (full suite) -- 7014 pass, 1 skip, 0 fail across 723
+  files.
+- `bun run typecheck` -- clean (tsgo --noEmit).
+- LSP diagnostics on the four changed files -- 0 errors.
+- Manual QA harness `.local-ignore/init-deep-hang-qa.ts` (gitignored)
+  drove production default 5s timeout against a wedged client:
+  serial `formatTaskResult` resolved in 5001ms, serial
+  `formatFullSession` in 5002ms, 10 parallel `formatTaskResult` calls
+  all resolved within 5002ms with the timeout fallback. Without the
+  fix every call hangs indefinitely.
+
+Refs: builds on #4086 (dynamic-truncator) which patched the Read hot
+path of the same SDK hang.
+---
+ .../background-task/full-session-format.ts    | 13 ++-
+ .../background-task/sdk-call-timeout.test.ts  | 96 +++++++++++++++++++
+ .../background-task/task-result-format.ts     | 13 ++-
+ .../background-task/with-sdk-call-timeout.ts  | 42 ++++++++
+ 4 files changed, 158 insertions(+), 6 deletions(-)
+ create mode 100644 src/tools/background-task/sdk-call-timeout.test.ts
+ create mode 100644 src/tools/background-task/with-sdk-call-timeout.ts
+
+diff --git a/src/tools/background-task/full-session-format.ts b/src/tools/background-task/full-session-format.ts
+index fae77299..a33806b1 100644
+--- a/src/tools/background-task/full-session-format.ts
++++ b/src/tools/background-task/full-session-format.ts
+@@ -4,6 +4,7 @@ import { extractMessages, getErrorMessage } from "./session-messages"
+ import { formatMessageTime } from "./time-format"
+ import { truncateText } from "./truncate-text"
+ import { formatTaskStatus } from "./task-status-format"
++import { getBackgroundOutputFetchTimeoutMs, withSdkCallTimeout } from "./with-sdk-call-timeout"
+ 
+ const MAX_MESSAGE_LIMIT = 100
+ const THINKING_MAX_CHARS = 2000
+@@ -45,9 +46,15 @@ export async function formatFullSession(
+     return formatTaskStatus(task)
+   }
+ 
+-  const messagesResult: BackgroundOutputMessagesResult = await client.session.messages({
+-    path: { id: task.sessionId },
+-  })
++  let messagesResult: BackgroundOutputMessagesResult
++  try {
++    messagesResult = await withSdkCallTimeout(
++      client.session.messages({ path: { id: task.sessionId } }),
++      getBackgroundOutputFetchTimeoutMs(),
++    )
++  } catch (error) {
++    return `Error fetching messages: ${error instanceof Error ? error.message : String(error)}`
++  }
+ 
+   const errorMessage = getErrorMessage(messagesResult)
+   if (errorMessage) {
+diff --git a/src/tools/background-task/sdk-call-timeout.test.ts b/src/tools/background-task/sdk-call-timeout.test.ts
+new file mode 100644
+index 00000000..1b189e4c
+--- /dev/null
++++ b/src/tools/background-task/sdk-call-timeout.test.ts
+@@ -0,0 +1,96 @@
++import { describe, expect, test, afterEach } from "bun:test"
++
++import type { BackgroundTask } from "../../features/background-agent"
++import type { BackgroundOutputClient } from "./clients"
++import { formatFullSession } from "./full-session-format"
++import { formatTaskResult } from "./task-result-format"
++import { _setBackgroundOutputFetchTimeoutMsForTesting } from "./with-sdk-call-timeout"
++
++function createTask(overrides: Partial<BackgroundTask> = {}): BackgroundTask {
++  return {
++    id: "task-hang",
++    sessionId: "ses-hang",
++    parentSessionId: "main-1",
++    parentMessageId: "msg-1",
++    description: "background task that hangs on session.messages",
++    prompt: "do work",
++    agent: "test-agent",
++    status: "completed",
++    startedAt: new Date("2026-01-01T00:00:00.000Z"),
++    completedAt: new Date("2026-01-01T00:00:05.000Z"),
++    ...overrides,
++  }
++}
++
++function createNeverSettlingClient(): BackgroundOutputClient {
++  return {
++    session: {
++      messages: () => new Promise(() => {}),
++    },
++  }
++}
++
++describe("background_output session.messages timeout protection", () => {
++  afterEach(() => {
++    _setBackgroundOutputFetchTimeoutMsForTesting(undefined)
++  })
++
++  describe("#given session.messages never resolves", () => {
++    test("#when formatTaskResult runs #then it resolves to an error string within the fetch timeout instead of hanging", async () => {
++      // given
++      _setBackgroundOutputFetchTimeoutMsForTesting(50)
++      const task = createTask()
++      const client = createNeverSettlingClient()
++
++      // when
++      const start = Date.now()
++      const output = await formatTaskResult(task, client)
++      const elapsed = Date.now() - start
++
++      // then
++      expect(elapsed).toBeLessThan(2000)
++      expect(output).toContain("Error fetching messages")
++      expect(output).toContain("timed out")
++    })
++
++    test("#when formatFullSession runs #then it resolves to an error string within the fetch timeout instead of hanging", async () => {
++      // given
++      _setBackgroundOutputFetchTimeoutMsForTesting(50)
++      const task = createTask()
++      const client = createNeverSettlingClient()
++
++      // when
++      const start = Date.now()
++      const output = await formatFullSession(task, client, {
++        includeThinking: false,
++        includeToolResults: false,
++      })
++      const elapsed = Date.now() - start
++
++      // then
++      expect(elapsed).toBeLessThan(2000)
++      expect(output).toContain("Error fetching messages")
++      expect(output).toContain("timed out")
++    })
++
++    test("#when two parallel formatTaskResult callers share a hung sessionID #then both resolve within the fetch timeout", async () => {
++      // given
++      _setBackgroundOutputFetchTimeoutMsForTesting(50)
++      const task = createTask()
++      const client = createNeverSettlingClient()
++
++      // when
++      const start = Date.now()
++      const [first, second] = await Promise.all([
++        formatTaskResult(task, client),
++        formatTaskResult(task, client),
++      ])
++      const elapsed = Date.now() - start
++
++      // then
++      expect(elapsed).toBeLessThan(2000)
++      expect(first).toContain("Error fetching messages")
++      expect(second).toContain("Error fetching messages")
++    })
++  })
++})
+diff --git a/src/tools/background-task/task-result-format.ts b/src/tools/background-task/task-result-format.ts
+index 9c1eae34..1bf6fd40 100644
+--- a/src/tools/background-task/task-result-format.ts
++++ b/src/tools/background-task/task-result-format.ts
+@@ -4,6 +4,7 @@ import { consumeNewMessages } from "../../shared/session-cursor"
+ import type { BackgroundOutputClient, BackgroundOutputMessagesResult } from "./clients"
+ import { extractMessages, getErrorMessage } from "./session-messages"
+ import { formatDuration } from "./time-format"
++import { getBackgroundOutputFetchTimeoutMs, withSdkCallTimeout } from "./with-sdk-call-timeout"
+ 
+ function getTimeString(value: unknown): string {
+   return typeof value === "string" ? value : ""
+@@ -14,9 +15,15 @@ export async function formatTaskResult(task: BackgroundTask, client: BackgroundO
+     return `Error: Task has no sessionID`
+   }
+ 
+-  const messagesResult: BackgroundOutputMessagesResult = await client.session.messages({
+-    path: { id: task.sessionId },
+-  })
++  let messagesResult: BackgroundOutputMessagesResult
++  try {
++    messagesResult = await withSdkCallTimeout(
++      client.session.messages({ path: { id: task.sessionId } }),
++      getBackgroundOutputFetchTimeoutMs(),
++    )
++  } catch (error) {
++    return `Error fetching messages: ${error instanceof Error ? error.message : String(error)}`
++  }
+ 
+   const errorMessage = getErrorMessage(messagesResult)
+   if (errorMessage) {
+diff --git a/src/tools/background-task/with-sdk-call-timeout.ts b/src/tools/background-task/with-sdk-call-timeout.ts
+new file mode 100644
+index 00000000..60e3fbc3
+--- /dev/null
++++ b/src/tools/background-task/with-sdk-call-timeout.ts
+@@ -0,0 +1,42 @@
++// Hard ceiling on how long an SDK `session.messages` call inside the
++// `background_output` tool is allowed to block. Without it, a stuck OpenCode
++// RPC (observed when `session.processor` enters an "Aborted process" loop)
++// would leave `formatTaskResult` / `formatFullSession` pending forever and
++// the `background_output` tool call would never return. During `/init-deep`
++// (and other heavy slash commands) the parent agent fires many child tasks
++// and calls `background_output` for each, so even one hung fetch wedges the
++// whole command.
++export const DEFAULT_BACKGROUND_OUTPUT_FETCH_TIMEOUT_MS = 5_000
++
++let backgroundOutputFetchTimeoutMsForTesting: number | undefined
++
++export function _setBackgroundOutputFetchTimeoutMsForTesting(value: number | undefined): void {
++  backgroundOutputFetchTimeoutMsForTesting = value
++}
++
++export function getBackgroundOutputFetchTimeoutMs(): number {
++  return backgroundOutputFetchTimeoutMsForTesting ?? DEFAULT_BACKGROUND_OUTPUT_FETCH_TIMEOUT_MS
++}
++
++export class BackgroundOutputFetchTimeoutError extends Error {
++  constructor(timeoutMs: number) {
++    super(`[background-output] session.messages timed out after ${timeoutMs}ms`)
++    this.name = "BackgroundOutputFetchTimeoutError"
++  }
++}
++
++export function withSdkCallTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
++  if (timeoutMs <= 0) {
++    return operation
++  }
++  let timeoutID: ReturnType<typeof globalThis.setTimeout> | undefined
++  const timeoutPromise = new Promise<never>((_, reject) => {
++    timeoutID = globalThis.setTimeout(
++      () => reject(new BackgroundOutputFetchTimeoutError(timeoutMs)),
++      timeoutMs,
++    )
++  })
++  return Promise.race([operation, timeoutPromise]).finally(() => {
++    if (timeoutID !== undefined) clearTimeout(timeoutID)
++  })
++}
+-- 
+2.39.2
+

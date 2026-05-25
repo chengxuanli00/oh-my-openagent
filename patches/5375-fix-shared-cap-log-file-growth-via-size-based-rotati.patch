@@ -1,0 +1,443 @@
+From 4713a90816b2b4740bb45d804429573485856b3c Mon Sep 17 00:00:00 2001
+From: Chau Luu <32367480+cvqluu@users.noreply.github.com>
+Date: Fri, 8 May 2026 09:51:50 +0000
+Subject: [PATCH 5375/5749] fix(shared): cap log file growth via size-based
+ rotation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Refs #3772 (the rotation half — EPIPE shutdown-noise suppression
+remains a separate follow-up).
+
+`src/shared/logger.ts` appends every entry to `os.tmpdir()/oh-my-opencode.log`
+via `fs.appendFileSync` with no size cap. On long-running or busy projects
+the file grows into the multi-GB range — a real-world reproduction on one
+machine showed a 4.5 GB `oh-my-opencode.log.1` accumulated from per-shutdown
+noise across many sessions. Eats `%TEMP%` on Windows and `/tmp` on Unix.
+
+Add size-based rotation inside the existing batched `flush()` path:
+
+  oh-my-opencode.log    → oh-my-opencode.log.1
+  oh-my-opencode.log.1  → oh-my-opencode.log.2 (oldest dropped)
+
+Cap is 50 MB per file; worst-case on-disk footprint is therefore ~150 MB.
+The check runs only inside `flush()`, so the cost is amortized over
+`BUFFER_SIZE_LIMIT` (50 entries) or the 500 ms flush timer. All filesystem
+ops stay wrapped in try/catch — logging must never throw — and a failed
+rotation leaves existing on-disk state intact rather than crashing the
+agent. Pattern mirrors `src/openclaw/reply-listener-log.ts`, but with two
+backup slots instead of one to keep a usable history window for debugging.
+
+No config knobs in this iteration. The issue proposes `logs.max_size_mb`
+/ `logs.max_files`, but the defaults are reasonable and adding schema is
+more surface area than the bug warrants. Easy to promote later (the
+existing test seams already let callers override the cap).
+
+Tests:
+- `src/shared/logger.test.ts` (new): under-threshold no-rotate, over-
+  threshold rotates to `.1`, repeated rotation evicts oldest, rotation-
+  failure-doesn't-throw, default path lives under `os.tmpdir()`. Uses a
+  `mock.module(...)` substring marker so `script/run-ci-tests.ts` routes
+  the file to its own bun process — the logger module's singleton state
+  otherwise gets contaminated by sibling tests that mock `./shared`.
+
+Out of scope: suppressing specific shutdown-noise messages (EPIPE,
+`unhandledRejection received during shutdown cleanup`). The rotation
+cap bounds the disk impact regardless of which noise pattern is
+generating volume; per-message suppression can stand on its own
+merits in a follow-up.
+---
+ AGENTS.md                                     |   4 +-
+ .../plans/2026-05-08-log-rotation-design.md   |  43 ++++
+ src/shared/AGENTS.md                          |   4 +-
+ src/shared/logger.test.ts                     | 185 ++++++++++++++++++
+ src/shared/logger.ts                          |  70 ++++++-
+ 5 files changed, 301 insertions(+), 5 deletions(-)
+ create mode 100644 docs/superpowers/plans/2026-05-08-log-rotation-design.md
+ create mode 100644 src/shared/logger.test.ts
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 51836dcf..447fb179 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -21,7 +21,7 @@ oh-my-opencode/
+ │   ├── hooks/                # ~52 lifecycle hooks across 58 dirs (incl. 5 zauc-mocks + 1 shared)
+ │   ├── tools/                # 16 tool dirs; produces 20–39 tools (config-gated)
+ │   ├── features/             # 20 feature modules (incl. team-mode, background-agent, skill-mcp-manager, opencode-skill-loader, tmux-subagent, mcp-oauth, claude-code-plugin-loader, boulder-state, etc.)
+-│   ├── shared/               # 278 utility files (170 non-test); logger → /tmp/oh-my-opencode.log
++│   ├── shared/               # 278 utility files (170 non-test); logger → oh-my-opencode.log in os.tmpdir() (50 MB cap, .1/.2 backups)
+ │   ├── config/               # Zod v4 schema system (30 schema files)
+ │   ├── cli/                  # CLI: install, run, doctor, mcp-oauth, refresh-model-capabilities, get-local-version, boulder
+ │   ├── mcp/                  # 3 built-in remote MCPs (websearch, context7, grep_app)
+@@ -245,7 +245,7 @@ bunx oh-my-opencode mcp-oauth login <server-url>  # Tier-3 MCP OAuth (PKCE + DCR
+ 
+ ## NOTES
+ 
+-- **Logger:** writes to `/tmp/oh-my-opencode.log` — check there for debugging.
++- **Logger:** writes `oh-my-opencode.log` to the OS temp dir (`/tmp` on Linux, `/var/folders/.../T/` on macOS, `%TEMP%` on Windows — i.e. Node's `os.tmpdir()`). Rotated at 50 MB; previous segments live at `.1` and `.2` (oldest dropped).
+ - **Background tasks:** 5 concurrent per `${providerID}/${modelID}` key by default (configurable via `background_task.modelConcurrency` / `providerConcurrency`); FIFO queue when slots full.
+ - **Plugin load timeout:** 10s for Claude Code plugin discovery.
+ - **Model fallback:** per-agent chains in `src/shared/model-requirements.ts`. **There is no single global priority.**
+diff --git a/docs/superpowers/plans/2026-05-08-log-rotation-design.md b/docs/superpowers/plans/2026-05-08-log-rotation-design.md
+new file mode 100644
+index 00000000..385a5550
+--- /dev/null
++++ b/docs/superpowers/plans/2026-05-08-log-rotation-design.md
+@@ -0,0 +1,43 @@
++# Log file rotation — design (#3772)
++
++**Issue:** [oh-my-openagent#3772](https://github.com/code-yeongyu/oh-my-openagent/issues/3772) — `oh-my-opencode.log` grows unbounded; long-running or busy projects accumulate multi-GB log files in `%TEMP%` (Windows) and `/tmp` (Unix).
++
++## Problem
++
++`src/shared/logger.ts` writes every log entry to `os.tmpdir()/oh-my-opencode.log` via `fs.appendFileSync` with no size cap. There is no rotation, no truncation threshold, and no automatic cleanup. A single bug pattern that emits a few extra log lines per shutdown can — over many sessions — fill `/tmp` with multi-gigabyte files. The bug report on a real machine showed a 4.5 GB `oh-my-opencode.log.1` from 46.6 million accumulated noise lines.
++
++The issue also calls out a specific EPIPE-on-shutdown error as a contributor to the noise. That noise is *one* source of bloat among several (e.g. `unhandledRejection received during shutdown cleanup: {}` was the dominant pattern in real-world reproduction). Capping file size addresses the disk-pressure symptom regardless of which noise pattern is generating volume on a given machine, and lets specific message-suppression land separately if and when they're needed.
++
++## Approach
++
++Mirror the size-based rotation pattern already used in `src/openclaw/reply-listener-log.ts` (rotate when over a size threshold), but with two backup slots instead of one to give a usable history window when debugging.
++
++- Constant `MAX_LOG_FILE_SIZE_BYTES` = 50 MB. Caps disk usage while still preserving a session's diagnostic context.
++- Rotation: `oh-my-opencode.log` → `oh-my-opencode.log.1` → `oh-my-opencode.log.2` (oldest dropped). Worst-case on-disk footprint is ~150 MB.
++- The size check runs inside `flush()` — the existing batched-write path — not on every `log()` call. Cost is amortized over `BUFFER_SIZE_LIMIT` (50 entries) or the 500 ms flush timer. Order is **append-then-rotate**: each batch is appended to the primary first, then the size threshold is checked. The in-flight batch therefore lands in the rotated file rather than the fresh primary, which guarantees the post-flush primary is bounded to ≤ cap.
++- All filesystem ops stay wrapped in try/catch (consistent with the existing logger's defensive style — logging must never throw). A failed rotation leaves the existing on-disk state intact rather than crashing the agent.
++
++No config knobs in this iteration. The issue proposes `logs.max_size_mb` / `logs.max_files`, but adding config schema is more surface area than the bug warrants — the constants are reasonable defaults and can be promoted later if a user needs to tune them. YAGNI.
++
++## Components touched
++
++| File | Change |
++|------|--------|
++| `src/shared/logger.ts` | Add size-based rotation in `flush()`; expose `_setLoggerForTesting` / `_resetLoggerForTesting` / `_flushForTesting` seams |
++| `src/shared/logger.test.ts` | New tests: rotation triggers at threshold, keeps N backups, never throws |
++| `AGENTS.md`, `src/shared/AGENTS.md` | Note rotation policy so the auto-generated codebase map points readers at `.1`/`.2` siblings |
++
++## Testing strategy
++
++TDD per superpowers conventions:
++
++- Stub `MAX_LOG_FILE_SIZE_BYTES` and `MAX_LOG_FILE_BACKUPS` via the `_setLoggerForTesting` seam, then exercise: (a) under threshold → no rotation, (b) over threshold → primary file moved to `.1`, (c) repeated rotation → `.1` → `.2`, `.2` dropped, (d) rotation failure (e.g. EROFS) does not throw.
++- Tests live in `src/shared/logger.test.ts`. The file uses a `mock.module(...)` substring marker so `script/run-ci-tests.ts` routes it to its own bun process — the logger module's singleton state otherwise gets contaminated by sibling tests that mock `./shared` (the barrel that re-exports `./logger`).
++
++## Out of scope
++
++- Suppressing specific shutdown-noise messages (e.g. EPIPE, `unhandledRejection received during shutdown cleanup`). The rotation cap bounds the disk impact regardless. If a particular message pattern proves chronically noisy, suppressing it is a follow-up that can stand on its own merits.
++- Config-driven `logs.max_size_mb` etc. — defer until requested.
++- Time-based rotation. The growth driver is volume per session, not session age.
++- Compressing rotated logs. Diminishing return for ~150 MB worst-case.
++- Reworking `reply-listener-log.ts` to share the rotation helper. Different file, different threshold (1 MB vs 50 MB), different backup count — extracting now would be premature DRY.
+diff --git a/src/shared/AGENTS.md b/src/shared/AGENTS.md
+index ef2b4f6d..ac004522 100644
+--- a/src/shared/AGENTS.md
++++ b/src/shared/AGENTS.md
+@@ -4,7 +4,7 @@
+ 
+ ## OVERVIEW
+ 
+-Cross-cutting utilities used throughout the plugin. Barrel-exported from `index.ts`. Logger writes to `/tmp/oh-my-opencode.log`. Includes runtime shims for `Bun.file`, `Bun.write`, `Bun.hash`, `Bun.which`, `Bun.spawn` to support non-Bun runtimes (Electron-hosted OpenCode).
++Cross-cutting utilities used throughout the plugin. Barrel-exported from `index.ts`. Logger writes `oh-my-opencode.log` to the OS temp dir (Node's `os.tmpdir()` — `/tmp` on Linux, `%TEMP%` on Windows, etc.); rotated at 50 MB; up to 2 backups at `.1` / `.2`. Includes runtime shims for `Bun.file`, `Bun.write`, `Bun.hash`, `Bun.which`, `Bun.spawn` to support non-Bun runtimes (Electron-hosted OpenCode).
+ 
+ ## CATEGORY MAP
+ 
+@@ -47,7 +47,7 @@ Automatically transforms legacy config on load:
+ 
+ | Utility | Import Count | Purpose |
+ |---------|-------------|---------|
+-| `logger.ts` | 62 | `/tmp/oh-my-opencode.log` |
++| `logger.ts` | 62 | `oh-my-opencode.log` in `os.tmpdir()` (50 MB cap, rotates to `.1`/`.2`) |
+ | `data-path.ts` | 11 | XDG storage resolution |
+ | `model-requirements.ts` | 11 | Agent fallback chains |
+ | `system-directive.ts` | 11 | System message filtering |
+diff --git a/src/shared/logger.test.ts b/src/shared/logger.test.ts
+new file mode 100644
+index 00000000..40057bf0
+--- /dev/null
++++ b/src/shared/logger.test.ts
+@@ -0,0 +1,185 @@
++/// <reference types="bun-types" />
++
++// This test file mutates the logger module's singleton state. It must run in an
++// isolated CI batch so that other test files mocking `./shared` (the barrel that
++// re-exports this logger) cannot leak a no-op `log` into our imports. See
++// script/run-ci-tests.ts — the `mock.module(` substring routes the file out of
++// the shared batch.
++import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
++mock.module("./logger-test-isolation", () => ({}))
++
++import * as fs from "fs"
++import * as os from "os"
++import * as path from "path"
++
++import {
++  _flushForTesting,
++  _resetLoggerForTesting,
++  _setLoggerForTesting,
++  getLogFilePath,
++  log,
++} from "./logger"
++
++const TEST_PREFIX = "oh-my-opencode-logger-test"
++
++function makeTempDir(): string {
++  return fs.mkdtempSync(path.join(os.tmpdir(), `${TEST_PREFIX}-`))
++}
++
++describe("#given the shared logger", () => {
++  let tempDir: string
++  let logFilePath: string
++
++  beforeEach(() => {
++    tempDir = makeTempDir()
++    logFilePath = path.join(tempDir, "log.txt")
++  })
++
++  afterEach(() => {
++    _resetLoggerForTesting()
++    fs.rmSync(tempDir, { recursive: true, force: true })
++  })
++
++  describe("#given log file size under threshold", () => {
++    test("#when log() is called and flushed #then the file is not rotated", () => {
++      _setLoggerForTesting({ filePath: logFilePath, maxSizeBytes: 1024, maxBackups: 2 })
++
++      log("small entry")
++      _flushForTesting()
++
++      expect(fs.existsSync(logFilePath)).toBe(true)
++      expect(fs.existsSync(`${logFilePath}.1`)).toBe(false)
++    })
++  })
++
++  describe("#given log file size over threshold", () => {
++    test("#when next flush runs #then the file rotates to .1 and a fresh file is created", () => {
++      _setLoggerForTesting({ filePath: logFilePath, maxSizeBytes: 100, maxBackups: 2 })
++
++      // Pre-fill the log file beyond the threshold so the next flush triggers rotation.
++      fs.writeFileSync(logFilePath, "x".repeat(200))
++
++      log("after rotation")
++      _flushForTesting()
++
++      // flush() appends first, then rotates — the in-flight batch becomes part
++      // of .1 so the post-flush primary is bounded to ≤ cap. The primary path
++      // is left absent after rotation; the next log() will re-create it on
++      // its next flush.
++      expect(fs.existsSync(`${logFilePath}.1`)).toBe(true)
++      const rotated = fs.readFileSync(`${logFilePath}.1`, "utf8")
++      expect(rotated).toContain("xxxx")
++      expect(rotated).toContain("after rotation")
++      expect(rotated.length).toBeGreaterThan(200)
++
++      expect(fs.existsSync(logFilePath)).toBe(false)
++
++      // A subsequent log() recreates the primary on its flush.
++      log("after recreation")
++      _flushForTesting()
++      expect(fs.existsSync(logFilePath)).toBe(true)
++      expect(fs.readFileSync(logFilePath, "utf8")).toContain("after recreation")
++    })
++
++    test("#when rotation happens repeatedly #then only maxBackups files are kept and the ladder shifts in order", () => {
++      _setLoggerForTesting({ filePath: logFilePath, maxSizeBytes: 100, maxBackups: 2 })
++
++      // First rotation
++      fs.writeFileSync(logFilePath, "first".repeat(50))
++      log("entry-A")
++      _flushForTesting()
++      expect(fs.existsSync(`${logFilePath}.1`)).toBe(true)
++      expect(fs.existsSync(`${logFilePath}.2`)).toBe(false)
++
++      // Second rotation
++      fs.writeFileSync(logFilePath, "second".repeat(50))
++      log("entry-B")
++      _flushForTesting()
++      expect(fs.existsSync(`${logFilePath}.1`)).toBe(true)
++      expect(fs.existsSync(`${logFilePath}.2`)).toBe(true)
++      // The previous .1 (containing entry-A) should now live at .2 — assert the
++      // ladder shifts in the expected direction so a regression that reverses
++      // the loop (.2 → .1) would fail here, not just silently keep two files.
++      expect(fs.readFileSync(`${logFilePath}.2`, "utf8")).toContain("entry-A")
++      expect(fs.readFileSync(`${logFilePath}.1`, "utf8")).toContain("entry-B")
++
++      // Third rotation should drop the oldest (.2) and shift .1 -> .2
++      fs.writeFileSync(logFilePath, "third".repeat(50))
++      log("entry-C")
++      _flushForTesting()
++      expect(fs.existsSync(`${logFilePath}.1`)).toBe(true)
++      expect(fs.existsSync(`${logFilePath}.2`)).toBe(true)
++      expect(fs.existsSync(`${logFilePath}.3`)).toBe(false)
++      // entry-A (oldest) was dropped; entry-B shifted from .1 to .2; entry-C is now .1.
++      expect(fs.readFileSync(`${logFilePath}.2`, "utf8")).toContain("entry-B")
++      expect(fs.readFileSync(`${logFilePath}.1`, "utf8")).toContain("entry-C")
++
++      // Total worst-case files on disk: primary + 2 backups
++      const survivors = fs
++        .readdirSync(tempDir)
++        .filter((name) => name.startsWith(path.basename(logFilePath)))
++      expect(survivors.length).toBeLessThanOrEqual(3)
++    })
++
++    test("#when log() is called past BUFFER_SIZE_LIMIT without explicit flush #then the inline flush path writes to disk", () => {
++      // BUFFER_SIZE_LIMIT in logger.ts is 50 — past that, log() flushes
++      // synchronously rather than scheduling a timer. A regression that drops
++      // the inline flush in favor of always scheduling would only surface here.
++      _setLoggerForTesting({ filePath: logFilePath, maxSizeBytes: 1024 * 1024, maxBackups: 2 })
++
++      for (let i = 0; i < 100; i += 1) {
++        log(`entry-${i}`)
++      }
++      // Note: no _flushForTesting() — relies on the inline flush at i=49 and i=99.
++
++      expect(fs.existsSync(logFilePath)).toBe(true)
++      const contents = fs.readFileSync(logFilePath, "utf8")
++      expect(contents).toContain("entry-0")
++      expect(contents).toContain("entry-99")
++    })
++  })
++
++  describe("#given filesystem failures during flush", () => {
++    test("#when the parent directory is missing #then append fails silently and does not throw", () => {
++      _setLoggerForTesting({
++        filePath: path.join(tempDir, "no-such-dir", "log.txt"),
++        maxSizeBytes: 10,
++        maxBackups: 2,
++      })
++
++      expect(() => {
++        log("entry")
++        _flushForTesting()
++      }).not.toThrow()
++    })
++
++    test("#when rotation fails partway through #then log() does not throw and primary keeps the entry", () => {
++      _setLoggerForTesting({ filePath: logFilePath, maxSizeBytes: 10, maxBackups: 2 })
++
++      // Pre-fill primary past the cap so rotateLogFileIfNeeded() actually triggers.
++      fs.writeFileSync(logFilePath, "x".repeat(200))
++      // Sabotage the oldest-eviction step: occupy the `.2` slot with a directory so
++      // unlinkSync inside rotateLogFileIfNeeded throws, exercising its inner catch.
++      // Portable: unlinkSync on a directory throws EISDIR on Linux/macOS and
++      // EPERM/EISDIR on Windows — both hit the catch.
++      fs.mkdirSync(`${logFilePath}.2`)
++
++      expect(() => {
++        log("entry")
++        _flushForTesting()
++      }).not.toThrow()
++
++      // appendFileSync succeeded; rotation failed silently; the primary still holds
++      // the new entry (rotation didn't move it) — confirms we reached the rotation
++      // path and recovered cleanly rather than short-circuiting on append failure.
++      expect(fs.readFileSync(logFilePath, "utf8")).toContain("entry")
++    })
++  })
++
++  describe("#given default configuration", () => {
++    test("#when getLogFilePath is called #then it points at os.tmpdir()", () => {
++      _resetLoggerForTesting()
++      expect(getLogFilePath().startsWith(os.tmpdir())).toBe(true)
++    })
++  })
++})
+diff --git a/src/shared/logger.ts b/src/shared/logger.ts
+index 483d0269..0fbe58c1 100644
+--- a/src/shared/logger.ts
++++ b/src/shared/logger.ts
+@@ -4,19 +4,53 @@ import * as path from "path"
+ 
+ import { LOG_FILENAME } from "./plugin-identity"
+ 
+-const logFile = path.join(os.tmpdir(), LOG_FILENAME)
++const DEFAULT_MAX_LOG_FILE_SIZE_BYTES = 50 * 1024 * 1024
++const DEFAULT_MAX_LOG_FILE_BACKUPS = 2
++
++let logFile = path.join(os.tmpdir(), LOG_FILENAME)
++let maxLogFileSizeBytes = DEFAULT_MAX_LOG_FILE_SIZE_BYTES
++let maxLogFileBackups = DEFAULT_MAX_LOG_FILE_BACKUPS
+ 
+ let buffer: string[] = []
+ let flushTimer: ReturnType<typeof setTimeout> | null = null
+ const FLUSH_INTERVAL_MS = 500
+ const BUFFER_SIZE_LIMIT = 50
+ 
++function rotateLogFileIfNeeded(): void {
++  // Best-effort, single-process: not safe under concurrent writers from sibling
++  // agents sharing the same tmpdir (worst case: one rotated backup is clobbered;
++  // primary writes still succeed). Same TOCTOU profile as
++  // src/openclaw/reply-listener-log.ts. All errors are swallowed because logging
++  // itself must never throw — a corrupt rotation state is preferable to crashing
++  // the agent over a temp-file rename failure.
++  try {
++    if (!fs.existsSync(logFile)) return
++    const stats = fs.statSync(logFile)
++    if (stats.size <= maxLogFileSizeBytes) return
++
++    const oldest = `${logFile}.${maxLogFileBackups}`
++    if (fs.existsSync(oldest)) {
++      fs.unlinkSync(oldest)
++    }
++    for (let i = maxLogFileBackups - 1; i >= 1; i -= 1) {
++      const src = `${logFile}.${i}`
++      const dst = `${logFile}.${i + 1}`
++      if (fs.existsSync(src)) {
++        fs.renameSync(src, dst)
++      }
++    }
++    fs.renameSync(logFile, `${logFile}.1`)
++  } catch {
++  }
++}
++
+ function flush(): void {
+   if (buffer.length === 0) return
+   const data = buffer.join("")
+   buffer = []
+   try {
+     fs.appendFileSync(logFile, data)
++    rotateLogFileIfNeeded()
+   } catch {
+   }
+ }
+@@ -46,3 +80,37 @@ export function log(message: string, data?: unknown): void {
+ export function getLogFilePath(): string {
+   return logFile
+ }
++
++interface LoggerTestOverrides {
++  filePath?: string
++  maxSizeBytes?: number
++  maxBackups?: number
++}
++
++/** @internal test-only seam */
++export function _setLoggerForTesting(overrides: LoggerTestOverrides): void {
++  if (overrides.filePath !== undefined) logFile = overrides.filePath
++  if (overrides.maxSizeBytes !== undefined) maxLogFileSizeBytes = overrides.maxSizeBytes
++  if (overrides.maxBackups !== undefined) maxLogFileBackups = overrides.maxBackups
++}
++
++/** @internal test-only seam */
++export function _resetLoggerForTesting(): void {
++  logFile = path.join(os.tmpdir(), LOG_FILENAME)
++  maxLogFileSizeBytes = DEFAULT_MAX_LOG_FILE_SIZE_BYTES
++  maxLogFileBackups = DEFAULT_MAX_LOG_FILE_BACKUPS
++  buffer = []
++  if (flushTimer) {
++    clearTimeout(flushTimer)
++    flushTimer = null
++  }
++}
++
++/** @internal test-only seam: synchronously flush the buffer */
++export function _flushForTesting(): void {
++  if (flushTimer) {
++    clearTimeout(flushTimer)
++    flushTimer = null
++  }
++  flush()
++}
+-- 
+2.39.2
+

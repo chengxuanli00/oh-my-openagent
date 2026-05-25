@@ -1,0 +1,455 @@
+From d1be22fb1b1a2ce4ac656b7666f5dfe84db6883e Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 5 Apr 2026 17:15:17 +0900
+Subject: [PATCH 3954/5749] feat(atlas): update resolvers and index for
+ lineage-aware session resolution
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Update recent-model-resolver for session origin awareness
+- Update resolve-active-boulder-session with lineage support
+- Add comprehensive test coverage for boulder session resolution
+- Add fallback tests for recent model resolver
+- Update index tests for new lineage tracking
+
+🤖 Generated with assistance of OhMyOpenCode
+---
+ src/hooks/atlas/index.test.ts                 | 58 +++++++++--
+ .../recent-model-resolver-fallback.test.ts    | 72 ++++++++++++++
+ src/hooks/atlas/recent-model-resolver.test.ts | 44 +++++++++
+ src/hooks/atlas/recent-model-resolver.ts      | 15 ++-
+ .../resolve-active-boulder-session.test.ts    | 99 +++++++++++++++++++
+ .../atlas/resolve-active-boulder-session.ts   | 36 ++-----
+ 6 files changed, 281 insertions(+), 43 deletions(-)
+ create mode 100644 src/hooks/atlas/recent-model-resolver-fallback.test.ts
+ create mode 100644 src/hooks/atlas/recent-model-resolver.test.ts
+ create mode 100644 src/hooks/atlas/resolve-active-boulder-session.test.ts
+
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index a336ad24..78b73b25 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -370,7 +370,7 @@ session_id: ses_standalone_def
+       cleanupMessageStorage(sessionID)
+     })
+ 
+-     test("should append session ID to boulder state if not present", async () => {
++     test("should not append unrelated current session to boulder state if not already tracked", async () => {
+        // given - boulder state without session-append-test, Atlas caller
+        const sessionID = "session-append-test"
+        setupMessageStorage(sessionID, "atlas")
+@@ -399,13 +399,53 @@ session_id: ses_standalone_def
+         output
+       )
+ 
+-      // then - sessionID should be appended
++      // then - unrelated current session should not be absorbed into boulder
+       const updatedState = readBoulderState(TEST_DIR)
+-      expect(updatedState?.session_ids).toContain(sessionID)
++      expect(updatedState?.session_ids).not.toContain(sessionID)
+       
+       cleanupMessageStorage(sessionID)
+     })
+ 
++     test("should not append current session when session lookup fails during append decision", async () => {
++       // given - boulder state without session-get-failure-test, Atlas caller, and session lookup failure
++       const sessionID = "session-get-failure-test"
++       setupMessageStorage(sessionID, "atlas")
++
++      const planPath = join(TEST_DIR, "test-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: ["session-1"],
++        plan_name: "test-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const hook = createAtlasHook(createMockPluginInput({
++        sessionGetMock: mock(async () => {
++          throw new Error("session lookup failed")
++        }),
++      }))
++      const output = {
++        title: "Sisyphus Task",
++        output: "Task output",
++        metadata: {},
++      }
++
++      // when
++      await hook["tool.execute.after"](
++        { tool: "task", sessionID },
++        output,
++      )
++
++      // then
++      const updatedState = readBoulderState(TEST_DIR)
++      expect(updatedState?.session_ids).not.toContain(sessionID)
++
++      cleanupMessageStorage(sessionID)
++    })
++
+      test("should not duplicate existing session ID", async () => {
+        // given - boulder state already has session-dup-test, Atlas caller
+        const sessionID = "session-dup-test"
+@@ -1361,7 +1401,7 @@ session_id: ses_untrusted_999
+       expect(mockInput._promptMock).not.toHaveBeenCalled()
+     })
+ 
+-    test("should append subagent session to boulder before injecting continuation", async () => {
++    test("should not append lineage-only subagent session during idle without explicit boulder tracking", async () => {
+       // given - active boulder plan with another registered session and current session tracked as subagent
+       const subagentSessionID = "subagent-session-456"
+       const planPath = join(TEST_DIR, "test-plan.md")
+@@ -1380,7 +1420,7 @@ session_id: ses_untrusted_999
+       const mockInput = createMockPluginInput()
+       const hook = createAtlasHook(mockInput)
+ 
+-      // when - subagent session goes idle before parent task output appends it
++      // when - subagent session goes idle before explicit tracking appends it
+       await hook.handler({
+         event: {
+           type: "session.idle",
+@@ -1388,11 +1428,9 @@ session_id: ses_untrusted_999
+         },
+       })
+ 
+-      // then - session is registered into boulder and continuation is injected
+-      expect(readBoulderState(TEST_DIR)?.session_ids).toContain(subagentSessionID)
+-      expect(mockInput._promptMock).toHaveBeenCalled()
+-      const callArgs = mockInput._promptMock.mock.calls[0][0]
+-      expect(callArgs.path.id).toBe(subagentSessionID)
++      // then - lineage alone is not enough to absorb the session into boulder
++      expect(readBoulderState(TEST_DIR)?.session_ids).not.toContain(subagentSessionID)
++      expect(mockInput._promptMock).not.toHaveBeenCalled()
+     })
+ 
+     test("should inject when registered boulder session has incomplete tasks even if last agent differs", async () => {
+diff --git a/src/hooks/atlas/recent-model-resolver-fallback.test.ts b/src/hooks/atlas/recent-model-resolver-fallback.test.ts
+new file mode 100644
+index 00000000..b2e09736
+--- /dev/null
++++ b/src/hooks/atlas/recent-model-resolver-fallback.test.ts
+@@ -0,0 +1,72 @@
++declare const require: (name: string) => any
++const { describe, expect, mock, test, afterAll } = require("bun:test")
++import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { join } from "node:path"
++import { tmpdir } from "node:os"
++
++const testDirs: string[] = []
++const TEST_STORAGE_ROOT = join(tmpdir(), `recent-model-fallback-${Date.now()}`)
++const TEST_MESSAGE_STORAGE = join(TEST_STORAGE_ROOT, "message")
++
++mock.module("../../shared/opencode-storage-detection", () => ({
++  isSqliteBackend: () => false,
++}))
++
++mock.module("../../shared/opencode-message-dir", () => ({
++  getMessageDir: (sessionID: string) => {
++    const directPath = join(TEST_MESSAGE_STORAGE, sessionID)
++    return require("node:fs").existsSync(directPath) ? directPath : null
++  },
++}))
++
++afterAll(() => {
++  mock.restore()
++  while (testDirs.length > 0) {
++    const directory = testDirs.pop()
++    if (directory) {
++      rmSync(directory, { recursive: true, force: true })
++    }
++  }
++})
++
++describe("resolveRecentPromptContextForSession fallback ordering", () => {
++  test("uses JSON fallback ordered by time.created when SDK messages fail", async () => {
++    // given
++    const sessionID = "ses_recent_model_fallback"
++    const directory = mkdtempSync(join(tmpdir(), "recent-model-fallback-dir-"))
++    testDirs.push(directory)
++    const messageDir = join(TEST_MESSAGE_STORAGE, sessionID)
++    mkdirSync(messageDir, { recursive: true })
++    writeFileSync(join(messageDir, "msg_ffff0000_000001.json"), JSON.stringify({
++      agent: "atlas",
++      model: { providerID: "anthropic", modelID: "claude-sonnet-4-6" },
++      tools: { read: true },
++      time: { created: 10 },
++    }), "utf-8")
++    writeFileSync(join(messageDir, "msg_00000000_000999.json"), JSON.stringify({
++      agent: "atlas",
++      model: { providerID: "openai", modelID: "gpt-5.4" },
++      tools: { edit: true },
++      time: { created: 100 },
++    }), "utf-8")
++
++    const { resolveRecentPromptContextForSession } = await import("./recent-model-resolver")
++
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => {
++            throw new Error("sdk ordering unavailable")
++          },
++        },
++      },
++    }
++
++    // when
++    const result = await resolveRecentPromptContextForSession(ctx as never, sessionID)
++
++    // then
++    expect(result.model).toEqual({ providerID: "openai", modelID: "gpt-5.4" })
++    expect(result.tools).toEqual({ edit: true })
++  })
++})
+diff --git a/src/hooks/atlas/recent-model-resolver.test.ts b/src/hooks/atlas/recent-model-resolver.test.ts
+new file mode 100644
+index 00000000..81db7dbe
+--- /dev/null
++++ b/src/hooks/atlas/recent-model-resolver.test.ts
+@@ -0,0 +1,44 @@
++import { describe, expect, mock, test } from "bun:test"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { resolveRecentPromptContextForSession } from "./recent-model-resolver"
++
++describe("resolveRecentPromptContextForSession", () => {
++  test("uses message time.created rather than SDK array order for recent prompt context", async () => {
++    // given
++    const ctx = {
++      client: {
++        session: {
++          messages: mock(async () => ({
++            data: [
++              {
++                id: "msg_newer_in_array",
++                info: {
++                  providerID: "anthropic",
++                  modelID: "claude-sonnet-4-6",
++                  tools: { read: true },
++                  time: { created: 10 },
++                },
++              },
++              {
++                id: "msg_older_in_array",
++                info: {
++                  providerID: "openai",
++                  modelID: "gpt-5.4",
++                  tools: { edit: true },
++                  time: { created: 100 },
++                },
++              },
++            ],
++          })),
++        },
++      },
++    } as unknown as PluginInput
++
++    // when
++    const result = await resolveRecentPromptContextForSession(ctx, "ses_123")
++
++    // then
++    expect(result.model).toEqual({ providerID: "openai", modelID: "gpt-5.4" })
++    expect(result.tools).toEqual({ edit: true })
++  })
++})
+diff --git a/src/hooks/atlas/recent-model-resolver.ts b/src/hooks/atlas/recent-model-resolver.ts
+index 5d2bdb3a..d7d8b9d9 100644
+--- a/src/hooks/atlas/recent-model-resolver.ts
++++ b/src/hooks/atlas/recent-model-resolver.ts
+@@ -18,16 +18,25 @@ export async function resolveRecentPromptContextForSession(
+   try {
+     const messagesResp = await ctx.client.session.messages({ path: { id: sessionID } })
+     const messages = normalizeSDKResponse(messagesResp, [] as Array<{
++      id?: string
+       info?: {
+         model?: ModelInfo
+         modelID?: string
+         providerID?: string
+         tools?: Record<string, boolean | "allow" | "deny" | "ask">
++        time?: { created?: number }
+       }
+-    }>)
++    }>).sort((left, right) => {
++      const leftTime = left.info?.time?.created ?? Number.NEGATIVE_INFINITY
++      const rightTime = right.info?.time?.created ?? Number.NEGATIVE_INFINITY
++      if (leftTime !== rightTime) return rightTime - leftTime
++      const leftId = typeof left.id === "string" ? left.id : ""
++      const rightId = typeof right.id === "string" ? right.id : ""
++      return rightId.localeCompare(leftId)
++    })
+ 
+-    for (let i = messages.length - 1; i >= 0; i--) {
+-      const info = messages[i].info
++    for (const message of messages) {
++      const info = message.info
+       const model = info?.model
+       const tools = normalizePromptTools(info?.tools)
+       if (model?.providerID && model?.modelID) {
+diff --git a/src/hooks/atlas/resolve-active-boulder-session.test.ts b/src/hooks/atlas/resolve-active-boulder-session.test.ts
+new file mode 100644
+index 00000000..b3eb28b1
+--- /dev/null
++++ b/src/hooks/atlas/resolve-active-boulder-session.test.ts
+@@ -0,0 +1,99 @@
++import { afterEach, beforeEach, describe, expect, test } from "bun:test"
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { randomUUID } from "node:crypto"
++import { clearBoulderState, writeBoulderState } from "../../features/boulder-state"
++import { resolveActiveBoulderSession } from "./resolve-active-boulder-session"
++
++describe("resolveActiveBoulderSession", () => {
++  let testDirectory = ""
++
++  beforeEach(() => {
++    testDirectory = join(tmpdir(), `resolve-active-boulder-${randomUUID()}`)
++    if (!existsSync(testDirectory)) {
++      mkdirSync(testDirectory, { recursive: true })
++    }
++    clearBoulderState(testDirectory)
++  })
++
++  afterEach(() => {
++    clearBoulderState(testDirectory)
++    if (existsSync(testDirectory)) {
++      rmSync(testDirectory, { recursive: true, force: true })
++    }
++  })
++
++  test("returns null for unrelated session even when active boulder plan is complete", async () => {
++    // given
++    const planPath = join(testDirectory, "complete-plan.md")
++    writeFileSync(planPath, "# Plan\n- [x] Task 1\n", "utf-8")
++    writeBoulderState(testDirectory, {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: ["ses_tracked"],
++      session_origins: { ses_tracked: "direct" },
++      plan_name: "complete-plan",
++    })
++
++    // when
++    const result = await resolveActiveBoulderSession({
++      client: { session: { get: async () => ({ data: {} }) } } as never,
++      directory: testDirectory,
++      sessionID: "ses_unrelated",
++    })
++
++    // then
++    expect(result).toBeNull()
++  })
++
++  test("returns tracked direct session for incomplete boulder plan", async () => {
++    // given
++    const planPath = join(testDirectory, "incomplete-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n", "utf-8")
++    writeBoulderState(testDirectory, {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: ["ses_tracked"],
++      session_origins: { ses_tracked: "direct" },
++      plan_name: "incomplete-plan",
++    })
++
++    // when
++    const result = await resolveActiveBoulderSession({
++      client: { session: { get: async () => ({ data: {} }) } } as never,
++      directory: testDirectory,
++      sessionID: "ses_tracked",
++    })
++
++    // then
++    expect(result).not.toBeNull()
++    expect(result?.progress.isComplete).toBe(false)
++    expect(result?.boulderState.session_ids).toContain("ses_tracked")
++  })
++
++  test("returns tracked appended session for incomplete boulder plan", async () => {
++    // given
++    const planPath = join(testDirectory, "appended-incomplete-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n", "utf-8")
++    writeBoulderState(testDirectory, {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: ["ses_root", "ses_appended"],
++      session_origins: { ses_root: "direct", ses_appended: "appended" },
++      plan_name: "appended-incomplete-plan",
++    })
++
++    // when
++    const result = await resolveActiveBoulderSession({
++      client: { session: { get: async () => ({ data: {} }) } } as never,
++      directory: testDirectory,
++      sessionID: "ses_appended",
++    })
++
++    // then
++    expect(result).not.toBeNull()
++    expect(result?.progress.isComplete).toBe(false)
++    expect(result?.boulderState.session_ids).toContain("ses_appended")
++  })
++})
+diff --git a/src/hooks/atlas/resolve-active-boulder-session.ts b/src/hooks/atlas/resolve-active-boulder-session.ts
+index 81e28ef6..7e8f3c4c 100644
+--- a/src/hooks/atlas/resolve-active-boulder-session.ts
++++ b/src/hooks/atlas/resolve-active-boulder-session.ts
+@@ -1,8 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+-import { appendSessionId, getPlanProgress, readBoulderState } from "../../features/boulder-state"
++import { getPlanProgress, readBoulderState } from "../../features/boulder-state"
+ import type { BoulderState, PlanProgress } from "../../features/boulder-state"
+-import { subagentSessions } from "../../features/claude-code-session-state"
+-import { isSessionInBoulderLineage } from "./boulder-session-lineage"
+ 
+ export async function resolveActiveBoulderSession(input: {
+   client: PluginInput["client"]
+@@ -18,36 +16,14 @@ export async function resolveActiveBoulderSession(input: {
+     return null
+   }
+ 
+-  const progress = getPlanProgress(boulderState.active_plan)
+-  if (progress.isComplete) {
+-    return { boulderState, progress, appendedSession: false }
+-  }
+-
+-  if (boulderState.session_ids.includes(input.sessionID)) {
+-    return { boulderState, progress, appendedSession: false }
+-  }
+-
+-  if (!subagentSessions.has(input.sessionID)) {
++  if (!boulderState.session_ids.includes(input.sessionID)) {
+     return null
+   }
+ 
+-  const belongsToActiveBoulder = await isSessionInBoulderLineage({
+-    client: input.client,
+-    sessionID: input.sessionID,
+-    boulderSessionIDs: boulderState.session_ids,
+-  })
+-  if (!belongsToActiveBoulder) {
+-    return null
+-  }
+-
+-  const updatedBoulderState = appendSessionId(input.directory, input.sessionID)
+-  if (!updatedBoulderState?.session_ids.includes(input.sessionID)) {
+-    return null
++  const progress = getPlanProgress(boulderState.active_plan)
++  if (progress.isComplete) {
++    return { boulderState, progress, appendedSession: false }
+   }
+ 
+-  return {
+-    boulderState: updatedBoulderState,
+-    progress,
+-    appendedSession: true,
+-  }
++  return { boulderState, progress, appendedSession: false }
+ }
+-- 
+2.39.2
+

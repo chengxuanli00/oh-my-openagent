@@ -1,0 +1,939 @@
+From e4583668c00f85f339aad2ba33dbc1301dd2872b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 8 Feb 2026 16:23:56 +0900
+Subject: [PATCH 1916/5749] refactor(hooks): split session-notification and
+ unstable-agent-babysitter
+
+Extract notification and babysitter logic:
+- session-notification-formatting.ts, session-notification-scheduler.ts
+- session-notification-sender.ts, session-todo-status.ts
+- task-message-analyzer.ts: message analysis for babysitter hook
+---
+ src/hooks/index.ts                            |   4 +
+ src/hooks/session-notification-formatting.ts  |  25 ++
+ src/hooks/session-notification-scheduler.ts   | 154 ++++++++++
+ src/hooks/session-notification-sender.ts      | 102 +++++++
+ src/hooks/session-notification.ts             | 271 ++----------------
+ src/hooks/session-todo-status.ts              |  19 ++
+ src/hooks/unstable-agent-babysitter/index.ts  |   8 +
+ .../task-message-analyzer.ts                  |  91 ++++++
+ .../unstable-agent-babysitter-hook.ts         |  98 +------
+ 9 files changed, 433 insertions(+), 339 deletions(-)
+ create mode 100644 src/hooks/session-notification-formatting.ts
+ create mode 100644 src/hooks/session-notification-scheduler.ts
+ create mode 100644 src/hooks/session-notification-sender.ts
+ create mode 100644 src/hooks/session-todo-status.ts
+ create mode 100644 src/hooks/unstable-agent-babysitter/task-message-analyzer.ts
+
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index a964780c..95447527 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -1,6 +1,10 @@
+ export { createTodoContinuationEnforcer, type TodoContinuationEnforcer } from "./todo-continuation-enforcer";
+ export { createContextWindowMonitorHook } from "./context-window-monitor";
+ export { createSessionNotification } from "./session-notification";
++export { sendSessionNotification, playSessionNotificationSound, detectPlatform, getDefaultSoundPath } from "./session-notification-sender";
++export { buildWindowsToastScript, escapeAppleScriptText, escapePowerShellSingleQuotedText } from "./session-notification-formatting";
++export { hasIncompleteTodos } from "./session-todo-status";
++export { createIdleNotificationScheduler } from "./session-notification-scheduler";
+ export { createSessionRecoveryHook, type SessionRecoveryHook, type SessionRecoveryOptions } from "./session-recovery";
+ export { createCommentCheckerHooks } from "./comment-checker";
+ export { createToolOutputTruncatorHook } from "./tool-output-truncator";
+diff --git a/src/hooks/session-notification-formatting.ts b/src/hooks/session-notification-formatting.ts
+new file mode 100644
+index 00000000..c39cb30d
+--- /dev/null
++++ b/src/hooks/session-notification-formatting.ts
+@@ -0,0 +1,25 @@
++export function escapeAppleScriptText(input: string): string {
++  return input.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
++}
++
++export function escapePowerShellSingleQuotedText(input: string): string {
++  return input.replace(/'/g, "''")
++}
++
++export function buildWindowsToastScript(title: string, message: string): string {
++  const psTitle = escapePowerShellSingleQuotedText(title)
++  const psMessage = escapePowerShellSingleQuotedText(message)
++
++  return `
++[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
++$Template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
++$RawXml = [xml] $Template.GetXml()
++($RawXml.toast.visual.binding.text | Where-Object {$_.id -eq '1'}).AppendChild($RawXml.CreateTextNode('${psTitle}')) | Out-Null
++($RawXml.toast.visual.binding.text | Where-Object {$_.id -eq '2'}).AppendChild($RawXml.CreateTextNode('${psMessage}')) | Out-Null
++$SerializedXml = New-Object Windows.Data.Xml.Dom.XmlDocument
++$SerializedXml.LoadXml($RawXml.OuterXml)
++$Toast = [Windows.UI.Notifications.ToastNotification]::new($SerializedXml)
++$Notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('OpenCode')
++$Notifier.Show($Toast)
++`.trim().replace(/\n/g, "; ")
++}
+diff --git a/src/hooks/session-notification-scheduler.ts b/src/hooks/session-notification-scheduler.ts
+new file mode 100644
+index 00000000..d28abd11
+--- /dev/null
++++ b/src/hooks/session-notification-scheduler.ts
+@@ -0,0 +1,154 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import type { Platform } from "./session-notification-sender"
++
++type SessionNotificationConfig = {
++  title: string
++  message: string
++  playSound: boolean
++  soundPath: string
++  idleConfirmationDelay: number
++  skipIfIncompleteTodos: boolean
++  maxTrackedSessions: number
++}
++
++export function createIdleNotificationScheduler(options: {
++  ctx: PluginInput
++  platform: Platform
++  config: SessionNotificationConfig
++  hasIncompleteTodos: (ctx: PluginInput, sessionID: string) => Promise<boolean>
++  send: (ctx: PluginInput, platform: Platform, title: string, message: string) => Promise<void>
++  playSound: (ctx: PluginInput, platform: Platform, soundPath: string) => Promise<void>
++}) {
++  const notifiedSessions = new Set<string>()
++  const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>()
++  const sessionActivitySinceIdle = new Set<string>()
++  const notificationVersions = new Map<string, number>()
++  const executingNotifications = new Set<string>()
++
++  function cleanupOldSessions(): void {
++    const maxSessions = options.config.maxTrackedSessions
++    if (notifiedSessions.size > maxSessions) {
++      const sessionsToRemove = Array.from(notifiedSessions).slice(0, notifiedSessions.size - maxSessions)
++      sessionsToRemove.forEach((id) => notifiedSessions.delete(id))
++    }
++    if (sessionActivitySinceIdle.size > maxSessions) {
++      const sessionsToRemove = Array.from(sessionActivitySinceIdle).slice(0, sessionActivitySinceIdle.size - maxSessions)
++      sessionsToRemove.forEach((id) => sessionActivitySinceIdle.delete(id))
++    }
++    if (notificationVersions.size > maxSessions) {
++      const sessionsToRemove = Array.from(notificationVersions.keys()).slice(0, notificationVersions.size - maxSessions)
++      sessionsToRemove.forEach((id) => notificationVersions.delete(id))
++    }
++    if (executingNotifications.size > maxSessions) {
++      const sessionsToRemove = Array.from(executingNotifications).slice(0, executingNotifications.size - maxSessions)
++      sessionsToRemove.forEach((id) => executingNotifications.delete(id))
++    }
++  }
++
++  function cancelPendingNotification(sessionID: string): void {
++    const timer = pendingTimers.get(sessionID)
++    if (timer) {
++      clearTimeout(timer)
++      pendingTimers.delete(sessionID)
++    }
++    sessionActivitySinceIdle.add(sessionID)
++    notificationVersions.set(sessionID, (notificationVersions.get(sessionID) ?? 0) + 1)
++  }
++
++  function markSessionActivity(sessionID: string): void {
++    cancelPendingNotification(sessionID)
++    if (!executingNotifications.has(sessionID)) {
++      notifiedSessions.delete(sessionID)
++    }
++  }
++
++  async function executeNotification(sessionID: string, version: number): Promise<void> {
++    if (executingNotifications.has(sessionID)) {
++      pendingTimers.delete(sessionID)
++      return
++    }
++
++    if (notificationVersions.get(sessionID) !== version) {
++      pendingTimers.delete(sessionID)
++      return
++    }
++
++    if (sessionActivitySinceIdle.has(sessionID)) {
++      sessionActivitySinceIdle.delete(sessionID)
++      pendingTimers.delete(sessionID)
++      return
++    }
++
++    if (notifiedSessions.has(sessionID)) {
++      pendingTimers.delete(sessionID)
++      return
++    }
++
++    executingNotifications.add(sessionID)
++    try {
++      if (options.config.skipIfIncompleteTodos) {
++        const hasPendingWork = await options.hasIncompleteTodos(options.ctx, sessionID)
++        if (notificationVersions.get(sessionID) !== version) {
++          return
++        }
++        if (hasPendingWork) return
++      }
++
++      if (notificationVersions.get(sessionID) !== version) {
++        return
++      }
++
++      if (sessionActivitySinceIdle.has(sessionID)) {
++        sessionActivitySinceIdle.delete(sessionID)
++        return
++      }
++
++      notifiedSessions.add(sessionID)
++
++      await options.send(options.ctx, options.platform, options.config.title, options.config.message)
++
++      if (options.config.playSound && options.config.soundPath) {
++        await options.playSound(options.ctx, options.platform, options.config.soundPath)
++      }
++    } finally {
++      executingNotifications.delete(sessionID)
++      pendingTimers.delete(sessionID)
++      if (sessionActivitySinceIdle.has(sessionID)) {
++        notifiedSessions.delete(sessionID)
++        sessionActivitySinceIdle.delete(sessionID)
++      }
++    }
++  }
++
++  function scheduleIdleNotification(sessionID: string): void {
++    if (notifiedSessions.has(sessionID)) return
++    if (pendingTimers.has(sessionID)) return
++    if (executingNotifications.has(sessionID)) return
++
++    sessionActivitySinceIdle.delete(sessionID)
++
++    const currentVersion = (notificationVersions.get(sessionID) ?? 0) + 1
++    notificationVersions.set(sessionID, currentVersion)
++
++    const timer = setTimeout(() => {
++      executeNotification(sessionID, currentVersion)
++    }, options.config.idleConfirmationDelay)
++
++    pendingTimers.set(sessionID, timer)
++    cleanupOldSessions()
++  }
++
++  function deleteSession(sessionID: string): void {
++    cancelPendingNotification(sessionID)
++    notifiedSessions.delete(sessionID)
++    sessionActivitySinceIdle.delete(sessionID)
++    notificationVersions.delete(sessionID)
++    executingNotifications.delete(sessionID)
++  }
++
++  return {
++    markSessionActivity,
++    scheduleIdleNotification,
++    deleteSession,
++  }
++}
+diff --git a/src/hooks/session-notification-sender.ts b/src/hooks/session-notification-sender.ts
+new file mode 100644
+index 00000000..8c5cf1df
+--- /dev/null
++++ b/src/hooks/session-notification-sender.ts
+@@ -0,0 +1,102 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { platform } from "os"
++import {
++  getOsascriptPath,
++  getNotifySendPath,
++  getPowershellPath,
++  getAfplayPath,
++  getPaplayPath,
++  getAplayPath,
++} from "./session-notification-utils"
++import { buildWindowsToastScript, escapeAppleScriptText, escapePowerShellSingleQuotedText } from "./session-notification-formatting"
++
++export type Platform = "darwin" | "linux" | "win32" | "unsupported"
++
++export function detectPlatform(): Platform {
++  const detected = platform()
++  if (detected === "darwin" || detected === "linux" || detected === "win32") return detected
++  return "unsupported"
++}
++
++export function getDefaultSoundPath(platform: Platform): string {
++  switch (platform) {
++    case "darwin":
++      return "/System/Library/Sounds/Glass.aiff"
++    case "linux":
++      return "/usr/share/sounds/freedesktop/stereo/complete.oga"
++    case "win32":
++      return "C:\\Windows\\Media\\notify.wav"
++    default:
++      return ""
++  }
++}
++
++export async function sendSessionNotification(
++  ctx: PluginInput,
++  platform: Platform,
++  title: string,
++  message: string
++): Promise<void> {
++  switch (platform) {
++    case "darwin": {
++      const osascriptPath = await getOsascriptPath()
++      if (!osascriptPath) return
++
++      const escapedTitle = escapeAppleScriptText(title)
++      const escapedMessage = escapeAppleScriptText(message)
++      await ctx.$`${osascriptPath} -e ${"display notification \"" + escapedMessage + "\" with title \"" + escapedTitle + "\""}`.catch(
++        () => {}
++      )
++      break
++    }
++    case "linux": {
++      const notifySendPath = await getNotifySendPath()
++      if (!notifySendPath) return
++
++      await ctx.$`${notifySendPath} ${title} ${message} 2>/dev/null`.catch(() => {})
++      break
++    }
++    case "win32": {
++      const powershellPath = await getPowershellPath()
++      if (!powershellPath) return
++
++      const toastScript = buildWindowsToastScript(title, message)
++      await ctx.$`${powershellPath} -Command ${toastScript}`.catch(() => {})
++      break
++    }
++  }
++}
++
++export async function playSessionNotificationSound(
++  ctx: PluginInput,
++  platform: Platform,
++  soundPath: string
++): Promise<void> {
++  switch (platform) {
++    case "darwin": {
++      const afplayPath = await getAfplayPath()
++      if (!afplayPath) return
++      ctx.$`${afplayPath} ${soundPath}`.catch(() => {})
++      break
++    }
++    case "linux": {
++      const paplayPath = await getPaplayPath()
++      if (paplayPath) {
++        ctx.$`${paplayPath} ${soundPath} 2>/dev/null`.catch(() => {})
++      } else {
++        const aplayPath = await getAplayPath()
++        if (aplayPath) {
++          ctx.$`${aplayPath} ${soundPath} 2>/dev/null`.catch(() => {})
++        }
++      }
++      break
++    }
++    case "win32": {
++      const powershellPath = await getPowershellPath()
++      if (!powershellPath) return
++      const escaped = escapePowerShellSingleQuotedText(soundPath)
++      ctx.$`${powershellPath} -Command ${("(New-Object Media.SoundPlayer '" + escaped + "').PlaySync()")}`.catch(() => {})
++      break
++    }
++  }
++}
+diff --git a/src/hooks/session-notification.ts b/src/hooks/session-notification.ts
+index 76b97dc9..a6380c5a 100644
+--- a/src/hooks/session-notification.ts
++++ b/src/hooks/session-notification.ts
+@@ -1,22 +1,16 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+-import { platform } from "os"
+ import { subagentSessions, getMainSessionID } from "../features/claude-code-session-state"
+ import {
+-  getOsascriptPath,
+-  getNotifySendPath,
+-  getPowershellPath,
+-  getAfplayPath,
+-  getPaplayPath,
+-  getAplayPath,
+   startBackgroundCheck,
+ } from "./session-notification-utils"
+-
+-interface Todo {
+-  content: string
+-  status: string
+-  priority: string
+-  id: string
+-}
++import {
++  detectPlatform,
++  getDefaultSoundPath,
++  playSessionNotificationSound,
++  sendSessionNotification,
++} from "./session-notification-sender"
++import { hasIncompleteTodos } from "./session-todo-status"
++import { createIdleNotificationScheduler } from "./session-notification-scheduler"
+ 
+ interface SessionNotificationConfig {
+   title?: string
+@@ -30,115 +24,6 @@ interface SessionNotificationConfig {
+   /** Maximum number of sessions to track before cleanup (default: 100) */
+   maxTrackedSessions?: number
+ }
+-
+-type Platform = "darwin" | "linux" | "win32" | "unsupported"
+-
+-function detectPlatform(): Platform {
+-  const p = platform()
+-  if (p === "darwin" || p === "linux" || p === "win32") return p
+-  return "unsupported"
+-}
+-
+-function getDefaultSoundPath(p: Platform): string {
+-  switch (p) {
+-    case "darwin":
+-      return "/System/Library/Sounds/Glass.aiff"
+-    case "linux":
+-      return "/usr/share/sounds/freedesktop/stereo/complete.oga"
+-    case "win32":
+-      return "C:\\Windows\\Media\\notify.wav"
+-    default:
+-      return ""
+-  }
+-}
+-
+-async function sendNotification(
+-  ctx: PluginInput,
+-  p: Platform,
+-  title: string,
+-  message: string
+-): Promise<void> {
+-  switch (p) {
+-    case "darwin": {
+-      const osascriptPath = await getOsascriptPath()
+-      if (!osascriptPath) return
+-
+-      const esTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+-      const esMessage = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+-      await ctx.$`${osascriptPath} -e ${"display notification \"" + esMessage + "\" with title \"" + esTitle + "\""}`.catch(() => {})
+-      break
+-    }
+-    case "linux": {
+-      const notifySendPath = await getNotifySendPath()
+-      if (!notifySendPath) return
+-
+-      await ctx.$`${notifySendPath} ${title} ${message} 2>/dev/null`.catch(() => {})
+-      break
+-    }
+-    case "win32": {
+-      const powershellPath = await getPowershellPath()
+-      if (!powershellPath) return
+-
+-      const psTitle = title.replace(/'/g, "''")
+-      const psMessage = message.replace(/'/g, "''")
+-      const toastScript = `
+-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+-$Template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+-$RawXml = [xml] $Template.GetXml()
+-($RawXml.toast.visual.binding.text | Where-Object {$_.id -eq '1'}).AppendChild($RawXml.CreateTextNode('${psTitle}')) | Out-Null
+-($RawXml.toast.visual.binding.text | Where-Object {$_.id -eq '2'}).AppendChild($RawXml.CreateTextNode('${psMessage}')) | Out-Null
+-$SerializedXml = New-Object Windows.Data.Xml.Dom.XmlDocument
+-$SerializedXml.LoadXml($RawXml.OuterXml)
+-$Toast = [Windows.UI.Notifications.ToastNotification]::new($SerializedXml)
+-$Notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('OpenCode')
+-$Notifier.Show($Toast)
+-`.trim().replace(/\n/g, "; ")
+-      await ctx.$`${powershellPath} -Command ${toastScript}`.catch(() => {})
+-      break
+-    }
+-  }
+-}
+-
+-async function playSound(ctx: PluginInput, p: Platform, soundPath: string): Promise<void> {
+-  switch (p) {
+-    case "darwin": {
+-      const afplayPath = await getAfplayPath()
+-      if (!afplayPath) return
+-      ctx.$`${afplayPath} ${soundPath}`.catch(() => {})
+-      break
+-    }
+-    case "linux": {
+-      const paplayPath = await getPaplayPath()
+-      if (paplayPath) {
+-        ctx.$`${paplayPath} ${soundPath} 2>/dev/null`.catch(() => {})
+-      } else {
+-        const aplayPath = await getAplayPath()
+-        if (aplayPath) {
+-          ctx.$`${aplayPath} ${soundPath} 2>/dev/null`.catch(() => {})
+-        }
+-      }
+-      break
+-    }
+-    case "win32": {
+-      const powershellPath = await getPowershellPath()
+-      if (!powershellPath) return
+-      ctx.$`${powershellPath} -Command ${"(New-Object Media.SoundPlayer '" + soundPath.replace(/'/g, "''") + "').PlaySync()"}`.catch(() => {})
+-      break
+-    }
+-  }
+-}
+-
+-async function hasIncompleteTodos(ctx: PluginInput, sessionID: string): Promise<boolean> {
+-  try {
+-    const response = await ctx.client.session.todo({ path: { id: sessionID } })
+-    const todos = (response.data ?? response) as Todo[]
+-    if (!todos || todos.length === 0) return false
+-    return todos.some((t) => t.status !== "completed" && t.status !== "cancelled")
+-  } catch {
+-    return false
+-  }
+-}
+-
+ export function createSessionNotification(
+   ctx: PluginInput,
+   config: SessionNotificationConfig = {}
+@@ -159,110 +44,14 @@ export function createSessionNotification(
+     ...config,
+   }
+ 
+-  const notifiedSessions = new Set<string>()
+-  const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>()
+-  const sessionActivitySinceIdle = new Set<string>()
+-  // Track notification execution version to handle race conditions
+-  const notificationVersions = new Map<string, number>()
+-  // Track sessions currently executing notification (prevents duplicate execution)
+-  const executingNotifications = new Set<string>()
+-
+-  function cleanupOldSessions() {
+-    const maxSessions = mergedConfig.maxTrackedSessions
+-    if (notifiedSessions.size > maxSessions) {
+-      const sessionsToRemove = Array.from(notifiedSessions).slice(0, notifiedSessions.size - maxSessions)
+-      sessionsToRemove.forEach(id => notifiedSessions.delete(id))
+-    }
+-    if (sessionActivitySinceIdle.size > maxSessions) {
+-      const sessionsToRemove = Array.from(sessionActivitySinceIdle).slice(0, sessionActivitySinceIdle.size - maxSessions)
+-      sessionsToRemove.forEach(id => sessionActivitySinceIdle.delete(id))
+-    }
+-    if (notificationVersions.size > maxSessions) {
+-      const sessionsToRemove = Array.from(notificationVersions.keys()).slice(0, notificationVersions.size - maxSessions)
+-      sessionsToRemove.forEach(id => notificationVersions.delete(id))
+-    }
+-    if (executingNotifications.size > maxSessions) {
+-      const sessionsToRemove = Array.from(executingNotifications).slice(0, executingNotifications.size - maxSessions)
+-      sessionsToRemove.forEach(id => executingNotifications.delete(id))
+-    }
+-  }
+-
+-  function cancelPendingNotification(sessionID: string) {
+-    const timer = pendingTimers.get(sessionID)
+-    if (timer) {
+-      clearTimeout(timer)
+-      pendingTimers.delete(sessionID)
+-    }
+-    sessionActivitySinceIdle.add(sessionID)
+-    // Increment version to invalidate any in-flight notifications
+-    notificationVersions.set(sessionID, (notificationVersions.get(sessionID) ?? 0) + 1)
+-  }
+-
+-  function markSessionActivity(sessionID: string) {
+-    cancelPendingNotification(sessionID)
+-    if (!executingNotifications.has(sessionID)) {
+-      notifiedSessions.delete(sessionID)
+-    }
+-  }
+-
+-  async function executeNotification(sessionID: string, version: number) {
+-    if (executingNotifications.has(sessionID)) {
+-      pendingTimers.delete(sessionID)
+-      return
+-    }
+-
+-    if (notificationVersions.get(sessionID) !== version) {
+-      pendingTimers.delete(sessionID)
+-      return
+-    }
+-
+-    if (sessionActivitySinceIdle.has(sessionID)) {
+-      sessionActivitySinceIdle.delete(sessionID)
+-      pendingTimers.delete(sessionID)
+-      return
+-    }
+-
+-    if (notifiedSessions.has(sessionID)) {
+-      pendingTimers.delete(sessionID)
+-      return
+-    }
+-
+-    executingNotifications.add(sessionID)
+-    try {
+-      if (mergedConfig.skipIfIncompleteTodos) {
+-        const hasPendingWork = await hasIncompleteTodos(ctx, sessionID)
+-        if (notificationVersions.get(sessionID) !== version) {
+-          return
+-        }
+-        if (hasPendingWork) return
+-      }
+-
+-      if (notificationVersions.get(sessionID) !== version) {
+-        return
+-      }
+-
+-      if (sessionActivitySinceIdle.has(sessionID)) {
+-        sessionActivitySinceIdle.delete(sessionID)
+-        return
+-      }
+-
+-      notifiedSessions.add(sessionID)
+-
+-      await sendNotification(ctx, currentPlatform, mergedConfig.title, mergedConfig.message)
+-
+-      if (mergedConfig.playSound && mergedConfig.soundPath) {
+-        await playSound(ctx, currentPlatform, mergedConfig.soundPath)
+-      }
+-    } finally {
+-      executingNotifications.delete(sessionID)
+-      pendingTimers.delete(sessionID)
+-      // Clear notified state if there was activity during notification
+-      if (sessionActivitySinceIdle.has(sessionID)) {
+-        notifiedSessions.delete(sessionID)
+-        sessionActivitySinceIdle.delete(sessionID)
+-      }
+-    }
+-  }
++  const scheduler = createIdleNotificationScheduler({
++    ctx,
++    platform: currentPlatform,
++    config: mergedConfig,
++    hasIncompleteTodos,
++    send: sendSessionNotification,
++    playSound: playSessionNotificationSound,
++  })
+ 
+   return async ({ event }: { event: { type: string; properties?: unknown } }) => {
+     if (currentPlatform === "unsupported") return
+@@ -273,7 +62,7 @@ export function createSessionNotification(
+       const info = props?.info as Record<string, unknown> | undefined
+       const sessionID = info?.id as string | undefined
+       if (sessionID) {
+-        markSessionActivity(sessionID)
++        scheduler.markSessionActivity(sessionID)
+       }
+       return
+     }
+@@ -288,21 +77,7 @@ export function createSessionNotification(
+       const mainSessionID = getMainSessionID()
+       if (mainSessionID && sessionID !== mainSessionID) return
+ 
+-      if (notifiedSessions.has(sessionID)) return
+-      if (pendingTimers.has(sessionID)) return
+-      if (executingNotifications.has(sessionID)) return
+-
+-      sessionActivitySinceIdle.delete(sessionID)
+-      
+-      const currentVersion = (notificationVersions.get(sessionID) ?? 0) + 1
+-      notificationVersions.set(sessionID, currentVersion)
+-
+-      const timer = setTimeout(() => {
+-        executeNotification(sessionID, currentVersion)
+-      }, mergedConfig.idleConfirmationDelay)
+-
+-      pendingTimers.set(sessionID, timer)
+-      cleanupOldSessions()
++      scheduler.scheduleIdleNotification(sessionID)
+       return
+     }
+ 
+@@ -310,7 +85,7 @@ export function createSessionNotification(
+       const info = props?.info as Record<string, unknown> | undefined
+       const sessionID = info?.sessionID as string | undefined
+       if (sessionID) {
+-        markSessionActivity(sessionID)
++        scheduler.markSessionActivity(sessionID)
+       }
+       return
+     }
+@@ -318,7 +93,7 @@ export function createSessionNotification(
+     if (event.type === "tool.execute.before" || event.type === "tool.execute.after") {
+       const sessionID = props?.sessionID as string | undefined
+       if (sessionID) {
+-        markSessionActivity(sessionID)
++        scheduler.markSessionActivity(sessionID)
+       }
+       return
+     }
+@@ -326,11 +101,7 @@ export function createSessionNotification(
+     if (event.type === "session.deleted") {
+       const sessionInfo = props?.info as { id?: string } | undefined
+       if (sessionInfo?.id) {
+-        cancelPendingNotification(sessionInfo.id)
+-        notifiedSessions.delete(sessionInfo.id)
+-        sessionActivitySinceIdle.delete(sessionInfo.id)
+-        notificationVersions.delete(sessionInfo.id)
+-        executingNotifications.delete(sessionInfo.id)
++        scheduler.deleteSession(sessionInfo.id)
+       }
+     }
+   }
+diff --git a/src/hooks/session-todo-status.ts b/src/hooks/session-todo-status.ts
+new file mode 100644
+index 00000000..cb2a28f2
+--- /dev/null
++++ b/src/hooks/session-todo-status.ts
+@@ -0,0 +1,19 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++
++interface Todo {
++  content: string
++  status: string
++  priority: string
++  id: string
++}
++
++export async function hasIncompleteTodos(ctx: PluginInput, sessionID: string): Promise<boolean> {
++  try {
++    const response = await ctx.client.session.todo({ path: { id: sessionID } })
++    const todos = (response.data ?? response) as Todo[]
++    if (!todos || todos.length === 0) return false
++    return todos.some((todo) => todo.status !== "completed" && todo.status !== "cancelled")
++  } catch {
++    return false
++  }
++}
+diff --git a/src/hooks/unstable-agent-babysitter/index.ts b/src/hooks/unstable-agent-babysitter/index.ts
+index 1850f186..4a0945f4 100644
+--- a/src/hooks/unstable-agent-babysitter/index.ts
++++ b/src/hooks/unstable-agent-babysitter/index.ts
+@@ -1 +1,9 @@
+ export { createUnstableAgentBabysitterHook } from "./unstable-agent-babysitter-hook"
++export {
++  buildReminder,
++  extractMessages,
++  getMessageInfo,
++  getMessageParts,
++  isUnstableTask,
++  THINKING_SUMMARY_MAX_CHARS,
++} from "./task-message-analyzer"
+diff --git a/src/hooks/unstable-agent-babysitter/task-message-analyzer.ts b/src/hooks/unstable-agent-babysitter/task-message-analyzer.ts
+new file mode 100644
+index 00000000..be536630
+--- /dev/null
++++ b/src/hooks/unstable-agent-babysitter/task-message-analyzer.ts
+@@ -0,0 +1,91 @@
++import type { BackgroundTask } from "../../features/background-agent"
++
++export const THINKING_SUMMARY_MAX_CHARS = 500 as const
++
++type MessageInfo = {
++  role?: string
++  agent?: string
++  model?: { providerID: string; modelID: string }
++  providerID?: string
++  modelID?: string
++}
++
++type MessagePart = {
++  type?: string
++  text?: string
++  thinking?: string
++}
++
++function hasData(value: unknown): value is { data?: unknown } {
++  return typeof value === "object" && value !== null && "data" in value
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null
++}
++
++export function getMessageInfo(value: unknown): MessageInfo | undefined {
++  if (!isRecord(value)) return undefined
++  if (!isRecord(value.info)) return undefined
++  const info = value.info
++  const modelValue = isRecord(info.model)
++    ? info.model
++    : undefined
++  const model = modelValue && typeof modelValue.providerID === "string" && typeof modelValue.modelID === "string"
++    ? { providerID: modelValue.providerID, modelID: modelValue.modelID }
++    : undefined
++  return {
++    role: typeof info.role === "string" ? info.role : undefined,
++    agent: typeof info.agent === "string" ? info.agent : undefined,
++    model,
++    providerID: typeof info.providerID === "string" ? info.providerID : undefined,
++    modelID: typeof info.modelID === "string" ? info.modelID : undefined,
++  }
++}
++
++export function getMessageParts(value: unknown): MessagePart[] {
++  if (!isRecord(value)) return []
++  if (!Array.isArray(value.parts)) return []
++  return value.parts.filter(isRecord).map((part) => ({
++    type: typeof part.type === "string" ? part.type : undefined,
++    text: typeof part.text === "string" ? part.text : undefined,
++    thinking: typeof part.thinking === "string" ? part.thinking : undefined,
++  }))
++}
++
++export function extractMessages(value: unknown): unknown[] {
++  if (Array.isArray(value)) {
++    return value
++  }
++  if (hasData(value) && Array.isArray(value.data)) {
++    return value.data
++  }
++  return []
++}
++
++export function isUnstableTask(task: BackgroundTask): boolean {
++  if (task.isUnstableAgent === true) return true
++  const modelId = task.model?.modelID?.toLowerCase()
++  return modelId ? modelId.includes("gemini") || modelId.includes("minimax") : false
++}
++
++export function buildReminder(task: BackgroundTask, summary: string | null, idleMs: number): string {
++  const idleSeconds = Math.round(idleMs / 1000)
++  const summaryText = summary ?? "(No thinking trace available)"
++  return `Unstable background agent appears idle for ${idleSeconds}s.
++
++Task ID: ${task.id}
++Description: ${task.description}
++Agent: ${task.agent}
++Status: ${task.status}
++Session ID: ${task.sessionID ?? "N/A"}
++
++Thinking summary (first ${THINKING_SUMMARY_MAX_CHARS} chars):
++${summaryText}
++
++Suggested actions:
++- background_output task_id="${task.id}" full_session=true include_thinking=true include_tool_results=true message_limit=50
++- background_cancel taskId="${task.id}"
++
++This is a reminder only. No automatic action was taken.`
++}
+diff --git a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+index a7b2b551..52a6ac86 100644
+--- a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
++++ b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+@@ -1,11 +1,18 @@
+-import type { BackgroundManager, BackgroundTask } from "../../features/background-agent"
++import type { BackgroundManager } from "../../features/background-agent"
+ import { getMainSessionID, getSessionAgent } from "../../features/claude-code-session-state"
+ import { log } from "../../shared/logger"
++import {
++  buildReminder,
++  extractMessages,
++  getMessageInfo,
++  getMessageParts,
++  isUnstableTask,
++  THINKING_SUMMARY_MAX_CHARS,
++} from "./task-message-analyzer"
+ 
+ const HOOK_NAME = "unstable-agent-babysitter"
+ const DEFAULT_TIMEOUT_MS = 120000
+ const COOLDOWN_MS = 5 * 60 * 1000
+-const THINKING_SUMMARY_MAX_CHARS = 500 as const
+ 
+ type BabysittingConfig = {
+   timeout_ms?: number
+@@ -43,72 +50,6 @@ type BabysitterOptions = {
+   config?: BabysittingConfig
+ }
+ 
+-type MessageInfo = {
+-  role?: string
+-  agent?: string
+-  model?: { providerID: string; modelID: string }
+-  providerID?: string
+-  modelID?: string
+-}
+-
+-type MessagePart = {
+-  type?: string
+-  text?: string
+-  thinking?: string
+-}
+-
+-function hasData(value: unknown): value is { data?: unknown } {
+-  return typeof value === "object" && value !== null && "data" in value
+-}
+-
+-function isRecord(value: unknown): value is Record<string, unknown> {
+-  return typeof value === "object" && value !== null
+-}
+-
+-function getMessageInfo(value: unknown): MessageInfo | undefined {
+-  if (!isRecord(value)) return undefined
+-  if (!isRecord(value.info)) return undefined
+-  const info = value.info
+-  const modelValue = isRecord(info.model)
+-    ? info.model
+-    : undefined
+-  const model = modelValue && typeof modelValue.providerID === "string" && typeof modelValue.modelID === "string"
+-    ? { providerID: modelValue.providerID, modelID: modelValue.modelID }
+-    : undefined
+-  return {
+-    role: typeof info.role === "string" ? info.role : undefined,
+-    agent: typeof info.agent === "string" ? info.agent : undefined,
+-    model,
+-    providerID: typeof info.providerID === "string" ? info.providerID : undefined,
+-    modelID: typeof info.modelID === "string" ? info.modelID : undefined,
+-  }
+-}
+-
+-function getMessageParts(value: unknown): MessagePart[] {
+-  if (!isRecord(value)) return []
+-  if (!Array.isArray(value.parts)) return []
+-  return value.parts.filter(isRecord).map((part) => ({
+-    type: typeof part.type === "string" ? part.type : undefined,
+-    text: typeof part.text === "string" ? part.text : undefined,
+-    thinking: typeof part.thinking === "string" ? part.thinking : undefined,
+-  }))
+-}
+-
+-function extractMessages(value: unknown): unknown[] {
+-  if (Array.isArray(value)) {
+-    return value
+-  }
+-  if (hasData(value) && Array.isArray(value.data)) {
+-    return value.data
+-  }
+-  return []
+-}
+-
+-function isUnstableTask(task: BackgroundTask): boolean {
+-  if (task.isUnstableAgent === true) return true
+-  const modelId = task.model?.modelID?.toLowerCase()
+-  return modelId ? modelId.includes("gemini") || modelId.includes("minimax") : false
+-}
+ 
+ async function resolveMainSessionTarget(
+   ctx: BabysitterContext,
+@@ -169,27 +110,6 @@ async function getThinkingSummary(ctx: BabysitterContext, sessionID: string): Pr
+   }
+ }
+ 
+-function buildReminder(task: BackgroundTask, summary: string | null, idleMs: number): string {
+-  const idleSeconds = Math.round(idleMs / 1000)
+-  const summaryText = summary ?? "(No thinking trace available)"
+-  return `Unstable background agent appears idle for ${idleSeconds}s.
+-
+-Task ID: ${task.id}
+-Description: ${task.description}
+-Agent: ${task.agent}
+-Status: ${task.status}
+-Session ID: ${task.sessionID ?? "N/A"}
+-
+-Thinking summary (first ${THINKING_SUMMARY_MAX_CHARS} chars):
+-${summaryText}
+-
+-Suggested actions:
+-- background_output task_id="${task.id}" full_session=true include_thinking=true include_tool_results=true message_limit=50
+-- background_cancel taskId="${task.id}"
+-
+-This is a reminder only. No automatic action was taken.`
+-}
+-
+ export function createUnstableAgentBabysitterHook(ctx: BabysitterContext, options: BabysitterOptions) {
+   const reminderCooldowns = new Map<string, number>()
+ 
+-- 
+2.39.2
+

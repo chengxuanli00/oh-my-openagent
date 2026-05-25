@@ -1,0 +1,199 @@
+From ba648685d4340c44ff4bf6a0fb3403a243359ef5 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 00:08:30 +0900
+Subject: [PATCH 5322/5749] fix(runtime-fallback): carry delegated system and
+ tools through bootstrap retry
+
+When the first prompt fails before any durable user message persists,
+runtime fallback retry was rebuilding the request from parts alone and
+losing the delegated agent system prompt and tool gates. Now it threads
+bootstrap.system and bootstrap.tools into the retry body alongside the
+captured retry parts, so the retried prompt keeps the same scope as the
+initial delegate launch.
+---
+ src/hooks/runtime-fallback/auto-retry.ts      |  7 ++--
+ src/hooks/runtime-fallback/index.test.ts      | 21 ++++++++++--
+ .../runtime-fallback/last-user-retry-parts.ts | 32 ++++++++++++++++---
+ src/hooks/runtime-fallback/types.ts           |  2 ++
+ 4 files changed, 53 insertions(+), 9 deletions(-)
+
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index f6975462..74d7932b 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -8,7 +8,7 @@ import { prepareFallback } from "./fallback-state"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+ import { clearDelegatedChildSessionBootstrap } from "../../shared/delegated-child-session-bootstrap"
+ import { buildRetryModelPayload } from "./retry-model-payload"
+-import { getLastUserRetryParts } from "./last-user-retry-parts"
++import { getLastUserRetryPayload } from "./last-user-retry-parts"
+ import { extractSessionMessages } from "./session-messages"
+ import { resolveRegisteredAgentName } from "../../features/claude-code-session-state"
+ import {
+@@ -144,7 +144,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         path: { id: sessionID },
+         query: { directory: ctx.directory },
+       })
+-      const retryParts = getLastUserRetryParts(messagesResp, sessionID)
++      const retryPayload = getLastUserRetryPayload(messagesResp, sessionID)
++      const retryParts = retryPayload.retryParts
+       if (retryParts.length > 0) {
+         log(`[${HOOK_NAME}] Auto-retrying with fallback model (${source})`, {
+           sessionID,
+@@ -166,6 +167,8 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+             body: {
+               ...(launchAgent ? { agent: launchAgent } : {}),
+               ...retryModelPayload,
++              ...(retryPayload.system ? { system: retryPayload.system } : {}),
++              ...(retryPayload.tools ? { tools: retryPayload.tools } : {}),
+               parts: retryParts,
+             },
+             query: { directory: ctx.directory },
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index 2d3196cd..2f194978 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -8,6 +8,7 @@ import {
+ } from "../../shared/delegated-child-session-bootstrap"
+ import * as loggerModule from "../../shared/logger"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
++import type { RuntimeFallbackPluginInput } from "./types"
+ 
+ type RuntimeFallbackModule = typeof import("./hook")
+ 
+@@ -49,8 +50,8 @@ describe("runtime-fallback", () => {
+       abort?: (args: unknown) => Promise<unknown>
+       status?: () => Promise<unknown>
+     }
+-  }) {
+-    return unsafeTestValue({
++  }): RuntimeFallbackPluginInput {
++    return unsafeTestValue<RuntimeFallbackPluginInput>({
+       client: {
+         tui: {
+           showToast: async (opts: { body: { title: string; message: string; variant: string; duration: number } }) => {
+@@ -522,6 +523,8 @@ describe("runtime-fallback", () => {
+         sessionID,
+         promptText: "inspect src/tools/delegate-task and report the issue",
+         category: "quick",
++        system: "delegated child system prompt",
++        tools: { call_omo_agent: true, question: false, task: false },
+       })
+ 
+       await hook.event({
+@@ -538,14 +541,19 @@ describe("runtime-fallback", () => {
+       const promptBody = promptCalls[0]?.body as {
+         model?: { providerID?: string; modelID?: string }
+         parts?: Array<{ type?: string; text?: string }>
++        system?: string
++        tools?: Record<string, boolean>
+         variant?: string
+       } | undefined
+       expect(promptBody?.model).toEqual({ providerID: "openai", modelID: "gpt-5.4" })
+       expect(promptBody?.variant).toBe("high")
++      expect(promptBody?.system).toBe("delegated child system prompt")
++      expect(promptBody?.tools?.question).toBe(false)
++      expect(promptBody?.tools?.call_omo_agent).toBe(true)
+       expect(promptBody?.parts?.[0]?.text).toContain("inspect src/tools/delegate-task")
+     })
+ 
+-    test("should discard delegated bootstrap once persisted user prompt exists", async () => {
++    test("should use persisted user prompt while preserving delegated bootstrap launch context", async () => {
+       const promptCalls: Array<Record<string, unknown>> = []
+       const sessionID = "test-delegated-history-prefers-persisted-user"
+       const hook = createRuntimeFallbackHook(
+@@ -577,6 +585,8 @@ describe("runtime-fallback", () => {
+       registerDelegatedChildSessionBootstrap({
+         sessionID,
+         promptText: "bootstrap copy should not be reused",
++        system: "persisted delegated child system prompt",
++        tools: { call_omo_agent: true, question: false, task: false },
+       })
+       SessionCategoryRegistry.register(sessionID, "test")
+ 
+@@ -593,8 +603,13 @@ describe("runtime-fallback", () => {
+       expect(promptCalls).toHaveLength(1)
+       const promptBody = promptCalls[0]?.body as {
+         parts?: Array<{ type?: string; text?: string }>
++        system?: string
++        tools?: Record<string, boolean>
+       } | undefined
+       expect(promptBody?.parts?.[0]?.text).toBe("persisted child task prompt")
++      expect(promptBody?.system).toBe("persisted delegated child system prompt")
++      expect(promptBody?.tools?.question).toBe(false)
++      expect(promptBody?.tools?.call_omo_agent).toBe(true)
+       expect(getDelegatedChildSessionBootstrap(sessionID)).toBeUndefined()
+     })
+ 
+diff --git a/src/hooks/runtime-fallback/last-user-retry-parts.ts b/src/hooks/runtime-fallback/last-user-retry-parts.ts
+index 7705188a..38a73eee 100644
+--- a/src/hooks/runtime-fallback/last-user-retry-parts.ts
++++ b/src/hooks/runtime-fallback/last-user-retry-parts.ts
+@@ -4,10 +4,26 @@ import {
+   getDelegatedChildSessionBootstrap,
+ } from "../../shared/delegated-child-session-bootstrap"
+ 
++type RetryPart = { type: "text"; text: string }
++
++export type LastUserRetryPayload = {
++  retryParts: RetryPart[]
++  system?: string
++  tools?: Record<string, boolean>
++}
++
+ export function getLastUserRetryParts(
+   messagesResponse: unknown,
+   sessionID?: string,
+-): Array<{ type: "text"; text: string }> {
++): RetryPart[] {
++  return getLastUserRetryPayload(messagesResponse, sessionID).retryParts
++}
++
++export function getLastUserRetryPayload(
++  messagesResponse: unknown,
++  sessionID?: string,
++): LastUserRetryPayload {
++  const bootstrap = sessionID ? getDelegatedChildSessionBootstrap(sessionID) : undefined
+   const messages = extractSessionMessages(messagesResponse)
+   const lastUserMessage = messages?.filter((message) => message.info?.role === "user").pop()
+   const lastUserParts =
+@@ -27,12 +43,20 @@ export function getLastUserRetryParts(
+     if (sessionID) {
+       clearDelegatedChildSessionBootstrap(sessionID)
+     }
+-    return retryParts
++    return {
++      retryParts,
++      ...(bootstrap?.system ? { system: bootstrap.system } : {}),
++      ...(bootstrap?.tools ? { tools: bootstrap.tools } : {}),
++    }
+   }
+ 
+   if (!sessionID) {
+-    return retryParts
++    return { retryParts }
+   }
+ 
+-  return getDelegatedChildSessionBootstrap(sessionID)?.retryParts ?? []
++  return {
++    retryParts: bootstrap?.retryParts ?? [],
++    ...(bootstrap?.system ? { system: bootstrap.system } : {}),
++    ...(bootstrap?.tools ? { tools: bootstrap.tools } : {}),
++  }
+ }
+diff --git a/src/hooks/runtime-fallback/types.ts b/src/hooks/runtime-fallback/types.ts
+index c05bfe95..aaa6436e 100644
+--- a/src/hooks/runtime-fallback/types.ts
++++ b/src/hooks/runtime-fallback/types.ts
+@@ -16,6 +16,8 @@ export interface RuntimeFallbackPluginInput {
+         body: {
+           agent?: string
+           model: { providerID: string; modelID: string }
++          system?: string
++          tools?: Record<string, boolean>
+           parts: Array<{ type: "text"; text: string }>
+         }
+         query: { directory: string }
+-- 
+2.39.2
+

@@ -1,0 +1,226 @@
+From 1717050f73765aa720a130f6f5369e8e81fb8546 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 10 Feb 2026 11:16:44 +0900
+Subject: [PATCH 1996/5749] feat(event): normalize session.status to
+ session.idle
+
+Add session-status-normalizer to handle session.status events and
+convert idle status to synthetic session.idle events. Includes
+deduplication logic to prevent duplicate idle events within 500ms.
+---
+ src/plugin/event.ts                          |  28 ++++-
+ src/plugin/session-status-normalizer.test.ts | 119 +++++++++++++++++++
+ src/plugin/session-status-normalizer.ts      |  22 ++++
+ 3 files changed, 168 insertions(+), 1 deletion(-)
+ create mode 100644 src/plugin/session-status-normalizer.test.ts
+ create mode 100644 src/plugin/session-status-normalizer.ts
+
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 4c068503..3755a88c 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -12,6 +12,7 @@ import { lspManager } from "../tools"
+ 
+ import type { CreatedHooks } from "../create-hooks"
+ import type { Managers } from "../create-managers"
++import { normalizeSessionStatusToIdle } from "./session-status-normalizer"
+ 
+ type FirstMessageVariantGate = {
+   markSessionCreated: (sessionInfo: { id?: string; title?: string; parentID?: string } | undefined) => void
+@@ -27,7 +28,7 @@ export function createEventHandler(args: {
+ }): (input: { event: { type: string; properties?: Record<string, unknown> } }) => Promise<void> {
+   const { ctx, firstMessageVariantGate, managers, hooks } = args
+ 
+-  return async (input): Promise<void> => {
++  const dispatchToHooks = async (input: { event: { type: string; properties?: Record<string, unknown> } }): Promise<void> => {
+     await Promise.resolve(hooks.autoUpdateChecker?.event?.(input))
+     await Promise.resolve(hooks.claudeCodeHooks?.event?.(input))
+     await Promise.resolve(hooks.backgroundNotificationHook?.event?.(input))
+@@ -47,6 +48,31 @@ export function createEventHandler(args: {
+     await Promise.resolve(hooks.stopContinuationGuard?.event?.(input))
+     await Promise.resolve(hooks.compactionTodoPreserver?.event?.(input))
+     await Promise.resolve(hooks.atlasHook?.handler?.(input))
++  }
++
++  const recentSyntheticIdles = new Map<string, number>()
++  const DEDUP_WINDOW_MS = 500
++
++  return async (input): Promise<void> => {
++    if (input.event.type === "session.idle") {
++      const sessionID = (input.event.properties as Record<string, unknown> | undefined)?.sessionID as string | undefined
++      if (sessionID) {
++        const emittedAt = recentSyntheticIdles.get(sessionID)
++        if (emittedAt && Date.now() - emittedAt < DEDUP_WINDOW_MS) {
++          recentSyntheticIdles.delete(sessionID)
++          return
++        }
++      }
++    }
++
++    await dispatchToHooks(input)
++
++    const syntheticIdle = normalizeSessionStatusToIdle(input)
++    if (syntheticIdle) {
++      const sessionID = (syntheticIdle.event.properties as Record<string, unknown>)?.sessionID as string
++      recentSyntheticIdles.set(sessionID, Date.now())
++      await dispatchToHooks(syntheticIdle)
++    }
+ 
+     const { event } = input
+     const props = event.properties as Record<string, unknown> | undefined
+diff --git a/src/plugin/session-status-normalizer.test.ts b/src/plugin/session-status-normalizer.test.ts
+new file mode 100644
+index 00000000..cfb99ec6
+--- /dev/null
++++ b/src/plugin/session-status-normalizer.test.ts
+@@ -0,0 +1,119 @@
++import { describe, it, expect } from "bun:test"
++import { normalizeSessionStatusToIdle } from "./session-status-normalizer"
++
++type EventInput = { event: { type: string; properties?: Record<string, unknown> } }
++
++describe("normalizeSessionStatusToIdle", () => {
++	it("converts session.status with idle type to synthetic session.idle event", () => {
++		//#given - a session.status event with type=idle
++		const input: EventInput = {
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: "ses_abc123",
++					status: { type: "idle" },
++				},
++			},
++		}
++
++		//#when - normalizeSessionStatusToIdle is called
++		const result = normalizeSessionStatusToIdle(input)
++
++		//#then - returns a synthetic session.idle event
++		expect(result).toEqual({
++			event: {
++				type: "session.idle",
++				properties: {
++					sessionID: "ses_abc123",
++				},
++			},
++		})
++	})
++
++	it("returns null for session.status with busy type", () => {
++		//#given - a session.status event with type=busy
++		const input: EventInput = {
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: "ses_abc123",
++					status: { type: "busy" },
++				},
++			},
++		}
++
++		//#when - normalizeSessionStatusToIdle is called
++		const result = normalizeSessionStatusToIdle(input)
++
++		//#then - returns null (no synthetic idle event)
++		expect(result).toBeNull()
++	})
++
++	it("returns null for session.status with retry type", () => {
++		//#given - a session.status event with type=retry
++		const input: EventInput = {
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: "ses_abc123",
++					status: { type: "retry", attempt: 1, message: "retrying", next: 5000 },
++				},
++			},
++		}
++
++		//#when - normalizeSessionStatusToIdle is called
++		const result = normalizeSessionStatusToIdle(input)
++
++		//#then - returns null
++		expect(result).toBeNull()
++	})
++
++	it("returns null for non-session.status events", () => {
++		//#given - a message.updated event
++		const input: EventInput = {
++			event: {
++				type: "message.updated",
++				properties: { info: { sessionID: "ses_abc123" } },
++			},
++		}
++
++		//#when - normalizeSessionStatusToIdle is called
++		const result = normalizeSessionStatusToIdle(input)
++
++		//#then - returns null
++		expect(result).toBeNull()
++	})
++
++	it("returns null when session.status has no properties", () => {
++		//#given - a session.status event with no properties
++		const input: EventInput = {
++			event: {
++				type: "session.status",
++			},
++		}
++
++		//#when - normalizeSessionStatusToIdle is called
++		const result = normalizeSessionStatusToIdle(input)
++
++		//#then - returns null
++		expect(result).toBeNull()
++	})
++
++	it("returns null when session.status has no status object", () => {
++		//#given - a session.status event with sessionID but no status
++		const input: EventInput = {
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: "ses_abc123",
++				},
++			},
++		}
++
++		//#when - normalizeSessionStatusToIdle is called
++		const result = normalizeSessionStatusToIdle(input)
++
++		//#then - returns null
++		expect(result).toBeNull()
++	})
++})
+diff --git a/src/plugin/session-status-normalizer.ts b/src/plugin/session-status-normalizer.ts
+new file mode 100644
+index 00000000..e02377d3
+--- /dev/null
++++ b/src/plugin/session-status-normalizer.ts
+@@ -0,0 +1,22 @@
++type EventInput = { event: { type: string; properties?: Record<string, unknown> } }
++type SessionStatus = { type: string }
++
++export function normalizeSessionStatusToIdle(input: EventInput): EventInput | null {
++	if (input.event.type !== "session.status") return null
++
++	const props = input.event.properties
++	if (!props) return null
++
++	const status = props.status as SessionStatus | undefined
++	if (!status || status.type !== "idle") return null
++
++	const sessionID = props.sessionID as string | undefined
++	if (!sessionID) return null
++
++	return {
++		event: {
++			type: "session.idle",
++			properties: { sessionID },
++		},
++	}
++}
+-- 
+2.39.2
+

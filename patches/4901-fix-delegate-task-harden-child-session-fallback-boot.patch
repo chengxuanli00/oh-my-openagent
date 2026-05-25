@@ -1,0 +1,1150 @@
+From fac90d69f8b01717dcad5209af8a974c1f86bb74 Mon Sep 17 00:00:00 2001
+From: tw-yshuang <tw.yshuang@gmail.com>
+Date: Thu, 7 May 2026 08:34:52 +0800
+Subject: [PATCH 4901/5749] fix(delegate-task): harden child-session fallback
+ bootstrap and cleanup
+
+Capture delegated child-session retry context before the first prompt so fallback recovery still works when session history is empty. Align background and sync launch paths around the same bootstrap contract, clear session-scoped fallback state on every terminal path, and lock the behavior with regression coverage for first-prompt retries, exhaustion, isolation, and cleanup.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/features/background-agent/manager.test.ts | 235 +++++++++++++++++-
+ src/features/background-agent/manager.ts      |  34 ++-
+ src/hooks/runtime-fallback/auto-retry.ts      |   2 +-
+ src/hooks/runtime-fallback/index.test.ts      |  83 ++++++-
+ .../runtime-fallback/last-user-retry-parts.ts |  12 +-
+ .../delegated-child-session-bootstrap.ts      |  55 ++++
+ src/tools/delegate-task/background-task.ts    |  73 +-----
+ src/tools/delegate-task/sync-prompt-sender.ts |   3 +-
+ src/tools/delegate-task/sync-task.test.ts     | 155 +++++++++++-
+ src/tools/delegate-task/sync-task.ts          |  23 +-
+ 10 files changed, 573 insertions(+), 102 deletions(-)
+ create mode 100644 src/shared/delegated-child-session-bootstrap.ts
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index f7aae5b4..a3f7b713 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -1,7 +1,10 @@
+ declare const require: (name: string) => any
+ const { describe, test, expect, beforeEach, afterEach, afterAll, spyOn, mock } = require("bun:test")
+ 
+-afterAll(() => { mock.restore() })
++afterAll(() => {
++  mock.restore()
++  clearAllDelegatedChildSessionBootstrap()
++})
+ 
+ import { getSessionPromptParams, clearSessionPromptParams } from "../../shared/session-prompt-params-state"
+ import { tmpdir } from "node:os"
+@@ -13,6 +16,12 @@ import { BackgroundManager } from "./manager"
+ import { ConcurrencyManager } from "./concurrency"
+ import { initTaskToastManager, _resetTaskToastManagerForTesting } from "../task-toast-manager/manager"
+ import { _resetForTesting as resetProcessCleanupState } from "./process-cleanup"
++import {
++  clearAllDelegatedChildSessionBootstrap,
++  getDelegatedChildSessionBootstrap,
++  registerDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
++import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+ 
+ mock.module("../../shared/connected-providers-cache", () => ({
+   readConnectedProvidersCache: () => null,
+@@ -338,23 +347,37 @@ describe("BackgroundManager session.error fallback hydration", () => {
+ })
+ 
+ describe("BackgroundManager prompt rejection fallback routing", () => {
+-  test("routes launch-time prompt rejections into tryFallbackRetry before marking interrupt", async () => {
++  test("routes delegated child-session launch-time prompt rejections into tryFallbackRetry before history exists", async () => {
+     //#given
+     const promptError = {
+       name: "APIError",
+       data: { message: "Forbidden: Selected provider is forbidden" },
+     }
++    const fallbackChain = [{ model: "claude-haiku-4-5", providers: ["anthropic"] }]
++    const messages = mock(async () => ({ data: [] }))
++    const bootstrapSnapshots: Array<ReturnType<typeof getDelegatedChildSessionBootstrap>> = []
+     const client = {
+       session: {
+         get: async () => ({ data: { directory: tmpdir() } }),
+         create: async () => ({ data: { id: "ses_launch_retry" } }),
++        messages,
+         promptAsync: async () => {
++          bootstrapSnapshots.push(getDelegatedChildSessionBootstrap("ses_launch_retry"))
+           throw promptError
+         },
+         abort: async () => ({}),
+       },
+     }
+-    const manager = new BackgroundManager({ pluginContext: { client, directory: tmpdir() } as unknown as PluginInput })
++    const setSessionFallbackChain = mock(() => {})
++    const manager = new BackgroundManager({
++      pluginContext: { client, directory: tmpdir() } as unknown as PluginInput,
++      modelFallbackControllerAccessor: {
++        register: () => {},
++        setSessionFallbackChain,
++        getSessionFallbackChain: () => undefined,
++        clearSessionFallbackChain: () => {},
++      },
++    })
+     stubNotifyParentSession(manager)
+     ;(manager as unknown as {
+       reserveSubagentSpawn: () => Promise<{
+@@ -386,8 +409,9 @@ describe("BackgroundManager prompt rejection fallback routing", () => {
+       agent: "sisyphus-junior",
+       parentSessionId: "parent-session",
+       parentMessageId: "parent-message",
++      category: "deep",
+       model: { providerID: "genai-proxy-openai", modelID: "gpt-5.4-mini" },
+-      fallbackChain: [{ model: "claude-haiku-4-5", providers: ["anthropic"] }],
++      fallbackChain,
+     })
+     await flushBackgroundNotifications()
+ 
+@@ -400,6 +424,72 @@ describe("BackgroundManager prompt rejection fallback routing", () => {
+       message: "Forbidden: Selected provider is forbidden",
+     })
+     expect(storedTask?.status).toBe("pending")
++    expect(messages).not.toHaveBeenCalled()
++    expect(setSessionFallbackChain).toHaveBeenCalledWith("ses_launch_retry", fallbackChain)
++    expect(bootstrapSnapshots[0]?.retryParts[0]?.text).toContain("say hi")
++  })
++
++  test("clears delegated bootstrap and fallback context when launch-time prompt failure is terminal", async () => {
++    //#given
++    const promptError = new Error("Connection timeout")
++    const fallbackChain = [{ model: "claude-haiku-4-5", providers: ["anthropic"] }]
++    const clearSessionFallbackChain = mock(() => {})
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: tmpdir() } }),
++        create: async () => ({ data: { id: "ses_launch_terminal" } }),
++        promptAsync: async () => {
++          throw promptError
++        },
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({
++      pluginContext: { client, directory: tmpdir() } as unknown as PluginInput,
++      modelFallbackControllerAccessor: {
++        register: () => {},
++        setSessionFallbackChain: () => {},
++        getSessionFallbackChain: () => undefined,
++        clearSessionFallbackChain,
++      },
++    })
++    stubNotifyParentSession(manager)
++    ;(manager as unknown as {
++      reserveSubagentSpawn: () => Promise<{
++        spawnContext: { rootSessionID: string; parentDepth: number; childDepth: number }
++        descendantCount: number
++        commit: () => number
++        rollback: () => void
++      }>
++    }).reserveSubagentSpawn = async () => ({
++      spawnContext: { rootSessionID: "parent-session", parentDepth: 0, childDepth: 1 },
++      descendantCount: 1,
++      commit: () => 1,
++      rollback: () => {},
++    })
++    ;(manager as unknown as {
++      tryFallbackRetry: (task: BackgroundTask, errorInfo: { name?: string; message?: string }, source: string) => Promise<boolean>
++    }).tryFallbackRetry = async () => false
++
++    //#when
++    const launchedTask = await manager.launch({
++      description: "background terminal retry test",
++      prompt: "say bye",
++      agent: "sisyphus-junior",
++      parentSessionId: "parent-session",
++      parentMessageId: "parent-message",
++      category: "deep",
++      model: { providerID: "genai-proxy-openai", modelID: "gpt-5.4-mini" },
++      fallbackChain,
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    const storedTask = getTaskMap(manager).get(launchedTask.id)
++    expect(storedTask?.status).toBe("interrupt")
++    expect(getDelegatedChildSessionBootstrap("ses_launch_terminal")).toBeUndefined()
++    expect(clearSessionFallbackChain).toHaveBeenCalledWith("ses_launch_terminal")
++    expect(SessionCategoryRegistry.has("ses_launch_terminal")).toBe(false)
+   })
+ 
+   test("routes resume-time prompt rejections into tryFallbackRetry before marking interrupt", async () => {
+@@ -602,6 +692,60 @@ describe("BackgroundManager retry observability", () => {
+     expect(retryReadyNotification).toContain("Forbidden: Selected provider is forbidden")
+   })
+ 
++  test("clears delegated bootstrap and fallback context for the failed session when a fallback retry is scheduled", async () => {
++    //#given
++    const clearSessionFallbackChain = mock(() => {})
++    const manager = createBackgroundManagerWithOptions({
++      modelFallbackControllerAccessor: {
++        register: () => {},
++        setSessionFallbackChain: () => {},
++        getSessionFallbackChain: () => undefined,
++        clearSessionFallbackChain,
++      },
++    })
++    registerDelegatedChildSessionBootstrap({
++      sessionID: "ses_retry_cleanup",
++      promptText: "retry me",
++      fallbackChain: [{ model: "claude-haiku-4-5", providers: ["anthropic"] }],
++      category: "deep",
++    })
++    const task = createMockTask({
++      id: "bg_retry_cleanup",
++      sessionId: "ses_retry_cleanup",
++      parentSessionId: "parent-session",
++      status: "running",
++      attemptCount: 0,
++      fallbackChain: [{ model: "claude-haiku-4-5", providers: ["anthropic"] }],
++      model: { providerID: "genai-proxy-openai", modelID: "gpt-5.4-mini" },
++      concurrencyKey: "genai-proxy-openai/gpt-5.4-mini",
++      attempts: [
++        {
++          attemptId: "att_retry_cleanup",
++          attemptNumber: 1,
++          sessionId: "ses_retry_cleanup",
++          providerId: "genai-proxy-openai",
++          modelId: "gpt-5.4-mini",
++          status: "running",
++        },
++      ],
++      currentAttemptID: "att_retry_cleanup",
++    })
++
++    //#when
++    const retried = await (manager as unknown as {
++      tryFallbackRetry: (task: BackgroundTask, errorInfo: { name?: string; message?: string }, source: string) => Promise<boolean>
++    }).tryFallbackRetry(task, {
++      name: "APIError",
++      message: "Forbidden: Selected provider is forbidden",
++    }, "promptAsync.launch")
++
++    //#then
++    expect(retried).toBe(true)
++    expect(getDelegatedChildSessionBootstrap("ses_retry_cleanup")).toBeUndefined()
++    expect(clearSessionFallbackChain).toHaveBeenCalledWith("ses_retry_cleanup")
++    expect(SessionCategoryRegistry.has("ses_retry_cleanup")).toBe(false)
++  })
++
+   test("builds retry-ready links from the parent session directory when it differs from the manager directory", async () => {
+     //#given
+     const queuePendingNotification = mock(() => {})
+@@ -1805,7 +1949,7 @@ describe("BackgroundManager.tryCompleteTask", () => {
+     expect(concurrencyManager.getCount(concurrencyKey)).toBe(0)
+   })
+ 
+-   test("should abort session on completion", async () => {
++  test("should abort session on completion", async () => {
+      // #given
+      const abortedSessionIDs: string[] = []
+      const client = {
+@@ -1842,6 +1986,47 @@ describe("BackgroundManager.tryCompleteTask", () => {
+     expect(abortedSessionIDs).toEqual(["session-1"])
+   })
+ 
++  test("should clear delegated bootstrap and fallback context on completion", async () => {
++    //#given
++    const clearSessionFallbackChain = mock(() => {})
++    manager.shutdown()
++    manager = createBackgroundManagerWithOptions({
++      modelFallbackControllerAccessor: {
++        register: () => {},
++        setSessionFallbackChain: () => {},
++        getSessionFallbackChain: () => undefined,
++        clearSessionFallbackChain,
++      },
++    })
++    stubNotifyParentSession(manager)
++    registerDelegatedChildSessionBootstrap({
++      sessionID: "session-bootstrap-complete",
++      promptText: "complete me",
++      fallbackChain: [{ model: "fallback-1", providers: ["provider-a"] }],
++      category: "deep",
++    })
++
++    const task: BackgroundTask = {
++      id: "task-bootstrap-complete",
++      sessionId: "session-bootstrap-complete",
++      parentSessionId: "parent-bootstrap-complete",
++      parentMessageId: "msg-1",
++      description: "bootstrap completion task",
++      prompt: "test",
++      agent: "explore",
++      status: "running",
++      startedAt: new Date(),
++    }
++
++    //#when
++    await tryCompleteTaskForTest(manager, task)
++
++    //#then
++    expect(getDelegatedChildSessionBootstrap("session-bootstrap-complete")).toBeUndefined()
++    expect(clearSessionFallbackChain).toHaveBeenCalledWith("session-bootstrap-complete")
++    expect(SessionCategoryRegistry.has("session-bootstrap-complete")).toBe(false)
++  })
++
+   test("should clean pendingByParent even when promptAsync notification fails", async () => {
+     // given
+     const client = {
+@@ -3584,6 +3769,46 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+       manager.shutdown()
+       resetToastManager()
+     })
++
++    test("should clear delegated bootstrap and fallback context when cancelling a running task", async () => {
++      //#given
++      const clearSessionFallbackChain = mock(() => {})
++      const manager = createBackgroundManagerWithOptions({
++        modelFallbackControllerAccessor: {
++          register: () => {},
++          setSessionFallbackChain: () => {},
++          getSessionFallbackChain: () => undefined,
++          clearSessionFallbackChain,
++        },
++      })
++      registerDelegatedChildSessionBootstrap({
++        sessionID: "session-cancel-bootstrap",
++        promptText: "cancel me",
++        fallbackChain: [{ model: "fallback-1", providers: ["provider-a"] }],
++        category: "deep",
++      })
++      const task = createMockTask({
++        id: "task-cancel-bootstrap",
++        sessionId: "session-cancel-bootstrap",
++        parentSessionId: "parent-cancel-bootstrap",
++        status: "running",
++      })
++      getTaskMap(manager).set(task.id, task)
++
++      //#when
++      const cancelled = await manager.cancelTask(task.id, {
++        source: "test",
++        skipNotification: true,
++      })
++
++      //#then
++      expect(cancelled).toBe(true)
++      expect(getDelegatedChildSessionBootstrap("session-cancel-bootstrap")).toBeUndefined()
++      expect(clearSessionFallbackChain).toHaveBeenCalledWith("session-cancel-bootstrap")
++      expect(SessionCategoryRegistry.has("session-cancel-bootstrap")).toBe(false)
++
++      manager.shutdown()
++    })
+   })
+ 
+   describe("multiple keys process in parallel", () => {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 9442c23d..e5333f0e 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -87,6 +87,10 @@ import {
+   resolveSubagentSpawnContext,
+   type SubagentSpawnContext,
+ } from "./subagent-spawn-limits"
++import {
++  clearDelegatedChildSessionBootstrap,
++  registerDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
+ 
+ type OpencodeClient = PluginInput["client"]
+ 
+@@ -249,6 +253,12 @@ export class BackgroundManager {
+     }
+   }
+ 
++  private cleanupDelegatedSessionContext(sessionID: string): void {
++    clearDelegatedChildSessionBootstrap(sessionID)
++    this.modelFallbackControllerAccessor?.clearSessionFallbackChain(sessionID)
++    SessionCategoryRegistry.remove(sessionID)
++  }
++
+   async assertCanSpawn(parentSessionID: string): Promise<SubagentSpawnContext> {
+     const spawnContext = await resolveSubagentSpawnContext(this.client, parentSessionID, this.directory)
+     const maxDepth = getMaxSubagentDepth(this.config)
+@@ -618,6 +628,14 @@ export class BackgroundManager {
+       return
+     }
+ 
++    registerDelegatedChildSessionBootstrap({
++      sessionID,
++      promptText: input.prompt,
++      fallbackChain: input.fallbackChain,
++      category: input.category,
++      modelFallbackControllerAccessor: this.modelFallbackControllerAccessor,
++    })
++
+     task.progress = {
+       toolCalls: 0,
+       lastUpdate: new Date(),
+@@ -778,6 +796,7 @@ The fallback retry session is now created and can be inspected directly.
+         // Abort the session to prevent infinite polling hang
+         // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+         await this.abortSessionWithLogging(sessionID, "launch error cleanup")
++        this.cleanupDelegatedSessionContext(sessionID)
+ 
+         this.markForNotification(existingTask)
+         this.enqueueNotificationForParent(existingTask.parentSessionId, () => this.notifyParentSession(existingTask)).catch(err => {
+@@ -1417,7 +1436,7 @@ The fallback retry session is now created and can be inspected directly.
+       }
+ 
+       this.rootDescendantCounts.delete(sessionID)
+-      SessionCategoryRegistry.remove(sessionID)
++      this.cleanupDelegatedSessionContext(sessionID)
+     }
+ 
+     if (event.type === "session.status") {
+@@ -1521,7 +1540,7 @@ The fallback retry session is now created and can be inspected directly.
+     }
+     this.scheduleTaskRemoval(task.id)
+     if (task.sessionId) {
+-      SessionCategoryRegistry.remove(task.sessionId)
++      this.cleanupDelegatedSessionContext(task.sessionId)
+     }
+ 
+     this.markForNotification(task)
+@@ -1571,6 +1590,7 @@ The task was re-queued on a fallback model after a retryable failure.
+         this.clearSessionOutputObserved(previousSessionID)
+         this.clearSessionTodoObservation(previousSessionID)
+         subagentSessions.delete(previousSessionID)
++        this.cleanupDelegatedSessionContext(previousSessionID)
+       }
+       return retried
+     })
+@@ -1743,7 +1763,7 @@ The task was re-queued on a fallback model after a retryable failure.
+       this.clearTaskHistoryWhenParentTasksGone(task.parentSessionId)
+       if (task.sessionId) {
+         subagentSessions.delete(task.sessionId)
+-        SessionCategoryRegistry.remove(task.sessionId)
++        this.cleanupDelegatedSessionContext(task.sessionId)
+       }
+       log("[background-agent] Removed completed task from memory:", taskId)
+     }, TASK_CLEANUP_DELAY_MS)
+@@ -1818,7 +1838,7 @@ The task was re-queued on a fallback model after a retryable failure.
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+       await this.abortSessionWithLogging(task.sessionId, `task cancellation (${source})`)
+ 
+-      SessionCategoryRegistry.remove(task.sessionId)
++      this.cleanupDelegatedSessionContext(task.sessionId)
+     }
+ 
+     removeTaskToastTracking(task.id)
+@@ -1938,7 +1958,7 @@ The task was re-queued on a fallback model after a retryable failure.
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+       await this.abortSessionWithLogging(task.sessionId, `task completion (${source})`)
+ 
+-      SessionCategoryRegistry.remove(task.sessionId)
++      this.cleanupDelegatedSessionContext(task.sessionId)
+     }
+ 
+     try {
+@@ -2236,7 +2256,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     removeTaskToastTracking(task.id)
+     this.scheduleTaskRemoval(task.id)
+     if (task.sessionId) {
+-      SessionCategoryRegistry.remove(task.sessionId)
++      this.cleanupDelegatedSessionContext(task.sessionId)
+     }
+ 
+     this.markForNotification(task)
+@@ -2414,7 +2434,7 @@ The task was re-queued on a fallback model after a retryable failure.
+ 
+     for (const sessionID of trackedSessionIDs) {
+       subagentSessions.delete(sessionID)
+-      SessionCategoryRegistry.remove(sessionID)
++      this.cleanupDelegatedSessionContext(sessionID)
+     }
+ 
+     this.concurrencyManager.clear()
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index cbb3be2b..05fb7027 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -125,7 +125,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         path: { id: sessionID },
+         query: { directory: ctx.directory },
+       })
+-      const retryParts = getLastUserRetryParts(messagesResp)
++      const retryParts = getLastUserRetryParts(messagesResp, sessionID)
+       if (retryParts.length > 0) {
+         log(`[${HOOK_NAME}] Auto-retrying with fallback model (${source})`, {
+           sessionID,
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index d96f6d21..ef1486cd 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -2,6 +2,10 @@ import { describe, expect, test, beforeEach, afterEach, mock } from "bun:test"
+ import type { RuntimeFallbackConfig, OhMyOpenCodeConfig } from "../../config"
+ import * as loggerModule from "../../shared/logger"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
++import {
++  clearAllDelegatedChildSessionBootstrap,
++  registerDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
+ 
+ type RuntimeFallbackModule = typeof import("./hook")
+ 
+@@ -15,6 +19,7 @@ describe("runtime-fallback", () => {
+     logCalls = []
+     toastCalls = []
+     SessionCategoryRegistry.clear()
++    clearAllDelegatedChildSessionBootstrap()
+ 
+     const cacheBuster = `${Date.now()}-${Math.random()}`
+ 
+@@ -31,6 +36,7 @@ describe("runtime-fallback", () => {
+ 
+   afterEach(() => {
+     SessionCategoryRegistry.clear()
++    clearAllDelegatedChildSessionBootstrap()
+     mock.restore()
+   })
+ 
+@@ -2720,9 +2726,18 @@ describe("runtime-fallback", () => {
+       expect(abortCalls.some((call) => call.path?.id === sessionID)).toBe(true)
+     })
+ 
+-    test("pendingFallbackModel advances chain on subsequent error even when persisted", async () => {
++    test("delegated child-session empty-history fallback retries with captured bootstrap prompt", async () => {
+       //#given
+-      const hook = createRuntimeFallbackHook(createMockPluginInput(), {
++      const promptCalls: Array<Record<string, unknown>> = []
++      const hook = createRuntimeFallbackHook(createMockPluginInput({
++        session: {
++          messages: async () => ({ data: [] }),
++          promptAsync: async (args) => {
++            promptCalls.push(args as Record<string, unknown>)
++            return {}
++          },
++        },
++      }), {
+         config: createMockConfig({ notify_on_fallback: false }),
+         pluginConfig: {
+           git_master: {
+@@ -2737,8 +2752,12 @@ describe("runtime-fallback", () => {
+           },
+         },
+       })
+-      const sessionID = "test-race-pending-persists"
+-      SessionCategoryRegistry.register(sessionID, "test")
++      const sessionID = "test-delegated-empty-history-pending-persists"
++      registerDelegatedChildSessionBootstrap({
++        sessionID,
++        promptText: "delegated retry payload",
++        category: "test",
++      })
+ 
+       await hook.event({
+         event: {
+@@ -2754,8 +2773,13 @@ describe("runtime-fallback", () => {
+         },
+       })
+ 
++      expect(promptCalls).toHaveLength(1)
++      expect(promptCalls[0]?.body).toMatchObject({
++        model: { providerID: "provider-a", modelID: "model-a" },
++        parts: [{ type: "text", text: expect.stringContaining("delegated retry payload") }],
++      })
+       const autoRetryLog = logCalls.find((call) => call.msg.includes("No user message found for auto-retry"))
+-      expect(autoRetryLog).toBeDefined()
++      expect(autoRetryLog).toBeUndefined()
+ 
+       //#when - second error fires after retry completed (retryInFlight cleared)
+       await hook.event({
+@@ -2769,5 +2793,54 @@ describe("runtime-fallback", () => {
+       const fallbackLogs = logCalls.filter((call) => call.msg.includes("Preparing fallback"))
+       expect(fallbackLogs.length).toBeGreaterThanOrEqual(2)
+     })
++
++    test("empty-history fallback without delegated bootstrap still does not invent retry payloads", async () => {
++      //#given
++      const promptCalls: Array<Record<string, unknown>> = []
++      const hook = createRuntimeFallbackHook(createMockPluginInput({
++        session: {
++          messages: async () => ({ data: [] }),
++          promptAsync: async (args) => {
++            promptCalls.push(args as Record<string, unknown>)
++            return {}
++          },
++        },
++      }), {
++        config: createMockConfig({ notify_on_fallback: false }),
++        pluginConfig: {
++          git_master: {
++            commit_footer: true,
++            include_co_authored_by: true,
++            git_env_prefix: "GIT_MASTER=1",
++          },
++          categories: {
++            test: {
++              fallback_models: ["provider-a/model-a", "provider-b/model-b"],
++            },
++          },
++        },
++      })
++      const sessionID = "test-empty-history-without-bootstrap"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      //#when
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "google/gemini-2.5-pro" } },
++        },
++      })
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit" } },
++        },
++      })
++
++      //#then
++      const autoRetryLog = logCalls.find((call) => call.msg.includes("No user message found for auto-retry"))
++      expect(autoRetryLog).toBeDefined()
++      expect(promptCalls).toHaveLength(0)
++    })
+   })
+ })
+diff --git a/src/hooks/runtime-fallback/last-user-retry-parts.ts b/src/hooks/runtime-fallback/last-user-retry-parts.ts
+index 899572a7..98aa4f16 100644
+--- a/src/hooks/runtime-fallback/last-user-retry-parts.ts
++++ b/src/hooks/runtime-fallback/last-user-retry-parts.ts
+@@ -1,7 +1,9 @@
+ import { extractSessionMessages } from "./session-messages"
++import { getDelegatedChildSessionBootstrap } from "../../shared/delegated-child-session-bootstrap"
+ 
+ export function getLastUserRetryParts(
+   messagesResponse: unknown,
++  sessionID?: string,
+ ): Array<{ type: "text"; text: string }> {
+   const messages = extractSessionMessages(messagesResponse)
+   const lastUserMessage = messages?.filter((message) => message.info?.role === "user").pop()
+@@ -9,7 +11,7 @@ export function getLastUserRetryParts(
+     lastUserMessage?.parts
+     ?? (lastUserMessage?.info?.parts as Array<{ type?: string; text?: string }> | undefined)
+ 
+-  return (lastUserParts ?? [])
++  const retryParts = (lastUserParts ?? [])
+     .filter(
+       (part): part is { type: "text"; text: string } =>
+         part.type === "text"
+@@ -17,4 +19,12 @@ export function getLastUserRetryParts(
+         && part.text.length > 0,
+     )
+     .map((part) => ({ type: "text" as const, text: part.text }))
++
++  if (retryParts.length > 0) {
++    return retryParts
++  }
++
++  return sessionID
++    ? (getDelegatedChildSessionBootstrap(sessionID)?.retryParts ?? [])
++    : []
+ }
+diff --git a/src/shared/delegated-child-session-bootstrap.ts b/src/shared/delegated-child-session-bootstrap.ts
+new file mode 100644
+index 00000000..2758411d
+--- /dev/null
++++ b/src/shared/delegated-child-session-bootstrap.ts
+@@ -0,0 +1,55 @@
++import type { FallbackEntry } from "./model-requirements"
++import type { ModelFallbackControllerAccessor } from "../hooks/model-fallback"
++import { createInternalAgentTextPart } from "./internal-initiator-marker"
++import { SessionCategoryRegistry } from "./session-category-registry"
++
++export type DelegatedChildSessionRetryPart = {
++  type: "text"
++  text: string
++}
++
++export type DelegatedChildSessionBootstrap = {
++  retryParts: DelegatedChildSessionRetryPart[]
++}
++
++const delegatedChildSessionBootstrapMap = new Map<string, DelegatedChildSessionBootstrap>()
++
++export function createDelegatedChildSessionRetryParts(promptText: string): DelegatedChildSessionRetryPart[] {
++  return [createInternalAgentTextPart(promptText)]
++}
++
++export function registerDelegatedChildSessionBootstrap(args: {
++  sessionID: string
++  promptText: string
++  fallbackChain?: FallbackEntry[]
++  category?: string
++  modelFallbackControllerAccessor?: ModelFallbackControllerAccessor
++}): void {
++  delegatedChildSessionBootstrapMap.set(args.sessionID, {
++    retryParts: createDelegatedChildSessionRetryParts(args.promptText),
++  })
++
++  args.modelFallbackControllerAccessor?.setSessionFallbackChain(args.sessionID, args.fallbackChain)
++  if (args.category) {
++    SessionCategoryRegistry.register(args.sessionID, args.category)
++  }
++}
++
++export function getDelegatedChildSessionBootstrap(sessionID: string): DelegatedChildSessionBootstrap | undefined {
++  const bootstrap = delegatedChildSessionBootstrapMap.get(sessionID)
++  if (!bootstrap) {
++    return undefined
++  }
++
++  return {
++    retryParts: bootstrap.retryParts.map((part) => ({ ...part })),
++  }
++}
++
++export function clearDelegatedChildSessionBootstrap(sessionID: string): void {
++  delegatedChildSessionBootstrapMap.delete(sessionID)
++}
++
++export function clearAllDelegatedChildSessionBootstrap(): void {
++  delegatedChildSessionBootstrapMap.clear()
++}
+diff --git a/src/tools/delegate-task/background-task.ts b/src/tools/delegate-task/background-task.ts
+index 8de84bf6..9c67e7c0 100644
+--- a/src/tools/delegate-task/background-task.ts
++++ b/src/tools/delegate-task/background-task.ts
+@@ -6,64 +6,11 @@ import { buildTaskPrompt } from "./prompt-builder"
+ import { publishToolMetadata } from "../../features/tool-metadata-store"
+ import { formatDetailedError } from "./error-formatting"
+ import { getSessionTools } from "../../shared/session-tools-store"
+-import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+ import { QUESTION_DENIED_SESSION_PERMISSION } from "../../shared/question-denied-session-permission"
+ import { stripAgentListSortPrefix } from "../../shared/agent-display-names"
+ import { buildTaskMetadataBlock } from "../../features/tool-metadata-store/task-metadata-contract"
+ import { resolveMetadataModel } from "./resolve-metadata-model"
+ 
+-function registerBackgroundSessionContext(args: {
+-  sessionId: string
+-  fallbackChain?: FallbackEntry[]
+-  category?: string
+-  modelFallbackControllerAccessor?: ExecutorContext["modelFallbackControllerAccessor"]
+-}): void {
+-  args.modelFallbackControllerAccessor?.setSessionFallbackChain(args.sessionId, args.fallbackChain)
+-  if (args.category) {
+-    SessionCategoryRegistry.register(args.sessionId, args.category)
+-  }
+-}
+-
+-function continueSessionSetup(args: {
+-  taskID: string
+-  manager: ExecutorContext["manager"]
+-  timing: ReturnType<typeof getTimingConfig>
+-  fallbackChain?: FallbackEntry[]
+-  category?: string
+-  modelFallbackControllerAccessor?: ExecutorContext["modelFallbackControllerAccessor"]
+-}): void {
+-  if (!args.fallbackChain && !args.category) {
+-    return
+-  }
+-
+-  void (async () => {
+-    const waitStart = Date.now()
+-    while (Date.now() - waitStart < args.timing.WAIT_FOR_SESSION_TIMEOUT_MS) {
+-      await new Promise(resolve => setTimeout(resolve, args.timing.WAIT_FOR_SESSION_INTERVAL_MS))
+-      const updated = args.manager.getTask(args.taskID)
+-      if (!updated) {
+-        return
+-      }
+-      if (updated.status === "error" || updated.status === "cancelled" || updated.status === "interrupt") {
+-        return
+-      }
+-
+-      const sessionId = updated.sessionId
+-      if (!sessionId) {
+-        continue
+-      }
+-
+-      registerBackgroundSessionContext({
+-        sessionId,
+-        fallbackChain: args.fallbackChain,
+-        category: args.category,
+-        modelFallbackControllerAccessor: args.modelFallbackControllerAccessor,
+-      })
+-      return
+-    }
+-  })()
+-}
+-
+ async function waitForBackgroundSessionStart(args: {
+   taskId: string
+   initialSessionId?: string
+@@ -141,16 +88,7 @@ export async function executeBackgroundTask(
+       manager,
+       timing,
+       abortSignal: ctx.abort,
+-      onAbort: () => {
+-        continueSessionSetup({
+-          taskID: task.id,
+-          manager,
+-          timing,
+-          fallbackChain,
+-          category: args.category,
+-          modelFallbackControllerAccessor: executorCtx.modelFallbackControllerAccessor,
+-        })
+-      },
++      onAbort: () => {},
+     })
+ 
+     const updatedTask = typeof manager.getTask === "function"
+@@ -160,15 +98,6 @@ export async function executeBackgroundTask(
+       return `Task failed to start (status: ${updatedTask.status}).\n\nTask ID: ${task.id}`
+     }
+ 
+-    if (sessionId) {
+-      registerBackgroundSessionContext({
+-        sessionId,
+-        fallbackChain,
+-        category: args.category,
+-        modelFallbackControllerAccessor: executorCtx.modelFallbackControllerAccessor,
+-      })
+-    }
+-
+     const resolvedModel = resolveMetadataModel(categoryModel, parentContext.model)
+     const metadata = {
+       prompt: args.prompt,
+diff --git a/src/tools/delegate-task/sync-prompt-sender.ts b/src/tools/delegate-task/sync-prompt-sender.ts
+index 1f8ad22a..6c7d4b60 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.ts
+@@ -57,6 +57,7 @@ export async function sendSyncPrompt(
+     sessionID: string
+     agentToUse: string
+     args: DelegateTaskArgs
++    promptText?: string
+     systemContent: string | undefined
+     categoryModel: DelegatedModelConfig | undefined
+     toastManager: { removeTask: (id: string) => void } | null | undefined
+@@ -67,7 +68,7 @@ export async function sendSyncPrompt(
+ ): Promise<string | null> {
+   const allowTask = isPlanFamily(input.agentToUse)
+   const tddEnabled = input.sisyphusAgentConfig?.tdd
+-  const effectivePrompt = buildTaskPrompt(input.args.prompt, input.agentToUse, tddEnabled)
++  const effectivePrompt = input.promptText ?? buildTaskPrompt(input.args.prompt, input.agentToUse, tddEnabled)
+   const tools = {
+     task: allowTask,
+     call_omo_agent: true,
+diff --git a/src/tools/delegate-task/sync-task.test.ts b/src/tools/delegate-task/sync-task.test.ts
+index e032f11a..5276b437 100644
+--- a/src/tools/delegate-task/sync-task.test.ts
++++ b/src/tools/delegate-task/sync-task.test.ts
+@@ -29,6 +29,8 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     addCalls = []
+ 
+     clearRequireCache("./sync-task")
++    const { clearAllDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
++    clearAllDelegatedChildSessionBootstrap()
+ 
+     const { initTaskToastManager, _resetTaskToastManagerForTesting } = require("../../features/task-toast-manager/manager")
+     _resetTaskToastManagerForTesting()
+@@ -62,6 +64,8 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     mock.restore()
+     resetToastManager?.()
+     resetToastManager = null
++    const { clearAllDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
++    clearAllDelegatedChildSessionBootstrap()
+   })
+ 
+   test("cleans up toast and subagentSessions when fetchSyncResult returns ok: false", async () => {
+@@ -223,7 +227,7 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     expect(deleteCalls[0]).toBe("ses_test_12345678")
+   })
+ 
+-  test("#given fallback chain set #when sendSyncPrompt fails #then retries with next model", async () => {
++  test("#given delegated child session first prompt fails #when fallback chain set #then retries in order before polling", async () => {
+     //#given
+     const mockClient = {
+       session: {
+@@ -232,16 +236,35 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     }
+ 
+     const { executeSyncTask } = require("./sync-task")
++    const { getDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
+     const attemptedModels: Array<{ providerID: string; modelID: string; variant?: string } | undefined> = []
++    const promptSessionIDs: string[] = []
++    const pollSessionIDs: string[] = []
++    const fetchSessionIDs: string[] = []
++    const bootstrapSnapshots: Array<{ retryParts: Array<{ type: "text"; text: string }> } | undefined> = []
++    let createSyncSessionCalls = 0
++    const setSessionFallbackChain = mock(() => {})
++    const clearSessionFallbackChain = mock(() => {})
+ 
+     const deps = {
+-      createSyncSession: async () => ({ ok: true, sessionID: "ses_test_12345678" }),
+-      sendSyncPrompt: async (_client: unknown, input: { categoryModel?: { providerID: string; modelID: string; variant?: string } }) => {
++      createSyncSession: async () => {
++        createSyncSessionCalls += 1
++        return { ok: true as const, sessionID: "ses_test_12345678" }
++      },
++      sendSyncPrompt: async (_client: unknown, input: { sessionID: string; categoryModel?: { providerID: string; modelID: string; variant?: string } }) => {
++        promptSessionIDs.push(input.sessionID)
++        bootstrapSnapshots.push(getDelegatedChildSessionBootstrap(input.sessionID))
+         attemptedModels.push(input.categoryModel)
+         return attemptedModels.length === 1 ? "Initial failure" : null
+       },
+-      pollSyncSession: async () => null,
+-      fetchSyncResult: async () => ({ ok: true as const, textContent: "Result" }),
++      pollSyncSession: async (_ctx: unknown, _client: unknown, input: { sessionID: string }) => {
++        pollSessionIDs.push(input.sessionID)
++        return null
++      },
++      fetchSyncResult: async (_client: unknown, sessionID: string) => {
++        fetchSessionIDs.push(sessionID)
++        return { ok: true as const, textContent: "Result" }
++      },
+     }
+ 
+     const mockCtx = {
+@@ -254,6 +277,10 @@ describe("executeSyncTask - cleanup on error paths", () => {
+       client: mockClient,
+       directory: "/tmp",
+       onSyncSessionCreated: null,
++      modelFallbackControllerAccessor: {
++        setSessionFallbackChain,
++        clearSessionFallbackChain,
++      },
+     }
+ 
+     const args = {
+@@ -287,6 +314,14 @@ describe("executeSyncTask - cleanup on error paths", () => {
+       { providerID: "anthropic", modelID: "claude-opus-4-7", variant: "max" },
+       { providerID: "opencode-go", modelID: "kimi-k2.5", variant: undefined },
+     ])
++    expect(setSessionFallbackChain).toHaveBeenCalledWith("ses_test_12345678", fallbackChain)
++    expect(bootstrapSnapshots[0]?.retryParts[0]?.text).toContain("test prompt")
++    expect(createSyncSessionCalls).toBe(1)
++    expect(promptSessionIDs).toEqual(["ses_test_12345678", "ses_test_12345678"])
++    expect(pollSessionIDs).toEqual(["ses_test_12345678"])
++    expect(fetchSessionIDs).toEqual(["ses_test_12345678"])
++    expect(clearSessionFallbackChain).toHaveBeenCalledWith("ses_test_12345678")
++    expect(getDelegatedChildSessionBootstrap("ses_test_12345678")).toBeUndefined()
+   })
+ 
+   test("#given fallback chain exhausted #when all retries fail #then returns final error", async () => {
+@@ -357,6 +392,110 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     ])
+   })
+ 
++  test("keeps concurrent delegated first-prompt fallback bootstrap isolated per session", async () => {
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ignored" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++    const { getDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
++    const perSessionAttempts = new Map<string, number>()
++    const bootstrapSnapshots: Array<{ sessionID: string; text: string | undefined }> = []
++    const setSessionFallbackChain = mock(() => {})
++    const clearSessionFallbackChain = mock(() => {})
++
++    const deps = {
++      createSyncSession: async (_client: unknown, input: { description: string }) => {
++        return {
++          ok: true as const,
++          sessionID: input.description === "alpha task" ? "ses_alpha" : "ses_beta",
++        }
++      },
++      sendSyncPrompt: async (_client: unknown, input: { sessionID: string; categoryModel?: { providerID: string; modelID: string; variant?: string } }) => {
++        const bootstrap = getDelegatedChildSessionBootstrap(input.sessionID)
++        bootstrapSnapshots.push({
++          sessionID: input.sessionID,
++          text: bootstrap?.retryParts[0]?.text,
++        })
++        const currentAttempt = (perSessionAttempts.get(input.sessionID) ?? 0) + 1
++        perSessionAttempts.set(input.sessionID, currentAttempt)
++        return currentAttempt === 1 ? `Initial failure for ${input.sessionID}` : null
++      },
++      pollSyncSession: async () => null,
++      fetchSyncResult: async (_client: unknown, sessionID: string) => ({ ok: true as const, textContent: `Result from ${sessionID}` }),
++    }
++
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++      modelFallbackControllerAccessor: {
++        setSessionFallbackChain,
++        clearSessionFallbackChain,
++      },
++    }
++
++    const alphaArgs = {
++      prompt: "alpha delegated prompt",
++      description: "alpha task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++    const betaArgs = {
++      prompt: "beta delegated prompt",
++      description: "beta task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: () => {},
++    }
++
++    const [alphaResult, betaResult] = await Promise.all([
++      executeSyncTask(alphaArgs, mockCtx, mockExecutorCtx, { sessionID: "parent-session" }, "test-agent", {
++        providerID: "anthropic",
++        modelID: "claude-opus-4-7",
++        variant: "max",
++      }, undefined, undefined, [
++        { providers: ["anthropic"], model: "claude-opus-4-7", variant: "max" },
++        { providers: ["openai"], model: "gpt-5.4" },
++      ], deps),
++      executeSyncTask(betaArgs, mockCtx, mockExecutorCtx, { sessionID: "parent-session" }, "test-agent", {
++        providerID: "genai-proxy-openai",
++        modelID: "gpt-5.4-mini",
++        variant: undefined,
++      }, undefined, undefined, [
++        { providers: ["genai-proxy-openai"], model: "gpt-5.4-mini" },
++        { providers: ["genai-proxy-aws"], model: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
++      ], deps),
++    ])
++
++    expect(alphaResult).toContain("Result from ses_alpha")
++    expect(betaResult).toContain("Result from ses_beta")
++    expect(bootstrapSnapshots.filter((snapshot) => snapshot.sessionID === "ses_alpha").every((snapshot) => snapshot.text?.includes("alpha delegated prompt"))).toBe(true)
++    expect(bootstrapSnapshots.filter((snapshot) => snapshot.sessionID === "ses_beta").every((snapshot) => snapshot.text?.includes("beta delegated prompt"))).toBe(true)
++    expect(setSessionFallbackChain).toHaveBeenCalledWith("ses_alpha", [
++      { providers: ["anthropic"], model: "claude-opus-4-7", variant: "max" },
++      { providers: ["openai"], model: "gpt-5.4" },
++    ])
++    expect(setSessionFallbackChain).toHaveBeenCalledWith("ses_beta", [
++      { providers: ["genai-proxy-openai"], model: "gpt-5.4-mini" },
++      { providers: ["genai-proxy-aws"], model: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
++    ])
++    expect(clearSessionFallbackChain).toHaveBeenCalledWith("ses_alpha")
++    expect(clearSessionFallbackChain).toHaveBeenCalledWith("ses_beta")
++    expect(getDelegatedChildSessionBootstrap("ses_alpha")).toBeUndefined()
++    expect(getDelegatedChildSessionBootstrap("ses_beta")).toBeUndefined()
++  })
++
+   test("cleans up toast and subagentSessions on successful completion", async () => {
+     const mockClient = {
+       session: {
+@@ -422,6 +561,7 @@ describe("executeSyncTask - cleanup on error paths", () => {
+   })
+ 
+   test("retries sync session on retryable runtime session error using next fallback model", async () => {
++    const { getDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
+     const mockClient = {
+       session: {
+         create: async () => ({ data: { id: "ignored" } }),
+@@ -500,6 +640,8 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     ])
+     expect(result).toContain("Result from ses_second")
+     expect(deleteCalls).toContain("ses_first")
++    expect(getDelegatedChildSessionBootstrap("ses_first")).toBeUndefined()
++    expect(getDelegatedChildSessionBootstrap("ses_second")).toBeUndefined()
+ 
+     const finalMetadata = metadataCalls.at(-1)
+     expect(finalMetadata.metadata.sessionId).toBe("ses_second")
+@@ -587,6 +729,7 @@ describe("executeSyncTask - cleanup on error paths", () => {
+   })
+ 
+   test("publishes latest retry session metadata when final retry still fails", async () => {
++    const { getDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
+     const mockClient = {
+       session: {
+         create: async () => ({ data: { id: "ignored" } }),
+@@ -652,6 +795,8 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     }, "sisyphus-junior", initialModel, undefined, undefined, fallbackChain, deps)
+ 
+     expect(result).toBe("Final retry failed")
++    expect(getDelegatedChildSessionBootstrap("ses_first")).toBeUndefined()
++    expect(getDelegatedChildSessionBootstrap("ses_second")).toBeUndefined()
+     const finalMetadata = metadataCalls.at(-1)
+     expect(finalMetadata.metadata.sessionId).toBe("ses_second")
+     expect(finalMetadata.metadata.taskId).toBe("ses_second")
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index 5601247b..448ef70c 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -14,6 +14,11 @@ import { buildTaskMetadataBlock } from "../../features/tool-metadata-store/task-
+ import { resolveMetadataModel } from "./resolve-metadata-model"
+ import { shouldRetryError } from "../../shared/model-error-classifier"
+ import type { ModelFallbackState } from "../../hooks/model-fallback/hook"
++import { buildTaskPrompt } from "./prompt-builder"
++import {
++  clearDelegatedChildSessionBootstrap,
++  registerDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
+ 
+ export async function executeSyncTask(
+   args: DelegateTaskArgs,
+@@ -36,6 +41,9 @@ export async function executeSyncTask(
+     | undefined
+ 
+   try {
++    const tddEnabled = executorCtx.sisyphusAgentConfig?.tdd
++    const delegatedPromptText = buildTaskPrompt(args.prompt, agentToUse, tddEnabled)
++
+     if (typeof manager?.reserveSubagentSpawn === "function") {
+       spawnReservation = await manager.reserveSubagentSpawn(parentContext.sessionID)
+     }
+@@ -80,11 +88,13 @@ export async function executeSyncTask(
+       subagentSessions.add(newSessionID)
+       syncSubagentSessions.add(newSessionID)
+       setSessionAgent(newSessionID, agentToUse)
+-      executorCtx.modelFallbackControllerAccessor?.setSessionFallbackChain(newSessionID, fallbackChain)
+-
+-      if (args.category) {
+-        SessionCategoryRegistry.register(newSessionID, args.category)
+-      }
++      registerDelegatedChildSessionBootstrap({
++        sessionID: newSessionID,
++        promptText: delegatedPromptText,
++        fallbackChain,
++        category: args.category,
++        modelFallbackControllerAccessor: executorCtx.modelFallbackControllerAccessor,
++      })
+ 
+       if (onSyncSessionCreated) {
+         log("[task] Invoking onSyncSessionCreated callback", { sessionID: newSessionID, parentID: parentContext.sessionID })
+@@ -150,6 +160,7 @@ export async function executeSyncTask(
+       sessionID,
+       agentToUse,
+       args,
++      promptText: delegatedPromptText,
+       systemContent,
+       toastManager,
+       taskId,
+@@ -171,6 +182,7 @@ export async function executeSyncTask(
+     const cleanupRetrySession = (currentSessionID: string): void => {
+       subagentSessions.delete(currentSessionID)
+       syncSubagentSessions.delete(currentSessionID)
++      clearDelegatedChildSessionBootstrap(currentSessionID)
+       executorCtx.modelFallbackControllerAccessor?.clearSessionFallbackChain(currentSessionID)
+       SessionCategoryRegistry.remove(currentSessionID)
+     }
+@@ -308,6 +320,7 @@ ${buildTaskMetadataBlock({
+     if (syncSessionID) {
+       subagentSessions.delete(syncSessionID)
+       syncSubagentSessions.delete(syncSessionID)
++      clearDelegatedChildSessionBootstrap(syncSessionID)
+       executorCtx.modelFallbackControllerAccessor?.clearSessionFallbackChain(syncSessionID)
+       SessionCategoryRegistry.remove(syncSessionID)
+     }
+-- 
+2.39.2
+

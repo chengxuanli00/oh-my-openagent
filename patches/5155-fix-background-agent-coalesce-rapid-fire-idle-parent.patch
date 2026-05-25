@@ -1,0 +1,354 @@
+From 268c89c945cc403a41cae82db441356b23f786af Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 14 May 2026 18:52:28 +0900
+Subject: [PATCH 5155/5749] fix(background-agent): coalesce rapid-fire idle
+ parent notifications
+
+When many background tasks complete in rapid succession while the parent
+session is idle, each completion fired its own promptAsync call, stacking
+N consecutive `<system-reminder>` user messages with no assistant turn
+between. Hyperplan + many parallel explore subagents made this very
+visible to the user.
+
+Route the idle-path through the existing pendingParentWakes queue with a
+100ms debounce window. Notifications arriving during the debounce join
+the same batch, the 150ms settle window also coalesces newcomers, and a
+single batched prompt fires to the parent. Busy-path semantics are
+unchanged (still 1s retry).
+
+Prior attempts (1c05c60dc, ea55c385b, a337635e3) all coalesced only the
+busy-defer path, leaving the idle-immediate-send path uncoalesced.
+---
+ src/features/background-agent/manager.test.ts | 13 +++-
+ src/features/background-agent/manager.ts      | 64 +++++++---------
+ .../task-completion-cleanup.test.ts           | 73 ++++++++++++++-----
+ 3 files changed, 96 insertions(+), 54 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index c28abfca..6c076d96 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -278,6 +278,10 @@ async function flushBackgroundNotifications(): Promise<void> {
+   }
+ }
+ 
++function waitForCoalescedFlush(): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, 400))
++}
++
+ function createToastRemoveTaskTracker(): { removeTaskCalls: string[]; resetToastManager: () => void } {
+   _resetTaskToastManagerForTesting()
+   const toastManager = initTaskToastManager(cast<PluginInput["client"]>({
+@@ -1303,6 +1307,7 @@ describe("BackgroundManager.notifyParentSession - dynamic message lookup", () =>
+     //#when
+     await (cast<{ notifyParentSession: (value: BackgroundTask) => Promise<void> }>(manager))
+       .notifyParentSession(task)
++    await waitForCoalescedFlush()
+ 
+     //#then
+     expect(capturedBody?.agent).toBe("sisyphus")
+@@ -1459,6 +1464,7 @@ describe("BackgroundManager.notifyParentSession - aborted parent", () => {
+     //#when
+     await (cast<{ notifyParentSession: (task: BackgroundTask) => Promise<void> }>(manager))
+       .notifyParentSession(task)
++    await waitForCoalescedFlush()
+ 
+     //#then
+     expect(promptCalled).toBe(true)
+@@ -1501,6 +1507,7 @@ describe("BackgroundManager.notifyParentSession - aborted parent", () => {
+     //#when
+     await (cast<{ notifyParentSession: (task: BackgroundTask) => Promise<void> }>(manager))
+       .notifyParentSession(task)
++    await waitForCoalescedFlush()
+ 
+     //#then
+     expect(promptCalled).toBe(true)
+@@ -1541,6 +1548,7 @@ describe("BackgroundManager.notifyParentSession - aborted parent", () => {
+     //#when
+     await (cast<{ notifyParentSession: (task: BackgroundTask) => Promise<void> }>(manager))
+       .notifyParentSession(task)
++    await waitForCoalescedFlush()
+ 
+     //#then
+     const queuedNotifications = getPendingNotifications(manager).get("session-parent") ?? []
+@@ -1652,6 +1660,7 @@ describe("BackgroundManager.notifyParentSession - variant propagation", () => {
+     //#when
+     await (cast<{ notifyParentSession: (task: BackgroundTask) => Promise<void> }>(manager))
+       .notifyParentSession(task)
++    await waitForCoalescedFlush()
+ 
+     //#then
+     expect(promptCalls).toHaveLength(1)
+@@ -1693,6 +1702,7 @@ describe("BackgroundManager.notifyParentSession - variant propagation", () => {
+     //#when
+     await (cast<{ notifyParentSession: (task: BackgroundTask) => Promise<void> }>(manager))
+       .notifyParentSession(task)
++    await waitForCoalescedFlush()
+ 
+     //#then
+     expect(promptCalls).toHaveLength(1)
+@@ -2117,7 +2127,7 @@ describe("BackgroundManager.tryCompleteTask", () => {
+ 
+     // then
+     expect(rejectedCount).toBe(0)
+-    expect(promptBodies.length).toBe(2)
++    expect(promptBodies.length).toBe(1)
+     expect(promptBodies.filter((body) => body.noReply === false)).toHaveLength(1)
+   })
+ })
+@@ -5410,6 +5420,7 @@ describe("BackgroundManager.pruneStaleTasksAndNotifications - removes pruned tas
+     //#when
+     pruneStaleTasksAndNotificationsForTest(manager)
+     await flushBackgroundNotifications()
++    await waitForCoalescedFlush()
+ 
+     //#then
+     const retainedTask = getTaskMap(manager).get(staleTask.id)
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index ede06d09..2a58b67c 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -111,6 +111,7 @@ type PendingParentWake = {
+ }
+ 
+ const PENDING_PARENT_WAKE_RETRY_MS = 1_000
++const PENDING_PARENT_WAKE_DEBOUNCE_MS = 100
+ 
+ interface MessagePartInfo {
+   id?: string
+@@ -2247,32 +2248,19 @@ The task was re-queued on a fallback model after a retryable failure.
+             shouldReply,
+           })
+         } else {
+-          try {
+-            await promptAsyncInDirectory(this.client, {
+-              path: { id: task.parentSessionId },
+-              body: {
+-                noReply: !shouldReply,
+-                ...parentPromptContext,
+-                parts: [createInternalAgentTextPart(notification)],
+-              },
+-            }, this.directory)
+-            log("[background-agent] Sent notification to parent session:", {
+-              taskId: task.id,
+-              allComplete,
+-              isTaskFailure,
+-              noReply: !shouldReply,
+-            })
+-          } catch (error) {
+-            if (isAbortedSessionError(error)) {
+-              log("[background-agent] Parent session aborted while sending notification; continuing cleanup:", {
+-                taskId: task.id,
+-                parentSessionID: task.parentSessionId,
+-              })
+-              this.queuePendingNotification(task.parentSessionId, notification)
+-            } else {
+-              log("[background-agent] Failed to send notification:", error)
+-            }
+-          }
++          this.queuePendingParentWake(
++            task.parentSessionId,
++            notification,
++            parentPromptContext,
++            shouldReply,
++            PENDING_PARENT_WAKE_DEBOUNCE_MS,
++          )
++          log("[background-agent] Queued notification for short-debounce flush to idle parent:", {
++            taskId: task.id,
++            allComplete,
++            isTaskFailure,
++            shouldReply,
++          })
+         }
+       } else {
+         log("[background-agent] Parent session notifications disabled, skipping prompt injection:", {
+@@ -2295,6 +2283,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     notification: string,
+     promptContext: ParentWakePromptContext,
+     shouldReply: boolean,
++    delayMs?: number,
+   ): void {
+     const pendingWake = this.pendingParentWakes.get(sessionID)
+     if (pendingWake) {
+@@ -2308,12 +2297,11 @@ The task was re-queued on a fallback model after a retryable failure.
+         shouldReply,
+       })
+     }
+-    this.schedulePendingParentWakeFlush(sessionID)
++    this.schedulePendingParentWakeFlush(sessionID, delayMs)
+   }
+ 
+   private async flushPendingParentWake(sessionID: string): Promise<void> {
+-    const pendingWake = this.pendingParentWakes.get(sessionID)
+-    if (!pendingWake) {
++    if (!this.pendingParentWakes.has(sessionID)) {
+       this.clearPendingParentWakeTimer(sessionID)
+       return
+     }
+@@ -2323,24 +2311,28 @@ The task was re-queued on a fallback model after a retryable failure.
+       return
+     }
+ 
+-    this.pendingParentWakes.delete(sessionID)
+     this.clearPendingParentWakeTimer(sessionID)
+     await settleAfterSessionIdle()
+ 
+     if (await this.isSessionActive(sessionID)) {
+-      this.pendingParentWakes.set(sessionID, pendingWake)
+       this.schedulePendingParentWakeFlush(sessionID)
+       return
+     }
+ 
+-    const notificationContent = pendingWake.notifications.join("\n\n")
++    const latestWake = this.pendingParentWakes.get(sessionID)
++    if (!latestWake) {
++      return
++    }
++    this.pendingParentWakes.delete(sessionID)
++
++    const notificationContent = latestWake.notifications.join("\n\n")
+ 
+     try {
+       await promptAsyncInDirectory(this.client, {
+         path: { id: sessionID },
+         body: {
+-          noReply: !pendingWake.shouldReply,
+-          ...pendingWake.promptContext,
++          noReply: !latestWake.shouldReply,
++          ...latestWake.promptContext,
+           parts: [createInternalAgentTextPart(notificationContent)],
+         },
+       }, this.directory)
+@@ -2351,7 +2343,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     }
+   }
+ 
+-  private schedulePendingParentWakeFlush(sessionID: string): void {
++  private schedulePendingParentWakeFlush(sessionID: string, delayMs?: number): void {
+     if (this.pendingParentWakeTimers.has(sessionID)) {
+       return
+     }
+@@ -2361,7 +2353,7 @@ The task was re-queued on a fallback model after a retryable failure.
+       void this.enqueueNotificationForParent(sessionID, () => this.flushPendingParentWake(sessionID)).catch((error) => {
+         log("[background-agent] Failed to retry pending parent wake:", { sessionID, error })
+       })
+-    }, PENDING_PARENT_WAKE_RETRY_MS)
++    }, delayMs ?? PENDING_PARENT_WAKE_RETRY_MS)
+ 
+     this.pendingParentWakeTimers.set(sessionID, timer)
+   }
+diff --git a/src/features/background-agent/task-completion-cleanup.test.ts b/src/features/background-agent/task-completion-cleanup.test.ts
+index 327c25ff..43a75fa2 100644
+--- a/src/features/background-agent/task-completion-cleanup.test.ts
++++ b/src/features/background-agent/task-completion-cleanup.test.ts
+@@ -171,6 +171,10 @@ function waitForDeferredWakeRetry(): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, 1_180))
+ }
+ 
++function waitForCoalescedFlush(): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, 400))
++}
++
+ function getRequiredTimer(manager: BackgroundManager, taskID: string): ReturnType<typeof setTimeout> {
+   const timer = getCompletionTimers(manager).get(taskID)
+   expect(timer).toBeDefined()
+@@ -225,11 +229,10 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+   })
+ 
+   describe("#given background tasks for same parent", () => {
+-    test("#when the second completion notification is sent #then ALL BACKGROUND TASKS COMPLETE notification still works correctly", async () => {
++    test("#when two completions arrive back-to-back while parent is idle #then one batched notification is sent with both tasks", async () => {
+       // given
+       const { manager, promptAsyncCalls } = createManager(true)
+       managerUnderTest = manager
+-      fakeTimers = installFakeTimers()
+       const taskA = createTask({ id: "task-a", parentSessionId: "parent-1", description: "task A", status: "completed", completedAt: new Date("2026-03-11T00:01:00.000Z") })
+       const taskB = createTask({ id: "task-b", parentSessionId: "parent-1", description: "task B", status: "running" })
+       getTasks(manager).set(taskA.id, taskA)
+@@ -242,25 +245,60 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+ 
+       // when
+       await notifyParentSessionForTest(manager, taskB)
++      await waitForCoalescedFlush()
+ 
+       // then
+-      expect(promptAsyncCalls).toHaveLength(2)
+-      expect(promptAsyncCalls[0]?.body.noReply).toBe(true)
+-      expect(getCompletionTimers(manager).size).toBe(2)
+-      const allCompleteCall = promptAsyncCalls[1]
+-      expect(allCompleteCall).toBeDefined()
+-      if (!allCompleteCall) {
+-        throw new Error("Missing all-complete notification call")
++      expect(promptAsyncCalls).toHaveLength(1)
++      const batchedCall = promptAsyncCalls[0]
++      if (!batchedCall) {
++        throw new Error("Missing batched notification call")
++      }
++      expect(batchedCall.body.noReply).toBe(false)
++      const batchedPayload = JSON.stringify(batchedCall.body.parts)
++      expect(batchedPayload).toContain("ALL BACKGROUND TASKS COMPLETE")
++      expect(batchedPayload).toContain(OMO_INTERNAL_INITIATOR_MARKER)
++      expect(batchedPayload).toContain(taskA.id)
++      expect(batchedPayload).toContain(taskB.id)
++      expect(batchedPayload).toContain(taskA.description)
++      expect(batchedPayload).toContain(taskB.description)
++    })
++
++    test("#when many completions arrive in rapid succession while parent is idle #then a single coalesced notification is sent", async () => {
++      // given
++      const { manager, promptAsyncCalls } = createManager(true)
++      managerUnderTest = manager
++      const taskIds = ["task-1", "task-2", "task-3", "task-4", "task-5"]
++      const tasks = taskIds.map((id, index) => createTask({
++        id,
++        parentSessionId: "parent-1",
++        description: `description ${id}`,
++        status: "completed",
++        completedAt: new Date(`2026-03-11T00:01:0${index}.000Z`),
++      }))
++      for (const task of tasks) {
++        getTasks(manager).set(task.id, task)
++      }
++      getPendingByParent(manager).set("parent-1", new Set(taskIds))
++
++      // when
++      for (const task of tasks) {
++        await notifyParentSessionForTest(manager, task)
+       }
++      await waitForCoalescedFlush()
+ 
+-      expect(allCompleteCall.body.noReply).toBe(false)
+-      const allCompletePayload = JSON.stringify(allCompleteCall.body.parts)
+-      expect(allCompletePayload).toContain("ALL BACKGROUND TASKS COMPLETE")
+-      expect(allCompletePayload).toContain(OMO_INTERNAL_INITIATOR_MARKER)
+-      expect(allCompletePayload).toContain(taskA.id)
+-      expect(allCompletePayload).toContain(taskB.id)
+-      expect(allCompletePayload).toContain(taskA.description)
+-      expect(allCompletePayload).toContain(taskB.description)
++      // then
++      expect(promptAsyncCalls).toHaveLength(1)
++      const batchedCall = promptAsyncCalls[0]
++      if (!batchedCall) {
++        throw new Error("Missing batched notification call")
++      }
++      expect(batchedCall.body.noReply).toBe(false)
++      const batchedPayload = JSON.stringify(batchedCall.body.parts)
++      expect(batchedPayload).toContain("ALL BACKGROUND TASKS COMPLETE")
++      for (const task of tasks) {
++        expect(batchedPayload).toContain(task.id)
++        expect(batchedPayload).toContain(task.description)
++      }
+     })
+ 
+     test("#when parent session is busy #then all-complete notification does not start an overlapping parent reply", async () => {
+@@ -362,6 +400,7 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+ 
+       // when
+       await notifyParentSessionForTest(manager, task)
++      await waitForCoalescedFlush()
+ 
+       // then
+       expect(promptAsyncCalls).toHaveLength(1)
+-- 
+2.39.2
+

@@ -1,0 +1,441 @@
+From 6389da3cd6bf6196745492a912a7cb85370dffeb Mon Sep 17 00:00:00 2001
+From: itsmylife44 <34112129+itsmylife44@users.noreply.github.com>
+Date: Sun, 1 Feb 2026 11:11:35 +0100
+Subject: [PATCH 1632/5749] fix(tmux): send Ctrl+C before kill-pane and
+ respawn-pane to prevent orphaned processes (#1329)
+
+* fix(tmux): send Ctrl+C before kill-pane and respawn-pane to prevent orphaned processes
+
+* fix(tmux-subagent): prevent premature pane closure with stability detection
+
+Implements stability detection pattern from background-agent to prevent
+tmux panes from closing while agents are still working (issue #1330).
+
+Problem: Session status 'idle' doesn't mean 'finished' - agent may still
+be thinking/reasoning. Previous code closed panes immediately on idle.
+
+Solution:
+- Require MIN_STABILITY_TIME_MS (10s) before stability detection activates
+- Track message count changes to detect ongoing activity
+- Require STABLE_POLLS_REQUIRED (3) consecutive polls with same message count
+- Double-check session status before closing
+
+Changes:
+- types.ts: Add lastMessageCount and stableIdlePolls to TrackedSession
+- manager.ts: Implement stability detection in pollSessions()
+- manager.test.ts: Add 4 tests for stability detection behavior
+
+* test(tmux-subagent): improve stability detection tests to properly verify age gate
+
+- First test now sets session age >10s and verifies 3 polls don't close
+- Last test now does 5 polls to prove age gate prevents closure
+- Added comments explaining what each poll does
+---
+ src/features/tmux-subagent/manager.test.ts | 223 +++++++++++++++++++++
+ src/features/tmux-subagent/manager.ts      |  68 ++++++-
+ src/features/tmux-subagent/types.ts        |   3 +
+ src/shared/tmux/tmux-utils.ts              |  23 +++
+ 4 files changed, 315 insertions(+), 2 deletions(-)
+
+diff --git a/src/features/tmux-subagent/manager.test.ts b/src/features/tmux-subagent/manager.test.ts
+index 38bbe638..954a9d8b 100644
+--- a/src/features/tmux-subagent/manager.test.ts
++++ b/src/features/tmux-subagent/manager.test.ts
+@@ -75,6 +75,7 @@ const trackedSessions = new Set<string>()
+ 
+ function createMockContext(overrides?: {
+   sessionStatusResult?: { data?: Record<string, { type: string }> }
++  sessionMessagesResult?: { data?: unknown[] }
+ }) {
+   return {
+     serverUrl: new URL('http://localhost:4096'),
+@@ -90,6 +91,12 @@ function createMockContext(overrides?: {
+           }
+           return { data }
+         }),
++        messages: mock(async () => {
++          if (overrides?.sessionMessagesResult) {
++            return overrides.sessionMessagesResult
++          }
++          return { data: [] }
++        }),
+       },
+     },
+   } as any
+@@ -549,6 +556,222 @@ describe('TmuxSessionManager', () => {
+       expect(mockExecuteAction).toHaveBeenCalledTimes(2)
+     })
+   })
++
++  describe('Stability Detection (Issue #1330)', () => {
++    test('does NOT close session immediately when idle - requires 4 polls (1 baseline + 3 stable)', async () => {
++      //#given - session that is old enough (>10s) and idle
++      mockIsInsideTmux.mockReturnValue(true)
++      
++      const { TmuxSessionManager } = await import('./manager')
++      
++      const statusMock = mock(async () => ({
++        data: { 'ses_child': { type: 'idle' } }
++      }))
++      const messagesMock = mock(async () => ({
++        data: [{ id: 'msg1' }]  // Same message count each time
++      }))
++      
++      const ctx = {
++        serverUrl: new URL('http://localhost:4096'),
++        client: {
++          session: {
++            status: statusMock,
++            messages: messagesMock,
++          },
++        },
++      } as any
++      
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 80,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      // Spawn a session first
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_child', 'ses_parent', 'Task')
++      )
++      
++      // Make session old enough for stability detection (>10s)
++      const sessions = (manager as any).sessions as Map<string, any>
++      const tracked = sessions.get('ses_child')
++      tracked.createdAt = new Date(Date.now() - 15000)  // 15 seconds ago
++      
++      mockExecuteAction.mockClear()
++
++      //#when - poll only 3 times (need 4: 1 baseline + 3 stable)
++      await (manager as any).pollSessions()  // sets lastMessageCount = 1
++      await (manager as any).pollSessions()  // stableIdlePolls = 1
++      await (manager as any).pollSessions()  // stableIdlePolls = 2
++
++      //#then - should NOT have closed yet (need one more poll)
++      expect(mockExecuteAction).not.toHaveBeenCalled()
++    })
++
++    test('closes session after 3 consecutive stable idle polls', async () => {
++      //#given
++      mockIsInsideTmux.mockReturnValue(true)
++      
++      const { TmuxSessionManager } = await import('./manager')
++      
++      const statusMock = mock(async () => ({
++        data: { 'ses_child': { type: 'idle' } }
++      }))
++      const messagesMock = mock(async () => ({
++        data: [{ id: 'msg1' }]  // Same message count each time
++      }))
++      
++      const ctx = {
++        serverUrl: new URL('http://localhost:4096'),
++        client: {
++          session: {
++            status: statusMock,
++            messages: messagesMock,
++          },
++        },
++      } as any
++      
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 80,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_child', 'ses_parent', 'Task')
++      )
++      
++      // Simulate session being old enough (>10s) by manipulating createdAt
++      const sessions = (manager as any).sessions as Map<string, any>
++      const tracked = sessions.get('ses_child')
++      tracked.createdAt = new Date(Date.now() - 15000)  // 15 seconds ago
++      
++      mockExecuteAction.mockClear()
++
++      //#when - poll 4 times (1st sets lastMessageCount, then 3 stable polls)
++      await (manager as any).pollSessions()  // sets lastMessageCount = 1
++      await (manager as any).pollSessions()  // stableIdlePolls = 1
++      await (manager as any).pollSessions()  // stableIdlePolls = 2
++      await (manager as any).pollSessions()  // stableIdlePolls = 3 -> close
++
++      //#then - should have closed the session
++      expect(mockExecuteAction).toHaveBeenCalled()
++      const call = mockExecuteAction.mock.calls[0]
++      expect(call![0].type).toBe('close')
++    })
++
++    test('resets stability counter when new messages arrive', async () => {
++      //#given
++      mockIsInsideTmux.mockReturnValue(true)
++      
++      const { TmuxSessionManager } = await import('./manager')
++      
++      let messageCount = 1
++      const statusMock = mock(async () => ({
++        data: { 'ses_child': { type: 'idle' } }
++      }))
++      const messagesMock = mock(async () => {
++        // Simulate new messages arriving each poll
++        messageCount++
++        return { data: Array(messageCount).fill({ id: 'msg' }) }
++      })
++      
++      const ctx = {
++        serverUrl: new URL('http://localhost:4096'),
++        client: {
++          session: {
++            status: statusMock,
++            messages: messagesMock,
++          },
++        },
++      } as any
++      
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 80,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_child', 'ses_parent', 'Task')
++      )
++      
++      const sessions = (manager as any).sessions as Map<string, any>
++      const tracked = sessions.get('ses_child')
++      tracked.createdAt = new Date(Date.now() - 15000)
++      
++      mockExecuteAction.mockClear()
++
++      //#when - poll multiple times (message count keeps changing)
++      await (manager as any).pollSessions()
++      await (manager as any).pollSessions()
++      await (manager as any).pollSessions()
++      await (manager as any).pollSessions()
++
++      //#then - should NOT have closed (stability never reached due to changing messages)
++      expect(mockExecuteAction).not.toHaveBeenCalled()
++    })
++
++    test('does NOT apply stability detection for sessions younger than 10s', async () => {
++      //#given - freshly created session (age < 10s)
++      mockIsInsideTmux.mockReturnValue(true)
++      
++      const { TmuxSessionManager } = await import('./manager')
++      
++      const statusMock = mock(async () => ({
++        data: { 'ses_child': { type: 'idle' } }
++      }))
++      const messagesMock = mock(async () => ({
++        data: [{ id: 'msg1' }]  // Same message count - would trigger close if age check wasn't there
++      }))
++      
++      const ctx = {
++        serverUrl: new URL('http://localhost:4096'),
++        client: {
++          session: {
++            status: statusMock,
++            messages: messagesMock,
++          },
++        },
++      } as any
++      
++      const config: TmuxConfig = {
++        enabled: true,
++        layout: 'main-vertical',
++        main_pane_size: 60,
++        main_pane_min_width: 80,
++        agent_pane_min_width: 40,
++      }
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++      await manager.onSessionCreated(
++        createSessionCreatedEvent('ses_child', 'ses_parent', 'Task')
++      )
++      
++      // Session is fresh (createdAt is now) - don't manipulate it
++      // This tests the 10s age gate - stability detection should NOT activate
++      mockExecuteAction.mockClear()
++
++      //#when - poll 5 times (more than enough to close if age check wasn't there)
++      await (manager as any).pollSessions()  // Would set lastMessageCount if age check passed
++      await (manager as any).pollSessions()  // Would be stableIdlePolls = 1
++      await (manager as any).pollSessions()  // Would be stableIdlePolls = 2
++      await (manager as any).pollSessions()  // Would be stableIdlePolls = 3 -> would close
++      await (manager as any).pollSessions()  // Extra poll to be sure
++
++      //#then - should NOT have closed (session too young for stability detection)
++      expect(mockExecuteAction).not.toHaveBeenCalled()
++    })
++  })
+ })
+ 
+ describe('DecisionEngine', () => {
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index 94099608..ad600dc5 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -33,6 +33,11 @@ const defaultTmuxDeps: TmuxUtilDeps = {
+ 
+ const SESSION_TIMEOUT_MS = 10 * 60 * 1000
+ 
++// Stability detection constants (prevents premature closure - see issue #1330)
++// Mirrors the proven pattern from background-agent/manager.ts
++const MIN_STABILITY_TIME_MS = 10 * 1000  // Must run at least 10s before stability detection kicks in
++const STABLE_POLLS_REQUIRED = 3          // 3 consecutive idle polls (~6s with 2s poll interval)
++
+ /**
+  * State-first Tmux Session Manager
+  * 
+@@ -324,18 +329,77 @@ export class TmuxSessionManager {
+         const missingSince = !status ? now - tracked.lastSeenAt.getTime() : 0
+         const missingTooLong = missingSince >= SESSION_MISSING_GRACE_MS
+         const isTimedOut = now - tracked.createdAt.getTime() > SESSION_TIMEOUT_MS
++        const elapsedMs = now - tracked.createdAt.getTime()
++
++        // Stability detection: Don't close immediately on idle
++        // Wait for STABLE_POLLS_REQUIRED consecutive polls with same message count
++        let shouldCloseViaStability = false
++
++        if (isIdle && elapsedMs >= MIN_STABILITY_TIME_MS) {
++          // Fetch message count to detect if agent is still producing output
++          try {
++            const messagesResult = await this.client.session.messages({ 
++              path: { id: sessionId } 
++            })
++            const currentMsgCount = Array.isArray(messagesResult.data) 
++              ? messagesResult.data.length 
++              : 0
++
++            if (tracked.lastMessageCount === currentMsgCount) {
++              // Message count unchanged - increment stable polls
++              tracked.stableIdlePolls = (tracked.stableIdlePolls ?? 0) + 1
++              
++              if (tracked.stableIdlePolls >= STABLE_POLLS_REQUIRED) {
++                // Double-check status before closing
++                const recheckResult = await this.client.session.status({ path: undefined })
++                const recheckStatuses = (recheckResult.data ?? {}) as Record<string, { type: string }>
++                const recheckStatus = recheckStatuses[sessionId]
++                
++                if (recheckStatus?.type === "idle") {
++                  shouldCloseViaStability = true
++                } else {
++                  // Status changed - reset stability counter
++                  tracked.stableIdlePolls = 0
++                  log("[tmux-session-manager] stability reached but session not idle on recheck, resetting", {
++                    sessionId,
++                    recheckStatus: recheckStatus?.type,
++                  })
++                }
++              }
++            } else {
++              // New messages - agent is still working, reset stability counter
++              tracked.stableIdlePolls = 0
++            }
++            
++            tracked.lastMessageCount = currentMsgCount
++          } catch (msgErr) {
++            log("[tmux-session-manager] failed to fetch messages for stability check", {
++              sessionId,
++              error: String(msgErr),
++            })
++            // On error, don't close - be conservative
++          }
++        } else if (!isIdle) {
++          // Not idle - reset stability counter
++          tracked.stableIdlePolls = 0
++        }
+ 
+         log("[tmux-session-manager] session check", {
+           sessionId,
+           statusType: status?.type,
+           isIdle,
++          elapsedMs,
++          stableIdlePolls: tracked.stableIdlePolls,
++          lastMessageCount: tracked.lastMessageCount,
+           missingSince,
+           missingTooLong,
+           isTimedOut,
+-          shouldClose: isIdle || missingTooLong || isTimedOut,
++          shouldCloseViaStability,
+         })
+ 
+-        if (isIdle || missingTooLong || isTimedOut) {
++        // Close if: stability detection confirmed OR missing too long OR timed out
++        // Note: We no longer close immediately on idle - stability detection handles that
++        if (shouldCloseViaStability || missingTooLong || isTimedOut) {
+           sessionsToClose.push(sessionId)
+         }
+       }
+diff --git a/src/features/tmux-subagent/types.ts b/src/features/tmux-subagent/types.ts
+index ce57140b..6af50393 100644
+--- a/src/features/tmux-subagent/types.ts
++++ b/src/features/tmux-subagent/types.ts
+@@ -4,6 +4,9 @@ export interface TrackedSession {
+   description: string
+   createdAt: Date
+   lastSeenAt: Date
++  // Stability detection fields (prevents premature closure)
++  lastMessageCount?: number
++  stableIdlePolls?: number
+ }
+ 
+ export const MIN_PANE_WIDTH = 52
+diff --git a/src/shared/tmux/tmux-utils.ts b/src/shared/tmux/tmux-utils.ts
+index c5e7d4a5..76abb737 100644
+--- a/src/shared/tmux/tmux-utils.ts
++++ b/src/shared/tmux/tmux-utils.ts
+@@ -173,6 +173,17 @@ export async function closeTmuxPane(paneId: string): Promise<boolean> {
+     return false
+   }
+ 
++  // Send Ctrl+C to trigger graceful exit of opencode attach process
++  log("[closeTmuxPane] sending Ctrl+C for graceful shutdown", { paneId })
++  const ctrlCProc = spawn([tmux, "send-keys", "-t", paneId, "C-c"], {
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++  await ctrlCProc.exited
++
++  // Brief delay for graceful shutdown
++  await new Promise((r) => setTimeout(r, 250))
++
+   log("[closeTmuxPane] killing pane", { paneId })
+   
+   const proc = spawn([tmux, "kill-pane", "-t", paneId], {
+@@ -214,6 +225,18 @@ export async function replaceTmuxPane(
+     return { success: false }
+   }
+ 
++  // Send Ctrl+C to trigger graceful exit of existing opencode attach process
++  // Note: No delay here - respawn-pane -k will handle any remaining process.
++  // We send Ctrl+C first to give the process a chance to exit gracefully,
++  // then immediately respawn. This prevents orphaned processes while avoiding
++  // the race condition where the pane closes before respawn-pane runs.
++  log("[replaceTmuxPane] sending Ctrl+C for graceful shutdown", { paneId })
++  const ctrlCProc = spawn([tmux, "send-keys", "-t", paneId, "C-c"], {
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++  await ctrlCProc.exited
++
+   const opencodeCmd = `opencode attach ${serverUrl} --session ${sessionId}`
+ 
+   const proc = spawn([tmux, "respawn-pane", "-k", "-t", paneId, opencodeCmd], {
+-- 
+2.39.2
+

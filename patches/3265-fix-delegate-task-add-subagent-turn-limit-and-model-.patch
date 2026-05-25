@@ -1,0 +1,119 @@
+From f2b26e5346656843c1404f46e8f06129a924ecdc Mon Sep 17 00:00:00 2001
+From: Ouyang Xingyuan <galaxyroaming@qq.com>
+Date: Sun, 15 Mar 2026 12:05:42 +0800
+Subject: [PATCH 3265/5749] fix(delegate-task): add subagent turn limit and
+ model routing transparency
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原因：
+- subagent 无最大步数限制，陷入 tool-call 死循环时可无限运行，造成巨额 API 费用
+- category 路由将 subagent 静默切换到与父 session 不同的模型，用户完全无感知
+
+改动：
+- sync-session-poller: 新增 maxAssistantTurns 参数（默认 300），每检测到新 assistant 消息
+  计数一次，超限后调用 abortSyncSession 并返回明确错误信息
+- sync-task: task 完成时在返回字符串中显示实际使用的模型；若与父 session 模型不同，
+  加 ⚠️ 警告提示用户发生了静默路由
+
+影响：
+- 现有行为不变，maxAssistantTurns 为可选参数，默认值 300 远高于正常任务所需轮次
+- 修复 #2571：用户一个下午因 Sisyphus-Junior 死循环 + 静默路由到 Gemini 3.1 Pro
+  烧掉 $350+，且 OpenCode 显示费用仅为实际的一半
+---
+ .../delegate-task/sync-session-poller.ts      | 24 ++++++++++++++++++-
+ src/tools/delegate-task/sync-task.ts          | 16 ++++++++++++-
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/src/tools/delegate-task/sync-session-poller.ts b/src/tools/delegate-task/sync-session-poller.ts
+index 316039c7..516c8321 100644
+--- a/src/tools/delegate-task/sync-session-poller.ts
++++ b/src/tools/delegate-task/sync-session-poller.ts
+@@ -39,6 +39,8 @@ export function isSessionComplete(messages: SessionMessage[]): boolean {
+   return lastUser.info.id < lastAssistant.info.id
+ }
+ 
++const DEFAULT_MAX_ASSISTANT_TURNS = 300
++
+ export async function pollSyncSession(
+   ctx: ToolContextWithMetadata,
+   client: OpencodeClient,
+@@ -48,16 +50,20 @@ export async function pollSyncSession(
+     toastManager: { removeTask: (id: string) => void } | null | undefined
+     taskId: string | undefined
+     anchorMessageCount?: number
++    maxAssistantTurns?: number
+   },
+   timeoutMs?: number
+ ): Promise<string | null> {
+   const syncTiming = getTimingConfig()
+   const maxPollTimeMs = Math.max(timeoutMs ?? getDefaultSyncPollTimeoutMs(), 50)
++  const maxTurns = input.maxAssistantTurns ?? DEFAULT_MAX_ASSISTANT_TURNS
+   const pollStart = Date.now()
+   let pollCount = 0
+   let timedOut = false
++  let assistantTurnCount = 0
++  let lastSeenAssistantId: string | undefined
+ 
+-  log("[task] Starting poll loop", { sessionID: input.sessionID, agentToUse: input.agentToUse })
++  log("[task] Starting poll loop", { sessionID: input.sessionID, agentToUse: input.agentToUse, maxTurns })
+ 
+   while (Date.now() - pollStart < maxPollTimeMs) {
+     if (ctx.abort?.aborted) {
+@@ -112,7 +118,23 @@ export async function pollSyncSession(
+       break
+     }
+ 
++    // 计数新出现的 assistant 轮次，用于熔断无限循环
+     const lastAssistant = [...msgs].reverse().find((m) => m.info?.role === "assistant")
++    if (lastAssistant?.info?.id && lastAssistant.info.id !== lastSeenAssistantId) {
++      lastSeenAssistantId = lastAssistant.info.id
++      assistantTurnCount++
++      if (assistantTurnCount >= maxTurns) {
++        log("[task] Max assistant turns reached, aborting to prevent infinite loop", {
++          sessionID: input.sessionID,
++          assistantTurnCount,
++          maxTurns,
++        })
++        abortSyncSession(client, input.sessionID, "max_turns_exceeded")
++        if (input.toastManager && input.taskId) input.toastManager.removeTask(input.taskId)
++        return `Task aborted: subagent exceeded ${maxTurns} assistant turns without completing. This usually indicates an infinite tool-call loop. Session ID: ${input.sessionID}`
++      }
++    }
++
+     const hasAssistantText = msgs.some((m) => {
+       if (m.info?.role !== "assistant") return false
+       const parts = m.parts ?? []
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index fa5fad4c..6117f82a 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -149,9 +149,23 @@ export async function executeSyncTask(
+ 
+       const duration = formatDuration(startTime)
+ 
++      // 检测模型路由是否与父 session 不同，给用户可见的提示
++      const actualModelStr = categoryModel
++        ? `${categoryModel.providerID}/${categoryModel.modelID}`
++        : undefined
++      const parentModelStr = parentContext.model
++        ? `${parentContext.model.providerID}/${parentContext.model.modelID}`
++        : undefined
++      const modelRoutingNote =
++        actualModelStr && parentModelStr && actualModelStr !== parentModelStr
++          ? `\n⚠️  Model routing: parent used ${parentModelStr}, this subagent used ${actualModelStr} (via category: ${args.category ?? "unknown"})`
++          : actualModelStr
++            ? `\nModel: ${actualModelStr}${args.category ? ` (category: ${args.category})` : ""}`
++            : ""
++
+       return `Task completed in ${duration}.
+ 
+-Agent: ${agentToUse}${args.category ? ` (category: ${args.category})` : ""}
++Agent: ${agentToUse}${args.category ? ` (category: ${args.category})` : ""}${modelRoutingNote}
+ 
+ ---
+ 
+-- 
+2.39.2
+

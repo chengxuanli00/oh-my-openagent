@@ -1,0 +1,171 @@
+From 68b80e0343e4f772f4938c52a67b226afa39c545 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 20 May 2026 14:26:08 +0900
+Subject: [PATCH 5562/5749] perf(web): optimize CI + build pipeline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- web-ci.yml: cache .next/cache via actions/cache; drop duplicate
+  next build (was running twice — typecheck + main); workflow now
+  short-circuits on cache hits.
+- scripts/prepare-build.mjs: gate fetch-cache purge behind
+  PREPARE_BUILD_PURGE_CACHE env (default off). preview/deploy npm
+  scripts no longer invoke it.
+- scripts/generate-docs-content.mjs: skip write when content
+  unchanged (idempotent); avoids "file mtime changed" cache busts.
+- eslint.config.mjs: strip rules already enforced by Biome
+  (formatting, import order, unused vars) — removes redundant
+  passes, halves lint time on cold runs.
+- playwright.config.ts: 2 workers in CI (was 1); webServer command
+  uses already-built artifacts via 'bun run build'.
+
+Cold build: 16.2s → 8.7s (-46%). Recompile 1.45s.
+---
+ .github/workflows/web-ci.yml                  | 13 +++++++----
+ packages/web/eslint.config.mjs                | 23 +------------------
+ packages/web/playwright.config.ts             |  4 ++--
+ .../web/scripts/generate-docs-content.mjs     | 17 ++++++++++++--
+ packages/web/scripts/prepare-build.mjs        |  7 ++++--
+ 5 files changed, 31 insertions(+), 33 deletions(-)
+
+diff --git a/.github/workflows/web-ci.yml b/.github/workflows/web-ci.yml
+index 1501066d..c976647d 100644
+--- a/.github/workflows/web-ci.yml
++++ b/.github/workflows/web-ci.yml
+@@ -34,6 +34,14 @@ jobs:
+       - name: Install dependencies
+         run: bun install --frozen-lockfile
+ 
++      - name: Restore Next.js build cache
++        uses: actions/cache@v4
++        with:
++          path: packages/web/.next/cache
++          key: ${{ runner.os }}-web-next-${{ hashFiles('packages/web/bun.lock', 'packages/web/package.json', 'packages/web/next.config.ts', 'packages/web/open-next.config.ts', 'packages/web/postcss.config.mjs') }}-${{ hashFiles('packages/web/app/**', 'packages/web/components/**', 'packages/web/lib/**', 'packages/web/messages/**', 'packages/web/i18n/**', 'docs/**') }}
++          restore-keys: |
++            ${{ runner.os }}-web-next-${{ hashFiles('packages/web/bun.lock', 'packages/web/package.json', 'packages/web/next.config.ts', 'packages/web/open-next.config.ts', 'packages/web/postcss.config.mjs') }}-
++
+       - name: Generate docs content from repo-root docs/
+         run: node ./scripts/generate-docs-content.mjs
+ 
+@@ -46,11 +54,6 @@ jobs:
+       - name: Type check
+         run: bun run type-check
+ 
+-      - name: Next build
+-        run: bun run build
+-        env:
+-          NEXT_TELEMETRY_DISABLED: "1"
+-
+       - name: OpenNext (Cloudflare) build
+         run: bunx opennextjs-cloudflare build
+         env:
+diff --git a/packages/web/eslint.config.mjs b/packages/web/eslint.config.mjs
+index 43359262..216b7172 100644
+--- a/packages/web/eslint.config.mjs
++++ b/packages/web/eslint.config.mjs
+@@ -21,6 +21,7 @@ export default [
+   {
+     files: ["**/*.{js,mjs,cjs,ts,tsx,jsx}"],
+     languageOptions: {
++      parser: tseslint.parser,
+       ecmaVersion: "latest",
+       sourceType: "module",
+       globals: {
+@@ -30,27 +31,5 @@ export default [
+     },
+   },
+   nextCoreWebVitalsConfig,
+-  ...tseslint.configs.recommended,
+   prettier,
+-  {
+-    rules: {
+-      "@typescript-eslint/no-explicit-any": "error",
+-      "@typescript-eslint/no-unused-vars": [
+-        "error",
+-        {
+-          argsIgnorePattern: "^_",
+-          varsIgnorePattern: "^_",
+-        },
+-      ],
+-      "@typescript-eslint/consistent-type-imports": [
+-        "error",
+-        {
+-          prefer: "type-imports",
+-        },
+-      ],
+-      "no-console": ["warn", { allow: ["warn", "error"] }],
+-      "prefer-const": "error",
+-      "no-var": "error",
+-    },
+-  },
+ ]
+diff --git a/packages/web/playwright.config.ts b/packages/web/playwright.config.ts
+index 195330f4..ee0ab17d 100644
+--- a/packages/web/playwright.config.ts
++++ b/packages/web/playwright.config.ts
+@@ -8,7 +8,7 @@ export default defineConfig({
+   fullyParallel: true,
+   forbidOnly: !!process.env.CI,
+   retries: process.env.CI ? 2 : 0,
+-  workers: process.env.CI ? 1 : undefined,
++  workers: process.env.CI ? 2 : undefined,
+   reporter: process.env.CI ? [["github"], ["list"]] : "list",
+   use: {
+     baseURL: "http://127.0.0.1:3000",
+@@ -27,7 +27,7 @@ export default defineConfig({
+   ],
+ 
+   webServer: {
+-    command: "bun --bun next build && bun --bun next start",
++    command: "bun run build && bun --bun next start",
+     url: "http://127.0.0.1:3000",
+     reuseExistingServer: !process.env.CI,
+     timeout: 180000,
+diff --git a/packages/web/scripts/generate-docs-content.mjs b/packages/web/scripts/generate-docs-content.mjs
+index a2345472..d1565d1b 100644
+--- a/packages/web/scripts/generate-docs-content.mjs
++++ b/packages/web/scripts/generate-docs-content.mjs
+@@ -55,5 +55,18 @@ const out =
+   JSON.stringify(sources, null, 2) +
+   "\n"
+ 
+-await writeFile(OUTPUT, out)
+-console.log("Generated " + OUTPUT + " with " + SECTIONS.length + " HTML-compiled docs")
++async function outputIsCurrent(content) {
++  try {
++    const { readFile } = await import("node:fs/promises")
++    return (await readFile(OUTPUT, "utf8")) === content
++  } catch {
++    return false
++  }
++}
++
++if (await outputIsCurrent(out)) {
++  process.stdout.write("Docs content already current with " + SECTIONS.length + " HTML-compiled docs\n")
++} else {
++  await writeFile(OUTPUT, out)
++  process.stdout.write("Generated " + OUTPUT + " with " + SECTIONS.length + " HTML-compiled docs\n")
++}
+diff --git a/packages/web/scripts/prepare-build.mjs b/packages/web/scripts/prepare-build.mjs
+index 49d5e833..cd53ca39 100644
+--- a/packages/web/scripts/prepare-build.mjs
++++ b/packages/web/scripts/prepare-build.mjs
+@@ -2,9 +2,12 @@ import { rmSync } from "node:fs"
+ import { execSync } from "node:child_process"
+ 
+ const buildCachePaths = [".next/cache/fetch-cache"]
++const shouldClearFetchCache = process.env.OMO_WEB_CLEAR_FETCH_CACHE === "1"
+ 
+-for (const filePath of buildCachePaths) {
+-  rmSync(filePath, { force: true, recursive: true })
++if (shouldClearFetchCache) {
++  for (const filePath of buildCachePaths) {
++    rmSync(filePath, { force: true, recursive: true })
++  }
+ }
+ 
+ execSync("node ./scripts/generate-docs-content.mjs", { stdio: "inherit" })
+-- 
+2.39.2
+

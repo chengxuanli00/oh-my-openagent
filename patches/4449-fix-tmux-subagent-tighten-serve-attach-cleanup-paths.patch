@@ -1,0 +1,282 @@
+From 21554be8709fc73b1a9dd19ac248bb5b86621167 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 18 Apr 2026 19:31:45 +0900
+Subject: [PATCH 4449/5749] fix(tmux-subagent): tighten serve/attach cleanup
+ paths so panes and sessions are torn down reliably
+
+Three defects observed with tmux.isolation="session" where the omo-agents
+session was left with orphan fish panes after subagents finished:
+
+1. cleanup() never ran 'tmux kill-session -t omo-agents'. If any pane
+   lingered (for example because opencode attach stayed blocked on SSE),
+   the isolated session survived process shutdown. Now we explicitly kill
+   the shared session through killTmuxSessionIfExists when isolation is
+   "session".
+
+2. session.error events bypassed tmux cleanup entirely. Only session.deleted
+   closed panes, so any provider error that did not escalate into a delete
+   left the pane behind. Added onSessionError on TmuxSessionManager, wired
+   from plugin/event.ts, which funnels through the same onSessionDeleted
+   close path for tracked sessions only.
+
+3. retryPendingCloses() only ran when a new session was created. If the
+   main process went idle after a failed close, the pending session stayed
+   pending forever. TmuxPollingManager now accepts the retry callback and
+   fires it on every tick, alongside the existing stability-based close
+   sweep.
+
+Manager tests cover isolation=session kill invocation, inline/window
+isolation skipping the kill, the onSessionError happy + untracked paths,
+and an isolated-session kill failure that must not break cleanup.
+---
+ src/features/tmux-subagent/manager.test.ts    | 109 ++++++++++++++++++
+ src/features/tmux-subagent/manager.ts         |  32 ++++-
+ src/features/tmux-subagent/polling-manager.ts |  11 +-
+ src/plugin/event.ts                           |   4 +
+ 4 files changed, 154 insertions(+), 2 deletions(-)
+
+diff --git a/src/features/tmux-subagent/manager.test.ts b/src/features/tmux-subagent/manager.test.ts
+index c8cf2c1d..f828ff9d 100644
+--- a/src/features/tmux-subagent/manager.test.ts
++++ b/src/features/tmux-subagent/manager.test.ts
+@@ -57,6 +57,7 @@ const mockSpawnTmuxSession = mock<(
+   success: true,
+   paneId: '%isolated-session',
+ }))
++const mockKillTmuxSessionIfExists = mock<(sessionName: string) => Promise<boolean>>(async () => true)
+ const mockIsInsideTmux = mock<() => boolean>(() => true)
+ const mockGetCurrentPaneId = mock<() => string | undefined>(() => '%0')
+ 
+@@ -99,6 +100,8 @@ mock.module('../../shared/tmux', () => {
+     SESSION_READY_TIMEOUT_MS: 500,
+     spawnTmuxWindow: mockSpawnTmuxWindow,
+     spawnTmuxSession: mockSpawnTmuxSession,
++    killTmuxSessionIfExists: mockKillTmuxSessionIfExists,
++    ISOLATED_SESSION_NAME: 'omo-agents',
+   }
+ })
+ 
+@@ -1852,6 +1855,112 @@ describe('TmuxSessionManager', () => {
+       // then
+       expect(mockExecuteAction).toHaveBeenCalledTimes(2)
+     })
++
++    test('#given tmux isolation is "session" #when cleanup runs #then killTmuxSessionIfExists is invoked for the isolated session', async () => {
++      // given
++      mockKillTmuxSessionIfExists.mockClear()
++      const { TmuxSessionManager } = await import('./manager')
++      const manager = new TmuxSessionManager(createMockContext(), createTmuxConfig({
++        enabled: true,
++        isolation: 'session',
++      }), mockTmuxDeps)
++
++      // when
++      await manager.cleanup()
++
++      // then
++      expect(mockKillTmuxSessionIfExists).toHaveBeenCalledTimes(1)
++      expect(mockKillTmuxSessionIfExists).toHaveBeenCalledWith('omo-agents')
++    })
++
++    test('#given tmux isolation is "inline" #when cleanup runs #then killTmuxSessionIfExists is NOT invoked', async () => {
++      // given
++      mockKillTmuxSessionIfExists.mockClear()
++      const { TmuxSessionManager } = await import('./manager')
++      const manager = new TmuxSessionManager(createMockContext(), createTmuxConfig({
++        enabled: true,
++        isolation: 'inline',
++      }), mockTmuxDeps)
++
++      // when
++      await manager.cleanup()
++
++      // then
++      expect(mockKillTmuxSessionIfExists).toHaveBeenCalledTimes(0)
++    })
++
++    test('#given tmux isolation is "window" #when cleanup runs #then killTmuxSessionIfExists is NOT invoked', async () => {
++      // given
++      mockKillTmuxSessionIfExists.mockClear()
++      const { TmuxSessionManager } = await import('./manager')
++      const manager = new TmuxSessionManager(createMockContext(), createTmuxConfig({
++        enabled: true,
++        isolation: 'window',
++      }), mockTmuxDeps)
++
++      // when
++      await manager.cleanup()
++
++      // then
++      expect(mockKillTmuxSessionIfExists).toHaveBeenCalledTimes(0)
++    })
++
++    test('#given a tracked session #when onSessionError is invoked #then the pane is closed like onSessionDeleted', async () => {
++      // given
++      mockIsInsideTmux.mockReturnValue(true)
++      mockExecuteAction.mockClear()
++      const { TmuxSessionManager } = await import('./manager')
++      const manager = new TmuxSessionManager(createMockContext(), createTmuxConfig({
++        enabled: true,
++        isolation: 'session',
++      }), mockTmuxDeps)
++      await manager.onSessionCreated(createSessionCreatedEvent('ses_err', 'ses_parent', 'Errored Task'))
++      mockExecuteAction.mockClear()
++
++      // when
++      await manager.onSessionError({ sessionID: 'ses_err' })
++
++      // then
++      expect(mockExecuteAction).toHaveBeenCalled()
++    })
++
++    test('#given an untracked session #when onSessionError is invoked #then it is a no-op and does not throw', async () => {
++      // given
++      mockIsInsideTmux.mockReturnValue(true)
++      mockExecuteAction.mockClear()
++      const { TmuxSessionManager } = await import('./manager')
++      const manager = new TmuxSessionManager(createMockContext(), createTmuxConfig({
++        enabled: true,
++        isolation: 'session',
++      }), mockTmuxDeps)
++
++      // when
++      const errorHandler = manager.onSessionError({ sessionID: 'ses_unknown' })
++
++      // then
++      await expect(errorHandler).resolves.toBeUndefined()
++      expect(mockExecuteAction).not.toHaveBeenCalled()
++    })
++
++    test('#given killTmuxSessionIfExists throws #when cleanup runs #then cleanup still completes without throwing', async () => {
++      // given
++      mockKillTmuxSessionIfExists.mockClear()
++      mockKillTmuxSessionIfExists.mockImplementationOnce(async () => {
++        throw new Error('simulated teardown failure')
++      })
++      const { TmuxSessionManager } = await import('./manager')
++      const manager = new TmuxSessionManager(createMockContext(), createTmuxConfig({
++        enabled: true,
++        isolation: 'session',
++      }), mockTmuxDeps)
++
++      // when
++      const cleanupPromise = manager.cleanup()
++
++      // then
++      await expect(cleanupPromise).resolves.toBeUndefined()
++      expect(mockKillTmuxSessionIfExists).toHaveBeenCalledTimes(1)
++    })
+   })
+ 
+ })
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index e379bce9..ee1b8b50 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -10,6 +10,8 @@ import {
+   SESSION_READY_TIMEOUT_MS,
+   spawnTmuxWindow,
+   spawnTmuxSession,
++  killTmuxSessionIfExists,
++  ISOLATED_SESSION_NAME,
+ } from "../../shared/tmux"
+ import { queryWindowState } from "./pane-state-querier"
+ import { decideSpawnActions, decideCloseAction, type SessionMapping } from "./decision-engine"
+@@ -89,7 +91,8 @@ export class TmuxSessionManager {
+     this.pollingManager = new TmuxPollingManager(
+       this.client,
+       this.sessions,
+-      this.closeSessionById.bind(this)
++      this.closeSessionById.bind(this),
++      this.retryPendingCloses.bind(this)
+     )
+     log("[tmux-session-manager] initialized", {
+       configEnabled: this.tmuxConfig.enabled,
+@@ -832,6 +835,18 @@ export class TmuxSessionManager {
+     await this.spawnQueue
+   }
+ 
++  async onSessionError(event: { sessionID: string }): Promise<void> {
++    if (!this.isEnabled()) return
++    if (!this.getEffectiveSourcePaneId()) return
++    if (!this.sessions.has(event.sessionID)) return
++
++    log("[tmux-session-manager] onSessionError - routing to cleanup", {
++      sessionId: event.sessionID,
++    })
++
++    await this.onSessionDeleted(event)
++  }
++
+   async onSessionDeleted(event: { sessionID: string }): Promise<void> {
+     if (!this.isEnabled()) return
+     if (!this.getEffectiveSourcePaneId()) return
+@@ -954,6 +969,21 @@ export class TmuxSessionManager {
+     this.isolatedContainerPaneId = undefined
+     this.isolatedWindowPaneId = undefined
+ 
++    if (this.tmuxConfig.isolation === "session") {
++      try {
++        const killed = await killTmuxSessionIfExists(ISOLATED_SESSION_NAME)
++        log("[tmux-session-manager] isolated session teardown", {
++          session: ISOLATED_SESSION_NAME,
++          killed,
++        })
++      } catch (error) {
++        log("[tmux-session-manager] isolated session teardown failed", {
++          session: ISOLATED_SESSION_NAME,
++          error: String(error),
++        })
++      }
++    }
++
+     log("[tmux-session-manager] cleanup complete")
+   }
+ }
+diff --git a/src/features/tmux-subagent/polling-manager.ts b/src/features/tmux-subagent/polling-manager.ts
+index d7a972d4..1a74be80 100644
+--- a/src/features/tmux-subagent/polling-manager.ts
++++ b/src/features/tmux-subagent/polling-manager.ts
+@@ -16,7 +16,8 @@ export class TmuxPollingManager {
+   constructor(
+     private client: OpencodeClient,
+     private sessions: Map<string, TrackedSession>,
+-    private closeSessionById: (sessionId: string) => Promise<void>
++    private closeSessionById: (sessionId: string) => Promise<void>,
++    private retryPendingCloses?: () => Promise<void>
+   ) {}
+ 
+   handleEvent(event: { type: string; properties?: Record<string, unknown> }): void {
+@@ -134,6 +135,14 @@ export class TmuxPollingManager {
+         log("[tmux-session-manager] closing session due to poll", { sessionId })
+         await this.closeSessionById(sessionId)
+       }
++
++      if (this.retryPendingCloses) {
++        try {
++          await this.retryPendingCloses()
++        } catch (err) {
++          log("[tmux-session-manager] retry pending closes failed", { error: String(err) })
++        }
++      }
+     } catch (err) {
+       log("[tmux-session-manager] poll error", { error: String(err) })
+     } finally {
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 5a5f177b..0f79a84d 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -615,6 +615,10 @@ export function createEventHandler(args: {
+         const sessionID = props?.sessionID as string | undefined;
+         const error = props?.error;
+ 
++        if (tmuxIntegrationEnabled && sessionID) {
++          await managers.tmuxSessionManager.onSessionError({ sessionID });
++        }
++
+         const errorName = extractErrorName(error);
+         const errorMessage = extractErrorMessage(error);
+         const errorInfo = { name: errorName, message: errorMessage };
+-- 
+2.39.2
+

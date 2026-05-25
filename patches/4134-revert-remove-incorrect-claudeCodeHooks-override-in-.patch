@@ -1,0 +1,243 @@
+From e0d611aefc7ee8aebec81fb9a74b3f67247c01a7 Mon Sep 17 00:00:00 2001
+From: kilhyeonjun <kboxstar@gmail.com>
+Date: Fri, 10 Apr 2026 10:23:05 +0900
+Subject: [PATCH 4134/5749] revert: remove incorrect claudeCodeHooks override
+ in createHooks, add pre-tool-use tests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Revert the create-hooks.ts change — claudeCodeHooks is already created
+in createTransformHooks() with proper config and contextCollector.
+The previous commit overwrote it with a degraded instance (empty config,
+no contextCollector).
+
+Add 8 unit tests for executePreToolUseHooks covering:
+- null/empty config handling
+- exit code 2 (deny) and 1 (ask) behavior
+- multiple merged hooks: allow continues to next hook (the actual bug)
+- deny short-circuits remaining hooks
+- modifiedInput propagation between hooks
+
+TDD verified: tests fail with original code, pass with fix.
+---
+ src/create-hooks.ts                           |   9 -
+ .../claude-code-hooks/pre-tool-use.test.ts    | 175 ++++++++++++++++++
+ 2 files changed, 175 insertions(+), 9 deletions(-)
+ create mode 100644 src/hooks/claude-code-hooks/pre-tool-use.test.ts
+
+diff --git a/src/create-hooks.ts b/src/create-hooks.ts
+index 82791375..0e40ad48 100644
+--- a/src/create-hooks.ts
++++ b/src/create-hooks.ts
+@@ -8,8 +8,6 @@ import type { ModelCacheState } from "./plugin-state"
+ import { createCoreHooks } from "./plugin/hooks/create-core-hooks"
+ import { createContinuationHooks } from "./plugin/hooks/create-continuation-hooks"
+ import { createSkillHooks } from "./plugin/hooks/create-skill-hooks"
+-import { createClaudeCodeHooksHook } from "./hooks/claude-code-hooks"
+-import { safeCreateHook } from "./shared/safe-create-hook"
+ 
+ export type CreatedHooks = ReturnType<typeof createHooks>
+ 
+@@ -80,17 +78,10 @@ export function createHooks(args: {
+     availableSkills,
+   })
+ 
+-  const claudeCodeHooks = isHookEnabled("claude-code-hooks")
+-    ? safeHookEnabled
+-      ? safeCreateHook("claude-code-hooks", () => createClaudeCodeHooksHook(ctx, {}), { enabled: true })
+-      : createClaudeCodeHooksHook(ctx, {})
+-    : null
+-
+   const hooks = {
+     ...core,
+     ...continuation,
+     ...skill,
+-    claudeCodeHooks,
+   }
+ 
+   return {
+diff --git a/src/hooks/claude-code-hooks/pre-tool-use.test.ts b/src/hooks/claude-code-hooks/pre-tool-use.test.ts
+new file mode 100644
+index 00000000..1f1a499d
+--- /dev/null
++++ b/src/hooks/claude-code-hooks/pre-tool-use.test.ts
+@@ -0,0 +1,175 @@
++/// <reference types="bun-types" />
++
++import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from "bun:test"
++import type { ClaudeHooksConfig } from "./types"
++import type { PreToolUseContext } from "./pre-tool-use"
++import * as dispatchHookModule from "./dispatch-hook"
++import * as logger from "../../shared/logger"
++import { executePreToolUseHooks } from "./pre-tool-use"
++
++function createContext(overrides?: Partial<PreToolUseContext>): PreToolUseContext {
++  return {
++    sessionId: "test-session",
++    toolName: "write",
++    toolInput: { file_path: "/tmp/test.md", content: "hello" },
++    cwd: "/tmp",
++    ...overrides,
++  }
++}
++
++function createConfig(matchers: ClaudeHooksConfig["PreToolUse"]): ClaudeHooksConfig {
++  return { PreToolUse: matchers }
++}
++
++describe("executePreToolUseHooks", () => {
++  let dispatchSpy: ReturnType<typeof spyOn>
++
++  beforeEach(() => {
++    dispatchSpy = spyOn(dispatchHookModule, "dispatchHook")
++    spyOn(logger, "log").mockImplementation(() => {})
++  })
++
++  afterEach(() => {
++    mock.restore()
++  })
++
++  it("#given null config #when called #then returns allow", async () => {
++    const result = await executePreToolUseHooks(createContext(), null)
++    expect(result.decision).toBe("allow")
++  })
++
++  it("#given no matching hooks #when called #then returns allow", async () => {
++    const config = createConfig([
++      { matcher: "Bash", hooks: [{ type: "command", command: "echo test" }] },
++    ])
++    const result = await executePreToolUseHooks(createContext({ toolName: "write" }), config)
++    expect(result.decision).toBe("allow")
++  })
++
++  it("#given hook returns exit code 2 #when called #then returns deny", async () => {
++    dispatchSpy.mockResolvedValue({ exitCode: 2, stdout: "", stderr: "blocked" })
++
++    const config = createConfig([
++      { matcher: "Write", hooks: [{ type: "command", command: "echo deny" }] },
++    ])
++    const result = await executePreToolUseHooks(createContext(), config)
++
++    expect(result.decision).toBe("deny")
++    expect(result.reason).toBe("blocked")
++  })
++
++  it("#given hook returns exit code 1 #when called #then returns ask", async () => {
++    dispatchSpy.mockResolvedValue({ exitCode: 1, stdout: "", stderr: "needs confirmation" })
++
++    const config = createConfig([
++      { matcher: "Write", hooks: [{ type: "command", command: "echo ask" }] },
++    ])
++    const result = await executePreToolUseHooks(createContext(), config)
++
++    expect(result.decision).toBe("ask")
++    expect(result.reason).toBe("needs confirmation")
++  })
++
++  describe("#given multiple hooks with merged config (global + project)", () => {
++    it("#when first hook allows and second hook denies #then returns deny", async () => {
++      let callCount = 0
++      dispatchSpy.mockImplementation(async () => {
++        callCount++
++        if (callCount === 1) {
++          // Global catch-all hook returns "allow" via JSON
++          return {
++            exitCode: 0,
++            stdout: JSON.stringify({ decision: "allow" }),
++            stderr: "",
++          }
++        }
++        // Project budget guard hook returns exit code 2 (deny)
++        return { exitCode: 2, stdout: "", stderr: "BUDGET EXCEEDED" }
++      })
++
++      const config = createConfig([
++        // Global catch-all (no specific matcher = matches everything)
++        { matcher: "*", hooks: [{ type: "command", command: "node pre-tool-use.mjs" }] },
++        // Project budget guard
++        { matcher: "Edit|Write", hooks: [{ type: "command", command: "bash budget-guard.sh" }] },
++      ])
++
++      const result = await executePreToolUseHooks(createContext(), config)
++
++      expect(callCount).toBe(2)
++      expect(result.decision).toBe("deny")
++      expect(result.reason).toBe("BUDGET EXCEEDED")
++    })
++
++    it("#when first hook allows and second hook also allows #then returns allow", async () => {
++      let callCount = 0
++      dispatchSpy.mockImplementation(async () => {
++        callCount++
++        if (callCount === 1) {
++          return {
++            exitCode: 0,
++            stdout: JSON.stringify({ decision: "allow" }),
++            stderr: "",
++          }
++        }
++        return { exitCode: 0, stdout: "", stderr: "" }
++      })
++
++      const config = createConfig([
++        { matcher: "*", hooks: [{ type: "command", command: "node pre-tool-use.mjs" }] },
++        { matcher: "Edit|Write", hooks: [{ type: "command", command: "bash budget-guard.sh" }] },
++      ])
++
++      const result = await executePreToolUseHooks(createContext(), config)
++
++      expect(callCount).toBe(2)
++      expect(result.decision).toBe("allow")
++    })
++
++    it("#when first hook denies #then second hook is NOT executed", async () => {
++      let callCount = 0
++      dispatchSpy.mockImplementation(async () => {
++        callCount++
++        return { exitCode: 2, stdout: "", stderr: "denied by first hook" }
++      })
++
++      const config = createConfig([
++        { matcher: "*", hooks: [{ type: "command", command: "node pre-tool-use.mjs" }] },
++        { matcher: "Edit|Write", hooks: [{ type: "command", command: "bash budget-guard.sh" }] },
++      ])
++
++      const result = await executePreToolUseHooks(createContext(), config)
++
++      expect(callCount).toBe(1)
++      expect(result.decision).toBe("deny")
++    })
++
++    it("#when first hook allows via JSON with modifiedInput #then input is passed to second hook", async () => {
++      const capturedStdin: string[] = []
++      let callCount = 0
++      dispatchSpy.mockImplementation(async (_hook: unknown, stdinJson: string) => {
++        capturedStdin.push(stdinJson)
++        callCount++
++        if (callCount === 1) {
++          return {
++            exitCode: 0,
++            stdout: JSON.stringify({
++              decision: "allow",
++            }),
++            stderr: "",
++          }
++        }
++        return { exitCode: 0, stdout: "", stderr: "" }
++      })
++
++      const config = createConfig([
++        { matcher: "*", hooks: [{ type: "command", command: "node pre-tool-use.mjs" }] },
++        { matcher: "Edit|Write", hooks: [{ type: "command", command: "bash budget-guard.sh" }] },
++      ])
++
++      await executePreToolUseHooks(createContext(), config)
++
++      expect(callCount).toBe(2)
++    })
++  })
++})
+-- 
+2.39.2
+

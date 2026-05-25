@@ -1,0 +1,546 @@
+From d09cf56e15f5ebb7208418bedd4b3980d9282b43 Mon Sep 17 00:00:00 2001
+From: Lynricsy <im@ling.plus>
+Date: Fri, 27 Feb 2026 13:54:50 +0800
+Subject: [PATCH 2819/5749] =?UTF-8?q?feat(delegate-task):=20=E2=9A=99?=
+ =?UTF-8?q?=EF=B8=8F=20make=20sync=20subagent=20timeout=20configurable=20v?=
+ =?UTF-8?q?ia=20syncPollTimeoutMs?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Allow users to set `background_task.syncPollTimeoutMs` in config to override
+the default 10-minute sync subagent timeout. Affects sync task, sync continuation,
+and unstable agent task paths. Minimum value: 60000ms (1 minute).
+
+Co-authored-by: Wine Fox <fox@ling.plus>
+---
+ assets/oh-my-opencode.schema.json             |   4 +
+ src/config/schema/background-task.test.ts     |  51 +++++
+ src/config/schema/background-task.ts          |   1 +
+ src/plugin/tool-registry.ts                   |   1 +
+ src/tools/delegate-task/executor-types.ts     |   1 +
+ src/tools/delegate-task/sync-continuation.ts  |   4 +-
+ .../delegate-task/sync-poll-timeout.test.ts   | 176 ++++++++++++++++++
+ .../delegate-task/sync-session-poller.test.ts |   2 +-
+ .../delegate-task/sync-session-poller.ts      |   7 +-
+ src/tools/delegate-task/sync-task.ts          |   4 +-
+ src/tools/delegate-task/timing.ts             |   2 +
+ src/tools/delegate-task/tools.test.ts         |  65 +++++--
+ src/tools/delegate-task/types.ts              |   1 +
+ .../delegate-task/unstable-agent-task.ts      |   6 +-
+ 14 files changed, 296 insertions(+), 29 deletions(-)
+ create mode 100644 src/config/schema/background-task.test.ts
+ create mode 100644 src/tools/delegate-task/sync-poll-timeout.test.ts
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index 2c4819e7..ed5f81f5 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -3685,6 +3685,10 @@
+         "messageStalenessTimeoutMs": {
+           "type": "number",
+           "minimum": 60000
++        },
++        "syncPollTimeoutMs": {
++          "type": "number",
++          "minimum": 60000
+         }
+       },
+       "additionalProperties": false
+diff --git a/src/config/schema/background-task.test.ts b/src/config/schema/background-task.test.ts
+new file mode 100644
+index 00000000..2ca22586
+--- /dev/null
++++ b/src/config/schema/background-task.test.ts
+@@ -0,0 +1,51 @@
++import { describe, expect, test } from "bun:test"
++import { ZodError } from "zod/v4"
++import { BackgroundTaskConfigSchema } from "./background-task"
++
++describe("BackgroundTaskConfigSchema", () => {
++  describe("syncPollTimeoutMs", () => {
++    describe("#given valid syncPollTimeoutMs (120000)", () => {
++      test("#when parsed #then returns correct value", () => {
++        const result = BackgroundTaskConfigSchema.parse({ syncPollTimeoutMs: 120000 })
++
++        expect(result.syncPollTimeoutMs).toBe(120000)
++      })
++    })
++
++    describe("#given syncPollTimeoutMs below minimum (59999)", () => {
++      test("#when parsed #then throws ZodError", () => {
++        let thrownError: unknown
++
++        try {
++          BackgroundTaskConfigSchema.parse({ syncPollTimeoutMs: 59999 })
++        } catch (error) {
++          thrownError = error
++        }
++
++        expect(thrownError).toBeInstanceOf(ZodError)
++      })
++    })
++
++    describe("#given syncPollTimeoutMs not provided", () => {
++      test("#when parsed #then field is undefined", () => {
++        const result = BackgroundTaskConfigSchema.parse({})
++
++        expect(result.syncPollTimeoutMs).toBeUndefined()
++      })
++    })
++
++    describe('#given syncPollTimeoutMs is non-number ("abc")', () => {
++      test("#when parsed #then throws ZodError", () => {
++        let thrownError: unknown
++
++        try {
++          BackgroundTaskConfigSchema.parse({ syncPollTimeoutMs: "abc" })
++        } catch (error) {
++          thrownError = error
++        }
++
++        expect(thrownError).toBeInstanceOf(ZodError)
++      })
++    })
++  })
++})
+diff --git a/src/config/schema/background-task.ts b/src/config/schema/background-task.ts
+index 233fe286..b955de6b 100644
+--- a/src/config/schema/background-task.ts
++++ b/src/config/schema/background-task.ts
+@@ -8,6 +8,7 @@ export const BackgroundTaskConfigSchema = z.object({
+   staleTimeoutMs: z.number().min(60000).optional(),
+   /** Timeout for tasks that never received any progress update, falling back to startedAt (default: 600000 = 10 minutes, minimum: 60000 = 1 minute) */
+   messageStalenessTimeoutMs: z.number().min(60000).optional(),
++  syncPollTimeoutMs: z.number().min(60000).optional(),
+ })
+ 
+ export type BackgroundTaskConfig = z.infer<typeof BackgroundTaskConfigSchema>
+diff --git a/src/plugin/tool-registry.ts b/src/plugin/tool-registry.ts
+index 21d7901f..ddcc227e 100644
+--- a/src/plugin/tool-registry.ts
++++ b/src/plugin/tool-registry.ts
+@@ -67,6 +67,7 @@ export function createToolRegistry(args: {
+     disabledSkills: skillContext.disabledSkills,
+     availableCategories,
+     availableSkills: skillContext.availableSkills,
++    syncPollTimeoutMs: pluginConfig.background_task?.syncPollTimeoutMs,
+     onSyncSessionCreated: async (event) => {
+       log("[index] onSyncSessionCreated callback", {
+         sessionID: event.sessionID,
+diff --git a/src/tools/delegate-task/executor-types.ts b/src/tools/delegate-task/executor-types.ts
+index 136f6dbf..ad8c0187 100644
+--- a/src/tools/delegate-task/executor-types.ts
++++ b/src/tools/delegate-task/executor-types.ts
+@@ -12,6 +12,7 @@ export interface ExecutorContext {
+   browserProvider?: BrowserAutomationProvider
+   agentOverrides?: AgentOverrides
+   onSyncSessionCreated?: (event: { sessionID: string; parentID: string; title: string }) => Promise<void>
++  syncPollTimeoutMs?: number
+ }
+ 
+ export interface ParentContext {
+diff --git a/src/tools/delegate-task/sync-continuation.ts b/src/tools/delegate-task/sync-continuation.ts
+index b31e1950..a65b2061 100644
+--- a/src/tools/delegate-task/sync-continuation.ts
++++ b/src/tools/delegate-task/sync-continuation.ts
+@@ -18,7 +18,7 @@ export async function executeSyncContinuation(
+   executorCtx: ExecutorContext,
+   deps: SyncContinuationDeps = syncContinuationDeps
+ ): Promise<string> {
+-  const { client } = executorCtx
++  const { client, syncPollTimeoutMs } = executorCtx
+   const toastManager = getTaskToastManager()
+   const taskId = `resume_sync_${args.session_id!.slice(0, 8)}`
+   const startTime = new Date()
+@@ -112,7 +112,7 @@ export async function executeSyncContinuation(
+         toastManager,
+         taskId,
+         anchorMessageCount,
+-      })
++      }, syncPollTimeoutMs)
+       if (pollError) {
+         return pollError
+       }
+diff --git a/src/tools/delegate-task/sync-poll-timeout.test.ts b/src/tools/delegate-task/sync-poll-timeout.test.ts
+new file mode 100644
+index 00000000..b89b7887
+--- /dev/null
++++ b/src/tools/delegate-task/sync-poll-timeout.test.ts
+@@ -0,0 +1,176 @@
++declare const require: (name: string) => any
++const { describe, test, expect, beforeEach, afterEach } = require("bun:test")
++import { __setTimingConfig, __resetTimingConfig, DEFAULT_SYNC_POLL_TIMEOUT_MS } from "./timing"
++
++function createMockCtx(aborted = false) {
++  const controller = new AbortController()
++  if (aborted) controller.abort()
++  return {
++    sessionID: "parent-session",
++    messageID: "parent-message",
++    agent: "test-agent",
++    abort: controller.signal,
++  }
++}
++
++function createNeverCompleteClient(sessionID: string) {
++  return {
++    session: {
++      messages: async () => ({
++        data: [{ info: { id: "msg_001", role: "user", time: { created: 1000 } } }],
++      }),
++      status: async () => ({ data: { [sessionID]: { type: "idle" } } }),
++    },
++  }
++}
++
++async function withMockedDateNow(stepMs: number, run: () => Promise<void>) {
++  const originalDateNow = Date.now
++  let now = 0
++
++  Date.now = () => {
++    const current = now
++    now += stepMs
++    return current
++  }
++
++  try {
++    await run()
++  } finally {
++    Date.now = originalDateNow
++  }
++}
++
++describe("syncPollTimeoutMs threading", () => {
++  beforeEach(() => {
++    __setTimingConfig({
++      POLL_INTERVAL_MS: 10,
++      MIN_STABILITY_TIME_MS: 0,
++      STABILITY_POLLS_REQUIRED: 1,
++      MAX_POLL_TIME_MS: 5000,
++    })
++  })
++
++  afterEach(() => {
++    __resetTimingConfig()
++  })
++
++  describe("#given pollSyncSession timeoutMs input", () => {
++    describe("#when custom timeout is provided", () => {
++      test("#then custom timeout value is used", async () => {
++        const { pollSyncSession } = require("./sync-session-poller")
++        const mockClient = createNeverCompleteClient("ses_custom")
++
++        await withMockedDateNow(60_000, async () => {
++          const result = await pollSyncSession(createMockCtx(), mockClient, {
++            sessionID: "ses_custom",
++            agentToUse: "test-agent",
++            toastManager: null,
++            taskId: undefined,
++          }, 120_000)
++
++          expect(result).toBe("Poll timeout reached after 120000ms for session ses_custom")
++        })
++      })
++    })
++
++    describe("#when timeoutMs is omitted", () => {
++      test("#then default timeout constant is used", async () => {
++        const { pollSyncSession } = require("./sync-session-poller")
++        const mockClient = createNeverCompleteClient("ses_default")
++
++        expect(DEFAULT_SYNC_POLL_TIMEOUT_MS).toBe(600_000)
++
++        await withMockedDateNow(300_000, async () => {
++          const result = await pollSyncSession(createMockCtx(), mockClient, {
++            sessionID: "ses_default",
++            agentToUse: "test-agent",
++            toastManager: null,
++            taskId: undefined,
++          })
++
++          expect(result).toBe(`Poll timeout reached after ${DEFAULT_SYNC_POLL_TIMEOUT_MS}ms for session ses_default`)
++        })
++      })
++    })
++
++    describe("#when timeoutMs is lower than minimum guard", () => {
++      test("#then minimum 50ms timeout is enforced", async () => {
++        const { pollSyncSession } = require("./sync-session-poller")
++        const mockClient = createNeverCompleteClient("ses_guard")
++
++        await withMockedDateNow(25, async () => {
++          const result = await pollSyncSession(createMockCtx(), mockClient, {
++            sessionID: "ses_guard",
++            agentToUse: "test-agent",
++            toastManager: null,
++            taskId: undefined,
++          }, 10)
++
++          expect(result).toBe("Poll timeout reached after 50ms for session ses_guard")
++        })
++      })
++    })
++  })
++
++  describe("#given unstable-agent-task path", () => {
++    describe("#when syncPollTimeoutMs is set in executor context", () => {
++      test("#then unstable path uses configured timeout budget", async () => {
++        const { executeUnstableAgentTask } = require("./unstable-agent-task")
++
++        let statusCallCount = 0
++        const mockClient = {
++          session: {
++            status: async () => {
++              statusCallCount++
++              return { data: { ses_unstable: { type: "idle" } } }
++            },
++            messages: async () => ({
++              data: [
++                {
++                  info: { id: "msg_001", role: "assistant", time: { created: 2000 } },
++                  parts: [{ type: "text", text: "unstable path done" }],
++                },
++              ],
++            }),
++          },
++        }
++
++        const mockManager = {
++          launch: async () => ({ id: "task_001", sessionID: "ses_unstable", status: "running" }),
++          getTask: () => ({ id: "task_001", sessionID: "ses_unstable", status: "running" }),
++        }
++
++        const result = await executeUnstableAgentTask(
++          {
++            description: "unstable timeout threading",
++            prompt: "run",
++            category: "unspecified-low",
++            run_in_background: false,
++            load_skills: [],
++            command: undefined,
++          },
++          createMockCtx(),
++          {
++            manager: mockManager,
++            client: mockClient,
++            syncPollTimeoutMs: 0,
++          },
++          {
++            sessionID: "parent-session",
++            messageID: "parent-message",
++            model: "gpt-test",
++            agent: "test-agent",
++          },
++          "test-agent",
++          undefined,
++          undefined,
++          "gpt-test"
++        )
++
++        expect(statusCallCount).toBe(0)
++        expect(result).toContain("SUPERVISED TASK COMPLETED SUCCESSFULLY")
++      })
++    })
++  })
++})
+diff --git a/src/tools/delegate-task/sync-session-poller.test.ts b/src/tools/delegate-task/sync-session-poller.test.ts
+index 61defaf8..279116a1 100644
+--- a/src/tools/delegate-task/sync-session-poller.test.ts
++++ b/src/tools/delegate-task/sync-session-poller.test.ts
+@@ -273,7 +273,7 @@ describe("pollSyncSession", () => {
+         agentToUse: "test-agent",
+         toastManager: null,
+         taskId: undefined,
+-      })
++      }, 0)
+ 
+       //#then - timeout returns error string
+       expect(result).toBe("Poll timeout reached after 50ms for session ses_timeout")
+diff --git a/src/tools/delegate-task/sync-session-poller.ts b/src/tools/delegate-task/sync-session-poller.ts
+index 9c8cb256..3d5e88df 100644
+--- a/src/tools/delegate-task/sync-session-poller.ts
++++ b/src/tools/delegate-task/sync-session-poller.ts
+@@ -1,6 +1,6 @@
+ import type { ToolContextWithMetadata, OpencodeClient } from "./types"
+ import type { SessionMessage } from "./executor-types"
+-import { getTimingConfig } from "./timing"
++import { DEFAULT_SYNC_POLL_TIMEOUT_MS, getTimingConfig } from "./timing"
+ import { log } from "../../shared/logger"
+ import { normalizeSDKResponse } from "../../shared"
+ 
+@@ -32,10 +32,11 @@ export async function pollSyncSession(
+     toastManager: { removeTask: (id: string) => void } | null | undefined
+     taskId: string | undefined
+     anchorMessageCount?: number
+-  }
++  },
++  timeoutMs?: number
+ ): Promise<string | null> {
+   const syncTiming = getTimingConfig()
+-  const maxPollTimeMs = Math.max(syncTiming.MAX_POLL_TIME_MS, 50)
++  const maxPollTimeMs = Math.max(timeoutMs ?? DEFAULT_SYNC_POLL_TIMEOUT_MS, 50)
+   const pollStart = Date.now()
+   let pollCount = 0
+   let timedOut = false
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index f384b370..2ff600d0 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -23,7 +23,7 @@ export async function executeSyncTask(
+   fallbackChain?: import("../../shared/model-requirements").FallbackEntry[],
+   deps: SyncTaskDeps = syncTaskDeps
+ ): Promise<string> {
+-  const { client, directory, onSyncSessionCreated } = executorCtx
++  const { client, directory, onSyncSessionCreated, syncPollTimeoutMs } = executorCtx
+   const toastManager = getTaskToastManager()
+   let taskId: string | undefined
+   let syncSessionID: string | undefined
+@@ -117,7 +117,7 @@ export async function executeSyncTask(
+         agentToUse,
+         toastManager,
+         taskId,
+-      })
++      }, syncPollTimeoutMs)
+       if (pollError) {
+         return pollError
+       }
+diff --git a/src/tools/delegate-task/timing.ts b/src/tools/delegate-task/timing.ts
+index 5510d4e2..5b404f3b 100644
+--- a/src/tools/delegate-task/timing.ts
++++ b/src/tools/delegate-task/timing.ts
+@@ -6,6 +6,8 @@ let WAIT_FOR_SESSION_TIMEOUT_MS = 30000
+ let MAX_POLL_TIME_MS = 10 * 60 * 1000
+ let SESSION_CONTINUATION_STABILITY_MS = 5000
+ 
++export const DEFAULT_SYNC_POLL_TIMEOUT_MS = 600_000
++
+ export function getTimingConfig() {
+   return {
+     POLL_INTERVAL_MS,
+diff --git a/src/tools/delegate-task/tools.test.ts b/src/tools/delegate-task/tools.test.ts
+index 8c0b01ac..bb0b5ec2 100644
+--- a/src/tools/delegate-task/tools.test.ts
++++ b/src/tools/delegate-task/tools.test.ts
+@@ -1357,29 +1357,58 @@ describe("sisyphus-task", () => {
+       return { data: {} }
+     })
+ 
++    const baseTime = Date.now()
++    const initialMessages = [
++      {
++        info: {
++          id: "msg_001",
++          role: "user",
++          agent: "sisyphus-junior",
++          model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
++          variant: "max",
++          time: { created: baseTime },
++        },
++        parts: [{ type: "text", text: "previous message" }],
++      },
++      {
++        info: { id: "msg_002", role: "assistant", time: { created: baseTime + 1 }, finish: "end_turn" },
++        parts: [{ type: "text", text: "Completed." }],
++      },
++    ]
++
++    const messagesCallCounts: Record<string, number> = {}
++
+     const mockClient = {
+       session: {
+         prompt: promptMock,
+         promptAsync: promptMock,
+-        messages: async () => ({
+-          data: [
+-            {
+-              info: {
+-                id: "msg_001",
+-                role: "user",
+-                agent: "sisyphus-junior",
+-                model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
+-                variant: "max",
+-                time: { created: Date.now() },
++        messages: async (input: any) => {
++          const sessionID = input?.path?.id
++          if (typeof sessionID !== "string") {
++            return { data: [] }
++          }
++
++          const callCount = (messagesCallCounts[sessionID] ?? 0) + 1
++          messagesCallCounts[sessionID] = callCount
++
++          if (sessionID !== "ses_var_test") {
++            return { data: [] }
++          }
++
++          if (callCount === 1) {
++            return { data: initialMessages }
++          }
++
++          return {
++            data: [
++              ...initialMessages,
++              {
++                info: { id: "msg_003", role: "assistant", time: { created: baseTime + 2 }, finish: "end_turn" },
++                parts: [{ type: "text", text: "Continued." }],
+               },
+-              parts: [{ type: "text", text: "previous message" }],
+-            },
+-            {
+-              info: { id: "msg_002", role: "assistant", time: { created: Date.now() + 1 }, finish: "end_turn" },
+-              parts: [{ type: "text", text: "Completed." }],
+-            },
+-          ],
+-        }),
++            ],
++          }
++        },
+         status: async () => ({ data: { "ses_var_test": { type: "idle" } } }),
+       },
+       config: { get: async () => ({ data: { model: SYSTEM_DEFAULT_MODEL } }) },
+diff --git a/src/tools/delegate-task/types.ts b/src/tools/delegate-task/types.ts
+index 7c749d20..c51a1bde 100644
+--- a/src/tools/delegate-task/types.ts
++++ b/src/tools/delegate-task/types.ts
+@@ -68,6 +68,7 @@ export interface DelegateTaskToolOptions {
+   availableSkills?: AvailableSkill[]
+   agentOverrides?: AgentOverrides
+   onSyncSessionCreated?: (event: SyncSessionCreatedEvent) => Promise<void>
++  syncPollTimeoutMs?: number
+ }
+ 
+ export interface BuildSystemContentInput {
+diff --git a/src/tools/delegate-task/unstable-agent-task.ts b/src/tools/delegate-task/unstable-agent-task.ts
+index c0972e7b..ca6c38ee 100644
+--- a/src/tools/delegate-task/unstable-agent-task.ts
++++ b/src/tools/delegate-task/unstable-agent-task.ts
+@@ -1,6 +1,6 @@
+ import type { DelegateTaskArgs, ToolContextWithMetadata } from "./types"
+ import type { ExecutorContext, ParentContext, SessionMessage } from "./executor-types"
+-import { getTimingConfig } from "./timing"
++import { DEFAULT_SYNC_POLL_TIMEOUT_MS, getTimingConfig } from "./timing"
+ import { storeToolMetadata } from "../../features/tool-metadata-store"
+ import { formatDuration } from "./time-formatter"
+ import { formatDetailedError } from "./error-formatting"
+@@ -17,7 +17,7 @@ export async function executeUnstableAgentTask(
+   systemContent: string | undefined,
+   actualModel: string | undefined
+ ): Promise<string> {
+-  const { manager, client } = executorCtx
++  const { manager, client, syncPollTimeoutMs } = executorCtx
+ 
+   try {
+     const task = await manager.launch({
+@@ -80,7 +80,7 @@ export async function executeUnstableAgentTask(
+     let stablePolls = 0
+     let terminalStatus: { status: string; error?: string } | undefined
+ 
+-    while (Date.now() - pollStart < timingCfg.MAX_POLL_TIME_MS) {
++    while (Date.now() - pollStart < (syncPollTimeoutMs ?? DEFAULT_SYNC_POLL_TIMEOUT_MS)) {
+       if (ctx.abort?.aborted) {
+         return `Task aborted (was running in background mode).\n\nSession ID: ${sessionID}`
+       }
+-- 
+2.39.2
+

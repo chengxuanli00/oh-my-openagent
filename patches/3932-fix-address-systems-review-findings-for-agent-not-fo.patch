@@ -1,0 +1,169 @@
+From 9470cbe090ab90b62f3a6fc86cc59643ed0522eb Mon Sep 17 00:00:00 2001
+From: Jim Park <jim@ramtank.com>
+Date: Sat, 4 Apr 2026 22:13:05 -0700
+Subject: [PATCH 3932/5749] fix: address systems review findings for
+ agent-not-found fallback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. [HIGH] Tool restrictions recomputed for fallback agent via
+   buildFallbackBody() — no longer inherits original agent's restrictions.
+
+2. [HIGH] Double-retry race prevented — handleSessionErrorEvent now
+   returns early for agent-not-found errors, since the prompt catch
+   block already handles them with agent fallback. This prevents
+   tryFallbackRetry from racing with a model-level retry on the same
+   error (the "not found" pattern in RETRYABLE_MESSAGE_PATTERNS).
+
+3. [MEDIUM] task.agent updated to FALLBACK_AGENT after successful
+   fallback — notifications, toast, and logging reflect actual agent.
+
+4. [MEDIUM] FALLBACK_AGENT exported from spawner.ts and imported into
+   manager.ts — single source of truth.
+
+5. [LOW] resumeTask fallback now uses promptWithModelSuggestionRetry
+   (consistent with startTask), getting timeout protection.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/features/background-agent/manager.ts      | 19 +++++++++++---
+ src/features/background-agent/spawner.test.ts |  8 ++++++
+ src/features/background-agent/spawner.ts      | 26 ++++++++++++++++---
+ 3 files changed, 45 insertions(+), 8 deletions(-)
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index c4c86b23..2c58dda0 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -1,6 +1,6 @@
+ 
+ import type { PluginInput } from "@opencode-ai/plugin"
+-import { isAgentNotFoundError } from "./spawner"
++import { isAgentNotFoundError, FALLBACK_AGENT, buildFallbackBody } from "./spawner"
+ import type {
+   BackgroundTask,
+   LaunchInput,
+@@ -547,8 +547,6 @@ export class BackgroundManager {
+       applySessionPromptParams(sessionID, input.model)
+     }
+ 
+-    const FALLBACK_AGENT = "general"
+-
+     const promptBody = {
+       agent: input.agent,
+       ...(launchModel ? { model: launchModel } : {}),
+@@ -579,10 +577,13 @@ export class BackgroundManager {
+           taskId: task.id,
+         })
+         try {
++          const fallbackBody = buildFallbackBody(promptBody, FALLBACK_AGENT)
++          setSessionTools(sessionID, fallbackBody.tools as Record<string, boolean>)
+           await promptWithModelSuggestionRetry(this.client, {
+             path: { id: sessionID },
+-            body: { ...promptBody, agent: FALLBACK_AGENT },
++            body: fallbackBody,
+           })
++          task.agent = FALLBACK_AGENT
+           return
+         } catch (retryError) {
+           log("[background-agent] Fallback agent also failed:", retryError)
+@@ -1225,6 +1226,16 @@ export class BackgroundManager {
+   }): Promise<void> {
+     const { task, errorInfo, errorMessage, errorName } = args
+ 
++    // Agent-not-found errors are handled by the prompt catch block with agent fallback.
++    // Do not also trigger model fallback retry — that would race with the agent retry.
++    if (isAgentNotFoundError({ message: errorInfo.message } as Error)) {
++      log("[background-agent] Skipping session.error fallback for agent-not-found (handled by prompt catch)", {
++        taskId: task.id,
++        errorMessage: errorInfo.message?.slice(0, 100),
++      })
++      return
++    }
++
+     if (await this.tryFallbackRetry(task, errorInfo, "session.error")) {
+       return
+     }
+diff --git a/src/features/background-agent/spawner.test.ts b/src/features/background-agent/spawner.test.ts
+index 214e15e4..34a70873 100644
+--- a/src/features/background-agent/spawner.test.ts
++++ b/src/features/background-agent/spawner.test.ts
+@@ -76,6 +76,14 @@ describe("background-agent spawner agent-not-found fallback", () => {
+     expect(promptCalls[1].body.agent).toBe("general")
+     // Original prompt content preserved in fallback
+     expect(promptCalls[1].body.parts).toEqual(promptCalls[0].body.parts)
++    // Tool restrictions recomputed for fallback agent (general has no restrictions)
++    expect(promptCalls[1].body.tools).toEqual({
++      task: false,
++      call_omo_agent: true,
++      question: false,
++    })
++    // Task agent identity updated to reflect fallback
++    expect(task.agent).toBe("general")
+     // Task should not have errored
+     expect(onTaskError).not.toHaveBeenCalled()
+   })
+diff --git a/src/features/background-agent/spawner.ts b/src/features/background-agent/spawner.ts
+index c1e3ccf7..c412e7c3 100644
+--- a/src/features/background-agent/spawner.ts
++++ b/src/features/background-agent/spawner.ts
+@@ -8,13 +8,29 @@ import { getTaskToastManager } from "../task-toast-manager"
+ import { isInsideTmux } from "../../shared/tmux"
+ import type { ConcurrencyManager } from "./concurrency"
+ 
+-const FALLBACK_AGENT = "general"
++export const FALLBACK_AGENT = "general"
+ 
+ export function isAgentNotFoundError(error: unknown): boolean {
+   const message = error instanceof Error ? error.message : String(error)
+   return message.includes("Agent not found")
+ }
+ 
++export function buildFallbackBody(
++  originalBody: Record<string, unknown>,
++  fallbackAgent: string,
++): Record<string, unknown> {
++  return {
++    ...originalBody,
++    agent: fallbackAgent,
++    tools: {
++      task: false,
++      call_omo_agent: true,
++      question: false,
++      ...getAgentToolRestrictions(fallbackAgent),
++    },
++  }
++}
++
+ export interface SpawnerContext {
+   client: OpencodeClient
+   directory: string
+@@ -172,8 +188,9 @@ export async function startTask(
+       try {
+         await promptWithModelSuggestionRetry(client, {
+           path: { id: sessionID },
+-          body: { ...promptBody, agent: FALLBACK_AGENT },
++          body: buildFallbackBody(promptBody, FALLBACK_AGENT),
+         })
++        task.agent = FALLBACK_AGENT
+         return
+       } catch (retryError) {
+         log("[background-agent] Fallback agent also failed:", retryError)
+@@ -279,10 +296,11 @@ export async function resumeTask(
+         taskId: task.id,
+       })
+       try {
+-        await client.session.promptAsync({
++        await promptWithModelSuggestionRetry(client, {
+           path: { id: task.sessionID! },
+-          body: { ...resumeBody, agent: FALLBACK_AGENT },
++          body: buildFallbackBody(resumeBody, FALLBACK_AGENT),
+         })
++        task.agent = FALLBACK_AGENT
+         return
+       } catch (retryError) {
+         log("[background-agent] Resume fallback agent also failed:", retryError)
+-- 
+2.39.2
+

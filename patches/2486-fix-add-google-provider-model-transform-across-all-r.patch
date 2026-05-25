@@ -1,0 +1,281 @@
+From 4c7b81986ace2919fd365a854a7476bf51029772 Mon Sep 17 00:00:00 2001
+From: feelsodev <swdoriz@gmail.com>
+Date: Tue, 17 Feb 2026 22:18:56 +0900
+Subject: [PATCH 2486/5749] fix: add google provider model transform across all
+ resolution paths
+
+transformModelForProvider only handled github-copilot provider, leaving
+google provider models untransformed. This caused ProviderModelNotFoundError
+when google/gemini-3-flash was sent to the API (correct ID is
+gemini-3-flash-preview).
+
+Changes:
+- Add google provider to transformModelForProvider with idempotent regex
+  negative lookahead to prevent double -preview suffix
+- Fix category-default path in model-resolution-pipeline when
+  availableModels is empty but connected provider exists
+- Fix getFirstFallbackModel first-run path that constructed raw model IDs
+  without transformation
+- Fix github-copilot provider gemini transforms to also use idempotent
+  regex (was vulnerable to double-transform)
+- Extract transformModelForProvider to shared module (single source of
+  truth, imported by cli and shared layers)
+- Add 20 new test cases: unit tests for both providers, runtime
+  integration tests for category-default and fallback-chain paths,
+  double-transform prevention for both providers
+---
+ src/agents/builtin-agents/model-resolution.ts |  5 +-
+ src/cli/provider-model-id-transform.test.ts   | 24 ++++++
+ src/shared/model-resolution-pipeline.ts       | 13 ++-
+ src/shared/model-resolver.test.ts             | 81 ++++++++++++++++++-
+ src/shared/provider-model-id-transform.ts     | 11 +--
+ src/tools/delegate-task/model-selection.ts    |  4 +-
+ 6 files changed, 122 insertions(+), 16 deletions(-)
+
+diff --git a/src/agents/builtin-agents/model-resolution.ts b/src/agents/builtin-agents/model-resolution.ts
+index dd5f3266..f692c935 100644
+--- a/src/agents/builtin-agents/model-resolution.ts
++++ b/src/agents/builtin-agents/model-resolution.ts
+@@ -1,4 +1,5 @@
+ import { resolveModelPipeline } from "../../shared"
++import { transformModelForProvider } from "../../shared/provider-model-id-transform"
+ 
+ export function applyModelResolution(input: {
+   uiSelectedModel?: string
+@@ -20,8 +21,10 @@ export function getFirstFallbackModel(requirement?: {
+ }) {
+   const entry = requirement?.fallbackChain?.[0]
+   if (!entry || entry.providers.length === 0) return undefined
++  const provider = entry.providers[0]
++  const transformedModel = transformModelForProvider(provider, entry.model)
+   return {
+-    model: `${entry.providers[0]}/${entry.model}`,
++    model: `${provider}/${transformedModel}`,
+     provenance: "provider-fallback" as const,
+     variant: entry.variant,
+   }
+diff --git a/src/cli/provider-model-id-transform.test.ts b/src/cli/provider-model-id-transform.test.ts
+index 08317afb..e13c7846 100644
+--- a/src/cli/provider-model-id-transform.test.ts
++++ b/src/cli/provider-model-id-transform.test.ts
+@@ -63,6 +63,30 @@ describe("transformModelForProvider", () => {
+ 			// #then should transform to gemini-3-flash-preview
+ 			expect(result).toBe("gemini-3-flash-preview")
+ 		})
++
++		test("prevents double transformation of gemini-3-pro-preview", () => {
++			// #given github-copilot provider and gemini-3-pro-preview model (already transformed)
++			const provider = "github-copilot"
++			const model = "gemini-3-pro-preview"
++
++			// #when transformModelForProvider is called
++			const result = transformModelForProvider(provider, model)
++
++			// #then should NOT become gemini-3-pro-preview-preview
++			expect(result).toBe("gemini-3-pro-preview")
++		})
++
++		test("prevents double transformation of gemini-3-flash-preview", () => {
++			// #given github-copilot provider and gemini-3-flash-preview model (already transformed)
++			const provider = "github-copilot"
++			const model = "gemini-3-flash-preview"
++
++			// #when transformModelForProvider is called
++			const result = transformModelForProvider(provider, model)
++
++			// #then should NOT become gemini-3-flash-preview-preview
++			expect(result).toBe("gemini-3-flash-preview")
++		})
+ 	})
+ 
+ 	describe("google provider", () => {
+diff --git a/src/shared/model-resolution-pipeline.ts b/src/shared/model-resolution-pipeline.ts
+index 34d1c13b..6b39f9d5 100644
+--- a/src/shared/model-resolution-pipeline.ts
++++ b/src/shared/model-resolution-pipeline.ts
+@@ -2,6 +2,7 @@ import { log } from "./logger"
+ import * as connectedProvidersCache from "./connected-providers-cache"
+ import { fuzzyMatchModel } from "./model-availability"
+ import type { FallbackEntry } from "./model-requirements"
++import { transformModelForProvider } from "./provider-model-id-transform"
+ 
+ export type ModelResolutionRequest = {
+   intent?: {
+@@ -85,10 +86,13 @@ export function resolveModelPipeline(
+       if (parts.length >= 2) {
+         const provider = parts[0]
+         if (connectedProviders.includes(provider)) {
++          const modelName = parts.slice(1).join("/")
++          const transformedModel = `${provider}/${transformModelForProvider(provider, modelName)}`
+           log("Model resolved via category default (connected provider)", {
+-            model: normalizedCategoryDefault,
++            model: transformedModel,
++            original: normalizedCategoryDefault,
+           })
+-          return { model: normalizedCategoryDefault, provenance: "category-default", attempted }
++          return { model: transformedModel, provenance: "category-default", attempted }
+         }
+       }
+     }
+@@ -108,10 +112,11 @@ export function resolveModelPipeline(
+         for (const entry of fallbackChain) {
+           for (const provider of entry.providers) {
+             if (connectedSet.has(provider)) {
+-              const model = `${provider}/${entry.model}`
++              const transformedModelId = transformModelForProvider(provider, entry.model)
++              const model = `${provider}/${transformedModelId}`
+               log("Model resolved via fallback chain (connected provider)", {
+                 provider,
+-                model: entry.model,
++                model: transformedModelId,
+                 variant: entry.variant,
+               })
+               return {
+diff --git a/src/shared/model-resolver.test.ts b/src/shared/model-resolver.test.ts
+index 520c0c00..ea301a78 100644
+--- a/src/shared/model-resolver.test.ts
++++ b/src/shared/model-resolver.test.ts
+@@ -543,7 +543,8 @@ describe("resolveModelWithFallback", () => {
+       const result = resolveModelWithFallback(input)
+ 
+       // then - should use github-copilot (second provider) since google not connected
+-      expect(result!.model).toBe("github-copilot/gemini-3-pro")
++      // model name is transformed to preview variant for github-copilot provider
++      expect(result!.model).toBe("github-copilot/gemini-3-pro-preview")
+       expect(result!.source).toBe("provider-fallback")
+       cacheSpy.mockRestore()
+     })
+@@ -795,8 +796,82 @@ describe("resolveModelWithFallback", () => {
+       // when
+       const result = resolveModelWithFallback(input)
+ 
+-      // then - should use categoryDefaultModel since google is connected
+-      expect(result!.model).toBe("google/gemini-3-pro")
++      // then - should use transformed categoryDefaultModel since google is connected
++      expect(result!.model).toBe("google/gemini-3-pro-preview")
++      expect(result!.source).toBe("category-default")
++      cacheSpy.mockRestore()
++    })
++
++    test("transforms gemini-3-flash in categoryDefaultModel for google connected provider", () => {
++      // given - google connected, category default uses gemini-3-flash
++      const cacheSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(["google"])
++      const input: ExtendedModelResolutionInput = {
++        categoryDefaultModel: "google/gemini-3-flash",
++        availableModels: new Set(),
++        systemDefaultModel: "anthropic/claude-sonnet-4-5",
++      }
++
++      // when
++      const result = resolveModelWithFallback(input)
++
++      // then - gemini-3-flash should be transformed to gemini-3-flash-preview
++      expect(result!.model).toBe("google/gemini-3-flash-preview")
++      expect(result!.source).toBe("category-default")
++      cacheSpy.mockRestore()
++    })
++
++    test("does not double-transform categoryDefaultModel already containing -preview", () => {
++      // given - category default already has -preview suffix
++      const cacheSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(["google"])
++      const input: ExtendedModelResolutionInput = {
++        categoryDefaultModel: "google/gemini-3-pro-preview",
++        availableModels: new Set(),
++        systemDefaultModel: "anthropic/claude-sonnet-4-5",
++      }
++
++      // when
++      const result = resolveModelWithFallback(input)
++
++      // then - should NOT become gemini-3-pro-preview-preview
++      expect(result!.model).toBe("google/gemini-3-pro-preview")
++      expect(result!.source).toBe("category-default")
++      cacheSpy.mockRestore()
++    })
++
++    test("transforms gemini-3-pro in fallback chain for google connected provider", () => {
++      // given - google connected, fallback chain has gemini-3-pro
++      const cacheSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(["google"])
++      const input: ExtendedModelResolutionInput = {
++        fallbackChain: [
++          { providers: ["google", "github-copilot"], model: "gemini-3-pro" },
++        ],
++        availableModels: new Set(),
++        systemDefaultModel: "anthropic/claude-sonnet-4-5",
++      }
++
++      // when
++      const result = resolveModelWithFallback(input)
++
++      // then - should transform to preview variant for google provider
++      expect(result!.model).toBe("google/gemini-3-pro-preview")
++      expect(result!.source).toBe("provider-fallback")
++      cacheSpy.mockRestore()
++    })
++
++    test("passes through non-gemini-3 models for google connected provider", () => {
++      // given - google connected, category default uses gemini-2.5-flash (no transform needed)
++      const cacheSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(["google"])
++      const input: ExtendedModelResolutionInput = {
++        categoryDefaultModel: "google/gemini-2.5-flash",
++        availableModels: new Set(),
++        systemDefaultModel: "anthropic/claude-sonnet-4-5",
++      }
++
++      // when
++      const result = resolveModelWithFallback(input)
++
++      // then - should pass through unchanged
++      expect(result!.model).toBe("google/gemini-2.5-flash")
+       expect(result!.source).toBe("category-default")
+       cacheSpy.mockRestore()
+     })
+diff --git a/src/shared/provider-model-id-transform.ts b/src/shared/provider-model-id-transform.ts
+index 0a326f12..5b8c810b 100644
+--- a/src/shared/provider-model-id-transform.ts
++++ b/src/shared/provider-model-id-transform.ts
+@@ -6,16 +6,13 @@ export function transformModelForProvider(provider: string, model: string): stri
+ 			.replace("claude-sonnet-4-5", "claude-sonnet-4.5")
+ 			.replace("claude-haiku-4-5", "claude-haiku-4.5")
+ 			.replace("claude-sonnet-4", "claude-sonnet-4")
+-			.replace("gemini-3-pro", "gemini-3-pro-preview")
+-			.replace("gemini-3-flash", "gemini-3-flash-preview")
++			.replace(/gemini-3-pro(?!-)/g, "gemini-3-pro-preview")
++			.replace(/gemini-3-flash(?!-)/g, "gemini-3-flash-preview")
+ 	}
+ 	if (provider === "google") {
+-		if (!model.endsWith("-preview")) {
+-			return model
+-				.replace("gemini-3-pro", "gemini-3-pro-preview")
+-				.replace("gemini-3-flash", "gemini-3-flash-preview")
+-		}
+ 		return model
++			.replace(/gemini-3-pro(?!-)/g, "gemini-3-pro-preview")
++			.replace(/gemini-3-flash(?!-)/g, "gemini-3-flash-preview")
+ 	}
+ 	return model
+ }
+diff --git a/src/tools/delegate-task/model-selection.ts b/src/tools/delegate-task/model-selection.ts
+index 12987421..188e3e37 100644
+--- a/src/tools/delegate-task/model-selection.ts
++++ b/src/tools/delegate-task/model-selection.ts
+@@ -1,5 +1,6 @@
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { fuzzyMatchModel } from "../../shared/model-availability"
++import { transformModelForProvider } from "../../shared/provider-model-id-transform"
+ 
+ function normalizeModel(model?: string): string | undefined {
+   const trimmed = model?.trim()
+@@ -38,7 +39,8 @@ export function resolveModelForDelegateTask(input: {
+       const first = fallbackChain[0]
+       const provider = first?.providers?.[0]
+       if (provider) {
+-        return { model: `${provider}/${first.model}`, variant: first.variant }
++        const transformedModelId = transformModelForProvider(provider, first.model)
++        return { model: `${provider}/${transformedModelId}`, variant: first.variant }
+       }
+     } else {
+       for (const entry of fallbackChain) {
+-- 
+2.39.2
+

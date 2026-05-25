@@ -1,0 +1,559 @@
+From a130fa70d1b644660f93c8ed5ef943c8fd0d9279 Mon Sep 17 00:00:00 2001
+From: Ivan Smetanin <smetanin23@yandex.ru>
+Date: Mon, 11 May 2026 16:45:49 +0100
+Subject: [PATCH 5218/5749] fix(runtime-fallback): add first-prompt watchdog
+ for stuck subagents
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a subagent is dispatched to a provider and the underlying SDK
+enters a silent internal retry loop on a 429/quota error, no error
+event is ever emitted back to OpenCode. The runtime-fallback hook —
+which is fully reactive (listens to message.updated/session.error/
+session.status) — has nothing to react to and never dispatches the
+configured fallback. The subagent sits in `retry` status until the
+parent's 30-minute poll timeout (DEFAULT_POLL_TIMEOUT_MS) gives up,
+during which the parent's pending task tool call shows "waiting for
+subagent" with no indication of failure.
+
+This change adds a first-prompt watchdog that synthesises the missing
+error-event trigger:
+
+  - Armed when a user message lands in a subagent session
+    (membership check via `subagentSessions`).
+  - Cancelled on the first sign of progress: any assistant message
+    with text/reasoning content, finish field, or an error field (any
+    of which is something the existing handlers will deal with).
+  - Cancelled on session terminal events (idle/stop/deleted/error).
+  - On fire (90s default): aborts the in-flight request and routes
+    into the existing dispatchFallbackRetry path — the same code that
+    runs when a session.error arrives. No new fallback mechanism.
+
+Design choices:
+
+  - Dispatch fallback, do not abort the subagent outright. Network
+    loss looks identical to a stuck retry from the hook's vantage
+    point; with fallback-dispatch behaviour, network loss degrades
+    to today's baseline (both attempts fail, 30-min outer timeout
+    still ends things) rather than destructively aborting work.
+  - Scope strictly to subagents. Parent/user sessions can legitimately
+    take 90s+ to produce the first token; subagent dispatches in
+    practice produce first content much faster, so a 90s ceiling is
+    safe.
+  - Threshold is tunable via the third arg to createFirstPromptWatchdog;
+    DEFAULT_FIRST_PROMPT_WATCHDOG_MS = 90_000 in constants.ts.
+
+Also adds a diagnostic log in session-status-handler when a
+`session.status: retry` event arrives whose message does not match
+RETRYABLE_ERROR_PATTERNS. This is the hook's other silent-return
+spot for retry events; logging the raw retry message will let us
+extend the patterns next time we hit a provider whose phrasing
+we don't yet match.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/hooks/runtime-fallback/constants.ts       |  11 +
+ .../first-prompt-watchdog.test.ts             | 200 ++++++++++++++++++
+ .../runtime-fallback/first-prompt-watchdog.ts | 132 ++++++++++++
+ src/hooks/runtime-fallback/hook.ts            |  59 ++++++
+ .../session-status-handler.ts                 |  13 +-
+ 5 files changed, 414 insertions(+), 1 deletion(-)
+ create mode 100644 src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
+ create mode 100644 src/hooks/runtime-fallback/first-prompt-watchdog.ts
+
+diff --git a/src/hooks/runtime-fallback/constants.ts b/src/hooks/runtime-fallback/constants.ts
+index f407ffea..20676296 100644
+--- a/src/hooks/runtime-fallback/constants.ts
++++ b/src/hooks/runtime-fallback/constants.ts
+@@ -47,3 +47,14 @@ export const RETRYABLE_ERROR_PATTERNS = [
+  * Hook name for identification and logging
+  */
+ export const HOOK_NAME = "runtime-fallback"
++
++/**
++ * First-prompt watchdog: how long to wait for the first sign of progress
++ * (assistant text/reasoning/finish) from a subagent session before assuming
++ * the provider is silently stuck and dispatching the configured fallback.
++ *
++ * Tuned to be longer than typical first-token latency (well under 30s in
++ * practice) yet much shorter than the 30-minute outer poll timeout that
++ * would otherwise be the only safety net.
++ */
++export const DEFAULT_FIRST_PROMPT_WATCHDOG_MS = 90_000
+diff --git a/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts b/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
+new file mode 100644
+index 00000000..a3fcb72d
+--- /dev/null
++++ b/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
+@@ -0,0 +1,200 @@
++import { afterEach, beforeEach, describe, expect, it } from "bun:test"
++import type { HookDeps, RuntimeFallbackPluginInput } from "./types"
++import type { AutoRetryHelpers } from "./auto-retry"
++import { subagentSessions } from "../../features/claude-code-session-state"
++import { createFirstPromptWatchdog } from "./first-prompt-watchdog"
++
++const WATCHDOG_MS = 40
++const SAFE_WAIT_AFTER_FIRE_MS = 120
++const SAFE_WAIT_BEFORE_FIRE_MS = 15
++
++function wait(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms))
++}
++
++function createContext(): RuntimeFallbackPluginInput {
++  return {
++    client: {
++      session: {
++        abort: async () => ({}),
++        messages: async () => ({ data: [] }),
++        promptAsync: async () => ({}),
++      },
++      tui: {
++        showToast: async () => ({}),
++      },
++    },
++    directory: "/test/dir",
++  }
++}
++
++function createDeps(pluginConfig: Record<string, unknown> = {}): HookDeps {
++  return {
++    ctx: createContext(),
++    config: {
++      enabled: true,
++      retry_on_errors: [429, 503, 529],
++      max_fallback_attempts: 3,
++      cooldown_seconds: 60,
++      timeout_seconds: 30,
++      notify_on_fallback: false,
++    },
++    options: undefined,
++    pluginConfig,
++    sessionStates: new Map(),
++    sessionLastAccess: new Map(),
++    sessionRetryInFlight: new Set(),
++    sessionAwaitingFallbackResult: new Set(),
++    sessionFallbackTimeouts: new Map(),
++    sessionStatusRetryKeys: new Map(),
++  }
++}
++
++interface RecordedCalls {
++  abort: Array<{ sessionID: string; source: string }>
++  autoRetry: Array<{ sessionID: string; newModel: string; resolvedAgent: string | undefined; source: string }>
++}
++
++function createHelpers(calls: RecordedCalls, resolvedAgentName?: string): AutoRetryHelpers {
++  return {
++    abortSessionRequest: async (sessionID: string, source: string) => {
++      calls.abort.push({ sessionID, source })
++    },
++    clearSessionFallbackTimeout: () => {},
++    scheduleSessionFallbackTimeout: () => {},
++    autoRetryWithFallback: async (sessionID, newModel, resolvedAgent, source) => {
++      calls.autoRetry.push({ sessionID, newModel, resolvedAgent, source })
++    },
++    resolveAgentForSessionFromContext: async () => resolvedAgentName,
++    cleanupStaleSessions: () => {},
++  }
++}
++
++const AGENT = "sisyphus-junior"
++const PRIMARY_MODEL = "openai/gpt-5.4-mini"
++const FALLBACK_MODEL = "anthropic/claude-haiku-4-5"
++const PLUGIN_CONFIG_WITH_FALLBACK = {
++  agents: {
++    [AGENT]: {
++      model: PRIMARY_MODEL,
++      fallback_models: [{ model: FALLBACK_MODEL }],
++    },
++  },
++}
++
++describe("first-prompt-watchdog", () => {
++  beforeEach(() => {
++    subagentSessions.clear()
++  })
++
++  afterEach(() => {
++    subagentSessions.clear()
++  })
++
++  it("#given a subagent stays silent past the threshold and has a fallback configured #when the watchdog fires #then it aborts the in-flight request and dispatches the fallback model", async () => {
++    // given
++    const sessionID = "session-silent-subagent"
++    subagentSessions.add(sessionID)
++    const deps = createDeps(PLUGIN_CONFIG_WITH_FALLBACK)
++    const calls: RecordedCalls = { abort: [], autoRetry: [] }
++    const helpers = createHelpers(calls, AGENT)
++    const watchdog = createFirstPromptWatchdog(deps, helpers, WATCHDOG_MS)
++
++    // when
++    watchdog.onUserMessage(sessionID, PRIMARY_MODEL, AGENT)
++    await wait(SAFE_WAIT_AFTER_FIRE_MS)
++
++    // then
++    expect(calls.abort).toEqual([{ sessionID, source: "first-prompt-watchdog" }])
++    expect(calls.autoRetry).toHaveLength(1)
++    expect(calls.autoRetry[0].sessionID).toBe(sessionID)
++    expect(calls.autoRetry[0].newModel).toBe(FALLBACK_MODEL)
++    expect(calls.autoRetry[0].source).toBe("first-prompt-watchdog")
++
++    watchdog.dispose()
++  })
++
++  it("#given a subagent produces assistant text before the threshold #when progress is observed #then the watchdog is cancelled and no fallback is dispatched", async () => {
++    // given
++    const sessionID = "session-makes-progress"
++    subagentSessions.add(sessionID)
++    const deps = createDeps(PLUGIN_CONFIG_WITH_FALLBACK)
++    const calls: RecordedCalls = { abort: [], autoRetry: [] }
++    const helpers = createHelpers(calls, AGENT)
++    const watchdog = createFirstPromptWatchdog(deps, helpers, WATCHDOG_MS)
++
++    // when
++    watchdog.onUserMessage(sessionID, PRIMARY_MODEL, AGENT)
++    await wait(SAFE_WAIT_BEFORE_FIRE_MS)
++    watchdog.onAssistantProgress(sessionID)
++    await wait(SAFE_WAIT_AFTER_FIRE_MS)
++
++    // then
++    expect(calls.abort).toEqual([])
++    expect(calls.autoRetry).toEqual([])
++
++    watchdog.dispose()
++  })
++
++  it("#given the session is not a subagent #when a user message is observed #then the watchdog never arms and nothing fires", async () => {
++    // given
++    const sessionID = "session-not-a-subagent"
++    // NOT added to subagentSessions
++    const deps = createDeps(PLUGIN_CONFIG_WITH_FALLBACK)
++    const calls: RecordedCalls = { abort: [], autoRetry: [] }
++    const helpers = createHelpers(calls, AGENT)
++    const watchdog = createFirstPromptWatchdog(deps, helpers, WATCHDOG_MS)
++
++    // when
++    watchdog.onUserMessage(sessionID, PRIMARY_MODEL, AGENT)
++    await wait(SAFE_WAIT_AFTER_FIRE_MS)
++
++    // then
++    expect(calls.abort).toEqual([])
++    expect(calls.autoRetry).toEqual([])
++
++    watchdog.dispose()
++  })
++
++  it("#given a subagent reaches a terminal session state before the threshold #when onSessionTerminal is called #then the watchdog is cancelled and no fallback is dispatched", async () => {
++    // given
++    const sessionID = "session-terminated-early"
++    subagentSessions.add(sessionID)
++    const deps = createDeps(PLUGIN_CONFIG_WITH_FALLBACK)
++    const calls: RecordedCalls = { abort: [], autoRetry: [] }
++    const helpers = createHelpers(calls, AGENT)
++    const watchdog = createFirstPromptWatchdog(deps, helpers, WATCHDOG_MS)
++
++    // when
++    watchdog.onUserMessage(sessionID, PRIMARY_MODEL, AGENT)
++    await wait(SAFE_WAIT_BEFORE_FIRE_MS)
++    watchdog.onSessionTerminal(sessionID)
++    await wait(SAFE_WAIT_AFTER_FIRE_MS)
++
++    // then
++    expect(calls.abort).toEqual([])
++    expect(calls.autoRetry).toEqual([])
++
++    watchdog.dispose()
++  })
++
++  it("#given a subagent silent past the threshold with no fallback configured #when the watchdog fires #then it logs but does not abort or dispatch (lets PR #3950 quota-abort path handle it later if an error event arrives)", async () => {
++    // given
++    const sessionID = "session-no-fallback"
++    subagentSessions.add(sessionID)
++    const deps = createDeps({}) // empty pluginConfig → no fallback models
++    const calls: RecordedCalls = { abort: [], autoRetry: [] }
++    const helpers = createHelpers(calls, AGENT)
++    const watchdog = createFirstPromptWatchdog(deps, helpers, WATCHDOG_MS)
++
++    // when
++    watchdog.onUserMessage(sessionID, PRIMARY_MODEL, AGENT)
++    await wait(SAFE_WAIT_AFTER_FIRE_MS)
++
++    // then
++    expect(calls.abort).toEqual([])
++    expect(calls.autoRetry).toEqual([])
++
++    watchdog.dispose()
++  })
++})
+diff --git a/src/hooks/runtime-fallback/first-prompt-watchdog.ts b/src/hooks/runtime-fallback/first-prompt-watchdog.ts
+new file mode 100644
+index 00000000..e4fe61e9
+--- /dev/null
++++ b/src/hooks/runtime-fallback/first-prompt-watchdog.ts
+@@ -0,0 +1,132 @@
++import type { HookDeps, RuntimeFallbackTimeout } from "./types"
++import type { AutoRetryHelpers } from "./auto-retry"
++import { HOOK_NAME, DEFAULT_FIRST_PROMPT_WATCHDOG_MS } from "./constants"
++import { log } from "../../shared/logger"
++import { subagentSessions } from "../../features/claude-code-session-state"
++import { createFallbackState } from "./fallback-state"
++import { getFallbackModelsForSession } from "./fallback-models"
++import { resolveFallbackBootstrapModel } from "./fallback-bootstrap-model"
++import { dispatchFallbackRetry } from "./fallback-retry-dispatcher"
++
++const SOURCE = "first-prompt-watchdog"
++
++declare function setTimeout(callback: () => void | Promise<void>, delay?: number): RuntimeFallbackTimeout
++declare function clearTimeout(timeout: RuntimeFallbackTimeout): void
++
++export interface FirstPromptWatchdog {
++  onUserMessage(sessionID: string, model?: string, agent?: string): void
++  onAssistantProgress(sessionID: string): void
++  onSessionTerminal(sessionID: string): void
++  dispose(): void
++}
++
++export function createFirstPromptWatchdog(
++  deps: HookDeps,
++  helpers: AutoRetryHelpers,
++  watchdogMs: number = DEFAULT_FIRST_PROMPT_WATCHDOG_MS,
++): FirstPromptWatchdog {
++  const timers = new Map<string, RuntimeFallbackTimeout>()
++  const armed = new Set<string>()
++
++  const cancel = (sessionID: string): void => {
++    const timer = timers.get(sessionID)
++    if (timer) {
++      clearTimeout(timer)
++      timers.delete(sessionID)
++    }
++    armed.delete(sessionID)
++  }
++
++  const fire = async (sessionID: string, model: string | undefined, agent: string | undefined): Promise<void> => {
++    timers.delete(sessionID)
++    armed.delete(sessionID)
++
++    if (!subagentSessions.has(sessionID)) {
++      log(`[${HOOK_NAME}] ${SOURCE}: session no longer a subagent at fire time, skipping`, { sessionID })
++      return
++    }
++
++    const resolvedAgent = await helpers.resolveAgentForSessionFromContext(sessionID, agent)
++    const fallbackModels = getFallbackModelsForSession(sessionID, resolvedAgent, deps.pluginConfig)
++
++    if (fallbackModels.length === 0) {
++      log(`[${HOOK_NAME}] ${SOURCE}: subagent silent past ${watchdogMs}ms with no fallback configured`, {
++        sessionID,
++        model,
++        agent: resolvedAgent,
++      })
++      return
++    }
++
++    let state = deps.sessionStates.get(sessionID)
++    if (!state) {
++      const initialModel = resolveFallbackBootstrapModel({
++        sessionID,
++        source: SOURCE,
++        eventModel: model,
++        resolvedAgent,
++        pluginConfig: deps.pluginConfig,
++      })
++      if (!initialModel) {
++        log(`[${HOOK_NAME}] ${SOURCE}: no model info available, cannot dispatch fallback`, { sessionID })
++        return
++      }
++      state = createFallbackState(initialModel)
++      deps.sessionStates.set(sessionID, state)
++      deps.sessionLastAccess.set(sessionID, Date.now())
++    }
++
++    log(`[${HOOK_NAME}] ${SOURCE}: subagent silent past ${watchdogMs}ms, dispatching fallback`, {
++      sessionID,
++      model: state.currentModel,
++      fallbackCount: fallbackModels.length,
++    })
++
++    // Unlike the error-event path, the original request is still pending from
++    // OpenCode's perspective when the watchdog fires. Forcefully end it so the
++    // fallback prompt can take over cleanly. Network errors from abort are
++    // logged inside abortSessionRequest and do not block fallback dispatch.
++    await helpers.abortSessionRequest(sessionID, SOURCE)
++
++    await dispatchFallbackRetry(deps, helpers, {
++      sessionID,
++      state,
++      fallbackModels,
++      resolvedAgent,
++      source: SOURCE,
++    })
++  }
++
++  return {
++    onUserMessage(sessionID, model, agent) {
++      if (!sessionID) return
++      if (!subagentSessions.has(sessionID)) return
++      if (armed.has(sessionID)) return
++
++      armed.add(sessionID)
++      const timer = setTimeout(async () => {
++        await fire(sessionID, model, agent)
++      }, watchdogMs)
++      timers.set(sessionID, timer)
++
++      log(`[${HOOK_NAME}] ${SOURCE}: armed for subagent`, { sessionID, model, agent, watchdogMs })
++    },
++    onAssistantProgress(sessionID) {
++      if (!sessionID || !armed.has(sessionID)) return
++      cancel(sessionID)
++      log(`[${HOOK_NAME}] ${SOURCE}: cancelled (assistant progress observed)`, { sessionID })
++    },
++    onSessionTerminal(sessionID) {
++      if (!sessionID || !armed.has(sessionID)) return
++      cancel(sessionID)
++      log(`[${HOOK_NAME}] ${SOURCE}: cancelled (session terminal)`, { sessionID })
++    },
++    dispose() {
++      for (const timer of timers.values()) {
++        clearTimeout(timer)
++      }
++      timers.clear()
++      armed.clear()
++    },
++  }
++}
+diff --git a/src/hooks/runtime-fallback/hook.ts b/src/hooks/runtime-fallback/hook.ts
+index e9510218..1c12a863 100644
+--- a/src/hooks/runtime-fallback/hook.ts
++++ b/src/hooks/runtime-fallback/hook.ts
+@@ -2,6 +2,7 @@ import { createAutoRetryHelpers } from "./auto-retry"
+ import { createChatMessageHandler } from "./chat-message-handler"
+ import { DEFAULT_CONFIG } from "./constants"
+ import { createEventHandler } from "./event-handler"
++import { createFirstPromptWatchdog } from "./first-prompt-watchdog"
+ import { createMessageUpdateHandler } from "./message-update-handler"
+ import type { HookDeps, RuntimeFallbackHook, RuntimeFallbackInterval, RuntimeFallbackOptions, RuntimeFallbackPluginInput, RuntimeFallbackTimeout } from "./types"
+ 
+@@ -14,6 +15,7 @@ type RuntimeFallbackHookFactories = {
+   createEventHandler: typeof createEventHandler
+   createMessageUpdateHandler: typeof createMessageUpdateHandler
+   createChatMessageHandler: typeof createChatMessageHandler
++  createFirstPromptWatchdog: typeof createFirstPromptWatchdog
+ }
+ 
+ const defaultRuntimeFallbackHookFactories: RuntimeFallbackHookFactories = {
+@@ -21,6 +23,7 @@ const defaultRuntimeFallbackHookFactories: RuntimeFallbackHookFactories = {
+   createEventHandler,
+   createMessageUpdateHandler,
+   createChatMessageHandler,
++  createFirstPromptWatchdog,
+ }
+ 
+ export function createRuntimeFallbackHook(
+@@ -59,6 +62,56 @@ export function createRuntimeFallbackHook(
+   const baseEventHandler = factories.createEventHandler(deps, helpers)
+   const messageUpdateHandler = factories.createMessageUpdateHandler(deps, helpers)
+   const chatMessageHandler = factories.createChatMessageHandler(deps)
++  const firstPromptWatchdog = factories.createFirstPromptWatchdog(deps, helpers)
++
++  const TERMINAL_EVENT_TYPES = new Set([
++    "session.idle",
++    "session.stop",
++    "session.deleted",
++    "session.error",
++  ])
++
++  const observeForWatchdog = (event: { type: string; properties?: unknown }): void => {
++    const props = event.properties as Record<string, unknown> | undefined
++    if (!props) return
++
++    if (event.type === "message.updated") {
++      const info = props.info as Record<string, unknown> | undefined
++      const sessionID = info?.sessionID as string | undefined
++      const role = info?.role as string | undefined
++      if (!sessionID || !role) return
++
++      if (role === "user") {
++        const model = info?.model as string | undefined
++        const agent = info?.agent as string | undefined
++        firstPromptWatchdog.onUserMessage(sessionID, model, agent)
++        return
++      }
++
++      if (role === "assistant") {
++        const hasError = info?.error !== undefined
++        const hasFinish = info?.finish !== undefined
++        const eventParts = props.parts as Array<{ type?: string; text?: string }> | undefined
++        const infoParts = info?.parts as Array<{ type?: string; text?: string }> | undefined
++        const parts = eventParts ?? infoParts ?? []
++        const hasContent = parts.some((part) => {
++          if (part.type !== "text" && part.type !== "reasoning") return false
++          return (part.text ?? "").trim().length > 0
++        })
++        if (hasError || hasFinish || hasContent) {
++          firstPromptWatchdog.onAssistantProgress(sessionID)
++        }
++      }
++      return
++    }
++
++    if (TERMINAL_EVENT_TYPES.has(event.type)) {
++      const sessionID =
++        (props.sessionID as string | undefined) ??
++        ((props.info as Record<string, unknown> | undefined)?.id as string | undefined)
++      if (sessionID) firstPromptWatchdog.onSessionTerminal(sessionID)
++    }
++  }
+ 
+   let cleanupInterval: RuntimeFallbackInterval | null = null
+   let intervalStarted = false
+@@ -77,6 +130,10 @@ export function createRuntimeFallbackHook(
+   const eventHandler = async ({ event }: { event: { type: string; properties?: unknown } }) => {
+     ensureInterval()
+ 
++    if (config.enabled) {
++      observeForWatchdog(event)
++    }
++
+     if (event.type === "message.updated") {
+       if (!config.enabled) return
+       const props = event.properties as Record<string, unknown> | undefined
+@@ -95,6 +152,8 @@ export function createRuntimeFallbackHook(
+       clearTimeout(fallbackTimeout)
+     }
+ 
++    firstPromptWatchdog.dispose()
++
+     deps.sessionStates.clear()
+     deps.sessionLastAccess.clear()
+     deps.sessionRetryInFlight.clear()
+diff --git a/src/hooks/runtime-fallback/session-status-handler.ts b/src/hooks/runtime-fallback/session-status-handler.ts
+index c356f2f6..a9e6d3dc 100644
+--- a/src/hooks/runtime-fallback/session-status-handler.ts
++++ b/src/hooks/runtime-fallback/session-status-handler.ts
+@@ -39,7 +39,18 @@ export function createSessionStatusHandler(
+       // retry status message may not contain "retrying in" text alongside the error.
+       const messageLower = retryMessage.toLowerCase()
+       const matchesRetryablePattern = RETRYABLE_ERROR_PATTERNS.some((pattern) => pattern.test(messageLower))
+-      if (!matchesRetryablePattern) return
++      if (!matchesRetryablePattern) {
++        // Diagnostic: capture the actual retry message content so we can extend
++        // RETRYABLE_ERROR_PATTERNS if a provider emits a phrasing we don't yet match.
++        if (retryMessage) {
++          log(`[${HOOK_NAME}] session.status retry with non-matching message`, {
++            sessionID,
++            attempt: status.attempt,
++            retryMessage,
++          })
++        }
++        return
++      }
+     }
+ 
+     const retryKey = `${extractRetryAttempt(status.attempt, retryMessage)}:${normalizeRetryStatusMessage(retryMessage)}`
+-- 
+2.39.2
+

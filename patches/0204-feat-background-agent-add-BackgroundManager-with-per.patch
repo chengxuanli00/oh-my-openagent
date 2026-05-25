@@ -1,0 +1,388 @@
+From 698cdb674455daa1745d74c83b384f1d6553d3b3 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 11 Dec 2025 15:45:37 +0900
+Subject: [PATCH 0204/5749] feat(background-agent): add BackgroundManager with
+ persistence layer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/features/background-agent/index.ts   |   3 +
+ src/features/background-agent/manager.ts | 281 +++++++++++++++++++++++
+ src/features/background-agent/storage.ts |  21 ++
+ src/features/background-agent/types.ts   |  35 +++
+ 4 files changed, 340 insertions(+)
+ create mode 100644 src/features/background-agent/index.ts
+ create mode 100644 src/features/background-agent/manager.ts
+ create mode 100644 src/features/background-agent/storage.ts
+ create mode 100644 src/features/background-agent/types.ts
+
+diff --git a/src/features/background-agent/index.ts b/src/features/background-agent/index.ts
+new file mode 100644
+index 00000000..c57c193d
+--- /dev/null
++++ b/src/features/background-agent/index.ts
+@@ -0,0 +1,3 @@
++export * from "./types"
++export { BackgroundManager } from "./manager"
++export * from "./storage"
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+new file mode 100644
+index 00000000..a91cd29e
+--- /dev/null
++++ b/src/features/background-agent/manager.ts
+@@ -0,0 +1,281 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import type {
++  BackgroundTask,
++  BackgroundTaskStatus,
++  LaunchInput,
++} from "./types"
++
++type OpencodeClient = PluginInput["client"]
++
++interface SessionInfo {
++  id?: string
++  parentID?: string
++  status?: string
++}
++
++interface MessagePartInfo {
++  sessionID?: string
++  type?: string
++  tool?: string
++}
++
++interface EventProperties {
++  info?: SessionInfo
++  sessionID?: string
++  [key: string]: unknown
++}
++
++interface Event {
++  type: string
++  properties?: EventProperties
++}
++
++export class BackgroundManager {
++  private tasks: Map<string, BackgroundTask>
++  private notifications: Map<string, BackgroundTask[]>
++  private client: OpencodeClient
++  private storePath: string
++  private persistTimer?: Timer
++
++  constructor(client: OpencodeClient, storePath: string) {
++    this.tasks = new Map()
++    this.notifications = new Map()
++    this.client = client
++    this.storePath = storePath
++  }
++
++  async launch(input: LaunchInput): Promise<BackgroundTask> {
++    const createResult = await this.client.session.create({
++      body: {
++        parentID: input.parentSessionID,
++        title: `Background: ${input.description}`,
++      },
++    })
++
++    if (createResult.error) {
++      throw new Error(`Failed to create background session: ${createResult.error}`)
++    }
++
++    const sessionID = createResult.data.id
++
++    const task: BackgroundTask = {
++      id: `bg_${crypto.randomUUID().slice(0, 8)}`,
++      sessionID,
++      parentSessionID: input.parentSessionID,
++      parentMessageID: input.parentMessageID,
++      description: input.description,
++      agent: input.agent,
++      status: "running",
++      startedAt: new Date(),
++      progress: {
++        toolCalls: 0,
++        lastUpdate: new Date(),
++      },
++    }
++
++    this.tasks.set(task.id, task)
++    this.persist()
++
++    this.client.session.promptAsync({
++      path: { id: sessionID },
++      body: {
++        agent: input.agent,
++        parts: [{ type: "text", text: input.prompt }],
++      },
++    }).catch((error) => {
++      const existingTask = this.findBySession(sessionID)
++      if (existingTask) {
++        existingTask.status = "error"
++        existingTask.error = String(error)
++        existingTask.completedAt = new Date()
++        this.persist()
++      }
++    })
++
++    return task
++  }
++
++  getTask(id: string): BackgroundTask | undefined {
++    return this.tasks.get(id)
++  }
++
++  getTasksByParentSession(sessionID: string): BackgroundTask[] {
++    const result: BackgroundTask[] = []
++    for (const task of this.tasks.values()) {
++      if (task.parentSessionID === sessionID) {
++        result.push(task)
++      }
++    }
++    return result
++  }
++
++  findBySession(sessionID: string): BackgroundTask | undefined {
++    for (const task of this.tasks.values()) {
++      if (task.sessionID === sessionID) {
++        return task
++      }
++    }
++    return undefined
++  }
++
++  handleEvent(event: Event): void {
++    const props = event.properties
++
++    if (event.type === "message.part.updated") {
++      const partInfo = props as unknown as MessagePartInfo
++      const sessionID = partInfo?.sessionID
++      if (!sessionID) return
++
++      const task = this.findBySession(sessionID)
++      if (!task) return
++
++      if (partInfo?.type === "tool" || partInfo?.tool) {
++        if (!task.progress) {
++          task.progress = {
++            toolCalls: 0,
++            lastUpdate: new Date(),
++          }
++        }
++        task.progress.toolCalls += 1
++        task.progress.lastTool = partInfo.tool
++        task.progress.lastUpdate = new Date()
++        this.persist()
++      }
++    }
++
++    if (event.type === "session.updated") {
++      const info = props?.info as SessionInfo | undefined
++      const sessionID = info?.id
++      const status = info?.status
++
++      if (!sessionID) return
++
++      const task = this.findBySession(sessionID)
++      if (!task) return
++
++      if (status === "idle" && task.status === "running") {
++        task.status = "completed"
++        task.completedAt = new Date()
++        this.markForNotification(task)
++        this.persist()
++      }
++    }
++
++    if (event.type === "session.deleted") {
++      const info = props?.info as SessionInfo | undefined
++      const sessionID = info?.id
++
++      if (!sessionID) return
++
++      const task = this.findBySession(sessionID)
++      if (!task) return
++
++      if (task.status === "running") {
++        task.status = "cancelled"
++        task.completedAt = new Date()
++        task.error = "Session deleted (cascade delete from parent)"
++      }
++
++      this.tasks.delete(task.id)
++      this.persist()
++
++      this.clearNotificationsForTask(task.id)
++    }
++  }
++
++  markForNotification(task: BackgroundTask): void {
++    const queue = this.notifications.get(task.parentSessionID) ?? []
++    queue.push(task)
++    this.notifications.set(task.parentSessionID, queue)
++  }
++
++  getPendingNotifications(sessionID: string): BackgroundTask[] {
++    return this.notifications.get(sessionID) ?? []
++  }
++
++  clearNotifications(sessionID: string): void {
++    this.notifications.delete(sessionID)
++  }
++
++  private clearNotificationsForTask(taskId: string): void {
++    for (const [sessionID, tasks] of this.notifications.entries()) {
++      const filtered = tasks.filter((t) => t.id !== taskId)
++      if (filtered.length === 0) {
++        this.notifications.delete(sessionID)
++      } else {
++        this.notifications.set(sessionID, filtered)
++      }
++    }
++  }
++
++  async persist(): Promise<void> {
++    if (this.persistTimer) {
++      clearTimeout(this.persistTimer)
++    }
++
++    this.persistTimer = setTimeout(async () => {
++      try {
++        const data = Array.from(this.tasks.values())
++        const serialized = data.map((task) => ({
++          ...task,
++          startedAt: task.startedAt.toISOString(),
++          completedAt: task.completedAt?.toISOString(),
++          progress: task.progress
++            ? {
++                ...task.progress,
++                lastUpdate: task.progress.lastUpdate.toISOString(),
++              }
++            : undefined,
++        }))
++        await Bun.write(this.storePath, JSON.stringify(serialized, null, 2))
++      } catch {
++        void 0
++      }
++    }, 500)
++  }
++
++  async restore(): Promise<void> {
++    try {
++      const file = Bun.file(this.storePath)
++      const exists = await file.exists()
++      if (!exists) return
++
++      const content = await file.text()
++      const data = JSON.parse(content) as Array<{
++        id: string
++        sessionID: string
++        parentSessionID: string
++        parentMessageID: string
++        description: string
++        agent: string
++        status: BackgroundTaskStatus
++        startedAt: string
++        completedAt?: string
++        result?: string
++        error?: string
++        progress?: {
++          toolCalls: number
++          lastTool?: string
++          lastUpdate: string
++        }
++      }>
++
++      for (const item of data) {
++        const task: BackgroundTask = {
++          ...item,
++          startedAt: new Date(item.startedAt),
++          completedAt: item.completedAt ? new Date(item.completedAt) : undefined,
++          progress: item.progress
++            ? {
++                ...item.progress,
++                lastUpdate: new Date(item.progress.lastUpdate),
++              }
++            : undefined,
++        }
++        this.tasks.set(task.id, task)
++      }
++    } catch {
++      void 0
++    }
++  }
++}
+diff --git a/src/features/background-agent/storage.ts b/src/features/background-agent/storage.ts
+new file mode 100644
+index 00000000..a2d2b85b
+--- /dev/null
++++ b/src/features/background-agent/storage.ts
+@@ -0,0 +1,21 @@
++import { writeFile, readFile } from "fs/promises"
++import type { BackgroundTask } from "./types"
++
++export async function saveToFile(
++  path: string,
++  tasks: BackgroundTask[]
++): Promise<void> {
++  await writeFile(path, JSON.stringify(tasks, null, 2), "utf-8")
++}
++
++export async function loadFromFile(path: string): Promise<BackgroundTask[]> {
++  try {
++    const content = await readFile(path, "utf-8")
++    return JSON.parse(content)
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
++      return []
++    }
++    throw error
++  }
++}
+diff --git a/src/features/background-agent/types.ts b/src/features/background-agent/types.ts
+new file mode 100644
+index 00000000..7a9362ec
+--- /dev/null
++++ b/src/features/background-agent/types.ts
+@@ -0,0 +1,35 @@
++export type BackgroundTaskStatus =
++  | "pending"
++  | "running"
++  | "completed"
++  | "error"
++  | "cancelled"
++
++export interface TaskProgress {
++  toolCalls: number
++  lastTool?: string
++  lastUpdate: Date
++}
++
++export interface BackgroundTask {
++  id: string
++  sessionID: string
++  parentSessionID: string
++  parentMessageID: string
++  description: string
++  agent: string
++  status: BackgroundTaskStatus
++  startedAt: Date
++  completedAt?: Date
++  result?: string
++  error?: string
++  progress?: TaskProgress
++}
++
++export interface LaunchInput {
++  description: string
++  prompt: string
++  agent: string
++  parentSessionID: string
++  parentMessageID: string
++}
+-- 
+2.39.2
+

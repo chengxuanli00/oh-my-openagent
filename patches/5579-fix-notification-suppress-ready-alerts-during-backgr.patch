@@ -1,0 +1,205 @@
+From 60a23a557e14ca9b370e9a9a7ac3b06801bd5a8c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=EC=8B=A0=EC=A0=95=EC=A7=84?= <jinjeongshin@gmail.com>
+Date: Wed, 20 May 2026 16:40:45 +0900
+Subject: [PATCH 5579/5749] fix(notification): suppress ready alerts during
+ background tasks
+
+Gate idle ready notifications on the existing background-task continuation marker so cmux does not receive premature ready alerts while delegated work is still active.
+
+Constraint: Reuse marker state from background task lifecycle without adding new notification config
+
+Rejected: Patch cmux directly | notification readiness belongs upstream in OMO
+
+Confidence: high
+
+Scope-risk: narrow
+---
+ src/hooks/session-notification.test.ts | 83 ++++++++++++++++++++++++--
+ src/hooks/session-notification.ts      |  4 +-
+ src/hooks/session-todo-status.ts       | 10 ++++
+ 3 files changed, 89 insertions(+), 8 deletions(-)
+
+diff --git a/src/hooks/session-notification.test.ts b/src/hooks/session-notification.test.ts
+index 31a133f9..7f9a871d 100644
+--- a/src/hooks/session-notification.test.ts
++++ b/src/hooks/session-notification.test.ts
+@@ -1,6 +1,11 @@
++/// <reference types="bun-types" />
+ import { afterEach, beforeEach, describe, expect, jest, spyOn, test } from "bun:test"
++import { mkdtempSync, rmSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
+ import { createSessionNotification } from "./session-notification"
+ import { setMainSession, subagentSessions, _resetForTesting } from "../features/claude-code-session-state"
++import { setContinuationMarkerSource } from "../features/run-continuation-state"
+ import * as utils from "./session-notification-utils"
+ import * as sender from "./session-notification-sender"
+ 
+@@ -57,7 +62,7 @@ function createShellMock(options: {
+   }
+ }
+ 
+-function createMockInput(shell: ReturnType<typeof createShellMock>): MockPluginInput {
++function createMockInput(shell: ReturnType<typeof createShellMock>, directory = "/tmp/test"): MockPluginInput {
+   const input = {} as MockPluginInput
+   return Object.assign(input, {
+     $: shell,
+@@ -66,17 +71,24 @@ function createMockInput(shell: ReturnType<typeof createShellMock>): MockPluginI
+         todo: async () => ({ data: [] }),
+       },
+     },
+-    directory: "/tmp/test",
+-    project: "/tmp/test",
+-    worktree: "/tmp/test",
++    directory,
++    project: directory,
++    worktree: directory,
+     serverUrl: "http://localhost",
+   })
+ }
+ 
+ describe("session-notification", () => {
+   let notificationCalls: string[]
++  const tempDirs: string[] = []
+ 
+-  function createMockPluginInput(): MockPluginInput {
++  function createTempDir(): string {
++    const directory = mkdtempSync(join(tmpdir(), "omo-session-notification-"))
++    tempDirs.push(directory)
++    return directory
++  }
++
++  function createMockPluginInput(directory = "/tmp/test"): MockPluginInput {
+     return createMockInput(
+       createShellMock({
+         capture: (cmdStr) => {
+@@ -85,7 +97,8 @@ describe("session-notification", () => {
+             notificationCalls.push(cmdStr)
+           }
+         }
+-      })
++      }),
++      directory,
+     )
+   }
+ 
+@@ -126,6 +139,12 @@ describe("session-notification", () => {
+     Date.now = originalDateNow
+     subagentSessions.clear()
+     _resetForTesting()
++    while (tempDirs.length > 0) {
++      const directory = tempDirs.pop()
++      if (directory) {
++        rmSync(directory, { recursive: true, force: true })
++      }
++    }
+   })
+ 
+   test("should not trigger notification for subagent session", async () => {
+@@ -203,6 +222,58 @@ describe("session-notification", () => {
+     expect(notificationCalls.length).toBeGreaterThanOrEqual(1)
+   })
+ 
++  test("should not trigger ready notification while background tasks are active", async () => {
++    // given - a main session has active background work marker
++    const mainSessionID = "main-bg-active"
++    const directory = createTempDir()
++    setMainSession(mainSessionID)
++    setContinuationMarkerSource(directory, mainSessionID, "background-task", "active", "1 background task active")
++
++    const hook = createSessionNotification(createMockPluginInput(directory), {
++      idleConfirmationDelay: 10,
++      enforceMainSessionFilter: false,
++    })
++
++    // when - main session goes idle before background work completes
++    await hook({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: mainSessionID },
++      },
++    })
++
++    await new Promise((resolve) => setTimeout(resolve, 100))
++
++    // then - ready notification should not be sent
++    expect(notificationCalls).toHaveLength(0)
++  })
++
++  test("should trigger ready notification when background task marker is idle", async () => {
++    // given - a main session has no active background work marker
++    const mainSessionID = "main-bg-idle"
++    const directory = createTempDir()
++    setMainSession(mainSessionID)
++    setContinuationMarkerSource(directory, mainSessionID, "background-task", "idle")
++
++    const hook = createSessionNotification(createMockPluginInput(directory), {
++      idleConfirmationDelay: 10,
++      enforceMainSessionFilter: false,
++    })
++
++    // when - main session goes idle after background work completes
++    await hook({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: mainSessionID },
++      },
++    })
++
++    await new Promise((resolve) => setTimeout(resolve, 100))
++
++    // then - ready notification should be sent
++    expect(notificationCalls.length).toBeGreaterThanOrEqual(1)
++  })
++
+   test("should skip notification for subagent even when mainSessionID is set", async () => {
+     // given - both mainSessionID and subagent session exist
+     const mainSessionID = "main-999"
+diff --git a/src/hooks/session-notification.ts b/src/hooks/session-notification.ts
+index e65f358c..37857a53 100644
+--- a/src/hooks/session-notification.ts
++++ b/src/hooks/session-notification.ts
+@@ -4,7 +4,7 @@ import { buildReadyNotificationContent } from "./session-notification-content"
+ import { type Platform } from "./session-notification-sender"
+ import * as sessionNotificationSender from "./session-notification-sender"
+ import { getEventToolName, getQuestionText, getSessionID } from "./session-notification-event-properties"
+-import { hasIncompleteTodos } from "./session-todo-status"
++import { hasPendingSessionWork } from "./session-todo-status"
+ import { createIdleNotificationScheduler } from "./session-notification-scheduler"
+ import { createSessionNotificationInit } from "./session-notification-init"
+ import { resolveSessionEventID } from "../shared/event-session-id"
+@@ -49,7 +49,7 @@ export function createSessionNotification(ctx: PluginInput, config: SessionNotif
+   const scheduler = createIdleNotificationScheduler({
+     ctx,
+     config: mergedConfig,
+-    hasIncompleteTodos,
++    hasIncompleteTodos: hasPendingSessionWork,
+     send: async (hookCtx, sessionID) => {
+       const platform = ensureNotificationPlatform()
+       if (typeof hookCtx.client.session.get !== "function" && typeof hookCtx.client.session.messages !== "function") {
+diff --git a/src/hooks/session-todo-status.ts b/src/hooks/session-todo-status.ts
+index c86752fe..11caf565 100644
+--- a/src/hooks/session-todo-status.ts
++++ b/src/hooks/session-todo-status.ts
+@@ -1,4 +1,5 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
++import { readContinuationMarker } from "../features/run-continuation-state"
+ import { normalizeSDKResponse } from "../shared"
+ 
+ interface Todo {
+@@ -18,3 +19,12 @@ export async function hasIncompleteTodos(ctx: PluginInput, sessionID: string): P
+     return false
+   }
+ }
++
++export async function hasPendingSessionWork(ctx: PluginInput, sessionID: string): Promise<boolean> {
++  const marker = readContinuationMarker(ctx.directory, sessionID)
++  if (marker?.sources["background-task"]?.state === "active") {
++    return true
++  }
++
++  return hasIncompleteTodos(ctx, sessionID)
++}
+-- 
+2.39.2
+

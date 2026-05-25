@@ -1,0 +1,455 @@
+From 5ffbe0e24eeea3dc6e582f29465a4dbaba69eae6 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 14 May 2026 01:03:19 +0900
+Subject: [PATCH 5141/5749] fix(fallback): guard duplicate prompt injections
+
+---
+ .../aggressive-truncation-strategy.test.ts    |  31 +++++-
+ .../aggressive-truncation-strategy.ts         |  15 ++-
+ .../fallback-state-controller.ts              |  18 +++
+ src/hooks/runtime-fallback/event-handler.ts   |  28 +++++
+ src/hooks/runtime-fallback/index.test.ts      |  67 +++++++++++-
+ src/plugin/event.model-fallback.test.ts       | 103 +++++++++++++++++-
+ src/plugin/event.ts                           |  10 +-
+ 7 files changed, 257 insertions(+), 15 deletions(-)
+
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.test.ts b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.test.ts
+index 2c8e1ae4..804fbf46 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.test.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.test.ts
+@@ -39,11 +39,14 @@ import { _resetForTesting as resetSessionState, updateSessionAgent } from "../..
+ import { runAggressiveTruncationStrategy } from "./aggressive-truncation-strategy"
+ 
+ type FakeClient = {
+-  session: { promptAsync: (input: PromptAsyncCall) => Promise<unknown> }
++  session: {
++    promptAsync: (input: PromptAsyncCall) => Promise<unknown>
++    status?: () => Promise<unknown>
++  }
+   tui: { showToast: (input: unknown) => Promise<unknown> }
+ }
+ 
+-function createRecordingClient(): { client: FakeClient; calls: PromptAsyncCall[] } {
++function createRecordingClient(status?: () => Promise<unknown>): { client: FakeClient; calls: PromptAsyncCall[] } {
+   const calls: PromptAsyncCall[] = []
+   const client: FakeClient = {
+     session: {
+@@ -51,6 +54,7 @@ function createRecordingClient(): { client: FakeClient; calls: PromptAsyncCall[]
+         calls.push(input)
+         return undefined
+       },
++      ...(status ? { status } : {}),
+     },
+     tui: {
+       showToast: async () => undefined,
+@@ -173,4 +177,27 @@ describe("runAggressiveTruncationStrategy - pins agent/model/variant on recovere
+     expect(calls[0].body.variant).toBeUndefined()
+     expect(calls[0].body.auto).toBe(true)
+   })
++
++  test("does not send the delayed auto prompt when the session becomes active before recovery fires", async () => {
++    // given
++    const sessionID = "session-truncation-active"
++    const { client, calls } = createRecordingClient(async () => ({
++      [sessionID]: { type: "busy" },
++    }))
++
++    // when
++    await runAggressiveTruncationStrategy({
++      sessionID,
++      autoCompactState: createAutoCompactState(),
++      client: client as never,
++      directory: "/tmp/test-truncation",
++      truncateAttempt: 0,
++      currentTokens: 250_000,
++      maxTokens: 200_000,
++    })
++    await flushDeferredPrompt()
++
++    // then
++    expect(calls).toHaveLength(0)
++  })
+ })
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+index 34660e74..21f761ab 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+@@ -17,6 +17,7 @@ import {
+   findNearestMessageWithFields,
+   findNearestMessageWithFieldsFromSDK,
+ } from "../../features/hook-message-injector"
++import { isSessionActive } from "../shared/session-idle-settle"
+ 
+ export async function runAggressiveTruncationStrategy(params: {
+   sessionID: string
+@@ -73,6 +74,13 @@ export async function runAggressiveTruncationStrategy(params: {
+     clearSessionState(params.autoCompactState, params.sessionID)
+     setTimeout(async () => {
+       try {
++        if (await isSessionActive(params.client, params.sessionID)) {
++          log("[auto-compact] skipped delayed auto prompt because session became active", {
++            sessionID: params.sessionID,
++          })
++          return
++        }
++
+         const sdkMessage = await findNearestMessageWithFieldsFromSDK(params.client, params.sessionID)
+         const previousMessage = sdkMessage ?? (() => {
+           const messageDir = getMessageDir(params.sessionID)
+@@ -98,7 +106,12 @@ export async function runAggressiveTruncationStrategy(params: {
+           } as never,
+           query: { directory: params.directory },
+         })
+-      } catch {}
++      } catch (error) {
++        log("[auto-compact] delayed auto prompt failed", {
++          sessionID: params.sessionID,
++          error: String(error),
++        })
++      }
+     }, 500)
+ 
+     return { handled: true, nextTruncateAttempt }
+diff --git a/src/hooks/model-fallback/fallback-state-controller.ts b/src/hooks/model-fallback/fallback-state-controller.ts
+index 9bc3d110..5d4af02e 100644
+--- a/src/hooks/model-fallback/fallback-state-controller.ts
++++ b/src/hooks/model-fallback/fallback-state-controller.ts
+@@ -12,6 +12,19 @@ type ModelFallbackStateLike = {
+   pending: boolean
+ }
+ 
++function canonicalizeModelIDForDuplicateCheck(modelID: string): string {
++  return modelID.toLowerCase().replace(/\./g, "-")
++}
++
++function isSameFailedModel(
++  state: ModelFallbackStateLike,
++  providerID: string,
++  modelID: string,
++): boolean {
++  return state.providerID.toLowerCase() === providerID.toLowerCase()
++    && canonicalizeModelIDForDuplicateCheck(state.modelID) === canonicalizeModelIDForDuplicateCheck(modelID)
++}
++
+ export type ModelFallbackStateController = {
+   lastToastKey: Map<string, string>
+   setSessionFallbackChain: (sessionID: string, fallbackChain: FallbackEntry[] | undefined) => void
+@@ -84,6 +97,11 @@ export function createModelFallbackStateController(input: {
+       return false
+     }
+ 
++    if (existing.attemptCount > 0 && isSameFailedModel(existing, currentProviderID, currentModelID)) {
++      log(`[model-fallback] Ignoring duplicate fallback arm for already handled model in session: ${sessionID}`)
++      return false
++    }
++
+     existing.providerID = currentProviderID
+     existing.modelID = currentModelID
+     existing.pending = true
+diff --git a/src/hooks/runtime-fallback/event-handler.ts b/src/hooks/runtime-fallback/event-handler.ts
+index d874c5c1..70e7af5b 100644
+--- a/src/hooks/runtime-fallback/event-handler.ts
++++ b/src/hooks/runtime-fallback/event-handler.ts
+@@ -12,6 +12,21 @@ import { dispatchFallbackRetry } from "./fallback-retry-dispatcher"
+ import { createSessionStatusHandler } from "./session-status-handler"
+ import { resolveMessageEventSessionID, resolveSessionEventID } from "../../shared/event-session-id"
+ 
++function resolveEventModel(props: Record<string, unknown> | undefined): string | undefined {
++  const model = props?.model
++  if (typeof model === "string") {
++    return model
++  }
++
++  const providerID = props?.providerID
++  const modelID = props?.modelID
++  if (typeof providerID === "string" && typeof modelID === "string") {
++    return `${providerID}/${modelID}`
++  }
++
++  return undefined
++}
++
+ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+   const { config, pluginConfig, sessionStates, sessionLastAccess, sessionRetryInFlight, sessionAwaitingFallbackResult, sessionFallbackTimeouts, sessionStatusRetryKeys } = deps
+   const sessionStatusHandler = createSessionStatusHandler(deps, helpers, sessionStatusRetryKeys)
+@@ -137,6 +152,19 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+       return
+     }
+ 
++    if (sessionAwaitingFallbackResult.has(sessionID)) {
++      const pendingFallbackModel = sessionStates.get(sessionID)?.pendingFallbackModel
++      const eventModel = resolveEventModel(props)
++      if (!pendingFallbackModel || eventModel !== pendingFallbackModel) {
++        log(`[${HOOK_NAME}] session.error skipped - awaiting fallback result`, {
++          sessionID,
++          pendingFallbackModel,
++          eventModel,
++        })
++        return
++      }
++    }
++
+     sessionAwaitingFallbackResult.delete(sessionID)
+     helpers.clearSessionFallbackTimeout(sessionID)
+ 
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index 45c52bcb..29e8332e 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -2650,7 +2650,7 @@ describe("runtime-fallback", () => {
+       await hook.event({
+         event: {
+           type: "session.error",
+-          properties: { sessionID, error: { statusCode: 429, message: "Rate limit again" } },
++          properties: { sessionID, model: "provider-a/model-a", error: { statusCode: 429, message: "Rate limit again" } },
+         },
+       })
+ 
+@@ -2659,6 +2659,71 @@ describe("runtime-fallback", () => {
+       expect(fallbackLogs.length).toBeGreaterThanOrEqual(2)
+     })
+ 
++    test("session.error is skipped while waiting for the dispatched fallback result", async () => {
++      const promptCalls: Array<unknown> = []
++
++      //#given
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }],
++            }),
++            promptAsync: async (args: unknown) => {
++              promptCalls.push(args)
++              return {}
++            },
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: {
++            git_master: {
++              commit_footer: true,
++              include_co_authored_by: true,
++              git_env_prefix: "GIT_MASTER=1",
++            },
++            categories: {
++              test: {
++                fallback_models: ["provider-a/model-a", "provider-b/model-b"],
++              },
++            },
++          },
++        }
++      )
++      const sessionID = "test-race-awaiting-fallback-result"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "google/gemini-2.5-pro" } },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit" } },
++        },
++      })
++
++      //#when - duplicate stale error fires after promptAsync resolved but before fallback output is visible
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit" } },
++        },
++      })
++
++      //#then
++      expect(promptCalls).toHaveLength(1)
++      const fallbackLogs = logCalls.filter((call) => call.msg.includes("Preparing fallback"))
++      expect(fallbackLogs).toHaveLength(1)
++      const skipLog = logCalls.find((call) => call.msg.includes("session.error skipped - awaiting fallback result"))
++      expect(skipLog).toBeDefined()
++    })
++
+     test("session.stop aborts when sessionAwaitingFallbackResult is set", async () => {
+       const abortCalls: Array<{ path?: { id?: string } }> = []
+ 
+diff --git a/src/plugin/event.model-fallback.test.ts b/src/plugin/event.model-fallback.test.ts
+index 654bffbc..5c5870bb 100644
+--- a/src/plugin/event.model-fallback.test.ts
++++ b/src/plugin/event.model-fallback.test.ts
+@@ -289,6 +289,97 @@ describe("createEventHandler - model fallback", () => {
+     expect(promptCalls).toEqual([sessionID])
+   })
+ 
++  test("does not re-arm fallback when a duplicate error reports the same failed model after fallback was applied", async () => {
++    //#given
++    const sessionID = "ses_model_fallback_duplicate_surface"
++    setMainSession(sessionID)
++    const modelFallback = createModelFallbackHook()
++    clearPendingModelFallback(modelFallback, sessionID)
++    const { handler, abortCalls, promptCalls } = createHandler({ hooks: { modelFallback } })
++    const chatMessageHandler = createChatMessageHandler({
++      ctx: unsafeTestValue({
++        client: {
++          tui: {
++            showToast: async () => ({}),
++          },
++        },
++      }),
++      pluginConfig: unsafeTestValue({}),
++      firstMessageVariantGate: {
++        shouldOverride: () => false,
++        markApplied: () => {},
++      },
++      hooks: unsafeTestValue({
++        modelFallback,
++        stopContinuationGuard: null,
++        keywordDetector: null,
++        claudeCodeHooks: null,
++        autoSlashCommand: null,
++        startWork: null,
++        ralphLoop: null,
++      }),
++    })
++
++    await handler({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            id: "msg_duplicate_surface_error",
++            sessionID,
++            role: "assistant",
++            error: {
++              name: "APIError",
++              data: {
++                message:
++                  "Bad Gateway: {\"error\":{\"message\":\"unknown provider for model claude-opus-4-7-thinking\"}}",
++                isRetryable: true,
++              },
++            },
++            modelID: "claude-opus-4-7-thinking",
++            providerID: "anthropic",
++            agent: "Sisyphus - Ultraworker",
++          },
++        },
++      },
++    })
++
++    const output = { message: {}, parts: [] as Array<{ type: string; text?: string }> }
++    await chatMessageHandler(
++      {
++        sessionID,
++        agent: "sisyphus",
++        model: { providerID: "anthropic", modelID: "claude-opus-4-7-thinking" },
++      },
++      output,
++    )
++
++    //#when - same failed model arrives again through another OpenCode event surface
++    await handler({
++      event: {
++        type: "session.error",
++        properties: {
++          sessionID,
++          providerID: "anthropic",
++          modelID: "claude-opus-4-7-thinking",
++          error: {
++            name: "UnknownError",
++            data: {
++              error: {
++                message:
++                  "Bad Gateway: {\"error\":{\"message\":\"unknown provider for model claude-opus-4-7-thinking\"}}",
++              },
++            },
++          },
++        },
++      },
++    })
++
++    //#then
++    expect(abortCalls).toEqual([sessionID])
++    expect(promptCalls).toEqual([sessionID])
++  })
++
+   test("does not trigger model-fallback from session.status when runtime_fallback is enabled", async () => {
+     //#given
+     const sessionID = "ses_status_retry_runtime_enabled"
+@@ -511,20 +602,20 @@ describe("createEventHandler - model fallback", () => {
+       }),
+     })
+ 
+-    const triggerRetryCycle = async () => {
++    const triggerRetryCycle = async (providerID: string, modelID: string) => {
+       await eventHandler({
+         event: {
+           type: "session.error",
+           properties: {
+             sessionID,
+-            providerID: "anthropic",
+-            modelID: "claude-opus-4-7-thinking",
++            providerID,
++            modelID,
+             error: {
+               name: "UnknownError",
+               data: {
+                 error: {
+                   message:
+-                    "Bad Gateway: {\"error\":{\"message\":\"unknown provider for model claude-opus-4-7-thinking\"}}",
++                    `Bad Gateway: {"error":{"message":"unknown provider for model ${modelID}"}}`,
+                 },
+               },
+             },
+@@ -545,7 +636,7 @@ describe("createEventHandler - model fallback", () => {
+     }
+ 
+     //#when - first retry cycle
+-    const first = await triggerRetryCycle()
++    const first = await triggerRetryCycle("anthropic", "claude-opus-4-7-thinking")
+ 
+     //#then - first fallback entry applied (no-op skip: claude-opus-4-7 matches current model after normalization)
+     expect(first.message["model"]).toMatchObject({
+@@ -555,7 +646,7 @@ describe("createEventHandler - model fallback", () => {
+     expect(first.message["variant"]).toBeUndefined()
+ 
+     //#when - second retry cycle
+-    const second = await triggerRetryCycle()
++    const second = await triggerRetryCycle("opencode-go", "kimi-k2.6")
+ 
+     //#then - second fallback entry applied (chain advanced past opencode-go/kimi-k2.6)
+     expect(second.message["model"]).toMatchObject({
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 474a81ff..b1c44a3e 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -221,6 +221,11 @@ export function createEventHandler(args: {
+   const lastKnownModelBySession = new Map<string, { providerID: string; modelID: string }>();
+ 
+   const resolveFallbackProviderID = (sessionID: string, providerHint?: string): string => {
++    const normalizedProviderHint = providerHint?.trim();
++    if (normalizedProviderHint) {
++      return normalizedProviderHint;
++    }
++
+     const sessionModel = getSessionModel(sessionID);
+     if (sessionModel?.providerID) {
+       return sessionModel.providerID;
+@@ -231,11 +236,6 @@ export function createEventHandler(args: {
+       return lastKnownModel.providerID;
+     }
+ 
+-    const normalizedProviderHint = providerHint?.trim();
+-    if (normalizedProviderHint) {
+-      return normalizedProviderHint;
+-    }
+-
+     const connectedProvider = readConnectedProvidersCache()?.[0];
+     if (connectedProvider) {
+       return connectedProvider;
+-- 
+2.39.2
+

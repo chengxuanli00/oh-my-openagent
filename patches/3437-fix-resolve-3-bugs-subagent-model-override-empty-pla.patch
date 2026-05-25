@@ -1,0 +1,287 @@
+From 230ce835e5c42460853e5df8a9e6d62f633ddc31 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 24 Mar 2026 09:45:11 +0900
+Subject: [PATCH 3437/5749] fix: resolve 3 bugs - subagent model override,
+ empty plan completion, deep task refusal
+
+- #2741: Pass inheritedModel as fallback in subagent-resolver when user hasn't
+  configured an override, ensuring custom provider models take priority
+- #2648: Fix getPlanProgress to treat plans with 0 checkboxes as incomplete
+  instead of complete (total > 0 && completed === total)
+- #2779: Relax Hephaestus single-task guard to accept multi-step sub-tasks
+  from Atlas delegation, only rejecting genuinely independent tasks
+
+Fixes #2741, fixes #2648, fixes #2779
+---
+ src/agents/hephaestus/gpt-5-3-codex.ts        | 14 ++++++++-
+ src/agents/hephaestus/gpt-5-4.ts              | 16 +++++++++-
+ src/agents/hephaestus/gpt.ts                  | 13 +++++++-
+ src/features/background-agent/spawner.ts      |  8 +++--
+ src/features/boulder-state/storage.test.ts    |  4 +--
+ src/features/boulder-state/storage.ts         |  2 +-
+ src/hooks/atlas/system-reminder-templates.ts  | 30 ++++++++++++-------
+ src/tools/delegate-task/constants.ts          |  6 +++-
+ src/tools/delegate-task/subagent-resolver.ts  |  5 ++--
+ src/tools/delegate-task/sync-prompt-sender.ts |  4 ++-
+ src/tools/delegate-task/tools.ts              |  2 +-
+ 11 files changed, 81 insertions(+), 23 deletions(-)
+
+diff --git a/src/agents/hephaestus/gpt-5-3-codex.ts b/src/agents/hephaestus/gpt-5-3-codex.ts
+index 9a5e43b1..f7cf912e 100644
+--- a/src/agents/hephaestus/gpt-5-3-codex.ts
++++ b/src/agents/hephaestus/gpt-5-3-codex.ts
+@@ -152,7 +152,19 @@ Asking the user is the LAST resort after exhausting creative alternatives.
+ - "I'll do X" / "I recommend X" then ending turn → You COMMITTED to X. DO X NOW before ending.
+ - Explaining findings without acting on them → ACT on your findings immediately.
+ 
+-**CORRECT:**
++|**CORRECT:**
++|- Keep going until COMPLETELY done
++|- Run verification (lint, tests, build) WITHOUT asking
++|- Make decisions. Course-correct only on CONCRETE failure
++|- Note assumptions in final message, not as questions mid-work
++|- Need context? Fire explore/librarian in background IMMEDIATELY — continue only with non-overlapping work while they search
++|- User asks "did you do X?" and you didn't → Acknowledge briefly, DO X immediately
++|- User asks a question implying work → Answer briefly, DO the implied work in the same turn
++|- You wrote a plan in your response → EXECUTE the plan before ending turn — plans are starting lines, not finish lines
++|
++### Task Scope Clarification
++|
++You handle multi-step sub-tasks of a SINGLE GOAL. What you receive is ONE goal that may require multiple steps to complete — this is your primary use case. Only reject when given MULTIPLE INDEPENDENT goals in one request.
+ - Keep going until COMPLETELY done
+ - Run verification (lint, tests, build) WITHOUT asking
+ - Make decisions. Course-correct only on CONCRETE failure
+diff --git a/src/agents/hephaestus/gpt-5-4.ts b/src/agents/hephaestus/gpt-5-4.ts
+index 43fd0b78..03a24f0e 100644
+--- a/src/agents/hephaestus/gpt-5-4.ts
++++ b/src/agents/hephaestus/gpt-5-4.ts
+@@ -111,7 +111,21 @@ When blocked: try a different approach → decompose the problem → challenge a
+ - "I'll do X" / "I recommend X" then ending turn → You COMMITTED to X. DO X NOW before ending.
+ - Explaining findings without acting on them → ACT on your findings immediately.
+ 
+-**CORRECT:**
++|**CORRECT:**
++|- Keep going until COMPLETELY done
++|- Run verification (lint, tests, build) WITHOUT asking
++|- Make decisions. Course-correct only on CONCRETE failure
++|- Note assumptions in final message, not as questions mid-work
++|- Need context? Fire explore/librarian in background IMMEDIATELY — continue only with non-overlapping work while they search
++|- User asks "did you do X?" and you didn't → Acknowledge briefly, DO X immediately
++|- User asks a question implying work → Answer briefly, DO the implied work in the same turn
++|- You wrote a plan in your response → EXECUTE the plan before ending turn — plans are starting lines, not finish lines
++|
++### Task Scope Clarification
++|
++You handle multi-step sub-tasks of a SINGLE GOAL. What you receive is ONE goal that may require multiple steps to complete — this is your primary use case. Only reject when given MULTIPLE INDEPENDENT goals in one request.
++|
++## Hard Constraints
+ - Keep going until COMPLETELY done
+ - Run verification (lint, tests, build) WITHOUT asking
+ - Make decisions. Course-correct only on CONCRETE failure
+diff --git a/src/agents/hephaestus/gpt.ts b/src/agents/hephaestus/gpt.ts
+index c29d6960..fc9109c5 100644
+--- a/src/agents/hephaestus/gpt.ts
++++ b/src/agents/hephaestus/gpt.ts
+@@ -105,7 +105,18 @@ Asking the user is the LAST resort after exhausting creative alternatives.
+ - "I noticed Y, should I fix it?" → FIX IT OR NOTE IN FINAL MESSAGE.
+ - Stopping after partial implementation → 100% OR NOTHING.
+ 
+-**CORRECT:**
++|**CORRECT:**
++|- Keep going until COMPLETELY done
++|- Run verification (lint, tests, build) WITHOUT asking
++|- Make decisions. Course-correct only on CONCRETE failure
++|- Note assumptions in final message, not as questions mid-work
++|- Need context? Fire explore/librarian in background IMMEDIATELY — continue only with non-overlapping work while they search
++|
++### Task Scope Clarification
++|
++You handle multi-step sub-tasks of a SINGLE GOAL. What you receive is ONE goal that may require multiple steps to complete — this is your primary use case. Only reject when given MULTIPLE INDEPENDENT goals in one request.
++|
++## Hard Constraints
+ - Keep going until COMPLETELY done
+ - Run verification (lint, tests, build) WITHOUT asking
+ - Make decisions. Course-correct only on CONCRETE failure
+diff --git a/src/features/background-agent/spawner.ts b/src/features/background-agent/spawner.ts
+index c4f43572..a6672096 100644
+--- a/src/features/background-agent/spawner.ts
++++ b/src/features/background-agent/spawner.ts
+@@ -135,7 +135,9 @@ export async function startTask(
+   promptWithModelSuggestionRetry(client, {
+     path: { id: sessionID },
+     body: {
+-      agent: input.agent,
++      // When a model is explicitly provided, omit the agent name so opencode's
++      // built-in agent fallback chain does not override the user-specified model.
++      ...(launchModel ? {} : { agent: input.agent }),
+       ...(launchModel ? { model: launchModel } : {}),
+       ...(launchVariant ? { variant: launchVariant } : {}),
+       system: input.skillContent,
+@@ -220,7 +222,9 @@ export async function resumeTask(
+   client.session.promptAsync({
+     path: { id: task.sessionID },
+     body: {
+-      agent: task.agent,
++      // When a model is explicitly provided, omit the agent name so opencode's
++      // built-in agent fallback chain does not override the user-specified model.
++      ...(resumeModel ? {} : { agent: task.agent }),
+       ...(resumeModel ? { model: resumeModel } : {}),
+       ...(resumeVariant ? { variant: resumeVariant } : {}),
+       tools: {
+diff --git a/src/features/boulder-state/storage.test.ts b/src/features/boulder-state/storage.test.ts
+index a8740662..f391b80f 100644
+--- a/src/features/boulder-state/storage.test.ts
++++ b/src/features/boulder-state/storage.test.ts
+@@ -481,7 +481,7 @@ describe("boulder-state", () => {
+       expect(progress.isComplete).toBe(true)
+     })
+ 
+-    test("should return isComplete true for empty plan", () => {
++    test("should return isComplete false for empty plan", () => {
+       // given - plan with no checkboxes
+       const planPath = join(TEST_DIR, "empty-plan.md")
+       writeFileSync(planPath, "# Plan\nNo tasks here")
+@@ -491,7 +491,7 @@ describe("boulder-state", () => {
+ 
+       // then
+       expect(progress.total).toBe(0)
+-      expect(progress.isComplete).toBe(true)
++      expect(progress.isComplete).toBe(false)
+     })
+ 
+     test("should handle non-existent file", () => {
+diff --git a/src/features/boulder-state/storage.ts b/src/features/boulder-state/storage.ts
+index ffbbb69a..0bef67bf 100644
+--- a/src/features/boulder-state/storage.ts
++++ b/src/features/boulder-state/storage.ts
+@@ -186,7 +186,7 @@ export function getPlanProgress(planPath: string): PlanProgress {
+     return {
+       total,
+       completed,
+-      isComplete: total === 0 || completed === total,
++      isComplete: total > 0 && completed === total,
+     }
+   } catch {
+     return { total: 0, completed: 0, isComplete: true }
+diff --git a/src/hooks/atlas/system-reminder-templates.ts b/src/hooks/atlas/system-reminder-templates.ts
+index af327463..c45d3f88 100644
+--- a/src/hooks/atlas/system-reminder-templates.ts
++++ b/src/hooks/atlas/system-reminder-templates.ts
+@@ -218,21 +218,31 @@ ${createSystemDirective(SystemDirectiveTypes.SINGLE_TASK_ONLY)}
+ 
+ **STOP. READ THIS BEFORE PROCEEDING.**
+ 
+-If you were NOT given **exactly ONE atomic task**, you MUST:
++If you were given **multiple genuinely independent goals** (unrelated tasks, parallel workstreams, separate features), you MUST:
+ 1. **IMMEDIATELY REFUSE** this request
+-2. **DEMAND** the orchestrator provide a single, specific task
++2. **DEMAND** the orchestrator provide a single goal
+ 
+-**Your response if multiple tasks detected:**
+-> "I refuse to proceed. You provided multiple tasks. An orchestrator's impatience destroys work quality.
++**What counts as multiple independent tasks (REFUSE):**
++- "Implement feature A. Also, add feature B."
++- "Fix bug X. Then refactor module Y. Also update the docs."
++- Multiple unrelated changes bundled into one request
++
++**What is a single task with sequential steps (PROCEED):**
++- A single goal broken into numbered steps (e.g., "Implement X by: 1. finding files, 2. adding logic, 3. writing tests")
++- Multi-step context where all steps serve ONE objective
++- Orchestrator-provided context explaining approach for a single deliverable
++
++**Your response if genuinely independent tasks are detected:**
++> "I refuse to proceed. You provided multiple independent tasks. Each task needs full attention.
+ > 
+-> PROVIDE EXACTLY ONE TASK. One file. One change. One verification.
++> PROVIDE EXACTLY ONE GOAL. One deliverable. One clear outcome.
+ > 
+-> Your rushing will cause: incomplete work, missed edge cases, broken tests, wasted context."
++> Batching unrelated tasks causes: incomplete work, missed edge cases, broken tests, wasted context."
+ 
+ **WARNING TO ORCHESTRATOR:**
+-- Your hasty batching RUINS deliverables
+-- Each task needs FULL attention and PROPER verification  
+-- Batch delegation = sloppy work = rework = wasted tokens
++- Bundling unrelated tasks RUINS deliverables
++- Each independent goal needs FULL attention and PROPER verification
++- Batch delegation of separate concerns = sloppy work = rework = wasted tokens
+ 
+-**REFUSE multi-task requests. DEMAND single-task clarity.**
++**REFUSE genuinely multi-task requests. ALLOW single-goal multi-step workflows.**
+ `
+diff --git a/src/tools/delegate-task/constants.ts b/src/tools/delegate-task/constants.ts
+index 6ecebb4f..322c0694 100644
+--- a/src/tools/delegate-task/constants.ts
++++ b/src/tools/delegate-task/constants.ts
+@@ -261,12 +261,16 @@ You are NOT an interactive assistant. You are an autonomous problem-solver.
+ 4. DO NOT ask clarifying questions - the goal is already defined
+ 
+ **Autonomous executor mindset**:
+-- You receive a GOAL, not step-by-step instructions
++- You receive a GOAL. When the goal includes numbered steps or phases, treat them as one atomic task broken into sub-steps - NOT as separate independent tasks.
+ - Figure out HOW to achieve the goal yourself
+ - Thorough research before any action
+ - Fix hairy problems that require deep understanding
+ - Work independently without frequent check-ins
+ 
++**Single vs. multi-step context**:
++- Sub-steps of ONE goal (e.g., "Step 1: analyze X, Step 2: implement Y, Step 3: test Z" for a single feature) = execute all steps, they are phases of one atomic task.
++- Genuinely independent tasks (e.g., "Task A: refactor module X" AND "Task B: fix unrelated bug Y") = flag and refuse, require separate delegations.
++
+ **Approach**:
+ - Explore extensively, understand deeply, then act decisively
+ - Prefer comprehensive solutions over quick patches
+diff --git a/src/tools/delegate-task/subagent-resolver.ts b/src/tools/delegate-task/subagent-resolver.ts
+index 5567ec6c..5c2d4444 100644
+--- a/src/tools/delegate-task/subagent-resolver.ts
++++ b/src/tools/delegate-task/subagent-resolver.ts
+@@ -17,7 +17,8 @@ export async function resolveSubagentExecution(
+   args: DelegateTaskArgs,
+   executorCtx: ExecutorContext,
+   parentAgent: string | undefined,
+-  categoryExamples: string
++  categoryExamples: string,
++  inheritedModel?: string
+ ): Promise<{ agentToUse: string; categoryModel: { providerID: string; modelID: string; variant?: string } | undefined; fallbackChain?: FallbackEntry[]; error?: string }> {
+   const { client, agentOverrides, userCategories } = executorCtx
+ 
+@@ -116,7 +117,7 @@ Create the work plan directly - that's your job as the planning agent.`,
+         : undefined
+ 
+       const resolution = resolveModelForDelegateTask({
+-        userModel: agentOverride?.model,
++        userModel: agentOverride?.model ?? inheritedModel,
+         userFallbackModels: normalizedAgentFallbackModels,
+         categoryDefaultModel: matchedAgentModelStr,
+         fallbackChain: agentRequirement?.fallbackChain,
+diff --git a/src/tools/delegate-task/sync-prompt-sender.ts b/src/tools/delegate-task/sync-prompt-sender.ts
+index fe4f8a69..f3400974 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.ts
+@@ -56,7 +56,9 @@ export async function sendSyncPrompt(
+   const promptArgs = {
+     path: { id: input.sessionID },
+     body: {
+-      agent: input.agentToUse,
++      // When a custom model is configured, omit the agent name so opencode's
++      // built-in agent fallback chain does not override the user-specified model.
++      ...(input.categoryModel ? {} : { agent: input.agentToUse }),
+       system: input.systemContent,
+       tools,
+       parts: [createInternalAgentTextPart(effectivePrompt)],
+diff --git a/src/tools/delegate-task/tools.ts b/src/tools/delegate-task/tools.ts
+index 2ab27abb..45890d03 100644
+--- a/src/tools/delegate-task/tools.ts
++++ b/src/tools/delegate-task/tools.ts
+@@ -226,7 +226,7 @@ export function createDelegateTask(options: DelegateTaskToolOptions): ToolDefini
+           return executeUnstableAgentTask(args, ctx, options, parentContext, agentToUse, categoryModel, systemContent, actualModel)
+         }
+       } else {
+-        const resolution = await resolveSubagentExecution(args, options, parentContext.agent, categoryExamples)
++        const resolution = await resolveSubagentExecution(args, options, parentContext.agent, categoryExamples, inheritedModel)
+         if (resolution.error) {
+           return resolution.error
+         }
+-- 
+2.39.2
+

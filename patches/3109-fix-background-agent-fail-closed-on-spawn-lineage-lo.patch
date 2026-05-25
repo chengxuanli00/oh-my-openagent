@@ -1,0 +1,166 @@
+From 594233183b8ed2d522534e5398f690c4465b0c70 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 20:57:09 +0900
+Subject: [PATCH 3109/5749] fix(background-agent): fail closed on spawn lineage
+ lookup errors
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/features/background-agent/manager.test.ts | 48 +++++++++++++++++--
+ src/features/background-agent/manager.ts      |  8 ++--
+ .../background-agent/subagent-spawn-limits.ts | 22 ++++++---
+ 3 files changed, 62 insertions(+), 16 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 7d751ea6..7d0fcdcf 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -1731,15 +1731,22 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+      }
+    }
+ 
+-    function createMockClientWithSessionChain(
+-      sessions: Record<string, { directory: string; parentID?: string }>
++  function createMockClientWithSessionChain(
++      sessions: Record<string, { directory: string; parentID?: string }>,
++      options?: { sessionLookupError?: Error }
+     ) {
+       return {
+         session: {
+           create: async (_args?: any) => ({ data: { id: `ses_${crypto.randomUUID()}` } }),
+-          get: async ({ path }: { path: { id: string } }) => ({
+-            data: sessions[path.id] ?? { directory: "/test/dir" },
+-          }),
++          get: async ({ path }: { path: { id: string } }) => {
++            if (options?.sessionLookupError) {
++              throw options.sessionLookupError
++            }
++
++            return {
++              data: sessions[path.id] ?? { directory: "/test/dir" },
++            }
++          },
+           prompt: async () => ({}),
+           promptAsync: async () => ({}),
+           messages: async () => ({ data: [] }),
+@@ -2058,6 +2065,37 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+       // then
+       await expect(result).rejects.toThrow("background_task.maxDescendants=1")
+     })
++
++    test("should fail closed when session lineage lookup fails", async () => {
++      // given
++      manager.shutdown()
++      manager = new BackgroundManager(
++        {
++          client: createMockClientWithSessionChain(
++            {
++              "session-root": { directory: "/test/dir" },
++            },
++            { sessionLookupError: new Error("session lookup failed") }
++          ),
++          directory: tmpdir(),
++        } as unknown as PluginInput,
++        { maxDescendants: 1 },
++      )
++
++      const input = {
++        description: "Test task",
++        prompt: "Do something",
++        agent: "test-agent",
++        parentSessionID: "session-root",
++        parentMessageID: "parent-message",
++      }
++
++      // when
++      const result = manager.launch(input)
++
++      // then
++      await expect(result).rejects.toThrow("background_task.maxDescendants cannot be enforced safely")
++    })
+   })
+ 
+   describe("pending task can be cancelled", () => {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index ba4ff816..92db3513 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -54,7 +54,7 @@ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
+ import {
+   createSubagentDepthLimitError,
+   createSubagentDescendantLimitError,
+-  getMaxRootDescendants,
++  getMaxRootSessionSpawnBudget,
+   getMaxSubagentDepth,
+   resolveSubagentSpawnContext,
+   type SubagentSpawnContext,
+@@ -165,13 +165,13 @@ export class BackgroundManager {
+       })
+     }
+ 
+-    const maxDescendants = getMaxRootDescendants(this.config)
++    const maxRootSessionSpawnBudget = getMaxRootSessionSpawnBudget(this.config)
+     const descendantCount = this.rootDescendantCounts.get(spawnContext.rootSessionID) ?? 0
+-    if (descendantCount >= maxDescendants) {
++    if (descendantCount >= maxRootSessionSpawnBudget) {
+       throw createSubagentDescendantLimitError({
+         rootSessionID: spawnContext.rootSessionID,
+         descendantCount,
+-        maxDescendants,
++        maxDescendants: maxRootSessionSpawnBudget,
+       })
+     }
+ 
+diff --git a/src/features/background-agent/subagent-spawn-limits.ts b/src/features/background-agent/subagent-spawn-limits.ts
+index 2b006810..c33ad7b2 100644
+--- a/src/features/background-agent/subagent-spawn-limits.ts
++++ b/src/features/background-agent/subagent-spawn-limits.ts
+@@ -2,7 +2,7 @@ import type { BackgroundTaskConfig } from "../../config/schema"
+ import type { OpencodeClient } from "./constants"
+ 
+ export const DEFAULT_MAX_SUBAGENT_DEPTH = 3
+-export const DEFAULT_MAX_ROOT_DESCENDANTS = 50
++export const DEFAULT_MAX_ROOT_SESSION_SPAWN_BUDGET = 50
+ 
+ export interface SubagentSpawnContext {
+   rootSessionID: string
+@@ -14,8 +14,8 @@ export function getMaxSubagentDepth(config?: BackgroundTaskConfig): number {
+   return config?.maxDepth ?? DEFAULT_MAX_SUBAGENT_DEPTH
+ }
+ 
+-export function getMaxRootDescendants(config?: BackgroundTaskConfig): number {
+-  return config?.maxDescendants ?? DEFAULT_MAX_ROOT_DESCENDANTS
++export function getMaxRootSessionSpawnBudget(config?: BackgroundTaskConfig): number {
++  return config?.maxDescendants ?? DEFAULT_MAX_ROOT_SESSION_SPAWN_BUDGET
+ }
+ 
+ export async function resolveSubagentSpawnContext(
+@@ -34,11 +34,19 @@ export async function resolveSubagentSpawnContext(
+ 
+     visitedSessionIDs.add(currentSessionID)
+ 
+-    const session = await client.session.get({
+-      path: { id: currentSessionID },
+-    }).catch(() => null)
++    let nextParentSessionID: string | undefined
++    try {
++      const session = await client.session.get({
++        path: { id: currentSessionID },
++      })
++      nextParentSessionID = session.data?.parentID
++    } catch (error) {
++      const reason = error instanceof Error ? error.message : String(error)
++      throw new Error(
++        `Subagent spawn blocked: failed to resolve session lineage for ${parentSessionID}, so background_task.maxDescendants cannot be enforced safely. ${reason}`
++      )
++    }
+ 
+-    const nextParentSessionID = session?.data?.parentID
+     if (!nextParentSessionID) {
+       rootSessionID = currentSessionID
+       break
+-- 
+2.39.2
+

@@ -1,0 +1,453 @@
+From 1fae073009dcb542db7946fb31f926593147f9cb Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 4 Apr 2026 15:40:37 +0900
+Subject: [PATCH 3839/5749] fix(sync): forward delegated model tuning params
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../call-omo-agent/sync-executor.test.ts      |  55 ++++++++++
+ src/tools/call-omo-agent/sync-executor.ts     |  22 ++++
+ .../delegate-task/subagent-resolver.test.ts   | 102 ++++++++++++++++++
+ src/tools/delegate-task/subagent-resolver.ts  |  49 ++++++---
+ .../delegate-task/sync-prompt-sender.test.ts  |  50 ++++++++-
+ src/tools/delegate-task/sync-prompt-sender.ts |  19 ++++
+ 6 files changed, 281 insertions(+), 16 deletions(-)
+
+diff --git a/src/tools/call-omo-agent/sync-executor.test.ts b/src/tools/call-omo-agent/sync-executor.test.ts
+index d1b1dd3f..baa59fb7 100644
+--- a/src/tools/call-omo-agent/sync-executor.test.ts
++++ b/src/tools/call-omo-agent/sync-executor.test.ts
+@@ -8,6 +8,11 @@ type PromptAsyncInput = {
+     agent: string
+     tools: Record<string, boolean>
+     parts: Array<{ type: string; text: string }>
++    model?: { providerID: string; modelID: string }
++    variant?: string
++    temperature?: number
++    topP?: number
++    options?: Record<string, unknown>
+   }
+ }
+ 
+@@ -141,6 +146,56 @@ describe("executeSync", () => {
+     )
+   })
+ 
++  test("forwards delegated model tuning params in the sync prompt body", async () => {
++    //#given
++    const executeSync = await importExecuteSync()
++    const deps = createDependencies()
++    const toolContext = createToolContext()
++    const recorder = createPromptAsyncRecorder()
++    const args = {
++      subagent_type: "explore",
++      description: "test task",
++      prompt: "find something",
++      run_in_background: false,
++    }
++    const model = {
++      providerID: "openai",
++      modelID: "gpt-5.4",
++      variant: "high",
++      temperature: 0.12,
++      top_p: 0.34,
++      maxTokens: 5678,
++      reasoningEffort: "medium",
++      thinking: { type: "disabled" as const },
++    }
++
++    //#when
++    await executeSync(
++      args,
++      toolContext,
++      createContext(recorder.promptAsync) as never,
++      deps,
++      undefined,
++      undefined,
++      model,
++    )
++
++    //#then
++    const promptInput = recorder.getCapturedInput()
++    expect(promptInput?.body.model).toEqual({
++      providerID: "openai",
++      modelID: "gpt-5.4",
++    })
++    expect(promptInput?.body.variant).toBe("high")
++    expect(promptInput?.body.temperature).toBe(0.12)
++    expect(promptInput?.body.topP).toBe(0.34)
++    expect(promptInput?.body.options).toEqual({
++      maxTokens: 5678,
++      reasoningEffort: "medium",
++      thinking: { type: "disabled" },
++    })
++  })
++
+   test("records metadata with description and created session id", async () => {
+     //#given
+     const executeSync = await importExecuteSync()
+diff --git a/src/tools/call-omo-agent/sync-executor.ts b/src/tools/call-omo-agent/sync-executor.ts
+index 77a1c23e..096a8021 100644
+--- a/src/tools/call-omo-agent/sync-executor.ts
++++ b/src/tools/call-omo-agent/sync-executor.ts
+@@ -3,6 +3,7 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { subagentSessions, syncSubagentSessions } from "../../features/claude-code-session-state"
+ import { clearSessionFallbackChain, setSessionFallbackChain } from "../../hooks/model-fallback/hook"
+ import { getAgentToolRestrictions, log } from "../../shared"
++import { applySessionPromptParams } from "../../shared/session-prompt-params-helpers"
+ import type { DelegatedModelConfig } from "../../shared/model-resolution-types"
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { waitForCompletion } from "./completion-poller"
+@@ -34,6 +35,24 @@ const defaultDeps: ExecuteSyncDeps = {
+   clearSessionFallbackChain,
+ }
+ 
++function buildPromptGenerationParams(model: DelegatedModelConfig | undefined): Record<string, unknown> {
++  if (!model) {
++    return {}
++  }
++
++  const promptOptions: Record<string, unknown> = {
++    ...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
++    ...(model.thinking ? { thinking: model.thinking } : {}),
++    ...(model.maxTokens !== undefined ? { maxTokens: model.maxTokens } : {}),
++  }
++
++  return {
++    ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
++    ...(model.top_p !== undefined ? { topP: model.top_p } : {}),
++    ...(Object.keys(promptOptions).length > 0 ? { options: promptOptions } : {}),
++  }
++}
++
+ export async function executeSync(
+   args: CallOmoAgentArgs,
+   toolContext: {
+@@ -69,6 +88,8 @@ export async function executeSync(
+       appliedFallbackChain = true
+     }
+ 
++    applySessionPromptParams(sessionID, model)
++
+     await Promise.resolve(
+       toolContext.metadata?.({
+         title: args.description,
+@@ -92,6 +113,7 @@ export async function executeSync(
+           parts: [{ type: "text", text: args.prompt }],
+           ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
+           ...(model?.variant ? { variant: model.variant } : {}),
++          ...buildPromptGenerationParams(model),
+         },
+       })
+     } catch (error) {
+diff --git a/src/tools/delegate-task/subagent-resolver.test.ts b/src/tools/delegate-task/subagent-resolver.test.ts
+index eaa4cbb7..4205a6b6 100644
+--- a/src/tools/delegate-task/subagent-resolver.test.ts
++++ b/src/tools/delegate-task/subagent-resolver.test.ts
+@@ -507,6 +507,108 @@ describe("resolveSubagentExecution", () => {
+     cacheSpy.mockRestore()
+     connectedSpy.mockRestore()
+   })
++
++  test("preserves category temperature when fallback entry leaves temperature undefined", async () => {
++    //#given
++    const cacheSpy = spyOn(connectedProvidersCache, "readProviderModelsCache").mockReturnValue({
++      models: { openai: ["gpt-5.4"] },
++      connected: ["openai"],
++      updatedAt: "2026-03-03T00:00:00.000Z",
++    })
++    const connectedSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(["openai"])
++    const args = createBaseArgs({ subagent_type: "explore" })
++    const executorCtx = createExecutorContext(
++      async () => ([
++        { name: "explore", mode: "subagent", model: "quotio/claude-haiku-4-5-unavailable" },
++      ]),
++      {
++        agentOverrides: {
++          explore: {
++            category: "research",
++          },
++        } as ExecutorContext["agentOverrides"],
++        userCategories: {
++          research: {
++            fallback_models: [
++              {
++                model: "openai/gpt-5.4",
++                variant: "max",
++              },
++            ],
++            temperature: 0.55,
++            top_p: 0.45,
++          },
++        } as ExecutorContext["userCategories"],
++      }
++    )
++
++    //#when
++    const result = await resolveSubagentExecution(args, executorCtx, "sisyphus", "deep")
++
++    //#then
++    expect(result.error).toBeUndefined()
++    expect(result.categoryModel).toEqual({
++      providerID: "openai",
++      modelID: "gpt-5.4",
++      variant: "max",
++      temperature: 0.55,
++      top_p: 0.45,
++    })
++    cacheSpy.mockRestore()
++    connectedSpy.mockRestore()
++  })
++
++  test("applies category tuning params in the cold-cache override path", async () => {
++    //#given
++    const cacheSpy = spyOn(connectedProvidersCache, "readProviderModelsCache").mockReturnValue({
++      models: {},
++      connected: [],
++      updatedAt: "2026-03-03T00:00:00.000Z",
++    })
++    const connectedSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue([])
++    const args = createBaseArgs({ subagent_type: "explore" })
++    const executorCtx = createExecutorContext(
++      async () => ([
++        { name: "explore", mode: "subagent", model: "openai/gpt-5.4" },
++      ]),
++      {
++        agentOverrides: {
++          explore: {
++            category: "research",
++          },
++        } as ExecutorContext["agentOverrides"],
++        userCategories: {
++          research: {
++            model: "openai/gpt-5.4",
++            variant: "high",
++            temperature: 0.61,
++            top_p: 0.62,
++            maxTokens: 3200,
++            reasoningEffort: "medium",
++            thinking: { type: "disabled" },
++          },
++        } as ExecutorContext["userCategories"],
++      }
++    )
++
++    //#when
++    const result = await resolveSubagentExecution(args, executorCtx, "sisyphus", "deep")
++
++    //#then
++    expect(result.error).toBeUndefined()
++    expect(result.categoryModel).toEqual({
++      providerID: "openai",
++      modelID: "gpt-5.4",
++      variant: "high",
++      temperature: 0.61,
++      top_p: 0.62,
++      maxTokens: 3200,
++      reasoningEffort: "medium",
++      thinking: { type: "disabled" },
++    })
++    cacheSpy.mockRestore()
++    connectedSpy.mockRestore()
++  })
+ })
+ 
+ describe("resolveSubagentExecution - agent name sanitization", () => {
+diff --git a/src/tools/delegate-task/subagent-resolver.ts b/src/tools/delegate-task/subagent-resolver.ts
+index 88117ca0..242bcdac 100644
+--- a/src/tools/delegate-task/subagent-resolver.ts
++++ b/src/tools/delegate-task/subagent-resolver.ts
+@@ -14,6 +14,25 @@ import { getAvailableModelsForDelegateTask } from "./available-models"
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { resolveModelForDelegateTask } from "./model-selection"
+ import { fuzzyMatchModel } from "../../shared/model-availability"
++import type { CategoryConfig } from "../../config/schema"
++
++function applyCategoryParams(
++  base: DelegatedModelConfig,
++  config: CategoryConfig | undefined,
++): DelegatedModelConfig {
++  if (!config) {
++    return base
++  }
++
++  return {
++    ...base,
++    ...(config.reasoningEffort !== undefined ? { reasoningEffort: config.reasoningEffort } : {}),
++    ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
++    ...(config.top_p !== undefined ? { top_p: config.top_p } : {}),
++    ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
++    ...(config.thinking !== undefined ? { thinking: config.thinking } : {}),
++  }
++}
+ 
+ export async function resolveSubagentExecution(
+   args: DelegateTaskArgs,
+@@ -104,12 +123,13 @@ Create the work plan directly - that's your job as the planning agent.`,
+     const agentOverride = agentOverrides?.[agentConfigKey as keyof typeof agentOverrides]
+       ?? (agentOverrides ? Object.entries(agentOverrides).find(([key]) => key.toLowerCase() === agentConfigKey)?.[1] : undefined)
+     const agentRequirement = AGENT_MODEL_REQUIREMENTS[agentConfigKey]
+-    const agentCategoryModel = agentOverride?.category
+-      ? userCategories?.[agentOverride.category]?.model
++    const agentCategoryConfig = agentOverride?.category
++      ? userCategories?.[agentOverride.category]
+       : undefined
++    const agentCategoryModel = agentCategoryConfig?.model
+     const normalizedAgentFallbackModels = normalizeFallbackModels(
+       agentOverride?.fallback_models
+-      ?? (agentOverride?.category ? userCategories?.[agentOverride.category]?.fallback_models : undefined)
++      ?? agentCategoryConfig?.fallback_models
+     )
+ 
+     const availableModels = await getAvailableModelsForDelegateTask(client)
+@@ -137,17 +157,16 @@ Create the work plan directly - that's your job as the planning agent.`,
+       if (resolution && !resolutionSkipped) {
+         const normalized = normalizeModelFormat(resolution.model)
+         if (normalized) {
+-          const variantToUse = agentOverride?.variant ?? resolution.variant
+-          categoryModel = variantToUse ? { ...normalized, variant: variantToUse } : normalized
++          const variantToUse = agentOverride?.variant ?? resolution.variant ?? agentCategoryConfig?.variant
++          const resolvedModel = variantToUse ? { ...normalized, variant: variantToUse } : normalized
++          categoryModel = applyCategoryParams(resolvedModel, agentCategoryConfig)
+         }
+       } else if (resolutionSkipped && (agentOverride?.model ?? agentCategoryModel)) {
+         const normalized = normalizeModelFormat((agentOverride?.model ?? agentCategoryModel)!)
+         if (normalized) {
+-          const agentCategoryVariant = agentOverride?.category
+-            ? userCategories?.[agentOverride.category]?.variant
+-            : undefined
+-          const variantToUse = agentOverride?.variant ?? agentCategoryVariant
+-          categoryModel = variantToUse ? { ...normalized, variant: variantToUse } : normalized
++          const variantToUse = agentOverride?.variant ?? agentCategoryConfig?.variant
++          const resolvedModel = variantToUse ? { ...normalized, variant: variantToUse } : normalized
++          categoryModel = applyCategoryParams(resolvedModel, agentCategoryConfig)
+           log("[delegate-task] Cold cache: using explicit user override for subagent", {
+             agent: agentToUse,
+             model: agentOverride?.model ?? agentCategoryModel,
+@@ -180,11 +199,11 @@ Create the work plan directly - that's your job as the planning agent.`,
+         categoryModel = {
+           ...categoryModel,
+           variant: agentOverride?.variant ?? effectiveEntry.variant ?? categoryModel.variant,
+-          reasoningEffort: effectiveEntry.reasoningEffort,
+-          temperature: effectiveEntry.temperature,
+-          top_p: effectiveEntry.top_p,
+-          maxTokens: effectiveEntry.maxTokens,
+-          thinking: effectiveEntry.thinking,
++          reasoningEffort: effectiveEntry.reasoningEffort ?? categoryModel.reasoningEffort,
++          temperature: effectiveEntry.temperature ?? categoryModel.temperature,
++          top_p: effectiveEntry.top_p ?? categoryModel.top_p,
++          maxTokens: effectiveEntry.maxTokens ?? categoryModel.maxTokens,
++          thinking: effectiveEntry.thinking ?? categoryModel.thinking,
+         }
+       }
+     }
+diff --git a/src/tools/delegate-task/sync-prompt-sender.test.ts b/src/tools/delegate-task/sync-prompt-sender.test.ts
+index e7df1b07..32970e72 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.test.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.test.ts
+@@ -274,7 +274,11 @@ bunDescribe("sendSyncPrompt", () => {
+       modelID: "gpt-5.4",
+     })
+     bunExpect(promptArgs.body.variant).toBe("low")
+-    bunExpect(promptArgs.body.options).toBeUndefined()
++    bunExpect(promptArgs.body.options).toEqual({
++      reasoningEffort: "high",
++      thinking: { type: "disabled" },
++      maxTokens: 4096,
++    })
+     bunExpect(getSessionPromptParams("test-session")).toEqual({
+       temperature: 0.4,
+       topP: 0.7,
+@@ -285,6 +289,50 @@ bunDescribe("sendSyncPrompt", () => {
+       },
+     })
+   })
++
++  bunTest("forwards category temperature through the sync prompt body", async () => {
++    //#given
++    const { sendSyncPrompt } = require("./sync-prompt-sender")
++
++    let promptArgs: any
++    const promptWithModelSuggestionRetry = bunMock(async (_client: any, input: any) => {
++      promptArgs = input
++    })
++
++    const input = {
++      sessionID: "test-session",
++      agentToUse: "sisyphus-junior",
++      args: {
++        description: "test task",
++        prompt: "test prompt",
++        category: "quick",
++        run_in_background: false,
++        load_skills: [],
++      },
++      systemContent: undefined,
++      categoryModel: {
++        providerID: "openai",
++        modelID: "gpt-5.4",
++        temperature: 0.25,
++      },
++      toastManager: null,
++      taskId: undefined,
++    }
++
++    //#when
++    await sendSyncPrompt(
++      { session: { promptAsync: bunMock(async () => ({ data: {} })) } },
++      input,
++      {
++        promptWithModelSuggestionRetry,
++        promptSyncWithModelSuggestionRetry: bunMock(async () => {}),
++      },
++    )
++
++    //#then
++    bunExpect(promptWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
++    bunExpect(promptArgs.body.temperature).toBe(0.25)
++  })
+   bunTest("retries with promptSync for oracle when promptAsync fails with unexpected EOF", async () => {
+     //#given
+     const { sendSyncPrompt } = require("./sync-prompt-sender")
+diff --git a/src/tools/delegate-task/sync-prompt-sender.ts b/src/tools/delegate-task/sync-prompt-sender.ts
+index 1140344d..48980425 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.ts
+@@ -22,6 +22,24 @@ const sendSyncPromptDeps: SendSyncPromptDeps = {
+   promptSyncWithModelSuggestionRetry,
+ }
+ 
++function buildPromptGenerationParams(model: DelegatedModelConfig | undefined): Record<string, unknown> {
++  if (!model) {
++    return {}
++  }
++
++  const promptOptions: Record<string, unknown> = {
++    ...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
++    ...(model.thinking ? { thinking: model.thinking } : {}),
++    ...(model.maxTokens !== undefined ? { maxTokens: model.maxTokens } : {}),
++  }
++
++  return {
++    ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
++    ...(model.top_p !== undefined ? { topP: model.top_p } : {}),
++    ...(Object.keys(promptOptions).length > 0 ? { options: promptOptions } : {}),
++  }
++}
++
+ function isOracleAgent(agentToUse: string): boolean {
+   return agentToUse.toLowerCase() === "oracle"
+ }
+@@ -75,6 +93,7 @@ export async function sendSyncPrompt(
+           }
+         : {}),
+       ...(input.categoryModel?.variant ? { variant: input.categoryModel.variant } : {}),
++      ...buildPromptGenerationParams(input.categoryModel),
+     },
+   }
+ 
+-- 
+2.39.2
+

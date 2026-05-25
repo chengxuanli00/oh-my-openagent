@@ -1,0 +1,187 @@
+From 5f733f471c2d006afdcd7646718a8d60df57fd6b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 19 May 2026 13:48:26 +0900
+Subject: [PATCH 5501/5749] fix(parent-wake): recognize sdk tool progress
+
+---
+ .../background-agent/parent-wake-notifier.ts  | 16 +++-
+ .../parent-wake-user-message-race.test.ts     | 73 +++++++++++++++++++
+ .../task-completion-cleanup.test.ts           | 46 ++++++++++++
+ 3 files changed, 133 insertions(+), 2 deletions(-)
+
+diff --git a/src/features/background-agent/parent-wake-notifier.ts b/src/features/background-agent/parent-wake-notifier.ts
+index c65e43d9..e1b2e979 100644
+--- a/src/features/background-agent/parent-wake-notifier.ts
++++ b/src/features/background-agent/parent-wake-notifier.ts
+@@ -387,7 +387,12 @@ export class ParentWakeNotifier {
+   }
+ 
+   private parentWakePartIsWaitingOnTool(part: NonNullable<ParentWakeSessionMessage["parts"]>[number]): boolean {
+-    if (part.type !== "tool" && part.type !== "tool_use") {
++    if (
++      part.type !== "tool"
++      && part.type !== "tool_use"
++      && part.type !== "tool-call"
++      && part.type !== "tool-invocation"
++    ) {
+       return false
+     }
+ 
+@@ -434,7 +439,14 @@ export class ParentWakeNotifier {
+       if (part.type === "text" || part.type === "reasoning") {
+         return typeof part.text === "string" && part.text.trim().length > 0
+       }
+-      if (part.type === "tool" || part.type === "tool_result") {
++      if (
++        part.type === "tool"
++        || part.type === "tool_use"
++        || part.type === "tool-call"
++        || part.type === "tool-invocation"
++        || part.type === "tool_result"
++        || part.type === "tool-result"
++      ) {
+         return true
+       }
+       if (part.content !== undefined) {
+diff --git a/src/features/background-agent/parent-wake-user-message-race.test.ts b/src/features/background-agent/parent-wake-user-message-race.test.ts
+index cf59ae97..e6d4d3ee 100644
+--- a/src/features/background-agent/parent-wake-user-message-race.test.ts
++++ b/src/features/background-agent/parent-wake-user-message-race.test.ts
+@@ -692,4 +692,77 @@ describe("ParentWakeNotifier — user message race guard (issue #4120)", () => {
+       releaseAllPromptAsyncReservationsForTesting()
+     }
+   })
++
++  test("#given accepted wake produces sdk tool-call output #when late failure is requeued #then accepted dispatch is not duplicated", async () => {
++    // given
++    const originalDateNow = Date.now
++    let now = 1_000
++    Date.now = () => now
++    const sessionMessages: SessionMessageStub[] = [
++      {
++        info: {
++          role: "assistant",
++          finish: "stop",
++          time: { created: 500 },
++        },
++      },
++    ]
++    const client = {
++      session: {
++        status: async () => ({ data: { "parent-tool-call-output": { type: "idle" } } }),
++        messages: async () => ({ data: sessionMessages }),
++        promptAsync: async () => {
++          sessionMessages.push({
++            info: {
++              role: "assistant",
++              time: { created: 1_100 },
++            },
++            parts: [{ type: "tool-call" }],
++          })
++          now = 2_000
++          return { data: {} }
++        },
++      },
++    } as unknown as ConstructorParameters<typeof ParentWakeNotifier>[0]["client"]
++    const notifier = new ParentWakeNotifier(
++      {
++        client,
++        directory: "/tmp/test-omo",
++        enqueueNotificationForParent: async (_sessionID, operation) => {
++          await operation()
++        },
++      },
++      {
++        pendingRetryMs: 1_000,
++        acceptedMessageSkewMs: 100,
++        toolCallDeferMaxMs: 5_000,
++        failureRequeueWindowMs: 5_000,
++        userMessageInProgressWindowMs: 0,
++      },
++    )
++    notifier.queuePendingParentWake(
++      "parent-tool-call-output",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    try {
++      // when
++      await notifier.flushPendingParentWake("parent-tool-call-output")
++      const requeued = await notifier.requeueDispatchedParentWake(
++        "parent-tool-call-output",
++        "late session.error",
++      )
++
++      // then
++      expect(requeued).toBe(false)
++      expect(notifier.getPendingParentWakes().has("parent-tool-call-output")).toBe(false)
++      expect(notifier.getDispatchedParentWakes().has("parent-tool-call-output")).toBe(false)
++    } finally {
++      Date.now = originalDateNow
++      notifier.shutdown()
++      releaseAllPromptAsyncReservationsForTesting()
++    }
++  })
+ })
+diff --git a/src/features/background-agent/task-completion-cleanup.test.ts b/src/features/background-agent/task-completion-cleanup.test.ts
+index feafab54..1dcb9e80 100644
+--- a/src/features/background-agent/task-completion-cleanup.test.ts
++++ b/src/features/background-agent/task-completion-cleanup.test.ts
+@@ -597,6 +597,52 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+       expect(notificationPayload).toContain("ALL BACKGROUND TASKS COMPLETE")
+     })
+ 
++    test("#when stale sdk tool-call part keeps blocking an all-complete wake #then completion eventually wakes the parent", async () => {
++      // given
++      const sessionStatuses: Record<string, { type: string }> = {
++        "parent-1": { type: "idle" },
++      }
++      const sessionMessages: SessionMessageForTest[] = [
++        {
++          info: { role: "user", time: { created: 1778819814009 } },
++          parts: [{ type: "text" }],
++        },
++        {
++          info: { role: "assistant", time: { created: 1778819997535 } },
++          parts: [{ type: "tool-call", state: { status: "running" } }],
++        },
++      ]
++      const { manager, promptAsyncCalls } = createManager(true, sessionStatuses, undefined, sessionMessages)
++      managerUnderTest = manager
++      const task = createTask({
++        id: "task-a",
++        parentSessionId: "parent-1",
++        description: "task A",
++        status: "completed",
++        completedAt: new Date("2026-05-15T13:40:19.368Z"),
++      })
++      getTasks(manager).set(task.id, task)
++      getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++      await notifyParentSessionForTest(manager, task)
++      await waitForCoalescedFlush()
++      const pendingWake = getPendingParentWakes(manager).get("parent-1")
++      expect(pendingWake).toBeDefined()
++      if (!pendingWake) {
++        throw new Error("Missing pending parent wake")
++      }
++      pendingWake.toolCallDeferralStartedAt = Date.now() - 60_000
++
++      // when
++      manager.handleEvent({ type: "session.idle", properties: { sessionID: "parent-1" } })
++      await waitForDeferredWake(promptAsyncCalls)
++
++      // then
++      expect(promptAsyncCalls).toHaveLength(1)
++      expect(promptAsyncCalls[0]?.body.noReply).toBe(false)
++      const notificationPayload = JSON.stringify(promptAsyncCalls[0]?.body.parts)
++      expect(notificationPayload).toContain("ALL BACKGROUND TASKS COMPLETE")
++    })
++
+     test("#when stale deferral age is exceeded but latest tool turn is recent #then all-complete wake still waits", async () => {
+       // given
+       const originalDateNow = Date.now
+-- 
+2.39.2
+

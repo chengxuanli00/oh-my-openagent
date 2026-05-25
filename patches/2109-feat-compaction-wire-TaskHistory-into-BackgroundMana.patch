@@ -1,0 +1,126 @@
+From e3924437cebef023064cec26091bf01359d6f730 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 13 Feb 2026 17:40:44 +0900
+Subject: [PATCH 2109/5749] feat(compaction): wire TaskHistory into
+ BackgroundManager and compaction pipeline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Records task history at 6 status transitions (pending, running×2, error,
+cancelled, completed). Exports TaskHistory from background-agent barrel.
+Passes backgroundManager and sessionID through compaction hook chain.
+---
+ src/features/background-agent/index.ts        | 1 +
+ src/features/background-agent/manager.ts      | 8 ++++++++
+ src/index.ts                                  | 2 +-
+ src/plugin/hooks/create-continuation-hooks.ts | 2 +-
+ 4 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/features/background-agent/index.ts b/src/features/background-agent/index.ts
+index 6dc61829..5d3905d2 100644
+--- a/src/features/background-agent/index.ts
++++ b/src/features/background-agent/index.ts
+@@ -1,4 +1,5 @@
+ export * from "./types"
+ export { BackgroundManager, type SubagentSessionCreatedEvent, type OnSubagentSessionCreated } from "./manager"
++export { TaskHistory, type TaskHistoryEntry } from "./task-history"
+ export { ConcurrencyManager } from "./concurrency"
+ export { TaskStateManager } from "./state"
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index cbe16999..bfab927a 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -5,6 +5,7 @@ import type {
+   LaunchInput,
+   ResumeInput,
+ } from "./types"
++import { TaskHistory } from "./task-history"
+ import { log, getAgentToolRestrictions, promptWithModelSuggestionRetry } from "../../shared"
+ import { ConcurrencyManager } from "./concurrency"
+ import type { BackgroundTaskConfig, TmuxConfig } from "../../config/schema"
+@@ -90,6 +91,7 @@ export class BackgroundManager {
+   private completionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
++  readonly taskHistory = new TaskHistory()
+ 
+   constructor(
+     ctx: PluginInput,
+@@ -144,6 +146,7 @@ export class BackgroundManager {
+     }
+ 
+     this.tasks.set(task.id, task)
++    this.taskHistory.record(input.parentSessionID, { id: task.id, agent: input.agent, description: input.description, status: "pending", category: input.category })
+ 
+     // Track for batched notifications immediately (pending state)
+     if (input.parentSessionID) {
+@@ -291,6 +294,7 @@ export class BackgroundManager {
+     task.concurrencyKey = concurrencyKey
+     task.concurrencyGroup = concurrencyKey
+ 
++    this.taskHistory.record(input.parentSessionID, { id: task.id, sessionID, agent: input.agent, description: input.description, status: "running", category: input.category, startedAt: task.startedAt })
+     this.startPolling()
+ 
+     log("[background-agent] Launching task:", { taskId: task.id, sessionID, agent: input.agent })
+@@ -486,6 +490,7 @@ export class BackgroundManager {
+     this.tasks.set(task.id, task)
+     subagentSessions.add(input.sessionID)
+     this.startPolling()
++    this.taskHistory.record(input.parentSessionID, { id: task.id, sessionID: input.sessionID, agent: input.agent || "task", description: input.description, status: "running", startedAt: task.startedAt })
+ 
+     if (input.parentSessionID) {
+       const pending = this.pendingByParent.get(input.parentSessionID) ?? new Set()
+@@ -741,6 +746,7 @@ export class BackgroundManager {
+       task.status = "error"
+       task.error = errorMessage ?? "Session error"
+       task.completedAt = new Date()
++      this.taskHistory.record(task.parentSessionID, { id: task.id, sessionID: task.sessionID, agent: task.agent, description: task.description, status: "error", category: task.category, startedAt: task.startedAt, completedAt: task.completedAt })
+ 
+       if (task.concurrencyKey) {
+         this.concurrencyManager.release(task.concurrencyKey)
+@@ -951,6 +957,7 @@ export class BackgroundManager {
+     if (reason) {
+       task.error = reason
+     }
++    this.taskHistory.record(task.parentSessionID, { id: task.id, sessionID: task.sessionID, agent: task.agent, description: task.description, status: "cancelled", category: task.category, startedAt: task.startedAt, completedAt: task.completedAt })
+ 
+     if (task.concurrencyKey) {
+       this.concurrencyManager.release(task.concurrencyKey)
+@@ -1095,6 +1102,7 @@ export class BackgroundManager {
+     // Atomically mark as completed to prevent race conditions
+     task.status = "completed"
+     task.completedAt = new Date()
++    this.taskHistory.record(task.parentSessionID, { id: task.id, sessionID: task.sessionID, agent: task.agent, description: task.description, status: "completed", category: task.category, startedAt: task.startedAt, completedAt: task.completedAt })
+ 
+     // Release concurrency BEFORE any async operations to prevent slot leaks
+     if (task.concurrencyKey) {
+diff --git a/src/index.ts b/src/index.ts
+index 69cae8cd..74707851 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -82,7 +82,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       if (!hooks.compactionContextInjector) {
+         return
+       }
+-      output.context.push(hooks.compactionContextInjector())
++      output.context.push(hooks.compactionContextInjector(_input.sessionID))
+     },
+   }
+ }
+diff --git a/src/plugin/hooks/create-continuation-hooks.ts b/src/plugin/hooks/create-continuation-hooks.ts
+index dbc2d3d0..96bf5de0 100644
+--- a/src/plugin/hooks/create-continuation-hooks.ts
++++ b/src/plugin/hooks/create-continuation-hooks.ts
+@@ -53,7 +53,7 @@ export function createContinuationHooks(args: {
+     : null
+ 
+   const compactionContextInjector = isHookEnabled("compaction-context-injector")
+-    ? safeHook("compaction-context-injector", () => createCompactionContextInjector())
++    ? safeHook("compaction-context-injector", () => createCompactionContextInjector(backgroundManager))
+     : null
+ 
+   const compactionTodoPreserver = isHookEnabled("compaction-todo-preserver")
+-- 
+2.39.2
+

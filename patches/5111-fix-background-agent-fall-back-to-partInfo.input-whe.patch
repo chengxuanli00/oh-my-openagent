@@ -1,0 +1,159 @@
+From 5cd95cf57ea9d06754cb85f4d4b7137949c1269b Mon Sep 17 00:00:00 2001
+From: MoerAI <friendnt@g.skku.edu>
+Date: Tue, 12 May 2026 19:02:20 +0900
+Subject: [PATCH 5111/5749] fix(background-agent): fall back to partInfo.input
+ when state.input is unavailable for circuit breaker (fixes #3962)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The circuit breaker in manager.ts uses recordToolCall to detect when a subagent gets stuck repeating identical tool_use blocks. It passed partInfo.state?.input as the tool-input signature. When a model (Kimi K2.6 in the reporter's case) emits duplicate tool_use parts faster than the tool actually starts running, state.input is still null, so loop-detector falls back to the bare 'tool::__unknown-input__' signature. As soon as one part has state.input populated (next event), the signature flips to 'tool::{actual-args}' and the consecutive counter resets to 1, repeatedly. The breaker never reaches its 20-call threshold.
+
+Add a top-level input?: Record<string, unknown> field to the local MessagePartInfo interface and prefer state.input when present, falling back to the part's own input when state is still pre-running. The OpenCode part payload carries the tool input as soon as the tool_use block is generated, so this fallback restores signature stability across the model's repeated emissions.
+
+Verification: added 2 regression tests in manager-circuit-breaker.test.ts. Test 1 (reproduce) emits 20 part.updated events with only top-level input and asserts the task is cancelled by the breaker — fails before the fix, passes after. Test 2 confirms that when state.input IS present, it still wins over the top-level input (precedence preserved). All 10 manager-circuit-breaker tests pass, all 20 loop-detector tests pass, typecheck clean.
+---
+ .../manager-circuit-breaker.test.ts           | 100 ++++++++++++++++++
+ src/features/background-agent/manager.ts      |   4 +-
+ 2 files changed, 103 insertions(+), 1 deletion(-)
+
+diff --git a/src/features/background-agent/manager-circuit-breaker.test.ts b/src/features/background-agent/manager-circuit-breaker.test.ts
+index 1df52581..3edffb83 100644
+--- a/src/features/background-agent/manager-circuit-breaker.test.ts
++++ b/src/features/background-agent/manager-circuit-breaker.test.ts
+@@ -306,6 +306,106 @@ describe("BackgroundManager circuit breaker", () => {
+     })
+   })
+ 
++  describe("#given duplicate tool_use blocks arrive without state.input but with top-level input", () => {
++    test("#when 20 identical reads arrive #then circuit breaker still detects the loop", async () => {
++      // Regression for #3962: when a model (e.g. Kimi K2.6) generates duplicate
++      // tool_use blocks faster than the tool actually starts running, the
++      // updated events carry `input` on the part itself but `state.input`
++      // stays null/undefined. Before the fix, the signature alternated
++      // between "read::__unknown-input__" and "read::{filePath:...}" and the
++      // consecutive counter kept resetting to 1, so the breaker never fired.
++      const manager = createManager({
++        circuitBreaker: {
++          consecutiveThreshold: 20,
++        },
++      })
++      const task: BackgroundTask = {
++        id: "task-no-state-input-1",
++        sessionId: "session-no-state-input-1",
++        parentSessionId: "parent-1",
++        parentMessageId: "msg-1",
++        description: "Duplicate tool_use blocks",
++        prompt: "work",
++        agent: "explore",
++        status: "running",
++        startedAt: new Date(Date.now() - 60_000),
++        progress: {
++          toolCalls: 0,
++          lastUpdate: new Date(Date.now() - 60_000),
++        },
++      }
++      getTaskMap(manager).set(task.id, task)
++
++      for (let i = 0; i < 20; i++) {
++        manager.handleEvent({
++          type: "message.part.updated",
++          properties: {
++            part: {
++              sessionID: task.sessionId,
++              type: "tool",
++              tool: "read",
++              input: { filePath: "/src/hooks/thinking-block-validator/hook.ts" },
++            },
++          },
++        })
++      }
++
++      await flushAsyncWork()
++
++      expect(task.status).toBe("cancelled")
++      expect(task.error).toContain("read 20 consecutive times")
++    })
++
++    test("#when state.input is present #then it takes precedence over top-level input", async () => {
++      // Confirm the fallback order: state.input wins when both are present.
++      const manager = createManager({
++        circuitBreaker: {
++          consecutiveThreshold: 20,
++        },
++      })
++      const task: BackgroundTask = {
++        id: "task-state-input-wins-1",
++        sessionId: "session-state-input-wins-1",
++        parentSessionId: "parent-1",
++        parentMessageId: "msg-1",
++        description: "state.input precedence",
++        prompt: "work",
++        agent: "explore",
++        status: "running",
++        startedAt: new Date(Date.now() - 60_000),
++        progress: {
++          toolCalls: 0,
++          lastUpdate: new Date(Date.now() - 60_000),
++        },
++      }
++      getTaskMap(manager).set(task.id, task)
++
++      // 20 distinct state.input.filePath values but identical top-level input.
++      // If state.input takes precedence (correct), signatures differ and the
++      // loop does NOT trigger. If we erroneously preferred top-level input,
++      // signatures would all be identical and the breaker would fire.
++      for (let i = 0; i < 20; i++) {
++        manager.handleEvent({
++          type: "message.part.updated",
++          properties: {
++            part: {
++              sessionID: task.sessionId,
++              type: "tool",
++              tool: "read",
++              input: { filePath: "/src/same.ts" },
++              state: { status: "running", input: { filePath: `/src/file-${i}.ts` } },
++            },
++          },
++        })
++      }
++
++      await flushAsyncWork()
++
++      expect(task.status).toBe("running")
++      expect(task.progress?.toolCalls).toBe(20)
++    })
++  })
++
+   describe("#given circuit breaker enabled is false", () => {
+     test("#when repetitive tools arrive #then task keeps running", async () => {
+       const manager = createManager({
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index ae963a28..5d80696d 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -105,6 +105,7 @@ interface MessagePartInfo {
+   sessionID?: string
+   type?: string
+   tool?: string
++  input?: Record<string, unknown>
+   state?: { status?: string; input?: Record<string, unknown> }
+ }
+ 
+@@ -1351,11 +1352,12 @@ The fallback retry session is now created and can be inspected directly.
+          const circuitBreaker = this.cachedCircuitBreakerSettings ?? resolveCircuitBreakerSettings(this.config)
+          this.cachedCircuitBreakerSettings = circuitBreaker
+          if (partInfo.tool) {
++           const toolInput = partInfo.state?.input ?? partInfo.input
+            task.progress.toolCallWindow = recordToolCall(
+              task.progress.toolCallWindow,
+              partInfo.tool,
+              circuitBreaker,
+-             partInfo.state?.input
++             toolInput
+            )
+ 
+            if (circuitBreaker.enabled) {
+-- 
+2.39.2
+

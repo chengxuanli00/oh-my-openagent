@@ -1,0 +1,267 @@
+From 847a8db2dc25c458ec377e950aa0454cb2f55d97 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 20 May 2026 11:42:46 +0900
+Subject: [PATCH 5535/5749] fix(runtime-fallback): preserve accepted pending
+ retries
+
+---
+ src/hooks/runtime-fallback/auto-retry.test.ts | 24 ++++++++++++
+ src/hooks/runtime-fallback/auto-retry.ts      | 21 +++++++++-
+ .../runtime-fallback/chat-message-handler.ts  |  1 +
+ src/hooks/runtime-fallback/event-handler.ts   |  1 +
+ .../message-update-handler.ts                 |  2 +
+ .../session-status-handler.test.ts            | 39 +++++++++++++++++++
+ .../session-status-handler.ts                 |  8 ++++
+ src/hooks/runtime-fallback/types.ts           |  1 +
+ 8 files changed, 95 insertions(+), 2 deletions(-)
+
+diff --git a/src/hooks/runtime-fallback/auto-retry.test.ts b/src/hooks/runtime-fallback/auto-retry.test.ts
+index b8842b1a..30ad722c 100644
+--- a/src/hooks/runtime-fallback/auto-retry.test.ts
++++ b/src/hooks/runtime-fallback/auto-retry.test.ts
+@@ -56,6 +56,30 @@ function createDeps(promptCalls: { count: number }): HookDeps {
+ }
+ 
+ describe("createAutoRetryHelpers", () => {
++  test("#given fallback prompt returns ambiguous EOF #when auto retry runs #then pending fallback is marked as possibly accepted", async () => {
++    // given
++    const promptCalls = { count: 0 }
++    const deps = createDeps(promptCalls)
++    deps.ctx.client.session.promptAsync = async () => {
++      promptCalls.count += 1
++      throw new Error("JSON Parse error: Unexpected EOF")
++    }
++    const helpers = createAutoRetryHelpers(deps)
++    const sessionID = "session-auto-retry-ambiguous"
++    const state = createFallbackState("anthropic/claude-opus-4-7")
++    state.pendingFallbackModel = "openai/gpt-5.4"
++    deps.sessionStates.set(sessionID, state)
++
++    // when
++    await helpers.autoRetryWithFallback(sessionID, "openai/gpt-5.4", undefined, "session.error")
++
++    // then
++    expect(promptCalls.count).toBe(1)
++    expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(true)
++    expect(state.pendingFallbackModel).toBe("openai/gpt-5.4")
++    expect(state.pendingFallbackPromptMayHaveBeenAccepted).toBe(true)
++  })
++
+   test("#given an existing fallback result is pending #when a new fallback retry is skipped by the prompt gate #then the previous pending state is preserved", async () => {
+     // given
+     const promptCalls = { count: 0 }
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index 4eb04c45..37ae55bf 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -16,7 +16,7 @@ import {
+   isInternalPromptDispatchAccepted,
+   releasePromptAsyncReservation,
+ } from "../shared/prompt-async-gate"
+-import { isAmbiguousPromptDispatchFailure } from "../../shared/prompt-failure-classifier"
++import { isAmbiguousPostDispatchPromptFailure } from "../../shared/prompt-failure-classifier"
+ 
+ const SESSION_TTL_MS = 30 * 60 * 1000
+ 
+@@ -93,6 +93,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+       if (state.pendingFallbackModel) {
+         state.pendingFallbackModel = undefined
+       }
++      state.pendingFallbackPromptMayHaveBeenAccepted = false
+ 
+       const fallbackModels = getFallbackModelsForSession(sessionID, resolvedAgent, pluginConfig)
+       if (fallbackModels.length === 0) return
+@@ -136,11 +137,15 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+       if (state?.pendingFallbackModel) {
+         state.pendingFallbackModel = undefined
+       }
++      if (state) {
++        state.pendingFallbackPromptMayHaveBeenAccepted = false
++      }
+       return
+     }
+ 
+     const hadAwaitingFallbackResult = sessionAwaitingFallbackResult.has(sessionID)
+     const previousPendingFallbackModel = sessionStates.get(sessionID)?.pendingFallbackModel
++    const previousPendingFallbackPromptMayHaveBeenAccepted = sessionStates.get(sessionID)?.pendingFallbackPromptMayHaveBeenAccepted
+     sessionRetryInFlight.add(sessionID)
+     let retryDispatched = false
+     let retryMayHaveBeenAccepted = false
+@@ -184,7 +189,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+           },
+         })
+         if (promptResult.status === "failed") {
+-          if (isAmbiguousPromptDispatchFailure(promptResult.error)) {
++          if (isAmbiguousPostDispatchPromptFailure(promptResult)) {
+             retryMayHaveBeenAccepted = true
+             log(`[${HOOK_NAME}] Auto-retry prompt failed after dispatch may have been accepted (${source}); preserving fallback state`, {
+               sessionID,
+@@ -204,6 +209,10 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         if (hadAwaitingFallbackResult) {
+           scheduleSessionFallbackTimeout(sessionID, retryAgent)
+         }
++        const state = sessionStates.get(sessionID)
++        if (state) {
++          state.pendingFallbackPromptMayHaveBeenAccepted = false
++        }
+         retryDispatched = true
+       } else {
+         log(`[${HOOK_NAME}] No user message found for auto-retry (${source})`, { sessionID })
+@@ -212,6 +221,12 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+       log(`[${HOOK_NAME}] Auto-retry failed (${source})`, { sessionID, error: String(retryError) })
+     } finally {
+       sessionRetryInFlight.delete(sessionID)
++      if (retryMayHaveBeenAccepted) {
++        const state = sessionStates.get(sessionID)
++        if (state) {
++          state.pendingFallbackPromptMayHaveBeenAccepted = true
++        }
++      }
+       if (!retryDispatched && !retryMayHaveBeenAccepted) {
+         if (hadAwaitingFallbackResult) {
+           sessionAwaitingFallbackResult.add(sessionID)
+@@ -223,8 +238,10 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         if (state) {
+           if (hadAwaitingFallbackResult) {
+             state.pendingFallbackModel = previousPendingFallbackModel
++            state.pendingFallbackPromptMayHaveBeenAccepted = previousPendingFallbackPromptMayHaveBeenAccepted
+           } else if (state.pendingFallbackModel) {
+             state.pendingFallbackModel = undefined
++            state.pendingFallbackPromptMayHaveBeenAccepted = false
+           }
+         }
+       }
+diff --git a/src/hooks/runtime-fallback/chat-message-handler.ts b/src/hooks/runtime-fallback/chat-message-handler.ts
+index 9d400f7d..9d882822 100644
+--- a/src/hooks/runtime-fallback/chat-message-handler.ts
++++ b/src/hooks/runtime-fallback/chat-message-handler.ts
+@@ -26,6 +26,7 @@ export function createChatMessageHandler(deps: HookDeps) {
+     if (requestedModel && requestedModel !== state.currentModel) {
+       if (state.pendingFallbackModel && state.pendingFallbackModel === requestedModel) {
+         state.pendingFallbackModel = undefined
++        state.pendingFallbackPromptMayHaveBeenAccepted = false
+         return
+       }
+ 
+diff --git a/src/hooks/runtime-fallback/event-handler.ts b/src/hooks/runtime-fallback/event-handler.ts
+index 2ea6948c..b79d511a 100644
+--- a/src/hooks/runtime-fallback/event-handler.ts
++++ b/src/hooks/runtime-fallback/event-handler.ts
+@@ -118,6 +118,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+     const state = sessionStates.get(sessionID)
+     if (state?.pendingFallbackModel) {
+       state.pendingFallbackModel = undefined
++      state.pendingFallbackPromptMayHaveBeenAccepted = false
+     }
+ 
+     if (hadTimeout) {
+diff --git a/src/hooks/runtime-fallback/message-update-handler.ts b/src/hooks/runtime-fallback/message-update-handler.ts
+index 88c2a69c..de69fb32 100644
+--- a/src/hooks/runtime-fallback/message-update-handler.ts
++++ b/src/hooks/runtime-fallback/message-update-handler.ts
+@@ -61,6 +61,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
+       let state = sessionStates.get(sessionID)
+       if (state?.pendingFallbackModel) {
+         state.pendingFallbackModel = undefined
++        state.pendingFallbackPromptMayHaveBeenAccepted = false
+       }
+       log(`[${HOOK_NAME}] Assistant response observed; cleared fallback timeout`, { sessionID, model })
+       return
+@@ -175,6 +176,7 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
+               pendingFallbackModel: state.pendingFallbackModel,
+             })
+             state.pendingFallbackModel = undefined
++            state.pendingFallbackPromptMayHaveBeenAccepted = false
+           } else {
+           log(`[${HOOK_NAME}] message.updated fallback skipped (pending fallback in progress)`, {
+             sessionID,
+diff --git a/src/hooks/runtime-fallback/session-status-handler.test.ts b/src/hooks/runtime-fallback/session-status-handler.test.ts
+index 6a7dee7c..100b2b46 100644
+--- a/src/hooks/runtime-fallback/session-status-handler.test.ts
++++ b/src/hooks/runtime-fallback/session-status-handler.test.ts
+@@ -65,6 +65,45 @@ function createHelpers(abortCalls: string[], retryCalls: Array<{ sessionID: stri
+ }
+ 
+ describe("createSessionStatusHandler", () => {
++  it("#given pending fallback prompt may already be accepted #when provider retry status arrives #then it keeps waiting for that accepted prompt", async () => {
++    // given
++    SessionCategoryRegistry.clear()
++    const sessionID = "session-status-ambiguous-pending"
++    SessionCategoryRegistry.register(sessionID, "test")
++
++    const deps = createDeps()
++    const abortCalls: string[] = []
++    const retryCalls: Array<{ sessionID: string; model: string; source: string }> = []
++    const state = createFallbackState("anthropic/claude-opus-4-7")
++    state.currentModel = "openai/gpt-5.4"
++    state.fallbackIndex = 0
++    state.attemptCount = 1
++    state.pendingFallbackModel = "openai/gpt-5.4"
++    state.pendingFallbackPromptMayHaveBeenAccepted = true
++    deps.sessionStates.set(sessionID, state)
++
++    const handler = createSessionStatusHandler(deps, createHelpers(abortCalls, retryCalls), deps.sessionStatusRetryKeys)
++
++    // when
++    await handler({
++      sessionID,
++      model: "openai/gpt-5.4",
++      status: {
++        type: "retry",
++        attempt: 2,
++        message: "All credentials for model gpt-5.4 are cooling down [retrying in 7m 56s attempt #2]",
++      },
++    })
++
++    // then
++    expect(abortCalls).toEqual([])
++    expect(retryCalls).toEqual([])
++    expect(state.currentModel).toBe("openai/gpt-5.4")
++    expect(state.pendingFallbackModel).toBe("openai/gpt-5.4")
++    expect(state.pendingFallbackPromptMayHaveBeenAccepted).toBe(true)
++    SessionCategoryRegistry.clear()
++  })
++
+   it("#given a pending fallback model #when a new provider cooldown retry arrives #then the handler overrides the pending fallback and advances the chain", async () => {
+     // given
+     SessionCategoryRegistry.clear()
+diff --git a/src/hooks/runtime-fallback/session-status-handler.ts b/src/hooks/runtime-fallback/session-status-handler.ts
+index a9e6d3dc..806b7a3b 100644
+--- a/src/hooks/runtime-fallback/session-status-handler.ts
++++ b/src/hooks/runtime-fallback/session-status-handler.ts
+@@ -104,12 +104,20 @@ export function createSessionStatusHandler(
+     sessionLastAccess.set(sessionID, Date.now())
+ 
+     if (state.pendingFallbackModel) {
++      if (state.pendingFallbackPromptMayHaveBeenAccepted) {
++        log(`[${HOOK_NAME}] session.status retry skipped (pending fallback prompt may already be accepted)`, {
++          sessionID,
++          pendingFallbackModel: state.pendingFallbackModel,
++        })
++        return
++      }
+       if (timeoutEnabled) {
+         log(`[${HOOK_NAME}] Clearing pending fallback due to provider auto-retry signal`, {
+           sessionID,
+           pendingFallbackModel: state.pendingFallbackModel,
+         })
+         state.pendingFallbackModel = undefined
++        state.pendingFallbackPromptMayHaveBeenAccepted = false
+       } else {
+         log(`[${HOOK_NAME}] session.status retry skipped (pending fallback in progress)`, {
+           sessionID,
+diff --git a/src/hooks/runtime-fallback/types.ts b/src/hooks/runtime-fallback/types.ts
+index aaa6436e..1f593f4c 100644
+--- a/src/hooks/runtime-fallback/types.ts
++++ b/src/hooks/runtime-fallback/types.ts
+@@ -44,6 +44,7 @@ export interface FallbackState {
+   failedModels: Map<string, number>
+   attemptCount: number
+   pendingFallbackModel?: string
++  pendingFallbackPromptMayHaveBeenAccepted?: boolean
+ }
+ 
+ export interface FallbackResult {
+-- 
+2.39.2
+

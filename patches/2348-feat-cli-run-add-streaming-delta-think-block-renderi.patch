@@ -1,0 +1,1291 @@
+From eaf315a8d76f8df6f52d7e2561a2f1a073e8ecab Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 17 Feb 2026 23:33:06 +0900
+Subject: [PATCH 2348/5749] feat(cli-run): add streaming delta, think block
+ rendering, and rich tool headers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds message.part.delta event handling for real-time streaming output,
+reasoning/think block display with in-place updates, per-agent profile
+colors, padded text output, and semantic tool headers with icons.
+
+🤖 Generated with [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/cli/run/agent-profile-colors.ts    |  28 ++
+ src/cli/run/event-formatting.ts        |  10 +
+ src/cli/run/event-handlers.ts          | 182 ++++++++--
+ src/cli/run/event-state.ts             |  30 ++
+ src/cli/run/event-stream-processor.ts  |   2 +
+ src/cli/run/message-part-delta.test.ts | 466 +++++++++++++++++++++++++
+ src/cli/run/output-renderer.ts         | 104 ++++++
+ src/cli/run/runner.ts                  |   5 +-
+ src/cli/run/tool-input-preview.ts      | 180 ++++++++--
+ src/cli/run/types.ts                   |  11 +
+ 10 files changed, 945 insertions(+), 73 deletions(-)
+ create mode 100644 src/cli/run/agent-profile-colors.ts
+ create mode 100644 src/cli/run/message-part-delta.test.ts
+ create mode 100644 src/cli/run/output-renderer.ts
+
+diff --git a/src/cli/run/agent-profile-colors.ts b/src/cli/run/agent-profile-colors.ts
+new file mode 100644
+index 00000000..b7904e81
+--- /dev/null
++++ b/src/cli/run/agent-profile-colors.ts
+@@ -0,0 +1,28 @@
++import type { OpencodeClient } from "@opencode-ai/sdk"
++import { normalizeSDKResponse } from "../../shared"
++
++interface AgentProfile {
++  name?: string
++  color?: string
++}
++
++export async function loadAgentProfileColors(
++  client: OpencodeClient,
++): Promise<Record<string, string>> {
++  try {
++    const agentsRes = await client.app.agents()
++    const agents = normalizeSDKResponse(agentsRes, [] as AgentProfile[], {
++      preferResponseOnMissingData: true,
++    })
++
++    const colors: Record<string, string> = {}
++    for (const agent of agents) {
++      if (!agent.name || !agent.color) continue
++      colors[agent.name] = agent.color
++    }
++
++    return colors
++  } catch {
++    return {}
++  }
++}
+diff --git a/src/cli/run/event-formatting.ts b/src/cli/run/event-formatting.ts
+index 7d996b26..9954615a 100644
+--- a/src/cli/run/event-formatting.ts
++++ b/src/cli/run/event-formatting.ts
+@@ -4,6 +4,7 @@ import type {
+   EventPayload,
+   MessageUpdatedProps,
+   MessagePartUpdatedProps,
++  MessagePartDeltaProps,
+   ToolExecuteProps,
+   ToolResultProps,
+   SessionErrorProps,
+@@ -93,6 +94,15 @@ export function logEventVerbose(ctx: RunContext, payload: EventPayload): void {
+       break
+     }
+ 
++    case "message.part.delta": {
++      const deltaProps = props as MessagePartDeltaProps | undefined
++      const field = deltaProps?.field ?? "unknown"
++      const delta = deltaProps?.delta ?? ""
++      const preview = delta.slice(0, 80).replace(/\n/g, "\\n")
++      console.error(pc.dim(`${sessionTag} message.part.delta (${field}): "${preview}${delta.length > 80 ? "..." : ""}"`))
++      break
++    }
++
+     case "message.updated": {
+       const msgProps = props as MessageUpdatedProps | undefined
+       const role = msgProps?.info?.role ?? "unknown"
+diff --git a/src/cli/run/event-handlers.ts b/src/cli/run/event-handlers.ts
+index 31e5adb1..5f3e125a 100644
+--- a/src/cli/run/event-handlers.ts
++++ b/src/cli/run/event-handlers.ts
+@@ -7,14 +7,22 @@ import type {
+   SessionErrorProps,
+   MessageUpdatedProps,
+   MessagePartUpdatedProps,
++  MessagePartDeltaProps,
+   ToolExecuteProps,
+   ToolResultProps,
+   TuiToastShowProps,
+ } from "./types"
+ import type { EventState } from "./event-state"
+ import { serializeError } from "./event-formatting"
+-import { formatToolInputPreview } from "./tool-input-preview"
++import { formatToolHeader } from "./tool-input-preview"
+ import { displayChars } from "./display-chars"
++import {
++  closeThinkBlock,
++  openThinkBlock,
++  renderAgentHeader,
++  renderThinkingLine,
++  writePaddedText,
++} from "./output-renderer"
+ 
+ function getSessionId(props?: { sessionID?: string; sessionId?: string }): string | undefined {
+   return props?.sessionID ?? props?.sessionId
+@@ -32,6 +40,18 @@ function getPartSessionId(props?: {
+   return props?.part?.sessionID ?? props?.part?.sessionId
+ }
+ 
++function getPartMessageId(props?: {
++  part?: { messageID?: string }
++}): string | undefined {
++  return props?.part?.messageID
++}
++
++function getDeltaMessageId(props?: {
++  messageID?: string
++}): string | undefined {
++  return props?.messageID
++}
++
+ export function handleSessionIdle(ctx: RunContext, payload: EventPayload, state: EventState): void {
+   if (payload.type !== "session.idle") return
+ 
+@@ -76,16 +96,36 @@ export function handleMessagePartUpdated(ctx: RunContext, payload: EventPayload,
+   const infoSid = getInfoSessionId(props)
+   if ((partSid ?? infoSid) !== ctx.sessionID) return
+ 
+-  const role = props?.info?.role ?? state.currentMessageRole
+-  if (role === "user") return
++  const role = props?.info?.role
++  const mappedRole = getPartMessageId(props)
++    ? state.messageRoleById[getPartMessageId(props) ?? ""]
++    : undefined
++  if ((role ?? mappedRole) === "user") return
+ 
+   const part = props?.part
+   if (!part) return
+ 
++  if (part.id && part.type) {
++    state.partTypesById[part.id] = part.type
++  }
++
++  if (part.type === "reasoning") {
++    ensureThinkBlockOpen(state)
++    const reasoningText = part.text ?? state.lastReasoningText
++    maybePrintThinkingLine(state, reasoningText)
++    state.lastReasoningText = reasoningText
++    state.hasReceivedMeaningfulWork = true
++    return
++  }
++
++  closeThinkBlockIfNeeded(state)
++
+   if (part.type === "text" && part.text) {
+     const newText = part.text.slice(state.lastPartText.length)
+     if (newText) {
+-      process.stdout.write(newText)
++      const padded = writePaddedText(newText, state.textAtLineStart)
++      process.stdout.write(padded.output)
++      state.textAtLineStart = padded.atLineStart
+       state.hasReceivedMeaningfulWork = true
+     }
+     state.lastPartText = part.text
+@@ -96,6 +136,43 @@ export function handleMessagePartUpdated(ctx: RunContext, payload: EventPayload,
+   }
+ }
+ 
++export function handleMessagePartDelta(ctx: RunContext, payload: EventPayload, state: EventState): void {
++  if (payload.type !== "message.part.delta") return
++
++  const props = payload.properties as MessagePartDeltaProps | undefined
++  const sessionID = props?.sessionID ?? props?.sessionId
++  if (sessionID !== ctx.sessionID) return
++
++  const role = getDeltaMessageId(props)
++    ? state.messageRoleById[getDeltaMessageId(props) ?? ""]
++    : undefined
++  if (role === "user") return
++
++  if (props?.field !== "text") return
++
++  const partType = props?.partID ? state.partTypesById[props.partID] : undefined
++
++  const delta = props.delta ?? ""
++  if (!delta) return
++
++  if (partType === "reasoning") {
++    ensureThinkBlockOpen(state)
++    const nextReasoningText = `${state.lastReasoningText}${delta}`
++    maybePrintThinkingLine(state, nextReasoningText)
++    state.lastReasoningText = nextReasoningText
++    state.hasReceivedMeaningfulWork = true
++    return
++  }
++
++  closeThinkBlockIfNeeded(state)
++
++  const padded = writePaddedText(delta, state.textAtLineStart)
++  process.stdout.write(padded.output)
++  state.textAtLineStart = padded.atLineStart
++  state.lastPartText += delta
++  state.hasReceivedMeaningfulWork = true
++}
++
+ function handleToolPart(
+   _ctx: RunContext,
+   part: NonNullable<MessagePartUpdatedProps["part"]>,
+@@ -106,23 +183,23 @@ function handleToolPart(
+ 
+   if (status === "running") {
+     state.currentTool = toolName
+-    const inputPreview = part.state?.input
+-      ? formatToolInputPreview(part.state.input)
+-      : ""
++    const header = formatToolHeader(toolName, part.state?.input ?? {})
++    const suffix = header.description ? ` ${pc.dim(header.description)}` : ""
+     state.hasReceivedMeaningfulWork = true
+-    process.stdout.write(`\n${pc.cyan(">")} ${pc.bold(toolName)}${inputPreview}\n`)
++    process.stdout.write(`\n  ${pc.cyan(header.icon)} ${pc.bold(header.title)}${suffix}  \n`)
+   }
+ 
+   if (status === "completed" || status === "error") {
+     const output = part.state?.output || ""
+-    const maxLen = 200
+-    const preview = output.length > maxLen ? output.slice(0, maxLen) + "..." : output
+-    if (preview.trim()) {
+-      const lines = preview.split("\n").slice(0, 3)
+-      process.stdout.write(pc.dim(`${displayChars.treeIndent}${displayChars.treeEnd} ${lines.join(`\n${displayChars.treeJoin}`)}\n`))
++    if (output.trim()) {
++      process.stdout.write(pc.dim(`  ${displayChars.treeEnd} output  \n`))
++      const padded = writePaddedText(output, true)
++      process.stdout.write(pc.dim(padded.output + (padded.atLineStart ? "" : "  ")))
++      process.stdout.write("\n")
+     }
+     state.currentTool = null
+     state.lastPartText = ""
++    state.textAtLineStart = true
+   }
+ }
+ 
+@@ -133,43 +210,50 @@ export function handleMessageUpdated(ctx: RunContext, payload: EventPayload, sta
+   if (getInfoSessionId(props) !== ctx.sessionID) return
+ 
+   state.currentMessageRole = props?.info?.role ?? null
++
++  const messageID = props?.info?.id
++  const role = props?.info?.role
++  if (messageID && role) {
++    state.messageRoleById[messageID] = role
++  }
++
+   if (props?.info?.role !== "assistant") return
+ 
+   state.hasReceivedMeaningfulWork = true
+   state.messageCount++
+   state.lastPartText = ""
++  state.lastReasoningText = ""
++  state.hasPrintedThinkingLine = false
++  state.lastThinkingSummary = ""
++  state.textAtLineStart = true
++  closeThinkBlockIfNeeded(state)
+ 
+   const agent = props?.info?.agent ?? null
+   const model = props?.info?.modelID ?? null
+-  if (agent !== state.currentAgent || model !== state.currentModel) {
++  const variant = props?.info?.variant ?? null
++  if (agent !== state.currentAgent || model !== state.currentModel || variant !== state.currentVariant) {
+     state.currentAgent = agent
+     state.currentModel = model
+-    printAgentHeader(agent, model)
++    state.currentVariant = variant
++    renderAgentHeader(agent, model, variant, state.agentColorsByName)
+   }
+ }
+ 
+-function printAgentHeader(agent: string | null, model: string | null): void {
+-  if (!agent && !model) return
+-  const agentLabel = agent ? pc.bold(pc.magenta(agent)) : ""
+-  const modelLabel = model ? pc.dim(model) : ""
+-  const separator = agent && model ? " " : ""
+-  process.stdout.write(`\n${agentLabel}${separator}${modelLabel}\n`)
+-}
+-
+ export function handleToolExecute(ctx: RunContext, payload: EventPayload, state: EventState): void {
+   if (payload.type !== "tool.execute") return
+ 
+   const props = payload.properties as ToolExecuteProps | undefined
+   if (getSessionId(props) !== ctx.sessionID) return
+ 
++  closeThinkBlockIfNeeded(state)
++
+   const toolName = props?.name || "unknown"
+   state.currentTool = toolName
+-  const inputPreview = props?.input
+-    ? formatToolInputPreview(props.input)
+-    : ""
++  const header = formatToolHeader(toolName, props?.input ?? {})
++  const suffix = header.description ? ` ${pc.dim(header.description)}` : ""
+ 
+   state.hasReceivedMeaningfulWork = true
+-  process.stdout.write(`\n${pc.cyan(">")} ${pc.bold(toolName)}${inputPreview}\n`)
++  process.stdout.write(`\n  ${pc.cyan(header.icon)} ${pc.bold(header.title)}${suffix}  \n`)
+ }
+ 
+ export function handleToolResult(ctx: RunContext, payload: EventPayload, state: EventState): void {
+@@ -178,17 +262,19 @@ export function handleToolResult(ctx: RunContext, payload: EventPayload, state:
+   const props = payload.properties as ToolResultProps | undefined
+   if (getSessionId(props) !== ctx.sessionID) return
+ 
+-  const output = props?.output || ""
+-  const maxLen = 200
+-  const preview = output.length > maxLen ? output.slice(0, maxLen) + "..." : output
++  closeThinkBlockIfNeeded(state)
+ 
+-  if (preview.trim()) {
+-    const lines = preview.split("\n").slice(0, 3)
+-    process.stdout.write(pc.dim(`${displayChars.treeIndent}${displayChars.treeEnd} ${lines.join(`\n${displayChars.treeJoin}`)}\n`))
++  const output = props?.output || ""
++  if (output.trim()) {
++    process.stdout.write(pc.dim(`  ${displayChars.treeEnd} output  \n`))
++    const padded = writePaddedText(output, true)
++    process.stdout.write(pc.dim(padded.output + (padded.atLineStart ? "" : "  ")))
++    process.stdout.write("\n")
+   }
+ 
+   state.currentTool = null
+   state.lastPartText = ""
++  state.textAtLineStart = true
+ }
+ 
+ export function handleTuiToast(_ctx: RunContext, payload: EventPayload, state: EventState): void {
+@@ -206,3 +292,33 @@ export function handleTuiToast(_ctx: RunContext, payload: EventPayload, state: E
+     }
+   }
+ }
++
++function ensureThinkBlockOpen(state: EventState): void {
++  if (state.inThinkBlock) return
++  openThinkBlock()
++  state.inThinkBlock = true
++  state.hasPrintedThinkingLine = false
++}
++
++function closeThinkBlockIfNeeded(state: EventState): void {
++  if (!state.inThinkBlock) return
++  closeThinkBlock()
++  state.inThinkBlock = false
++  state.lastThinkingLineWidth = 0
++  state.lastThinkingSummary = ""
++}
++
++function maybePrintThinkingLine(state: EventState, text: string): void {
++  const normalized = text.replace(/\s+/g, " ").trim()
++  if (!normalized) return
++
++  const summary = normalized
++  if (summary === state.lastThinkingSummary) return
++
++  state.lastThinkingLineWidth = renderThinkingLine(
++    summary,
++    state.lastThinkingLineWidth,
++  )
++  state.lastThinkingSummary = summary
++  state.hasPrintedThinkingLine = true
++}
+diff --git a/src/cli/run/event-state.ts b/src/cli/run/event-state.ts
+index d393bc85..a4980241 100644
+--- a/src/cli/run/event-state.ts
++++ b/src/cli/run/event-state.ts
+@@ -13,8 +13,28 @@ export interface EventState {
+   currentAgent: string | null
+   /** Current model ID from the latest assistant message */
+   currentModel: string | null
++  /** Current model variant from the latest assistant message */
++  currentVariant: string | null
+   /** Current message role (user/assistant) — used to filter user messages from display */
+   currentMessageRole: string | null
++  /** Agent profile colors keyed by display name */
++  agentColorsByName: Record<string, string>
++  /** Part type registry keyed by partID (text, reasoning, tool, ...) */
++  partTypesById: Record<string, string>
++  /** Whether a THINK block is currently open in output */
++  inThinkBlock: boolean
++  /** Tracks streamed reasoning text to avoid duplicates */
++  lastReasoningText: string
++  /** Whether compact thinking line already printed for current reasoning block */
++  hasPrintedThinkingLine: boolean
++  /** Last rendered thinking line width (for in-place padding updates) */
++  lastThinkingLineWidth: number
++  /** Message role lookup by message ID to filter user parts */
++  messageRoleById: Record<string, string>
++  /** Last rendered thinking summary (to avoid duplicate re-render) */
++  lastThinkingSummary: string
++  /** Whether text stream is currently at line start (for padding) */
++  textAtLineStart: boolean
+ }
+ 
+ export function createEventState(): EventState {
+@@ -29,6 +49,16 @@ export function createEventState(): EventState {
+     messageCount: 0,
+     currentAgent: null,
+     currentModel: null,
++    currentVariant: null,
+     currentMessageRole: null,
++    agentColorsByName: {},
++    partTypesById: {},
++    inThinkBlock: false,
++    lastReasoningText: "",
++    hasPrintedThinkingLine: false,
++    lastThinkingLineWidth: 0,
++    messageRoleById: {},
++    lastThinkingSummary: "",
++    textAtLineStart: true,
+   }
+ }
+diff --git a/src/cli/run/event-stream-processor.ts b/src/cli/run/event-stream-processor.ts
+index 04ba252b..c5e600e9 100644
+--- a/src/cli/run/event-stream-processor.ts
++++ b/src/cli/run/event-stream-processor.ts
+@@ -7,6 +7,7 @@ import {
+   handleSessionIdle,
+   handleSessionStatus,
+   handleMessagePartUpdated,
++  handleMessagePartDelta,
+   handleMessageUpdated,
+   handleToolExecute,
+   handleToolResult,
+@@ -38,6 +39,7 @@ export async function processEvents(
+       handleSessionIdle(ctx, payload, state)
+       handleSessionStatus(ctx, payload, state)
+       handleMessagePartUpdated(ctx, payload, state)
++      handleMessagePartDelta(ctx, payload, state)
+       handleMessageUpdated(ctx, payload, state)
+       handleToolExecute(ctx, payload, state)
+       handleToolResult(ctx, payload, state)
+diff --git a/src/cli/run/message-part-delta.test.ts b/src/cli/run/message-part-delta.test.ts
+new file mode 100644
+index 00000000..7403a488
+--- /dev/null
++++ b/src/cli/run/message-part-delta.test.ts
+@@ -0,0 +1,466 @@
++import { describe, expect, it, spyOn } from "bun:test"
++import type { EventPayload, RunContext } from "./types"
++import { createEventState } from "./events"
++import { processEvents } from "./event-stream-processor"
++
++const createMockContext = (sessionID: string = "test-session"): RunContext => ({
++  client: {} as RunContext["client"],
++  sessionID,
++  directory: "/test",
++  abortController: new AbortController(),
++})
++
++async function* toAsyncIterable<T>(items: T[]): AsyncIterable<T> {
++  for (const item of items) {
++    yield item
++  }
++}
++
++describe("message.part.delta handling", () => {
++  it("prints streaming text incrementally from delta events", async () => {
++    //#given
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const events: EventPayload[] = [
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          field: "text",
++          delta: "Hello",
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          field: "text",
++          delta: " world",
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++    expect(state.lastPartText).toBe("Hello world")
++    expect(stdoutSpy).toHaveBeenCalledTimes(2)
++    stdoutSpy.mockRestore()
++  })
++
++  it("does not suppress assistant tool/text parts when state role is stale user", () => {
++    //#given
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    state.currentMessageRole = "user"
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const payload: EventPayload = {
++      type: "message.part.updated",
++      properties: {
++        part: {
++          sessionID: "ses_main",
++          type: "tool",
++          tool: "task_create",
++          state: { status: "running" },
++        },
++      },
++    }
++
++    //#when
++    const { handleMessagePartUpdated } = require("./event-handlers") as {
++      handleMessagePartUpdated: (ctx: RunContext, payload: EventPayload, state: ReturnType<typeof createEventState>) => void
++    }
++    handleMessagePartUpdated(ctx, payload, state)
++
++    //#then
++    expect(state.currentTool).toBe("task_create")
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++    stdoutSpy.mockRestore()
++  })
++
++  it("renders agent header using profile hex color when available", () => {
++    //#given
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    state.agentColorsByName["Sisyphus (Ultraworker)"] = "#00CED1"
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const payload: EventPayload = {
++      type: "message.updated",
++      properties: {
++        info: {
++          sessionID: "ses_main",
++          role: "assistant",
++          agent: "Sisyphus (Ultraworker)",
++          modelID: "claude-opus-4-6",
++          variant: "max",
++        },
++      },
++    }
++
++    //#when
++    const { handleMessageUpdated } = require("./event-handlers") as {
++      handleMessageUpdated: (ctx: RunContext, payload: EventPayload, state: ReturnType<typeof createEventState>) => void
++    }
++    handleMessageUpdated(ctx, payload, state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    expect(rendered).toContain("\u001b[38;2;0;206;209m")
++    expect(rendered).toContain("claude-opus-4-6 (max)")
++    expect(rendered).toContain("└─")
++    expect(rendered).toContain("Sisyphus (Ultraworker)")
++    stdoutSpy.mockRestore()
++  })
++
++  it("separates think block output from normal response output", async () => {
++    //#given
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const events: EventPayload[] = [
++      {
++        type: "message.updated",
++        properties: {
++          info: { sessionID: "ses_main", role: "assistant", agent: "Sisyphus (Ultraworker)", modelID: "claude-opus-4-6" },
++        },
++      },
++      {
++        type: "message.part.updated",
++        properties: {
++          part: { id: "think-1", sessionID: "ses_main", type: "reasoning", text: "" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          partID: "think-1",
++          field: "text",
++          delta: "Composing final summary in Korean with clear concise structure",
++        },
++      },
++      {
++        type: "message.part.updated",
++        properties: {
++          part: { id: "text-1", sessionID: "ses_main", type: "text", text: "" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          partID: "text-1",
++          field: "text",
++          delta: "answer",
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    expect(rendered).toContain("┃  Thinking: Composing final summary in Korean")
++    expect(rendered).toContain("answer")
++    stdoutSpy.mockRestore()
++  })
++
++  it("updates thinking line incrementally on delta updates", async () => {
++    //#given
++    const previous = process.env.GITHUB_ACTIONS
++    delete process.env.GITHUB_ACTIONS
++
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const events: EventPayload[] = [
++      {
++        type: "message.updated",
++        properties: {
++          info: { sessionID: "ses_main", role: "assistant", agent: "Sisyphus (Ultraworker)", modelID: "claude-opus-4-6" },
++        },
++      },
++      {
++        type: "message.part.updated",
++        properties: {
++          part: { id: "think-1", sessionID: "ses_main", type: "reasoning", text: "" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          partID: "think-1",
++          field: "text",
++          delta: "Composing final summary",
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          partID: "think-1",
++          field: "text",
++          delta: " in Korean with specifics.",
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    expect(rendered).toContain("\r")
++    expect(rendered).toContain("Thinking: Composing final summary")
++    expect(rendered).toContain("in Korean with specifics.")
++
++    if (previous !== undefined) process.env.GITHUB_ACTIONS = previous
++    stdoutSpy.mockRestore()
++  })
++
++  it("does not re-render identical thinking summary repeatedly", async () => {
++    //#given
++    const previous = process.env.GITHUB_ACTIONS
++    delete process.env.GITHUB_ACTIONS
++
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const events: EventPayload[] = [
++      {
++        type: "message.updated",
++        properties: {
++          info: { id: "msg_assistant", sessionID: "ses_main", role: "assistant", agent: "Sisyphus (Ultraworker)", modelID: "claude-opus-4-6" },
++        },
++      },
++      {
++        type: "message.part.updated",
++        properties: {
++          part: { id: "think-1", messageID: "msg_assistant", sessionID: "ses_main", type: "reasoning", text: "" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          messageID: "msg_assistant",
++          partID: "think-1",
++          field: "text",
++          delta: "The user wants me",
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          messageID: "msg_assistant",
++          partID: "think-1",
++          field: "text",
++          delta: " to",
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          messageID: "msg_assistant",
++          partID: "think-1",
++          field: "text",
++          delta: " ",
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    const renderCount = rendered.split("Thinking:").length - 1
++    expect(renderCount).toBe(2)
++
++    if (previous !== undefined) process.env.GITHUB_ACTIONS = previous
++    stdoutSpy.mockRestore()
++  })
++
++  it("does not truncate thinking content", async () => {
++    //#given
++    const previous = process.env.GITHUB_ACTIONS
++    delete process.env.GITHUB_ACTIONS
++
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const longThinking = "This is a very long thinking stream that should never be truncated and must include final tail marker END-OF-THINKING-MARKER"
++    const events: EventPayload[] = [
++      {
++        type: "message.updated",
++        properties: {
++          info: { id: "msg_assistant", sessionID: "ses_main", role: "assistant", agent: "Sisyphus (Ultraworker)", modelID: "claude-opus-4-6" },
++        },
++      },
++      {
++        type: "message.part.updated",
++        properties: {
++          part: { id: "think-1", messageID: "msg_assistant", sessionID: "ses_main", type: "reasoning", text: "" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          messageID: "msg_assistant",
++          partID: "think-1",
++          field: "text",
++          delta: longThinking,
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    expect(rendered).toContain("END-OF-THINKING-MARKER")
++
++    if (previous !== undefined) process.env.GITHUB_ACTIONS = previous
++    stdoutSpy.mockRestore()
++  })
++
++  it("applies left and right padding to assistant text output", async () => {
++    //#given
++    const previous = process.env.GITHUB_ACTIONS
++    delete process.env.GITHUB_ACTIONS
++
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const events: EventPayload[] = [
++      {
++        type: "message.updated",
++        properties: {
++          info: { id: "msg_assistant", sessionID: "ses_main", role: "assistant", agent: "Sisyphus (Ultraworker)", modelID: "claude-opus-4-6", variant: "max" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          messageID: "msg_assistant",
++          partID: "part_assistant_text",
++          field: "text",
++          delta: "hello\nworld",
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    expect(rendered).toContain("  hello  \n  world")
++
++    if (previous !== undefined) process.env.GITHUB_ACTIONS = previous
++    stdoutSpy.mockRestore()
++  })
++
++  it("does not render user message parts in output stream", async () => {
++    //#given
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const events: EventPayload[] = [
++      {
++        type: "message.updated",
++        properties: {
++          info: { id: "msg_user", sessionID: "ses_main", role: "user", agent: "Sisyphus (Ultraworker)", modelID: "claude-opus-4-6" },
++        },
++      },
++      {
++        type: "message.part.updated",
++        properties: {
++          part: { id: "part_user_text", messageID: "msg_user", sessionID: "ses_main", type: "text", text: "[search-mode] should not print" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          messageID: "msg_user",
++          partID: "part_user_text",
++          field: "text",
++          delta: "still should not print",
++        },
++      },
++      {
++        type: "message.updated",
++        properties: {
++          info: { id: "msg_assistant", sessionID: "ses_main", role: "assistant", agent: "Sisyphus (Ultraworker)", modelID: "claude-opus-4-6" },
++        },
++      },
++      {
++        type: "message.part.delta",
++        properties: {
++          sessionID: "ses_main",
++          messageID: "msg_assistant",
++          partID: "part_assistant_text",
++          field: "text",
++          delta: "assistant output",
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    expect(rendered.includes("[search-mode] should not print")).toBe(false)
++    expect(rendered.includes("still should not print")).toBe(false)
++    expect(rendered).toContain("assistant output")
++    stdoutSpy.mockRestore()
++  })
++
++  it("renders tool header and full tool output without truncation", async () => {
++    //#given
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++    const longTail = "END-OF-TOOL-OUTPUT-MARKER"
++    const events: EventPayload[] = [
++      {
++        type: "tool.execute",
++        properties: {
++          sessionID: "ses_main",
++          name: "read",
++          input: { filePath: "src/index.ts", offset: 1, limit: 200 },
++        },
++      },
++      {
++        type: "tool.result",
++        properties: {
++          sessionID: "ses_main",
++          name: "read",
++          output: `line1\nline2\n${longTail}`,
++        },
++      },
++    ]
++
++    //#when
++    await processEvents(ctx, toAsyncIterable(events), state)
++
++    //#then
++    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
++    expect(rendered).toContain("→")
++    expect(rendered).toContain("Read src/index.ts")
++    expect(rendered).toContain("END-OF-TOOL-OUTPUT-MARKER")
++    stdoutSpy.mockRestore()
++  })
++})
+diff --git a/src/cli/run/output-renderer.ts b/src/cli/run/output-renderer.ts
+new file mode 100644
+index 00000000..57e6de9c
+--- /dev/null
++++ b/src/cli/run/output-renderer.ts
+@@ -0,0 +1,104 @@
++import pc from "picocolors"
++
++export function renderAgentHeader(
++  agent: string | null,
++  model: string | null,
++  variant: string | null,
++  agentColorsByName: Record<string, string>,
++): void {
++  if (!agent && !model) return
++
++  const agentLabel = agent
++    ? pc.bold(colorizeWithProfileColor(agent, agentColorsByName[agent]))
++    : ""
++  const modelBase = model ?? ""
++  const variantSuffix = variant ? ` (${variant})` : ""
++  const modelLabel = model ? pc.dim(`${modelBase}${variantSuffix}`) : ""
++
++  if (modelLabel) {
++    process.stdout.write(`  ${modelLabel}  \n`)
++  }
++
++  if (agentLabel) {
++    process.stdout.write(`  ${pc.dim("└─")} ${agentLabel}  \n`)
++  }
++}
++
++export function openThinkBlock(): void {
++  return
++}
++
++export function closeThinkBlock(): void {
++  process.stdout.write("\n")
++}
++
++export function renderThinkingLine(
++  summary: string,
++  previousWidth: number,
++): number {
++  const line = `  ┃  Thinking: ${summary}  `
++  const isGitHubActions = process.env.GITHUB_ACTIONS === "true"
++
++  if (isGitHubActions) {
++    process.stdout.write(`${pc.dim(line)}\n`)
++    return line.length
++  }
++
++  const minPadding = 6
++  const clearPadding = Math.max(previousWidth - line.length + minPadding, minPadding)
++  process.stdout.write(`\r${pc.dim(line)}${" ".repeat(clearPadding)}`)
++  return line.length
++}
++
++export function writePaddedText(
++  text: string,
++  atLineStart: boolean,
++): { output: string; atLineStart: boolean } {
++  const isGitHubActions = process.env.GITHUB_ACTIONS === "true"
++  if (isGitHubActions) {
++    return { output: text, atLineStart: text.endsWith("\n") }
++  }
++
++  let output = ""
++  let lineStart = atLineStart
++
++  for (let i = 0; i < text.length; i++) {
++    const ch = text[i]
++    if (lineStart) {
++      output += "  "
++      lineStart = false
++    }
++
++    if (ch === "\n") {
++      output += "  \n"
++      lineStart = true
++      continue
++    }
++
++    output += ch
++  }
++
++  return { output, atLineStart: lineStart }
++}
++
++function colorizeWithProfileColor(text: string, hexColor?: string): string {
++  if (!hexColor) return pc.magenta(text)
++
++  const rgb = parseHexColor(hexColor)
++  if (!rgb) return pc.magenta(text)
++
++  const [r, g, b] = rgb
++  return `\u001b[38;2;${r};${g};${b}m${text}\u001b[39m`
++}
++
++function parseHexColor(hexColor: string): [number, number, number] | null {
++  const cleaned = hexColor.trim()
++  const match = cleaned.match(/^#?([A-Fa-f0-9]{6})$/)
++  if (!match) return null
++
++  const hex = match[1]
++  const r = Number.parseInt(hex.slice(0, 2), 16)
++  const g = Number.parseInt(hex.slice(2, 4), 16)
++  const b = Number.parseInt(hex.slice(4, 6), 16)
++  return [r, g, b]
++}
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index b177963c..0da683de 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -8,6 +8,7 @@ import { createJsonOutputManager } from "./json-output"
+ import { executeOnCompleteHook } from "./on-complete-hook"
+ import { resolveRunAgent } from "./agent-resolver"
+ import { pollForCompletion } from "./poll-for-completion"
++import { loadAgentProfileColors } from "./agent-profile-colors"
+ 
+ export { resolveRunAgent }
+ 
+@@ -76,11 +77,11 @@ export async function run(options: RunOptions): Promise<number> {
+       }
+       const events = await client.event.subscribe({ query: { directory } })
+       const eventState = createEventState()
++      eventState.agentColorsByName = await loadAgentProfileColors(client)
+       const eventProcessor = processEvents(ctx, events.stream, eventState).catch(
+         () => {},
+       )
+ 
+-      console.log(pc.dim("\nSending prompt..."))
+       await client.session.promptAsync({
+         path: { id: sessionID },
+         body: {
+@@ -89,8 +90,6 @@ export async function run(options: RunOptions): Promise<number> {
+         },
+         query: { directory },
+       })
+-
+-      console.log(pc.dim("Waiting for completion...\n"))
+       const exitCode = await pollForCompletion(ctx, eventState, abortController)
+ 
+       // Abort the event stream to stop the processor
+diff --git a/src/cli/run/tool-input-preview.ts b/src/cli/run/tool-input-preview.ts
+index b165b9e1..cd9e2d07 100644
+--- a/src/cli/run/tool-input-preview.ts
++++ b/src/cli/run/tool-input-preview.ts
+@@ -1,38 +1,144 @@
+-import pc from "picocolors"
+-
+-const SINGLE_VALUE_FIELDS = ["command", "filePath"] as const
+-
+-const MULTI_VALUE_FIELDS = [
+-  "description",
+-  "pattern",
+-  "query",
+-  "url",
+-  "category",
+-  "subagent_type",
+-  "lang",
+-  "run_in_background",
+-] as const
+-
+-export function formatToolInputPreview(input: Record<string, unknown>): string {
+-  for (const key of SINGLE_VALUE_FIELDS) {
+-    if (!input[key]) continue
+-    const maxLen = key === "command" ? 80 : 120
+-    return ` ${pc.dim(String(input[key]).slice(0, maxLen))}`
+-  }
+-
+-  const parts: string[] = []
+-  let totalLen = 0
+-
+-  for (const key of MULTI_VALUE_FIELDS) {
+-    const val = input[key]
+-    if (val === undefined || val === null) continue
+-    const str = String(val)
+-    const truncated = str.length > 50 ? str.slice(0, 47) + "..." : str
+-    const entry = `${key}=${truncated}`
+-    if (totalLen + entry.length > 120) break
+-    parts.push(entry)
+-    totalLen += entry.length + 1
+-  }
+-
+-  return parts.length > 0 ? ` ${pc.dim(parts.join(" "))}` : ""
++export interface ToolHeader {
++  icon: string
++  title: string
++  description?: string
++}
++
++export function formatToolHeader(toolName: string, input: Record<string, unknown>): ToolHeader {
++  if (toolName === "glob") {
++    const pattern = str(input.pattern)
++    const root = str(input.path)
++    return {
++      icon: "✱",
++      title: pattern ? `Glob "${pattern}"` : "Glob",
++      description: root ? `in ${root}` : undefined,
++    }
++  }
++
++  if (toolName === "grep") {
++    const pattern = str(input.pattern)
++    const root = str(input.path)
++    return {
++      icon: "✱",
++      title: pattern ? `Grep "${pattern}"` : "Grep",
++      description: root ? `in ${root}` : undefined,
++    }
++  }
++
++  if (toolName === "list") {
++    const path = str(input.path)
++    return {
++      icon: "→",
++      title: path ? `List ${path}` : "List",
++    }
++  }
++
++  if (toolName === "read") {
++    const filePath = str(input.filePath)
++    return {
++      icon: "→",
++      title: filePath ? `Read ${filePath}` : "Read",
++      description: formatKeyValues(input, ["filePath"]),
++    }
++  }
++
++  if (toolName === "write") {
++    const filePath = str(input.filePath)
++    return {
++      icon: "←",
++      title: filePath ? `Write ${filePath}` : "Write",
++    }
++  }
++
++  if (toolName === "edit") {
++    const filePath = str(input.filePath)
++    return {
++      icon: "←",
++      title: filePath ? `Edit ${filePath}` : "Edit",
++      description: formatKeyValues(input, ["filePath", "oldString", "newString"]),
++    }
++  }
++
++  if (toolName === "webfetch") {
++    const url = str(input.url)
++    return {
++      icon: "%",
++      title: url ? `WebFetch ${url}` : "WebFetch",
++      description: formatKeyValues(input, ["url"]),
++    }
++  }
++
++  if (toolName === "websearch_web_search_exa") {
++    const query = str(input.query)
++    return {
++      icon: "◈",
++      title: query ? `Web Search "${query}"` : "Web Search",
++    }
++  }
++
++  if (toolName === "grep_app_searchGitHub") {
++    const query = str(input.query)
++    return {
++      icon: "◇",
++      title: query ? `Code Search "${query}"` : "Code Search",
++    }
++  }
++
++  if (toolName === "task") {
++    const desc = str(input.description)
++    const subagent = str(input.subagent_type)
++    return {
++      icon: "#",
++      title: desc || (subagent ? `${subagent} Task` : "Task"),
++      description: subagent ? `agent=${subagent}` : undefined,
++    }
++  }
++
++  if (toolName === "bash") {
++    const command = str(input.command)
++    return {
++      icon: "$",
++      title: command || "bash",
++      description: formatKeyValues(input, ["command"]),
++    }
++  }
++
++  if (toolName === "skill") {
++    const name = str(input.name)
++    return {
++      icon: "→",
++      title: name ? `Skill "${name}"` : "Skill",
++    }
++  }
++
++  if (toolName === "todowrite") {
++    return {
++      icon: "#",
++      title: "Todos",
++    }
++  }
++
++  return {
++    icon: "⚙",
++    title: toolName,
++    description: formatKeyValues(input, []),
++  }
++}
++
++function formatKeyValues(input: Record<string, unknown>, exclude: string[]): string | undefined {
++  const entries = Object.entries(input).filter(([key, value]) => {
++    if (exclude.includes(key)) return false
++    return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
++  })
++  if (!entries.length) return undefined
++
++  return entries
++    .map(([key, value]) => `${key}=${String(value)}`)
++    .join(" ")
++}
++
++function str(value: unknown): string | undefined {
++  if (typeof value !== "string") return undefined
++  const trimmed = value.trim()
++  return trimmed.length ? trimmed : undefined
+ }
+diff --git a/src/cli/run/types.ts b/src/cli/run/types.ts
+index b804644c..fb0082cb 100644
+--- a/src/cli/run/types.ts
++++ b/src/cli/run/types.ts
+@@ -67,12 +67,14 @@ export interface SessionStatusProps {
+ 
+ export interface MessageUpdatedProps {
+   info?: {
++    id?: string
+     sessionID?: string
+     sessionId?: string
+     role?: string
+     modelID?: string
+     providerID?: string
+     agent?: string
++    variant?: string
+   }
+ }
+ 
+@@ -96,6 +98,15 @@ export interface MessagePartUpdatedProps {
+   }
+ }
+ 
++export interface MessagePartDeltaProps {
++  sessionID?: string
++  sessionId?: string
++  messageID?: string
++  partID?: string
++  field?: string
++  delta?: string
++}
++
+ export interface ToolExecuteProps {
+   sessionID?: string
+   sessionId?: string
+-- 
+2.39.2
+

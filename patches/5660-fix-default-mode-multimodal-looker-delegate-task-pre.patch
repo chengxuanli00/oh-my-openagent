@@ -1,0 +1,537 @@
+From 11c3da752cd84141dd34c5bcb7a5442610635a20 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code-yeongyu@noreply.github.com>
+Date: Fri, 22 May 2026 00:06:56 +0900
+Subject: [PATCH 5660/5749] fix(default-mode,multimodal-looker,delegate-task):
+ preserve user-expected behavior
+
+default-mode (system-transform):
+- e5463e2db introduced auto-activation of ultrawork+ralph-loop, and
+  dc2e082ac then skipped the ultrawork system prompt whenever ralph_loop
+  was also enabled. Net effect: the keyword-detector still showed
+  'Default ultrawork mode enabled' to the user, but the first turn had
+  none of the ultrawork behavior. Loop continuation kept the ultrawork
+  prefix, so the contract was honored only on later iterations.
+- Drop the skip so the initial turn matches what the toast advertises.
+  New matrix test pins all four (ultrawork, ralph_loop) combinations.
+
+multimodal-looker:
+- Prompt claimed 'read' and 'call_omo_agent' were available, but the
+  look_at invocation runtime explicitly disables both via READ_ENABLED
+  and createAgentToolAllowlist([]). Small VL models trusted the prompt
+  and looped on rejected tool calls (#4116).
+- Rewrite the agent prompt to describe direct-attachment analysis and
+  forbid tool/agent calls. Add a consistency test that extracts the
+  prompt's 'available tools' claim and compares it against the
+  configured allowlist.
+
+delegate-task (skill-resolver):
+- 088693697 filtered per-agent restricted skills at the skill tool and
+  builtin agent prompt layers, but delegate-task itself happily injected
+  whatever skill name a caller passed. A target agent could be force-fed
+  a skill marked agent: oracle just by listing it in load_skills.
+- Thread the target agent through resolveSkills and silently filter
+  skills whose definition.agent does not include it. Public skills with
+  no restriction are unaffected. Regression test pins the bypass.
+---
+ src/agents/multimodal-looker.test.ts          |  56 ++++-
+ src/agents/multimodal-looker.ts               |  14 +-
+ src/plugin/default-mode-priority.test.ts      | 231 ++++++++++++++++++
+ src/plugin/system-transform.ts                |   7 -
+ .../delegate-task/skill-resolver.test.ts      |  29 +++
+ src/tools/delegate-task/skill-resolver.ts     |  32 ++-
+ src/tools/delegate-task/tools.ts              |   1 +
+ 7 files changed, 352 insertions(+), 18 deletions(-)
+ create mode 100644 src/plugin/default-mode-priority.test.ts
+
+diff --git a/src/agents/multimodal-looker.test.ts b/src/agents/multimodal-looker.test.ts
+index f2f28264..b4af4faf 100644
+--- a/src/agents/multimodal-looker.test.ts
++++ b/src/agents/multimodal-looker.test.ts
+@@ -1,17 +1,67 @@
+ import { describe, test, expect } from "bun:test"
++import { createAgentToolAllowlist } from "../shared/permission-compat"
++import { READ_ENABLED } from "../tools/look-at/look-at-prompt"
+ import { createMultimodalLookerAgent } from "./multimodal-looker"
+ 
++function extractAvailableToolClaims(prompt: string): readonly string[] {
++  const availableToolsLine = prompt
++    .split("\n")
++    .find((line) => line.toLowerCase().includes("available tools"))
++  if (availableToolsLine === undefined) {
++    return []
++  }
++
++  const tools: string[] = []
++  for (const match of availableToolsLine.matchAll(/['`]([^'`]+)['`]/g)) {
++    const toolName = match[1]
++    if (toolName !== undefined) {
++      tools.push(toolName)
++    }
++  }
++
++  return [...new Set(tools)].sort()
++}
++
++function allowedToolNames(
++  toolAllowlist: ReturnType<typeof createAgentToolAllowlist>
++): readonly string[] {
++  return Object.entries(toolAllowlist.permission)
++    .filter(([toolName, permission]) => toolName !== "*" && permission === "allow")
++    .map(([toolName]) => toolName)
++    .sort()
++}
++
++function createLookAtRuntimeToolAllowlist(): ReturnType<typeof createAgentToolAllowlist> {
++  return createAgentToolAllowlist(READ_ENABLED ? ["read"] : [])
++}
++
+ describe("createMultimodalLookerAgent", () => {
+-  test("prompt explicitly enumerates the agent's available tools to prevent death loop on small VL models", () => {
++  test("prompt available tool claims match the look_at runtime allowlist", () => {
++    // given
++    const agent = createMultimodalLookerAgent("openai/gpt-5-nano")
++    const runtimeToolAllowlist = createLookAtRuntimeToolAllowlist()
++
++    // when
++    const prompt = typeof agent.prompt === "string" ? agent.prompt : ""
++    const promptToolClaims = extractAvailableToolClaims(prompt)
++    const runtimeToolNames = allowedToolNames(runtimeToolAllowlist)
++
++    // then
++    expect(promptToolClaims).toEqual(runtimeToolNames)
++  })
++
++  test("prompt denies tool use to prevent death loop on small VL models", () => {
+     // given
+     const agent = createMultimodalLookerAgent("openai/gpt-5-nano")
+ 
+     // when
+     const prompt = typeof agent.prompt === "string" ? agent.prompt : ""
++    const normalizedPrompt = prompt.toLowerCase()
+ 
+     // then
+-    expect(prompt).toMatch(/available tools/i)
+-    expect(prompt).toContain("read")
++    expect(normalizedPrompt).toContain("never")
++    expect(normalizedPrompt).toContain("tools")
++    expect(extractAvailableToolClaims(prompt)).toEqual([])
+   })
+ 
+   test("prompt instructs the agent never to call other tools", () => {
+diff --git a/src/agents/multimodal-looker.ts b/src/agents/multimodal-looker.ts
+index 2a4b8043..557f89d9 100644
+--- a/src/agents/multimodal-looker.ts
++++ b/src/agents/multimodal-looker.ts
+@@ -23,28 +23,28 @@ export function createMultimodalLookerAgent(model: string): AgentConfig {
+     ...restrictions,
+     prompt: `You interpret media files that cannot be read as plain text.
+ 
+-Your only available tools are 'read' and 'call_omo_agent'. Always use 'read' to load the file first, then analyze the returned content. Never attempt to call any other tool.
++During look_at invocations, the file or image is already attached to the message. Analyze the attachment directly. Never call tools, never spawn other agents, and never try to load the file by path.
+ 
+ Your job: examine the attached file and extract ONLY what was requested.
+ 
+ When to use you:
+-- Media files the Read tool cannot interpret
++- Media files that need visual or document interpretation
+ - Extracting specific information or summaries from documents
+ - Describing visual content in images or diagrams
+ - When analyzed/extracted data is needed, not raw file contents
+ 
+ When NOT to use you:
+-- Source code or plain text files needing exact contents (use Read)
+-- Files that need editing afterward (need literal content from Read)
++- Source code or plain text files needing exact contents
++- Files that need editing afterward
+ - Simple file reading where no interpretation is needed
+ 
+ How you work:
+-1. Receive a file path and a goal describing what to extract
+-2. Read and analyze the file deeply
++1. Receive an attached file or image and a goal describing what to extract
++2. Analyze the attachment deeply
+ 3. Return ONLY the relevant extracted information
+ 4. The main agent never processes the raw file - you save context tokens
+ 
+-For PDFs and documents: Use the Read tool to load the file content first, then extract text, structure, tables, data from specific sections
++For PDFs and documents: extract text, structure, tables, and data from specific sections
+ For images: describe layouts, UI elements, text, diagrams, charts
+ For diagrams: explain relationships, flows, architecture depicted
+ 
+diff --git a/src/plugin/default-mode-priority.test.ts b/src/plugin/default-mode-priority.test.ts
+new file mode 100644
+index 00000000..f7d8766b
+--- /dev/null
++++ b/src/plugin/default-mode-priority.test.ts
+@@ -0,0 +1,231 @@
++import { afterEach, beforeEach, describe, expect, test } from "bun:test"
++import type { OhMyOpenCodeConfig } from "../config"
++import type { DefaultModeConfig } from "../config/schema/default-mode"
++import type { CreatedHooks } from "../create-hooks"
++import { _resetForTesting, setMainSession } from "../features/claude-code-session-state"
++import { createKeywordDetectorHook } from "../hooks/keyword-detector"
++import { unsafeTestValue } from "../../test-support/unsafe-test-value"
++import { createChatMessageHandler, type ChatMessageHandlerOutput } from "./chat-message"
++import { createSystemTransformHandler } from "./system-transform"
++import type { PluginContext } from "./types"
++
++const ULTRAWORK_INSTRUCTION_MARKER = "<ultrawork-mode>matrix ultrawork instructions"
++const FIRST_TURN_PROMPT = "ship the default-mode priority behavior"
++const DEFAULT_ULTRAWORK_TOAST = "Default ultrawork mode enabled. All agents at your disposal."
++
++type ToastCall = {
++  readonly body: {
++    readonly title: string
++    readonly message: string
++    readonly variant: string
++    readonly duration: number
++  }
++}
++
++type RalphLoopCall = {
++  readonly sessionID: string
++  readonly prompt: string
++  readonly options: Record<string, unknown>
++}
++
++type MatrixCase = {
++  readonly name: string
++  readonly ultrawork: boolean
++  readonly ralphLoop: boolean
++  readonly expectUltraworkSystem: boolean
++  readonly expectToast: boolean
++  readonly expectRalphLoop: boolean
++}
++
++const DEFAULT_MODE_CASES = [
++  {
++    name: "neither default mode enabled",
++    ultrawork: false,
++    ralphLoop: false,
++    expectUltraworkSystem: false,
++    expectToast: false,
++    expectRalphLoop: false,
++  },
++  {
++    name: "ultrawork default mode only",
++    ultrawork: true,
++    ralphLoop: false,
++    expectUltraworkSystem: true,
++    expectToast: true,
++    expectRalphLoop: false,
++  },
++  {
++    name: "ralph loop default mode only",
++    ultrawork: false,
++    ralphLoop: true,
++    expectUltraworkSystem: false,
++    expectToast: false,
++    expectRalphLoop: true,
++  },
++  {
++    name: "ultrawork and ralph loop default modes together",
++    ultrawork: true,
++    ralphLoop: true,
++    expectUltraworkSystem: true,
++    expectToast: true,
++    expectRalphLoop: true,
++  },
++] satisfies readonly MatrixCase[]
++
++function createDefaultMode(testCase: MatrixCase): DefaultModeConfig {
++  return {
++    ultrawork: testCase.ultrawork,
++    ralph_loop: testCase.ralphLoop,
++  }
++}
++
++function createPluginContext(toasts: ToastCall[]): PluginContext {
++  return unsafeTestValue<PluginContext>({
++    client: {
++      tui: {
++        showToast: async (toast: ToastCall): Promise<void> => {
++          toasts.push(toast)
++        },
++      },
++    },
++  })
++}
++
++function createPluginConfig(defaultMode: DefaultModeConfig): OhMyOpenCodeConfig {
++  return unsafeTestValue<OhMyOpenCodeConfig>({
++    default_mode: defaultMode,
++  })
++}
++
++function createFirstMessageVariantGate() {
++  let isFirstMessage = true
++  return {
++    shouldOverride: (): boolean => isFirstMessage,
++    markApplied: (): void => {
++      isFirstMessage = false
++    },
++  }
++}
++
++function createHooks(startLoopCalls: RalphLoopCall[]): CreatedHooks {
++  return unsafeTestValue<CreatedHooks>({
++    ralphLoop: {
++      startLoop: (sessionID: string, prompt: string, options?: Record<string, unknown>): boolean => {
++        startLoopCalls.push({ sessionID, prompt, options: options ?? {} })
++        return true
++      },
++      cancelLoop: (): boolean => true,
++      getState: () => null,
++      event: async (): Promise<void> => {},
++    },
++  })
++}
++
++async function renderSystemPrompt(defaultMode: DefaultModeConfig): Promise<string> {
++  const handler = createSystemTransformHandler(
++    defaultMode,
++    () => ULTRAWORK_INSTRUCTION_MARKER,
++  )
++  const output = { system: ["base system prompt"] }
++
++  await handler(
++    {
++      sessionID: "system-transform-session",
++      model: { id: "gpt-5.5", providerID: "openai" },
++    },
++    output,
++  )
++
++  return output.system.join("\n")
++}
++
++async function collectDefaultModeToasts(
++  defaultMode: DefaultModeConfig,
++  sessionID: string,
++): Promise<readonly ToastCall[]> {
++  const toasts: ToastCall[] = []
++  const hook = createKeywordDetectorHook(
++    createPluginContext(toasts),
++    undefined,
++    undefined,
++    undefined,
++    defaultMode,
++  )
++
++  await hook["chat.message"](
++    { sessionID, agent: "sisyphus" },
++    {
++      message: {},
++      parts: [{ type: "text", text: FIRST_TURN_PROMPT }],
++    },
++  )
++
++  return toasts
++}
++
++async function collectRalphLoopCalls(
++  defaultMode: DefaultModeConfig,
++  sessionID: string,
++): Promise<readonly RalphLoopCall[]> {
++  const startLoopCalls: RalphLoopCall[] = []
++  const handler = createChatMessageHandler({
++    ctx: createPluginContext([]),
++    pluginConfig: createPluginConfig(defaultMode),
++    firstMessageVariantGate: createFirstMessageVariantGate(),
++    hooks: createHooks(startLoopCalls),
++  })
++  const output: ChatMessageHandlerOutput = {
++    message: {},
++    parts: [{ type: "text", text: FIRST_TURN_PROMPT }],
++  }
++
++  await handler(
++    {
++      sessionID,
++      agent: "sisyphus",
++      model: { providerID: "openai", modelID: "gpt-5.5" },
++    },
++    output,
++  )
++
++  return startLoopCalls
++}
++
++describe("default-mode priority matrix", () => {
++  beforeEach(() => {
++    _resetForTesting()
++  })
++
++  afterEach(() => {
++    _resetForTesting()
++  })
++
++  for (const testCase of DEFAULT_MODE_CASES) {
++    test(`#given ${testCase.name} #when first user turn runs #then prompt toast and loop state match config`, async () => {
++      // given
++      const defaultMode = createDefaultMode(testCase)
++      const sessionID = `default-mode-${testCase.ultrawork}-${testCase.ralphLoop}`
++      setMainSession(sessionID)
++
++      // when
++      const systemPrompt = await renderSystemPrompt(defaultMode)
++      const toasts = await collectDefaultModeToasts(defaultMode, sessionID)
++      const startLoopCalls = await collectRalphLoopCalls(defaultMode, sessionID)
++
++      // then
++      expect(systemPrompt.includes(ULTRAWORK_INSTRUCTION_MARKER)).toBe(
++        testCase.expectUltraworkSystem,
++      )
++      expect(toasts.map((toast) => toast.body.message)).toEqual(
++        testCase.expectToast ? [DEFAULT_ULTRAWORK_TOAST] : [],
++      )
++      expect(startLoopCalls.length > 0).toBe(testCase.expectRalphLoop)
++      if (testCase.expectRalphLoop) {
++        expect(startLoopCalls).toHaveLength(1)
++        expect(startLoopCalls[0]?.sessionID).toBe(sessionID)
++        expect(startLoopCalls[0]?.prompt).toBe(FIRST_TURN_PROMPT)
++        expect(startLoopCalls[0]?.options["ultrawork"]).toBe(testCase.ultrawork)
++      }
++    })
++  }
++})
+diff --git a/src/plugin/system-transform.ts b/src/plugin/system-transform.ts
+index cb1e86af..39356a38 100644
+--- a/src/plugin/system-transform.ts
++++ b/src/plugin/system-transform.ts
+@@ -12,13 +12,6 @@ export function createSystemTransformHandler(
+   return async (input, output): Promise<void> => {
+     if (!defaultMode?.ultrawork || !getUltraworkMessage) return
+ 
+-    // When ralph_loop is also enabled, skip system prompt injection: the loop's
+-    // own continuation mechanism handles ultrawork re-injection on each iteration.
+-    // Injecting both would be redundant — the continuation prompt prepends
+-    // "ultrawork" and re-triggers keyword detection, defeating invisibility.
+-    // The `ultrawork` flag still controls loop behavior (500 iters + Oracle gate).
+-    if (defaultMode?.ralph_loop) return
+-
+     // Avoid re-injecting if the ultrawork prompt is already in the system prompt
+     // (e.g. after compaction the system prompt is rebuilt and this hook fires again)
+     if (output.system.some((part) => part.includes(ULTRAWORK_MODE_TAG))) return
+diff --git a/src/tools/delegate-task/skill-resolver.test.ts b/src/tools/delegate-task/skill-resolver.test.ts
+index 0348f184..a1353462 100644
+--- a/src/tools/delegate-task/skill-resolver.test.ts
++++ b/src/tools/delegate-task/skill-resolver.test.ts
+@@ -173,6 +173,35 @@ describe("resolveSkillContent — nativeSkills integration", () => {
+     expect(result.content).toContain("SHORT_NAME_BODY")
+   })
+ 
++  it("#given an agent-restricted OMO skill #when another target agent requests it #then filters the restricted skill but keeps public skills", async () => {
++    // given
++    const oracleSkillDir = join(TEST_DIR, ".opencode", "skills", "oracle-only-skill")
++    mkdirSync(oracleSkillDir, { recursive: true })
++    writeFileSync(
++      join(oracleSkillDir, "SKILL.md"),
++      "---\nname: oracle-only-skill\ndescription: Oracle only\nagent: oracle\n---\nORACLE_ONLY_BODY",
++    )
++
++    const publicSkillDir = join(TEST_DIR, ".opencode", "skills", "public-skill")
++    mkdirSync(publicSkillDir, { recursive: true })
++    writeFileSync(
++      join(publicSkillDir, "SKILL.md"),
++      "---\nname: public-skill\ndescription: Public skill\n---\nPUBLIC_BODY",
++    )
++
++    // when
++    const result = await resolveSkillContent(["oracle-only-skill", "public-skill"], {
++      directory: TEST_DIR,
++      targetAgent: "explore",
++    })
++
++    // then
++    expect(result.error).toBeNull()
++    expect(result.content).not.toContain("ORACLE_ONLY_BODY")
++    expect(result.content).toContain("PUBLIC_BODY")
++    expect(result.contents).toHaveLength(1)
++  })
++
+   it("#given no nativeSkills passed #when resolved #then behaves like pre-fix (no native discovery)", async () => {
+     // when
+     const result = await resolveSkillContent(["does-not-exist"], {
+diff --git a/src/tools/delegate-task/skill-resolver.ts b/src/tools/delegate-task/skill-resolver.ts
+index 1af4c4f6..40d7d3c0 100644
+--- a/src/tools/delegate-task/skill-resolver.ts
++++ b/src/tools/delegate-task/skill-resolver.ts
+@@ -6,6 +6,7 @@ import {
+   injectGitMasterConfig,
+ } from "../../features/opencode-skill-loader/skill-content"
+ import type { LoadedSkill } from "../../features/opencode-skill-loader/types"
++import { getAgentConfigKey } from "../../shared/agent-display-names"
+ import { log } from "../../shared/logger"
+ import { mergeNativeSkills } from "../skill/native-skills"
+ import type { NativeSkillEntry } from "../skill/native-skills"
+@@ -18,10 +19,18 @@ type ResolveSkillContentOptions = {
+   disabledSkills?: Set<string>
+   teamModeEnabled?: boolean
+   directory?: string
++  targetAgent?: string
+   nativeSkills?: DelegateTaskToolOptions["nativeSkills"]
+   nativeSkillEntries?: NativeSkillEntry[]
+ }
+ 
++function isSkillAllowedForTargetAgent(skill: LoadedSkill, targetAgent: string | undefined): boolean {
++  const restrictedAgent = skill.definition.agent
++  if (!restrictedAgent) return true
++  if (!targetAgent) return false
++  return getAgentConfigKey(restrictedAgent) === getAgentConfigKey(targetAgent)
++}
++
+ async function loadNativeSkillEntries(
+   nativeSkills: DelegateTaskToolOptions["nativeSkills"] | undefined,
+   nativeSkillEntries: NativeSkillEntry[] | undefined,
+@@ -55,13 +64,34 @@ export async function resolveSkillContent(
+ 
+   const resolved = new Map<string, string>()
+   const notFound: string[] = []
++  let unfilteredDiscoveredSkills: LoadedSkill[] | undefined
++
++  const getUnfilteredDiscoveredSkills = async (): Promise<LoadedSkill[]> => {
++    if (unfilteredDiscoveredSkills) return unfilteredDiscoveredSkills
++    unfilteredDiscoveredSkills = await discoverSkills({
++      includeClaudeCodePaths: true,
++      directory: options.directory,
++    })
++    return unfilteredDiscoveredSkills
++  }
+ 
+   for (const name of skills) {
+-    const skill = matchSkillByName(baseSkills, name)
++    let skill = matchSkillByName(baseSkills, name)
++    if (!skill && options.browserProvider === undefined && !options.disabledSkills?.has(name)) {
++      skill = matchSkillByName(await getUnfilteredDiscoveredSkills(), name)
++    }
+     if (!skill) {
+       notFound.push(name)
+       continue
+     }
++    if (!isSkillAllowedForTargetAgent(skill, options.targetAgent)) {
++      log("[skill-resolver] filtered agent-restricted skill for delegate target", {
++        skill: skill.name,
++        restricted_agent: skill.definition.agent,
++        target_agent: options.targetAgent ?? "(unknown)",
++      })
++      continue
++    }
+     const template = extractSkillTemplate(skill)
+     if (name === "git-master") {
+       resolved.set(name, injectGitMasterConfig(template, options.gitMasterConfig))
+diff --git a/src/tools/delegate-task/tools.ts b/src/tools/delegate-task/tools.ts
+index 630e8d0d..102d8884 100644
+--- a/src/tools/delegate-task/tools.ts
++++ b/src/tools/delegate-task/tools.ts
+@@ -74,6 +74,7 @@ export function createDelegateTask(options: DelegateTaskToolOptions): ToolDefini
+         disabledSkills: options.disabledSkills,
+         teamModeEnabled: options.teamModeEnabled,
+         directory: options.directory,
++        targetAgent: delegateTaskArgs.subagent_type,
+         nativeSkills: options.nativeSkills,
+         nativeSkillEntries,
+       })
+-- 
+2.39.2
+

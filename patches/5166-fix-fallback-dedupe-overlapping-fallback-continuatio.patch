@@ -1,0 +1,359 @@
+From da339204bb3352ef35068d92dc372309040c69de Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 10:07:35 +0900
+Subject: [PATCH 5166/5749] fix(fallback): dedupe overlapping fallback
+ continuations
+
+Guard model fallback continuation dispatch so overlapping message.updated/session.error surfaces issue only one abort+promptAsync cycle for the same failed fallback.
+
+Refs https://github.com/code-yeongyu/oh-my-openagent/issues/4019
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/plugin/event.model-fallback.test.ts | 136 +++++++++++++++++++++---
+ src/plugin/event.ts                     | 107 +++++++++++++------
+ 2 files changed, 191 insertions(+), 52 deletions(-)
+
+diff --git a/src/plugin/event.model-fallback.test.ts b/src/plugin/event.model-fallback.test.ts
+index 5c5870bb..e18c4cc1 100644
+--- a/src/plugin/event.model-fallback.test.ts
++++ b/src/plugin/event.model-fallback.test.ts
+@@ -1,5 +1,5 @@
+-declare const require: (name: string) => any
+-const { afterEach, describe, expect, spyOn, test } = require("bun:test")
++/// <reference types="bun-types" />
++import { afterEach, describe, expect, spyOn, test } from "bun:test"
+ 
+ import { createEventHandler } from "./event"
+ import { createChatMessageHandler } from "./chat-message"
+@@ -8,6 +8,13 @@ import { createModelFallbackHook, clearPendingModelFallback } from "../hooks/mod
+ import * as connectedProvidersCache from "../shared/connected-providers-cache"
+ import { unsafeTestValue } from "../../test-support/unsafe-test-value"
+ 
++type EventInput = { event: { type: string; properties?: unknown } }
++type EventHandlerInput = Parameters<ReturnType<typeof createEventHandler>>[0]
++
++function asEventHandlerInput(input: EventInput): EventHandlerInput {
++  return unsafeTestValue<EventHandlerInput>(input)
++}
++
+ let readConnectedProvidersCacheSpy: { mockRestore: () => void } | undefined
+ let readProviderModelsCacheSpy: { mockRestore: () => void } | undefined
+ 
+@@ -17,25 +24,40 @@ function setupConnectedProviderCacheMocks(): void {
+ }
+ 
+ describe("createEventHandler - model fallback", () => {
+-  const createHandler = (args?: { hooks?: any; pluginConfig?: any }) => {
++  const createHandler = (args?: {
++    hooks?: any
++    pluginConfig?: any
++    promptAsync?: (input: { path: { id: string } }) => Promise<unknown>
++  }) => {
+     setupConnectedProviderCacheMocks()
+     const abortCalls: string[] = []
+     const promptCalls: string[] = []
++    const promptAsyncCalls: string[] = []
++
++    const sessionClient = {
++      abort: async ({ path }: { path: { id: string } }) => {
++        abortCalls.push(path.id)
++        return {}
++      },
++      prompt: async ({ path }: { path: { id: string } }) => {
++        promptCalls.push(path.id)
++        return {}
++      },
++      ...(args?.promptAsync
++        ? {
++            promptAsync: async (input: { path: { id: string } }) => {
++              promptAsyncCalls.push(input.path.id)
++              return args.promptAsync?.(input)
++            },
++          }
++        : {}),
++    }
+ 
+-    const handler = createEventHandler({
++    const eventHandler = createEventHandler({
+       ctx: unsafeTestValue({
+         directory: "/tmp",
+         client: {
+-          session: {
+-            abort: async ({ path }: { path: { id: string } }) => {
+-              abortCalls.push(path.id)
+-              return {}
+-            },
+-            prompt: async ({ path }: { path: { id: string } }) => {
+-              promptCalls.push(path.id)
+-              return {}
+-            },
+-          },
++          session: sessionClient,
+         },
+       }),
+       pluginConfig: unsafeTestValue((args?.pluginConfig ?? {})),
+@@ -54,8 +76,9 @@ describe("createEventHandler - model fallback", () => {
+       }),
+       hooks: args?.hooks ?? (unsafeTestValue({})),
+     })
++    const handler = (input: EventInput): Promise<void> => eventHandler(asEventHandlerInput(input))
+ 
+-    return { handler, abortCalls, promptCalls }
++    return { handler, abortCalls, promptCalls, promptAsyncCalls }
+   }
+ 
+   afterEach(() => {
+@@ -139,6 +162,85 @@ describe("createEventHandler - model fallback", () => {
+     expect(promptCalls).toEqual([sessionID])
+   })
+ 
++  test("does not dispatch duplicate fallback continuations when error events overlap", async () => {
++    //#given
++    const sessionID = "ses_model_fallback_concurrent_events"
++    setMainSession(sessionID)
++    let releasePromptAsync: (() => void) | undefined
++    const promptAsyncBlocked = new Promise<void>((resolve) => {
++      releasePromptAsync = resolve
++    })
++    let firstPromptAsyncStartedResolve: (() => void) | undefined
++    const firstPromptAsyncStarted = new Promise<void>((resolve) => {
++      firstPromptAsyncStartedResolve = resolve
++    })
++    let pendingFallbackArms = 0
++    const modelFallback = unsafeTestValue({
++      setSessionFallbackChain: () => {},
++      setPendingModelFallback: () => {
++        pendingFallbackArms += 1
++        return true
++      },
++    })
++    const { handler, abortCalls, promptAsyncCalls } = createHandler({
++      hooks: { modelFallback },
++      promptAsync: async () => {
++        if (promptAsyncCalls.length === 1) {
++          firstPromptAsyncStartedResolve?.()
++        }
++        await promptAsyncBlocked
++        return {}
++      },
++    })
++
++    const assistantError = {
++      name: "APIError",
++      data: {
++        message:
++          "Bad Gateway: {\"error\":{\"message\":\"unknown provider for model claude-opus-4-7-thinking\"}}",
++        isRetryable: true,
++      },
++    }
++
++    //#when
++    const messageUpdated = handler({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            id: "msg_err_concurrent_1",
++            sessionID,
++            role: "assistant",
++            error: assistantError,
++            modelID: "claude-opus-4-7-thinking",
++            providerID: "anthropic",
++            agent: "Sisyphus - Ultraworker",
++          },
++        },
++      },
++    })
++    await firstPromptAsyncStarted
++    const sessionError = handler({
++      event: {
++        type: "session.error",
++        properties: {
++          sessionID,
++          providerID: "anthropic",
++          modelID: "claude-opus-4-7-thinking",
++          error: assistantError,
++        },
++      },
++    })
++
++    releasePromptAsync?.()
++    await Promise.all([messageUpdated, sessionError])
++
++    //#then
++    expect(pendingFallbackArms).toBe(2)
++    expect(promptAsyncCalls).toEqual([sessionID])
++    expect(abortCalls).toEqual([sessionID])
++  })
++
+   test("triggers retry prompt on session.status retry events and applies fallback", async () => {
+     //#given
+     const sessionID = "ses_status_retry_fallback"
+@@ -603,7 +705,7 @@ describe("createEventHandler - model fallback", () => {
+     })
+ 
+     const triggerRetryCycle = async (providerID: string, modelID: string) => {
+-      await eventHandler({
++      await eventHandler(asEventHandlerInput({
+         event: {
+           type: "session.error",
+           properties: {
+@@ -621,7 +723,7 @@ describe("createEventHandler - model fallback", () => {
+             },
+           },
+         },
+-      })
++      }))
+ 
+       const output = { message: {}, parts: [] as Array<{ type: string; text?: string }> }
+       await chatMessageHandler(
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index b1c44a3e..8752815d 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -219,6 +219,8 @@ export function createEventHandler(args: {
+   const lastHandledModelErrorMessageID = new Map<string, string>();
+   const lastHandledRetryStatusKey = new Map<string, string>();
+   const lastKnownModelBySession = new Map<string, { providerID: string; modelID: string }>();
++  const modelFallbackContinuationsInFlight = new Set<string>();
++  const lastDispatchedModelFallbackContinuationKey = new Map<string, string>();
+ 
+   const resolveFallbackProviderID = (sessionID: string, providerHint?: string): string => {
+     const normalizedProviderHint = providerHint?.trim();
+@@ -368,46 +370,78 @@ export function createEventHandler(args: {
+       modelID?: string;
+     },
+   ): Promise<void> => {
+-    await pluginContext.client.session.abort({ path: { id: sessionID } }).catch((error) => {
+-      log("[event] model-fallback abort failed", { sessionID, source, error });
+-    });
+-
+-    const launchAgent = fallbackContext?.agentName
+-      ? resolveRegisteredAgentName(fallbackContext.agentName)
+-      : undefined;
+-    const launchModel = fallbackContext?.providerID && fallbackContext?.modelID
+-      ? { providerID: fallbackContext.providerID, modelID: fallbackContext.modelID }
+-      : undefined;
+-
+-    const agentConfigKey = fallbackContext?.agentName
+-      ? getAgentConfigKey(fallbackContext.agentName)
+-      : undefined;
+-    const agentSettings = agentConfigKey
+-      ? pluginConfig.agents?.[agentConfigKey as keyof NonNullable<typeof pluginConfig.agents>]
+-      : undefined;
+-    const launchVariant = (agentSettings as { variant?: string } | undefined)?.variant;
+-
+-    const promptBody = {
+-      path: { id: sessionID },
+-      body: {
+-        ...(launchAgent ? { agent: launchAgent } : {}),
+-        ...(launchModel ? { model: launchModel } : {}),
+-        ...(launchVariant ? { variant: launchVariant } : {}),
+-        parts: [createInternalAgentContinuationTextPart("continue")],
+-      },
+-      query: { directory: pluginContext.directory },
+-    };
++    const fallbackKey = [
++      fallbackContext?.agentName ? getAgentConfigKey(fallbackContext.agentName) : "",
++      fallbackContext?.providerID ?? "",
++      fallbackContext?.modelID ?? "",
++    ].join(":");
++
++    if (modelFallbackContinuationsInFlight.has(sessionID)) {
++      log("[event] model-fallback continuation skipped because one is already in flight", { sessionID, source });
++      return;
++    }
+ 
+-    if (typeof pluginContext.client.session.promptAsync === "function") {
+-      await pluginContext.client.session.promptAsync(promptBody).catch((error) => {
+-        log("[event] model-fallback promptAsync failed", { sessionID, source, error });
++    if (fallbackKey && lastDispatchedModelFallbackContinuationKey.get(sessionID) === fallbackKey) {
++      log("[event] model-fallback continuation skipped because matching fallback was already dispatched", {
++        sessionID,
++        source,
+       });
+       return;
+     }
+ 
+-    await pluginContext.client.session.prompt(promptBody).catch((error) => {
+-      log("[event] model-fallback prompt failed", { sessionID, source, error });
+-    });
++    modelFallbackContinuationsInFlight.add(sessionID);
++    let dispatched = false;
++    try {
++      await pluginContext.client.session.abort({ path: { id: sessionID } }).catch((error) => {
++        log("[event] model-fallback abort failed", { sessionID, source, error });
++      });
++
++      const launchAgent = fallbackContext?.agentName
++        ? resolveRegisteredAgentName(fallbackContext.agentName)
++        : undefined;
++      const launchModel = fallbackContext?.providerID && fallbackContext?.modelID
++        ? { providerID: fallbackContext.providerID, modelID: fallbackContext.modelID }
++        : undefined;
++
++      const agentConfigKey = fallbackContext?.agentName
++        ? getAgentConfigKey(fallbackContext.agentName)
++        : undefined;
++      const agentSettings = agentConfigKey
++        ? pluginConfig.agents?.[agentConfigKey as keyof NonNullable<typeof pluginConfig.agents>]
++        : undefined;
++      const launchVariant = (agentSettings as { variant?: string } | undefined)?.variant;
++
++      const promptBody = {
++        path: { id: sessionID },
++        body: {
++          ...(launchAgent ? { agent: launchAgent } : {}),
++          ...(launchModel ? { model: launchModel } : {}),
++          ...(launchVariant ? { variant: launchVariant } : {}),
++          parts: [createInternalAgentContinuationTextPart("continue")],
++        },
++        query: { directory: pluginContext.directory },
++      };
++
++      if (typeof pluginContext.client.session.promptAsync === "function") {
++        await pluginContext.client.session.promptAsync(promptBody).then(() => {
++          dispatched = true;
++        }).catch((error) => {
++          log("[event] model-fallback promptAsync failed", { sessionID, source, error });
++        });
++        return;
++      }
++
++      await pluginContext.client.session.prompt(promptBody).then(() => {
++        dispatched = true;
++      }).catch((error) => {
++        log("[event] model-fallback prompt failed", { sessionID, source, error });
++      });
++    } finally {
++      if (dispatched && fallbackKey) {
++        lastDispatchedModelFallbackContinuationKey.set(sessionID, fallbackKey);
++      }
++      modelFallbackContinuationsInFlight.delete(sessionID);
++    }
+   };
+ 
+   return async (input): Promise<void> => {
+@@ -526,6 +560,8 @@ export function createEventHandler(args: {
+         lastHandledModelErrorMessageID.delete(sessionID);
+         lastHandledRetryStatusKey.delete(sessionID);
+         lastKnownModelBySession.delete(sessionID);
++        modelFallbackContinuationsInFlight.delete(sessionID);
++        lastDispatchedModelFallbackContinuationKey.delete(sessionID);
+         if (modelFallback) {
+           clearPendingModelFallback(modelFallback, sessionID);
+           clearSessionFallbackChain(modelFallback, sessionID);
+@@ -684,6 +720,7 @@ export function createEventHandler(args: {
+       // (non-retry idle) so future failures with the same key can trigger fallback again.
+       if (sessionID && status?.type === "idle") {
+         lastHandledRetryStatusKey.delete(sessionID);
++        lastDispatchedModelFallbackContinuationKey.delete(sessionID);
+       }
+ 
+       if (sessionID && status?.type === "retry" && isModelFallbackEnabled && !isRuntimeFallbackEnabled) {
+-- 
+2.39.2
+

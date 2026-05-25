@@ -1,0 +1,332 @@
+From 282010f97d398ed698ca33c8592d2eccaf64133e Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code-yeongyu@noreply.github.com>
+Date: Thu, 21 May 2026 15:50:44 +0900
+Subject: [PATCH 5644/5749] fix(background-agent): gate stale timeout on abort
+ success
+
+---
+ src/features/background-agent/manager.test.ts |   4 +-
+ .../background-agent/task-poller.test.ts      | 115 +++++++++++++++
+ src/features/background-agent/task-poller.ts  | 132 ++++++++++++------
+ 3 files changed, 207 insertions(+), 44 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index d5e6e99a..8098cdf2 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -4821,9 +4821,7 @@ describe("BackgroundManager.checkAndInterruptStaleTasks", () => {
+         prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         abort: async () => ({}),
+-        get: async () => {
+-          throw new Error("missing")
+-        },
++        get: async () => ({ data: { id: "session-running", time: { updated: fixedTime - 300_000 } } }),
+       },
+     }
+     const manager = new BackgroundManager({ pluginContext: createPluginInput(client), config: { staleTimeoutMs: 180_000 } })
+diff --git a/src/features/background-agent/task-poller.test.ts b/src/features/background-agent/task-poller.test.ts
+index da4d2da1..19038cca 100644
+--- a/src/features/background-agent/task-poller.test.ts
++++ b/src/features/background-agent/task-poller.test.ts
+@@ -180,6 +180,36 @@ describe("checkAndInterruptStaleTasks", () => {
+     expect(task.error).toContain("messageStalenessTimeoutMs")
+   })
+ 
++  it("should keep never-updated task running when stale abort returns SDK error", async () => {
++    //#given
++    const task = createRunningTask({
++      startedAt: new Date(Date.now() - 15 * 60 * 1000),
++      progress: undefined,
++      concurrencyKey: "anthropic/claude-opus-4-7",
++    })
++    const releaseMock = mock(() => {})
++    const onTaskInterrupted = mock(() => {})
++    mockClient.session.abort.mockImplementationOnce(() => Promise.resolve({ error: { message: "still running" } }))
++
++    //#when
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient as never,
++      config: { messageStalenessTimeoutMs: 600_000 },
++      concurrencyManager: { release: releaseMock } as never,
++      notifyParentSession: mockNotify,
++      onTaskInterrupted,
++    })
++
++    //#then
++    expect(task.status).toBe("running")
++    expect(task.error).toBeUndefined()
++    expect(task.concurrencyKey).toBe("anthropic/claude-opus-4-7")
++    expect(releaseMock).not.toHaveBeenCalled()
++    expect(onTaskInterrupted).not.toHaveBeenCalled()
++    expect(mockNotify).not.toHaveBeenCalled()
++  })
++
+   it("should await abort before resolving for no-progress stale interruption", async () => {
+     //#given
+     const task = createRunningTask({
+@@ -303,6 +333,91 @@ describe("checkAndInterruptStaleTasks", () => {
+     expect(task.error).toContain("Stale timeout")
+   })
+ 
++  it("should keep stale-progress task running when abort returns SDK error", async () => {
++    //#given
++    const task = createRunningTask({
++      startedAt: new Date(Date.now() - 900_000),
++      progress: {
++        toolCalls: 2,
++        lastUpdate: new Date(Date.now() - 900_000),
++      },
++      concurrencyKey: "anthropic/claude-opus-4-7",
++    })
++    const releaseMock = mock(() => {})
++    const onTaskInterrupted = mock(() => {})
++    mockClient.session.abort.mockImplementationOnce(() => Promise.resolve({ error: { message: "still running" } }))
++
++    //#when
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient as never,
++      config: { staleTimeoutMs: 180_000, messageStalenessTimeoutMs: 600_000 },
++      concurrencyManager: { release: releaseMock } as never,
++      notifyParentSession: mockNotify,
++      sessionStatuses: { "ses-1": { type: "busy" } },
++      onTaskInterrupted,
++    })
++
++    //#then
++    expect(task.status).toBe("running")
++    expect(task.error).toBeUndefined()
++    expect(task.concurrencyKey).toBe("anthropic/claude-opus-4-7")
++    expect(releaseMock).not.toHaveBeenCalled()
++    expect(onTaskInterrupted).not.toHaveBeenCalled()
++    expect(mockNotify).not.toHaveBeenCalled()
++  })
++
++  it("should abort multiple stale-progress tasks concurrently before marking them cancelled", async () => {
++    //#given
++    const firstAbort = createDeferredPromise()
++    const secondAbort = createDeferredPromise()
++    const abortSessionIDs: string[] = []
++    const taskA = createRunningTask({
++      id: "task-stale-a",
++      sessionId: "ses-stale-a",
++      parentSessionId: "parent-stale-a",
++      progress: {
++        toolCalls: 1,
++        lastUpdate: new Date(Date.now() - 900_000),
++      },
++    })
++    const taskB = createRunningTask({
++      id: "task-stale-b",
++      sessionId: "ses-stale-b",
++      parentSessionId: "parent-stale-b",
++      progress: {
++        toolCalls: 1,
++        lastUpdate: new Date(Date.now() - 900_000),
++      },
++    })
++    mockClient.session.abort.mockImplementation(({ path }: { path: { id: string } }) => {
++      abortSessionIDs.push(path.id)
++      return path.id === "ses-stale-a" ? firstAbort.promise : secondAbort.promise
++    })
++
++    //#when
++    const interruption = checkAndInterruptStaleTasks({
++      tasks: [taskA, taskB],
++      client: mockClient as never,
++      config: { staleTimeoutMs: 180_000 },
++      concurrencyManager: mockConcurrencyManager as never,
++      notifyParentSession: mockNotify,
++    })
++    await Promise.resolve()
++
++    //#then
++    expect(abortSessionIDs).toEqual(["ses-stale-a", "ses-stale-b"])
++    expect(taskA.status).toBe("running")
++    expect(taskB.status).toBe("running")
++
++    firstAbort.resolve()
++    secondAbort.resolve()
++    await interruption
++
++    expect(taskA.status).toBe("cancelled")
++    expect(taskB.status).toBe("cancelled")
++  })
++
+   it("should NOT interrupt busy session with no progress within message staleness timeout", async () => {
+     //#given - task has no progress yet, but it is still inside the configured first-progress window
+     const task = createRunningTask({
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index d80a16cf..9537e43d 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -113,6 +113,64 @@ export function pruneStaleTasksAndNotifications(args: {
+ 
+ export type SessionStatusMap = Record<string, { type: string }>
+ 
++async function interruptStaleTask(args: {
++  task: BackgroundTask
++  client: OpencodeClient
++  concurrencyManager: ConcurrencyManager
++  notifyParentSession: (task: BackgroundTask) => Promise<void>
++  onTaskInterrupted: (task: BackgroundTask) => void
++  sessionID: string
++  reason: string
++  staleMinutes: number
++  timeoutConfigKey: "messageStalenessTimeoutMs" | "sessionGoneTimeoutMs" | "staleTimeoutMs"
++  errorSuffix: string
++  logReason: string
++}): Promise<void> {
++  const {
++    task,
++    client,
++    concurrencyManager,
++    notifyParentSession,
++    onTaskInterrupted,
++    sessionID,
++    reason,
++    staleMinutes,
++    timeoutConfigKey,
++    errorSuffix,
++    logReason,
++  } = args
++
++  const aborted = await abortWithTimeout(client, sessionID)
++  if (!aborted) {
++    log("[background-agent] Task stale interruption skipped because session abort failed:", {
++      taskId: task.id,
++      sessionID,
++      reason,
++    })
++    return
++  }
++
++  if (task.status !== "running" || task.sessionId !== sessionID) return
++
++  task.status = "cancelled"
++  task.error = `Stale timeout (${reason} for ${staleMinutes}min${errorSuffix}). This is a FINAL cancellation - do NOT create a replacement task. If the timeout is too short, increase 'background_task.${timeoutConfigKey}' in .opencode/${CONFIG_BASENAME}.json.`
++  task.completedAt = new Date()
++
++  if (task.concurrencyKey) {
++    concurrencyManager.release(task.concurrencyKey)
++    task.concurrencyKey = undefined
++  }
++
++  onTaskInterrupted(task)
++  log(`[background-agent] Task ${task.id} interrupted: ${logReason}`)
++
++  try {
++    await notifyParentSession(task)
++  } catch (err) {
++    log("[background-agent] Error in notifyParentSession for stale task:", { taskId: task.id, error: err })
++  }
++}
++
+ export async function checkAndInterruptStaleTasks(args: {
+   tasks: Iterable<BackgroundTask>
+   client: OpencodeClient
+@@ -137,11 +195,11 @@ export async function checkAndInterruptStaleTasks(args: {
+   const staleTimeoutMs = config?.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS
+   const sessionGoneTimeoutMs = config?.sessionGoneTimeoutMs ?? DEFAULT_SESSION_GONE_TIMEOUT_MS
+   const now = Date.now()
+-  const abortPromises: Array<Promise<unknown>> = []
+ 
+   const messageStalenessMs = config?.messageStalenessTimeoutMs ?? DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS
+   const getSessionActivity = args.getSessionActivity
+     ?? ((id: string) => getSessionActivityFromClient(client, id, directory))
++  const staleInterruptions: Array<Promise<void>> = []
+ 
+   for (const task of tasks) {
+     if (task.status !== "running") continue
+@@ -189,25 +247,21 @@ export async function checkAndInterruptStaleTasks(args: {
+ 
+       const staleMinutes = Math.round(runtime / 60000)
+       const reason = sessionGone ? "session gone from status registry" : "no activity"
+-      task.status = "cancelled"
+-      task.error = `Stale timeout (${reason} for ${staleMinutes}min since start). This is a FINAL cancellation - do NOT create a replacement task. If the timeout is too short, increase 'background_task.${sessionGone ? "sessionGoneTimeoutMs" : "messageStalenessTimeoutMs"}' in .opencode/${CONFIG_BASENAME}.json.`
+-      task.completedAt = new Date()
+-
+-      if (task.concurrencyKey) {
+-        concurrencyManager.release(task.concurrencyKey)
+-        task.concurrencyKey = undefined
+-      }
+-
+-      onTaskInterrupted(task)
+-
+-      abortPromises.push(abortWithTimeout(client, sessionID))
+-      log(`[background-agent] Task ${task.id} interrupted: no progress since start`)
+-
+-      try {
+-        await notifyParentSession(task)
+-      } catch (err) {
+-        log("[background-agent] Error in notifyParentSession for stale task:", { taskId: task.id, error: err })
+-      }
++      staleInterruptions.push(
++        interruptStaleTask({
++          task,
++          client,
++          concurrencyManager,
++          notifyParentSession,
++          onTaskInterrupted,
++          sessionID,
++          reason,
++          staleMinutes,
++          timeoutConfigKey: sessionGone ? "sessionGoneTimeoutMs" : "messageStalenessTimeoutMs",
++          errorSuffix: " since start",
++          logReason: "no progress since start",
++        }),
++      )
+       continue
+     }
+ 
+@@ -243,28 +297,24 @@ export async function checkAndInterruptStaleTasks(args: {
+ 
+     const staleMinutes = Math.round(timeSinceLastUpdate / 60000)
+     const reason = sessionGone ? "session gone from status registry" : "no activity"
+-    task.status = "cancelled"
+-    task.error = `Stale timeout (${reason} for ${staleMinutes}min). This is a FINAL cancellation - do NOT create a replacement task. If the timeout is too short, increase 'background_task.${sessionGone ? "sessionGoneTimeoutMs" : "staleTimeoutMs"}' in .opencode/${CONFIG_BASENAME}.json.`
+-    task.completedAt = new Date()
+-
+-    if (task.concurrencyKey) {
+-      concurrencyManager.release(task.concurrencyKey)
+-      task.concurrencyKey = undefined
+-    }
+-
+-    onTaskInterrupted(task)
+-
+-    abortPromises.push(abortWithTimeout(client, sessionID))
+-    log(`[background-agent] Task ${task.id} interrupted: stale timeout`)
+-
+-    try {
+-      await notifyParentSession(task)
+-    } catch (err) {
+-      log("[background-agent] Error in notifyParentSession for stale task:", { taskId: task.id, error: err })
+-    }
++    staleInterruptions.push(
++      interruptStaleTask({
++        task,
++        client,
++        concurrencyManager,
++        notifyParentSession,
++        onTaskInterrupted,
++        sessionID,
++        reason,
++        staleMinutes,
++        timeoutConfigKey: sessionGone ? "sessionGoneTimeoutMs" : "staleTimeoutMs",
++        errorSuffix: "",
++        logReason: "stale timeout",
++      }),
++    )
+   }
+ 
+-  if (abortPromises.length > 0) {
+-    await Promise.allSettled(abortPromises)
++  if (staleInterruptions.length > 0) {
++    await Promise.all(staleInterruptions)
+   }
+ }
+-- 
+2.39.2
+

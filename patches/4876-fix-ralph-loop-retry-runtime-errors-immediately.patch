@@ -1,0 +1,305 @@
+From 47b5c566607568f7758bfad5df0d1bea81f37b92 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 6 May 2026 16:08:13 +0900
+Subject: [PATCH 4876/5749] fix(ralph-loop): retry runtime errors immediately
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../non-abort-error-continuation.test.ts      |  73 ++++++++-
+ .../ralph-loop/ralph-loop-event-handler.ts    | 143 ++++++++++++++++--
+ 2 files changed, 197 insertions(+), 19 deletions(-)
+
+diff --git a/src/hooks/ralph-loop/non-abort-error-continuation.test.ts b/src/hooks/ralph-loop/non-abort-error-continuation.test.ts
+index 470aa832..a61207cb 100644
+--- a/src/hooks/ralph-loop/non-abort-error-continuation.test.ts
++++ b/src/hooks/ralph-loop/non-abort-error-continuation.test.ts
+@@ -25,7 +25,7 @@ describe("ralph-loop non-abort error continuation", () => {
+ 		}
+ 	})
+ 
+-	test("continues on next idle after non-abort session error", async () => {
++	test("continues immediately after non-abort session error", async () => {
+ 		// given - an active Ralph Loop receives a recoverable command error
+ 		const hook = createRalphLoopHook({
+ 			directory: testDirectory,
+@@ -81,16 +81,75 @@ describe("ralph-loop non-abort error continuation", () => {
+ 			},
+ 		})
+ 
+-		// when - OpenCode emits the idle event caused by that failed command
+-		await hook.event({
+-			event: { type: "session.idle", properties: { sessionID: "session-123" } },
+-		})
+-
+-		// then - the loop should continue instead of skipping idle as recovery
++		// then - the loop should continue without waiting for a later idle event
+ 		expect(promptCalls).toHaveLength(1)
+ 		expect(promptCalls[0]?.sessionID).toBe("session-123")
+ 		expect(promptCalls[0]?.text).toContain("Keep working")
+ 		expect(messagesCalls.length).toBeGreaterThan(0)
+ 		expect(hook.getState()?.iteration).toBe(2)
+ 	})
++
++	test("stops retrying runtime errors after max iterations", async () => {
++		// given - an active Ralph Loop has one retry remaining
++		const hook = createRalphLoopHook({
++			directory: testDirectory,
++			project: testDirectory,
++			worktree: testDirectory,
++			serverUrl: "http://localhost:4096",
++			$: async () => ({}),
++			client: {
++				session: {
++					messages: async (options: { path: { id: string } }) => {
++						messagesCalls.push({ sessionID: options.path.id })
++						return { data: [] }
++					},
++					promptAsync: async (options: {
++						path: { id: string }
++						body: { parts: Array<{ type: string; text: string }> }
++					}) => {
++						promptCalls.push({
++							sessionID: options.path.id,
++							text: options.body.parts[0]?.text ?? "",
++						})
++						return {}
++					},
++					prompt: async () => ({}),
++				},
++				tui: {
++					showToast: async () => ({}),
++				},
++			},
++		} as never)
++
++		hook.startLoop("session-123", "Keep working", {
++			messageCountAtStart: 0,
++			maxIterations: 2,
++		})
++
++		// when - the first runtime error consumes the final allowed attempt
++		await hook.event({
++			event: {
++				type: "session.error",
++				properties: {
++					sessionID: "session-123",
++					error: { name: "RuntimeError" },
++				},
++			},
++		})
++
++		// when - another runtime error arrives after the retry budget is exhausted
++		await hook.event({
++			event: {
++				type: "session.error",
++				properties: {
++					sessionID: "session-123",
++					error: { name: "RuntimeError" },
++				},
++			},
++		})
++
++		// then - the loop does not exceed the configured retry count
++		expect(promptCalls).toHaveLength(1)
++		expect(hook.getState()).toBeNull()
++	})
+ })
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index 030723c6..fcffb9db 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -22,11 +22,42 @@ type LoopStateController = {
+ }
+ type RalphLoopEventHandlerOptions = { directory: string; apiTimeoutMs: number; getTranscriptPath: (sessionID: string) => string | undefined; checkSessionExists?: RalphLoopOptions["checkSessionExists"]; backgroundManager?: RalphLoopOptions["backgroundManager"]; loopState: LoopStateController }
+ 
++function isAbortError(error: unknown): boolean {
++	return typeof error === "object"
++		&& error !== null
++		&& "name" in error
++		&& (error as { name?: unknown }).name === "MessageAbortedError"
++}
++
++async function showMaxIterationsToast(
++	ctx: PluginInput,
++	state: RalphLoopState,
++): Promise<void> {
++	await ctx.client.tui?.showToast?.({
++		body: { title: "Ralph Loop Stopped", message: `Max iterations (${state.max_iterations}) reached without completion`, variant: "warning", duration: 5000 },
++	}).catch(() => {})
++}
++
++async function showIterationToast(
++	ctx: PluginInput,
++	state: RalphLoopState,
++): Promise<void> {
++	await ctx.client.tui?.showToast?.({
++		body: {
++			title: "Ralph Loop",
++			message: `Iteration ${state.iteration}/${typeof state.max_iterations === "number" ? state.max_iterations : "unbounded"}`,
++			variant: "info",
++			duration: 2000,
++		},
++	}).catch(() => {})
++}
++
+ export function createRalphLoopEventHandler(
+ 	ctx: PluginInput,
+ 	options: RalphLoopEventHandlerOptions,
+ ) {
+ 	const inFlightSessions = new Set<string>()
++	const runtimeErrorRetriedSessions = new Map<string, number>()
+ 
+ 	return async ({ event }: { event: { type: string; properties?: unknown } }): Promise<void> => {
+ 		const props = event.properties as Record<string, unknown> | undefined
+@@ -121,6 +152,7 @@ export function createRalphLoopEventHandler(
+ 					})
+ 
+ 				if (completionViaTranscript || completionViaApi) {
++					runtimeErrorRetriedSessions.delete(sessionID)
+ 					log(`[${HOOK_NAME}] Completion detected!`, {
+ 						sessionID,
+ 						iteration: state.iteration,
+@@ -160,6 +192,15 @@ export function createRalphLoopEventHandler(
+ 					return
+ 				}
+ 
++				if (runtimeErrorRetriedSessions.get(sessionID) === state.iteration) {
++					runtimeErrorRetriedSessions.delete(sessionID)
++					log(`[${HOOK_NAME}] Skipped stale idle after runtime error retry`, {
++						sessionID,
++						iteration: state.iteration,
++					})
++					return
++				}
++
+ 				if (
+ 					typeof state.max_iterations === "number"
+ 					&& state.iteration >= state.max_iterations
+@@ -171,9 +212,7 @@ export function createRalphLoopEventHandler(
+ 					})
+ 					options.loopState.clear()
+ 
+-					await ctx.client.tui?.showToast?.({
+-						body: { title: "Ralph Loop Stopped", message: `Max iterations (${state.max_iterations}) reached without completion`, variant: "warning", duration: 5000 },
+-						}).catch(() => {})
++					await showMaxIterationsToast(ctx, state)
+ 					return
+ 				}
+ 
+@@ -189,14 +228,7 @@ export function createRalphLoopEventHandler(
+ 					max: newState.max_iterations,
+ 				})
+ 
+-				await ctx.client.tui?.showToast?.({
+-					body: {
+-						title: "Ralph Loop",
+-						message: `Iteration ${newState.iteration}/${typeof newState.max_iterations === "number" ? newState.max_iterations : "unbounded"}`,
+-						variant: "info",
+-						duration: 2000,
+-					},
+-					}).catch(() => {})
++				await showIterationToast(ctx, newState)
+ 
+ 				try {
+ 					await continueIteration(ctx, newState, {
+@@ -223,7 +255,94 @@ export function createRalphLoopEventHandler(
+ 		}
+ 
+ 		if (event.type === "session.error") {
+-			handleErroredLoopSession(props, options.loopState)
++			const sessionID = props?.sessionID as string | undefined
++			const error = props?.error
++			if (!sessionID || isAbortError(error)) {
++				handleErroredLoopSession(props, options.loopState)
++				return
++			}
++
++			if (inFlightSessions.has(sessionID)) {
++				log(`[${HOOK_NAME}] Skipped runtime error retry: handler in flight`, { sessionID })
++				return
++			}
++
++			inFlightSessions.add(sessionID)
++			try {
++				const state = options.loopState.getState()
++				if (!state || !state.active) {
++					handleErroredLoopSession(props, options.loopState)
++					return
++				}
++
++				const verificationSessionID = state.verification_pending
++					? state.verification_session_id
++					: undefined
++				const matchesParentSession = state.session_id === undefined || state.session_id === sessionID
++				const matchesVerificationSession = verificationSessionID === sessionID
++				if (!matchesParentSession && !matchesVerificationSession) {
++					handleErroredLoopSession(props, options.loopState)
++					return
++				}
++
++				log(`[${HOOK_NAME}] Retrying after runtime session error`, {
++					sessionID,
++					iteration: state.iteration,
++					error: String(error),
++				})
++
++				if (state.verification_pending) {
++					await handlePendingVerification(ctx, {
++						sessionID,
++						state,
++						verificationSessionID,
++						matchesParentSession,
++						matchesVerificationSession,
++						loopState: options.loopState,
++						directory: options.directory,
++						apiTimeoutMs: options.apiTimeoutMs,
++					})
++					return
++				}
++
++				if (
++					typeof state.max_iterations === "number"
++					&& state.iteration >= state.max_iterations
++				) {
++					log(`[${HOOK_NAME}] Runtime error retry budget exhausted`, {
++						sessionID,
++						iteration: state.iteration,
++						max: state.max_iterations,
++					})
++					options.loopState.clear()
++					await showMaxIterationsToast(ctx, state)
++					return
++				}
++
++				const newState = options.loopState.incrementIteration()
++				if (!newState) {
++					log(`[${HOOK_NAME}] Failed to increment iteration after runtime error`, { sessionID })
++					return
++				}
++
++				await showIterationToast(ctx, newState)
++				try {
++					await continueIteration(ctx, newState, {
++						previousSessionID: sessionID,
++						directory: options.directory,
++						apiTimeoutMs: options.apiTimeoutMs,
++						loopState: options.loopState,
++					})
++					runtimeErrorRetriedSessions.set(sessionID, newState.iteration)
++				} catch (err) {
++					log(`[${HOOK_NAME}] Failed to retry after runtime error`, {
++						sessionID,
++						error: String(err),
++					})
++				}
++			} finally {
++				inFlightSessions.delete(sessionID)
++			}
+ 		}
+ 	}
+ }
+-- 
+2.39.2
+

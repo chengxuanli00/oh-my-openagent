@@ -1,0 +1,278 @@
+From 1ebf89cb9ff4b2aae83edc6ebeef33e24d3dfe03 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 11 May 2026 13:43:40 +0900
+Subject: [PATCH 5055/5749] feat(hooks/atlas): inject boulder-complete
+ elapsed-time nudge once per work
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/hooks/atlas/idle-event.test.ts | 125 +++++++++++++++++++++++++++++
+ src/hooks/atlas/idle-event.ts      |  75 +++++++++++++++--
+ 2 files changed, 193 insertions(+), 7 deletions(-)
+ create mode 100644 src/hooks/atlas/idle-event.test.ts
+
+diff --git a/src/hooks/atlas/idle-event.test.ts b/src/hooks/atlas/idle-event.test.ts
+new file mode 100644
+index 00000000..8168de5e
+--- /dev/null
++++ b/src/hooks/atlas/idle-event.test.ts
+@@ -0,0 +1,125 @@
++import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { randomUUID } from "node:crypto"
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { createBoulderState, readBoulderState, writeBoulderState } from "../../features/boulder-state"
++import { _resetForTesting, registerAgentName } from "../../features/claude-code-session-state"
++import { handleAtlasSessionIdle } from "./idle-event"
++import type { SessionState } from "./types"
++
++describe("handleAtlasSessionIdle completion nudge", () => {
++  const SESSION_ID = "session-main-1"
++
++  let testDirectory = ""
++
++  beforeEach(() => {
++    testDirectory = join(tmpdir(), `atlas-idle-complete-${randomUUID()}`)
++    if (!existsSync(testDirectory)) {
++      mkdirSync(testDirectory, { recursive: true })
++    }
++    _resetForTesting()
++    registerAgentName("atlas")
++  })
++
++  afterEach(() => {
++    if (existsSync(testDirectory)) {
++      rmSync(testDirectory, { recursive: true, force: true })
++    }
++    _resetForTesting()
++  })
++
++  it("injects BOULDER COMPLETE prompt once per work with substituted elapsed and task breakdown", async () => {
++    // given
++    const planPath = join(testDirectory, "plan.md")
++    writeFileSync(planPath, "## TODOs\n- [x] 1. Parse input\n- [x] 2. Save output\n")
++
++    const boulder = createBoulderState(planPath, SESSION_ID, "atlas")
++    const workId = boulder.active_work_id
++    if (!workId) {
++      throw new Error("Expected active_work_id")
++    }
++
++    const work = boulder.works?.[workId]
++    if (!work) {
++      throw new Error("Expected active work")
++    }
++
++    work.elapsed_ms = 65_000
++    boulder.elapsed_ms = 65_000
++    work.task_sessions = {
++      "todo:2": {
++        task_key: "todo:2",
++        task_label: "2",
++        task_title: "Save output",
++        session_id: "sub-2",
++        elapsed_ms: 4_000,
++        updated_at: new Date().toISOString(),
++      },
++      "todo:1": {
++        task_key: "todo:1",
++        task_label: "1",
++        task_title: "Parse input",
++        session_id: "sub-1",
++        elapsed_ms: 61_000,
++        updated_at: new Date().toISOString(),
++      },
++    }
++    boulder.task_sessions = work.task_sessions
++
++    writeBoulderState(testDirectory, boulder)
++
++    const promptRequests: Array<{ body?: { parts?: Array<{ text?: string }> } }> = []
++    const promptAsyncMock = mock(async (request: { body?: { parts?: Array<{ text?: string }> } }) => {
++      promptRequests.push(request)
++      return { data: {} }
++    })
++
++    const ctx = {
++      directory: testDirectory,
++      client: {
++        session: {
++          promptAsync: promptAsyncMock,
++        },
++      },
++    } as PluginInput
++
++    const sessionStateById = new Map<string, SessionState>()
++    const getState = (sessionId: string): SessionState => {
++      let state = sessionStateById.get(sessionId)
++      if (!state) {
++        state = { promptFailureCount: 0 }
++        sessionStateById.set(sessionId, state)
++      }
++      return state
++    }
++
++    // when
++    await handleAtlasSessionIdle({
++      ctx,
++      sessionID: SESSION_ID,
++      getState,
++    })
++
++    await handleAtlasSessionIdle({
++      ctx,
++      sessionID: SESSION_ID,
++      getState,
++    })
++
++    // then
++    expect(promptAsyncMock).toHaveBeenCalledTimes(1)
++
++    const promptText = promptRequests[0]?.body?.parts?.[0]?.text ?? ""
++    expect(promptText).toContain("BOULDER COMPLETE")
++    expect(promptText).toContain("Total elapsed: 1m 5s")
++    expect(promptText).toContain("- 1 Parse input: 1m 1s")
++    expect(promptText).toContain("- 2 Save output: 4s")
++    expect(promptText).not.toContain("{ELAPSED_HUMAN}")
++
++    const persistedState = getState(SESSION_ID)
++    expect(persistedState.boulderCompletionNudgedAt?.[workId]).toBeNumber()
++    expect(readBoulderState(testDirectory)?.works?.[workId]?.status).toBe("active")
++  })
++})
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 417a1f5b..ab9c637d 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -1,6 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import {
+-  completeBoulder,
++  formatDurationHuman,
+   getPlanProgress,
+   getWorkForSession,
+   getTaskSessionState,
+@@ -8,15 +8,21 @@ import {
+   readCurrentTopLevelTask,
+   resolveBoulderPlanPath,
+ } from "../../features/boulder-state"
+-import { getSessionAgent } from "../../features/claude-code-session-state"
++import {
++  getSessionAgent,
++  isAgentRegistered,
++  resolveRegisteredAgentName,
++} from "../../features/claude-code-session-state"
+ import { getLastAgentFromSession } from "./session-last-agent"
+ import { isSessionInBoulderLineage } from "./boulder-session-lineage"
++import { createInternalAgentTextPart } from "../../shared"
+ import { getAgentConfigKey } from "../../shared/agent-display-names"
+ import { log } from "../../shared/logger"
+ import { settleAfterSessionIdle } from "../shared/session-idle-settle"
+ import { injectBoulderContinuation } from "./boulder-continuation-injector"
+ import { HOOK_NAME } from "./hook-name"
+ import { resolveActiveBoulderSession } from "./resolve-active-boulder-session"
++import { BOULDER_COMPLETE_PROMPT } from "./system-reminder-templates"
+ import type { AtlasHookOptions, SessionState } from "./types"
+ 
+ const CONTINUATION_COOLDOWN_MS = 5000
+@@ -24,6 +30,11 @@ const FAILURE_BACKOFF_MS = 5 * 60 * 1000
+ const MAX_CONSECUTIVE_PROMPT_FAILURES = 10
+ const RETRY_DELAY_MS = CONTINUATION_COOLDOWN_MS + 1000
+ 
++function getTaskLabelSortValue(taskLabel: string): number {
++  const parsed = Number.parseInt(taskLabel.replace(/[^0-9]/g, ""), 10)
++  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed
++}
++
+ function hasRunningBackgroundTasks(sessionID: string, options?: AtlasHookOptions): boolean {
+   const backgroundManager = options?.backgroundManager
+   return backgroundManager
+@@ -207,6 +218,7 @@ export async function handleAtlasSessionIdle(input: {
+   sessionID: string
+ }): Promise<void> {
+   const { ctx, options, getState, sessionID } = input
++  const sessionState = getState(sessionID)
+ 
+   log(`[${HOOK_NAME}] session.idle`, { sessionID })
+ 
+@@ -223,11 +235,61 @@ export async function handleAtlasSessionIdle(input: {
+   const { boulderState, progress, appendedSession } = activeBoulderSession
+   if (progress.isComplete) {
+     const work = getWorkForSession(ctx.directory, sessionID)
+-    if (work) {
+-      completeBoulder(ctx.directory, work.work_id)
+-    } else {
+-      completeBoulder(ctx.directory, boulderState.active_work_id)
++    if (!work || work.status === "abandoned") {
++      log(`[${HOOK_NAME}] Boulder complete`, { sessionID, plan: boulderState.plan_name })
++      return
+     }
++
++    if (sessionState.boulderCompletionNudgedAt?.[work.work_id]) {
++      log(`[${HOOK_NAME}] Boulder complete`, { sessionID, plan: boulderState.plan_name })
++      return
++    }
++
++    const elapsedMilliseconds = work.elapsed_ms ?? (Date.now() - new Date(work.started_at).getTime())
++    const elapsedHuman = formatDurationHuman(elapsedMilliseconds)
++
++    const taskBreakdown = Object.values(work.task_sessions ?? {})
++      .sort((left, right) => {
++        const leftSortValue = getTaskLabelSortValue(left.task_label)
++        const rightSortValue = getTaskLabelSortValue(right.task_label)
++        if (leftSortValue !== rightSortValue) {
++          return leftSortValue - rightSortValue
++        }
++
++        return left.task_label.localeCompare(right.task_label)
++      })
++      .map((task) => {
++        if (typeof task.elapsed_ms === "number") {
++          return `- ${task.task_label} ${task.task_title}: ${formatDurationHuman(task.elapsed_ms)}`
++        }
++
++        return `- ${task.task_label} ${task.task_title}: (no timing)`
++      })
++      .join("\n")
++
++    const prompt = BOULDER_COMPLETE_PROMPT
++      .replace(/{PLAN_NAME}/g, work.plan_name)
++      .replace(/{ELAPSED_HUMAN}/g, elapsedHuman)
++      .replace(/{TASK_BREAKDOWN}/g, taskBreakdown.length > 0 ? taskBreakdown : "- (no task timings)")
++
++    const atlasAgent = resolveRegisteredAgentName(
++      boulderState.agent ?? (isAgentRegistered("atlas") ? "atlas" : undefined),
++    )
++    if (atlasAgent && isAgentRegistered(atlasAgent)) {
++      await ctx.client.session.promptAsync({
++        path: { id: sessionID },
++        body: {
++          agent: atlasAgent,
++          parts: [createInternalAgentTextPart(prompt)],
++        },
++        query: { directory: ctx.directory },
++      })
++      sessionState.boulderCompletionNudgedAt = {
++        ...(sessionState.boulderCompletionNudgedAt ?? {}),
++        [work.work_id]: Date.now(),
++      }
++    }
++
+     log(`[${HOOK_NAME}] Boulder complete`, { sessionID, plan: boulderState.plan_name })
+     return
+   }
+@@ -254,7 +316,6 @@ export async function handleAtlasSessionIdle(input: {
+     return
+   }
+ 
+-  const sessionState = getState(sessionID)
+   const now = Date.now()
+ 
+   if (sessionState.waitingForFinalWaveApproval) {
+-- 
+2.39.2
+

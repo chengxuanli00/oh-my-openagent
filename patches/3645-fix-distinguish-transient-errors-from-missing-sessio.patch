@@ -1,0 +1,324 @@
+From 3cce7406eabf06cfce9e78f56f6c4e710403184e Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 31 Mar 2026 17:04:07 -0700
+Subject: [PATCH 3645/5749] fix: distinguish transient errors from missing
+ sessions in crash detection
+
+---
+ .../background-agent/manager.polling.test.ts  | 72 ++++++++++++++++++-
+ src/features/background-agent/manager.test.ts |  4 ++
+ src/features/background-agent/manager.ts      | 17 +++--
+ .../background-agent/session-existence.ts     | 50 +++++++++++++
+ .../background-agent/task-poller.test.ts      | 32 +++++++++
+ src/features/background-agent/task-poller.ts  | 12 +---
+ 6 files changed, 167 insertions(+), 20 deletions(-)
+ create mode 100644 src/features/background-agent/session-existence.ts
+
+diff --git a/src/features/background-agent/manager.polling.test.ts b/src/features/background-agent/manager.polling.test.ts
+index 964d2603..3879f30a 100644
+--- a/src/features/background-agent/manager.polling.test.ts
++++ b/src/features/background-agent/manager.polling.test.ts
+@@ -1,4 +1,6 @@
+-import { describe, test, expect } from "bun:test"
++/// <reference types="bun-types" />
++
++import { describe, test, expect, mock } from "bun:test"
+ import { tmpdir } from "node:os"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { BackgroundManager } from "./manager"
+@@ -78,6 +80,7 @@ function createManagerWithClient(clientOverrides: Record<string, unknown> = {}):
+   const client = {
+     session: {
+       status: async () => ({ data: {} }),
++      get: async () => ({ data: { id: "ses-default" } }),
+       prompt: async () => ({}),
+       promptAsync: async () => ({}),
+       abort: async () => ({}),
+@@ -97,6 +100,46 @@ function createManagerWithClient(clientOverrides: Record<string, unknown> = {}):
+   return new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
+ }
+ 
++describe("BackgroundManager verifySessionExists", () => {
++  describe("#given session.get reports a not-found response", () => {
++    test("#when verifySessionExists runs #then it returns false", async () => {
++      //#given
++      const manager = createManagerWithClient({
++        get: async () => ({
++          error: { message: "Session not found", status: 404 },
++          data: undefined,
++        }),
++      })
++
++      //#when
++      const result = await manager["verifySessionExists"]("ses-missing")
++      await manager.shutdown()
++
++      //#then
++      expect(result).toBe(false)
++    })
++  })
++
++  describe("#given session.get reports a transient transport error", () => {
++    test("#when verifySessionExists runs #then it returns true", async () => {
++      //#given
++      const manager = createManagerWithClient({
++        get: async () => ({
++          error: { message: "Network timeout", status: 500 },
++          data: undefined,
++        }),
++      })
++
++      //#when
++      const result = await manager["verifySessionExists"]("ses-transient")
++      await manager.shutdown()
++
++      //#then
++      expect(result).toBe(true)
++    })
++  })
++})
++
+ describe("BackgroundManager pollRunningTasks", () => {
+   describe("#given a running task whose session is no longer in status response", () => {
+     test("#when pollRunningTasks runs #then completes the task instead of leaving it running", async () => {
+@@ -114,6 +157,31 @@ describe("BackgroundManager pollRunningTasks", () => {
+       expect(task.status).toBe("completed")
+       expect(task.completedAt).toBeDefined()
+     })
++
++    test("#when the first missing-status poll has no output #then it does not fail the task yet", async () => {
++      //#given
++      const getSession = mock(async () => ({
++        error: { message: "Session not found", status: 404 },
++        data: undefined,
++      }))
++      const manager = createManagerWithClient({
++        get: getSession,
++        messages: async () => ({ data: [] }),
++      })
++      const task = createRunningTask("ses-first-miss")
++      injectTask(manager, task)
++
++      //#when
++      const poll = manager["pollRunningTasks"]
++      await poll.call(manager)
++      await manager.shutdown()
++
++      //#then
++      expect(task.status).toBe("running")
++      expect(task.error).toBeUndefined()
++      expect(task.consecutiveMissedPolls).toBe(1)
++      expect(getSession).not.toHaveBeenCalled()
++    })
+   })
+ 
+   describe("#given a running task whose session status is idle", () => {
+@@ -191,4 +259,4 @@ describe("BackgroundManager pollRunningTasks", () => {
+       expect(task.completedAt).toBeDefined()
+     })
+   })
+-})
+\ No newline at end of file
++})
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 7050025b..269886af 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -3556,6 +3556,10 @@ describe("BackgroundManager.checkAndInterruptStaleTasks", () => {
+       session: {
+         prompt: async () => ({}),
+         promptAsync: async () => ({}),
++        get: async () => ({
++          error: { message: "Session not found", status: 404 },
++          data: undefined,
++        }),
+         abort: async () => ({}),
+       },
+     }
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index d3542844..790d92de 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -53,6 +53,10 @@ import { join } from "node:path"
+ import { pruneStaleTasksAndNotifications } from "./task-poller"
+ import { checkAndInterruptStaleTasks } from "./task-poller"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
++import {
++  MIN_SESSION_GONE_POLLS,
++  verifySessionExists as verifySessionStillExists,
++} from "./session-existence"
+ import { isActiveSessionStatus, isTerminalSessionStatus } from "./session-status-classifier"
+ import {
+   detectRepetitiveToolUse,
+@@ -1819,12 +1823,7 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+   }
+ 
+   private async verifySessionExists(sessionID: string): Promise<boolean> {
+-    try {
+-      const result = await this.client.session.get({ path: { id: sessionID } })
+-      return !!result.data
+-    } catch {
+-      return false
+-    }
++    return verifySessionStillExists(this.client, sessionID)
+   }
+ 
+   private async failCrashedTask(task: BackgroundTask, errorMessage: string): Promise<void> {
+@@ -1927,18 +1926,22 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+ 
+         // Session is idle or no longer in status response (completed/disappeared)
+         const sessionGoneFromStatus = !sessionStatus
++        const sessionGoneThresholdReached = sessionGoneFromStatus
++          && (task.consecutiveMissedPolls ?? 0) >= MIN_SESSION_GONE_POLLS
+         const completionSource = sessionStatus?.type === "idle"
+           ? "polling (idle status)"
+           : "polling (session gone from status)"
+         const hasValidOutput = await this.validateSessionHasOutput(sessionID)
+         if (!hasValidOutput) {
+-          if (sessionGoneFromStatus) {
++          if (sessionGoneThresholdReached) {
+             const sessionExists = await this.verifySessionExists(sessionID)
+             if (!sessionExists) {
+               log("[background-agent] Session no longer exists (crashed), marking task as error:", task.id)
+               await this.failCrashedTask(task, "Subagent session no longer exists (process likely crashed). The session disappeared without producing any output.")
+               continue
+             }
++
++            task.consecutiveMissedPolls = 0
+           }
+           log("[background-agent] Polling idle/gone but no valid output yet, waiting:", task.id)
+           continue
+diff --git a/src/features/background-agent/session-existence.ts b/src/features/background-agent/session-existence.ts
+new file mode 100644
+index 00000000..6ea52025
+--- /dev/null
++++ b/src/features/background-agent/session-existence.ts
+@@ -0,0 +1,50 @@
++import type { OpencodeClient } from "./opencode-client"
++
++export const MIN_SESSION_GONE_POLLS = 3
++
++function extractErrorMessage(error: unknown): string | undefined {
++  if (typeof error === "string") {
++    return error
++  }
++
++  if (typeof error !== "object" || error === null || !("message" in error)) {
++    return undefined
++  }
++
++  return typeof error.message === "string" ? error.message : undefined
++}
++
++function extractErrorStatus(error: unknown): number | undefined {
++  if (typeof error !== "object" || error === null || !("status" in error)) {
++    return undefined
++  }
++
++  return typeof error.status === "number" ? error.status : undefined
++}
++
++function isSessionNotFoundError(error: unknown): boolean {
++  if (extractErrorStatus(error) === 404) {
++    return true
++  }
++
++  const message = extractErrorMessage(error)?.toLowerCase()
++  if (!message) {
++    return false
++  }
++
++  return message.includes("not found") || message.includes("missing")
++}
++
++export async function verifySessionExists(client: OpencodeClient, sessionID: string): Promise<boolean> {
++  try {
++    const response = await client.session.get({ path: { id: sessionID } })
++
++    if (response.error !== undefined && response.error !== null) {
++      return !isSessionNotFoundError(response.error)
++    }
++
++    return response.data != null
++  } catch (error) {
++    return !isSessionNotFoundError(error)
++  }
++}
+diff --git a/src/features/background-agent/task-poller.test.ts b/src/features/background-agent/task-poller.test.ts
+index cd3d8a9c..0343f99c 100644
+--- a/src/features/background-agent/task-poller.test.ts
++++ b/src/features/background-agent/task-poller.test.ts
+@@ -347,6 +347,38 @@ describe("checkAndInterruptStaleTasks", () => {
+     expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: "ses-1" } })
+   })
+ 
++  it("should NOT cancel task when session.get returns a transient error response", async () => {
++    //#given — repeated missing polls but lookup failed with a retryable transport error
++    const task = createRunningTask({
++      startedAt: new Date(Date.now() - 300_000),
++      progress: {
++        toolCalls: 1,
++        lastUpdate: new Date(Date.now() - 120_000),
++      },
++      consecutiveMissedPolls: 2,
++    })
++
++    mockClient.session.get.mockResolvedValue({
++      error: { message: "Network timeout", status: 500 },
++      data: undefined,
++    })
++
++    //#when
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient as never,
++      config: { staleTimeoutMs: 180_000, sessionGoneTimeoutMs: 60_000 },
++      concurrencyManager: mockConcurrencyManager as never,
++      notifyParentSession: mockNotify,
++      sessionStatuses: {},
++    })
++
++    //#then
++    expect(task.status).toBe("running")
++    expect(task.consecutiveMissedPolls).toBe(0)
++    expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: "ses-1" } })
++  })
++
+   it("should use session-gone timeout when session is missing from status map (with progress)", async () => {
+     //#given — lastUpdate 2min ago, session completely gone from status
+     const task = createRunningTask({
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index 803b0f51..1b32a55f 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -14,10 +14,9 @@ import {
+   TASK_TTL_MS,
+ } from "./constants"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
++import { MIN_SESSION_GONE_POLLS, verifySessionExists } from "./session-existence"
+ 
+ import { isActiveSessionStatus } from "./session-status-classifier"
+-
+-const MIN_SESSION_GONE_POLLS = 3
+ const TERMINAL_TASK_STATUSES = new Set<BackgroundTask["status"]>([
+   "completed",
+   "error",
+@@ -99,15 +98,6 @@ export function pruneStaleTasksAndNotifications(args: {
+ 
+ export type SessionStatusMap = Record<string, { type: string }>
+ 
+-async function verifySessionExists(client: OpencodeClient, sessionID: string): Promise<boolean> {
+-  try {
+-    const result = await client.session.get({ path: { id: sessionID } })
+-    return !!result.data
+-  } catch {
+-    return false
+-  }
+-}
+-
+ export async function checkAndInterruptStaleTasks(args: {
+   tasks: Iterable<BackgroundTask>
+   client: OpencodeClient
+-- 
+2.39.2
+

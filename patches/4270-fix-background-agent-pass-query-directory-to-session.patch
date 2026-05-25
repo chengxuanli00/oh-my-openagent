@@ -1,0 +1,473 @@
+From 3bfa3bd60864e6a7b2245b60a1311fa6eb33f528 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 12 Apr 2026 02:30:01 +0900
+Subject: [PATCH 4270/5749] fix(background-agent): pass query directory to
+ session.get in 4 call-sites (#2937)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+resolveSubagentSpawnContext and related lookups called client.session.get
+without the query.directory parameter, causing project-scoped sessions
+to 404 under newer OpenCode SDK versions. Threaded directory through
+SpawnerContext/BackgroundManager so all four call-sites pass it.
+
+🤖 Generated with OhMyOpenCode assistance
+https://github.com/code-yeongyu/oh-my-opencode
+---
+ .../manager-session-permission.test.ts        | 42 +++++++++++++
+ src/features/background-agent/manager.ts      |  9 ++-
+ .../session-existence.test.ts                 | 26 ++++++++
+ .../background-agent/session-existence.ts     | 11 +++-
+ src/features/background-agent/spawner.test.ts | 56 ++++++++++++++++++
+ src/features/background-agent/spawner.ts      |  1 +
+ .../subagent-spawn-limits.test.ts             | 59 ++++++++++++++-----
+ .../background-agent/subagent-spawn-limits.ts |  4 +-
+ src/features/background-agent/task-poller.ts  |  6 +-
+ 9 files changed, 192 insertions(+), 22 deletions(-)
+ create mode 100644 src/features/background-agent/session-existence.test.ts
+
+diff --git a/src/features/background-agent/manager-session-permission.test.ts b/src/features/background-agent/manager-session-permission.test.ts
+index d55bd335..83c5139b 100644
+--- a/src/features/background-agent/manager-session-permission.test.ts
++++ b/src/features/background-agent/manager-session-permission.test.ts
+@@ -6,6 +6,48 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { BackgroundManager } from "./manager"
+ 
+ describe("BackgroundManager session permission", () => {
++  test("passes query directory when loading the parent session", async () => {
++    // given
++    const getCalls: Array<Record<string, unknown>> = []
++    const client = {
++      session: {
++        get: async (input: Record<string, unknown>) => {
++          getCalls.push(input)
++          return { data: { directory: "/parent" } }
++        },
++        create: async () => ({ data: { id: "ses_child" } }),
++        promptAsync: async () => ({}),
++        abort: async () => ({}),
++      },
++    }
++    const directory = tmpdir()
++    const manager = new BackgroundManager({ client, directory } as unknown as PluginInput)
++
++    // when
++    await manager.launch({
++      description: "Test task",
++      prompt: "Do something",
++      agent: "explore",
++      parentSessionID: "ses_parent",
++      parentMessageID: "msg_parent",
++    })
++    await new Promise((resolve) => setTimeout(resolve, 50))
++    manager.shutdown()
++
++    // then
++    expect(getCalls).toHaveLength(2)
++    expect(getCalls).toEqual([
++      {
++        path: { id: "ses_parent" },
++        query: { directory },
++      },
++      {
++        path: { id: "ses_parent" },
++        query: { directory },
++      },
++    ])
++  })
++
+   test("passes explicit session permission rules to child session creation", async () => {
+     // given
+     const createCalls: Array<Record<string, unknown>> = []
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index bd8ff247..a59ea953 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -207,7 +207,7 @@ export class BackgroundManager {
+   }
+ 
+   async assertCanSpawn(parentSessionID: string): Promise<SubagentSpawnContext> {
+-    const spawnContext = await resolveSubagentSpawnContext(this.client, parentSessionID)
++    const spawnContext = await resolveSubagentSpawnContext(this.client, parentSessionID, this.directory)
+     const maxDepth = getMaxSubagentDepth(this.config)
+     if (spawnContext.childDepth > maxDepth) {
+       throw createSubagentDepthLimitError({
+@@ -453,6 +453,7 @@ export class BackgroundManager {
+ 
+     const parentSession = await this.client.session.get({
+       path: { id: input.parentSessionID },
++      query: { directory: this.directory },
+     }).catch((err) => {
+       log(`[background-agent] Failed to get parent session: ${err}`)
+       return null
+@@ -1060,7 +1061,8 @@ export class BackgroundManager {
+ 
+         task.progress.toolCalls += 1
+         task.progress.lastTool = partInfo.tool
+-        const circuitBreaker = this.cachedCircuitBreakerSettings ?? (this.cachedCircuitBreakerSettings = resolveCircuitBreakerSettings(this.config))
++        const circuitBreaker = this.cachedCircuitBreakerSettings ?? resolveCircuitBreakerSettings(this.config)
++        this.cachedCircuitBreakerSettings = circuitBreaker
+         if (partInfo.tool) {
+          task.progress.toolCallWindow = recordToolCall(
+              task.progress.toolCallWindow,
+@@ -1947,6 +1949,7 @@ export class BackgroundManager {
+     await checkAndInterruptStaleTasks({
+       tasks: this.tasks.values(),
+       client: this.client,
++      directory: this.directory,
+       config: this.config,
+       concurrencyManager: this.concurrencyManager,
+       notifyParentSession: (task) => this.enqueueNotificationForParent(task.parentSessionID, () => this.notifyParentSession(task)),
+@@ -1955,7 +1958,7 @@ export class BackgroundManager {
+   }
+ 
+   private async verifySessionExists(sessionID: string): Promise<boolean> {
+-    return verifySessionStillExists(this.client, sessionID)
++    return verifySessionStillExists(this.client, sessionID, this.directory)
+   }
+ 
+   private async failCrashedTask(task: BackgroundTask, errorMessage: string): Promise<void> {
+diff --git a/src/features/background-agent/session-existence.test.ts b/src/features/background-agent/session-existence.test.ts
+new file mode 100644
+index 00000000..9b59a481
+--- /dev/null
++++ b/src/features/background-agent/session-existence.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, mock, test } from "bun:test"
++
++import type { OpencodeClient } from "./opencode-client"
++import { verifySessionExists } from "./session-existence"
++
++describe("verifySessionExists", () => {
++  test("passes query directory to session lookup when provided", async () => {
++    // given
++    const get = mock(async () => ({ data: { id: "session-123" } }))
++    const client = {
++      session: {
++        get,
++      },
++    } as unknown as OpencodeClient
++
++    // when
++    const result = await verifySessionExists(client, "session-123", "/project/root")
++
++    // then
++    expect(result).toBe(true)
++    expect(get).toHaveBeenCalledWith({
++      path: { id: "session-123" },
++      query: { directory: "/project/root" },
++    })
++  })
++})
+diff --git a/src/features/background-agent/session-existence.ts b/src/features/background-agent/session-existence.ts
+index 6ea52025..789b0189 100644
+--- a/src/features/background-agent/session-existence.ts
++++ b/src/features/background-agent/session-existence.ts
+@@ -35,9 +35,16 @@ function isSessionNotFoundError(error: unknown): boolean {
+   return message.includes("not found") || message.includes("missing")
+ }
+ 
+-export async function verifySessionExists(client: OpencodeClient, sessionID: string): Promise<boolean> {
++export async function verifySessionExists(
++  client: OpencodeClient,
++  sessionID: string,
++  directory?: string
++): Promise<boolean> {
+   try {
+-    const response = await client.session.get({ path: { id: sessionID } })
++    const response = await client.session.get({
++      path: { id: sessionID },
++      ...(directory ? { query: { directory } } : {}),
++    })
+ 
+     if (response.error !== undefined && response.error !== null) {
+       return !isSessionNotFoundError(response.error)
+diff --git a/src/features/background-agent/spawner.test.ts b/src/features/background-agent/spawner.test.ts
+index 6abf62bd..b1f486c5 100644
+--- a/src/features/background-agent/spawner.test.ts
++++ b/src/features/background-agent/spawner.test.ts
+@@ -467,6 +467,62 @@ describe("background-agent spawner fallback model promotion", () => {
+     expect(promptCalls[0]?.body?.variant).toBe("medium")
+   })
+ 
++  test("passes query.directory when loading the parent session", async () => {
++    // given
++    const getCalls: Array<Record<string, unknown>> = []
++
++    const client = {
++      session: {
++        get: async (input: Record<string, unknown>) => {
++          getCalls.push(input)
++          return { data: { directory: "/parent/dir" } }
++        },
++        create: async () => ({ data: { id: "ses_child_query" } }),
++        promptAsync: async () => ({}),
++      },
++    }
++
++    const task = createTask({
++      description: "Test task",
++      prompt: "Do work",
++      agent: "sisyphus-junior",
++      parentSessionID: "ses_parent",
++      parentMessageID: "msg_parent",
++    })
++
++    const item = {
++      task,
++      input: {
++        description: task.description,
++        prompt: task.prompt,
++        agent: task.agent,
++        parentSessionID: task.parentSessionID,
++        parentMessageID: task.parentMessageID,
++        parentModel: task.parentModel,
++        parentAgent: task.parentAgent,
++        model: task.model,
++      },
++    }
++
++    // when
++    await startTask(item as never, {
++      client: client as never,
++      directory: "/fallback",
++      concurrencyManager: { release: () => {} } as never,
++      tmuxEnabled: false,
++      onTaskError: () => {},
++    })
++    await new Promise((resolve) => setTimeout(resolve, 0))
++
++    // then
++    expect(getCalls).toEqual([
++      {
++        path: { id: "ses_parent" },
++        query: { directory: "/fallback" },
++      },
++    ])
++  })
++
+   test("strips leading zwsp from prompt body agent before promptAsync", async () => {
+     //#given
+     const promptCalls: Array<{ body?: { agent?: string } }> = []
+diff --git a/src/features/background-agent/spawner.ts b/src/features/background-agent/spawner.ts
+index b549c706..675aeb5d 100644
+--- a/src/features/background-agent/spawner.ts
++++ b/src/features/background-agent/spawner.ts
+@@ -86,6 +86,7 @@ export async function startTask(
+ 
+   const parentSession = await client.session.get({
+     path: { id: input.parentSessionID },
++    query: { directory },
+   }).catch((err) => {
+     log(`[background-agent] Failed to get parent session: ${err}`)
+     return null
+diff --git a/src/features/background-agent/subagent-spawn-limits.test.ts b/src/features/background-agent/subagent-spawn-limits.test.ts
+index 85824d46..e158c0da 100644
+--- a/src/features/background-agent/subagent-spawn-limits.test.ts
++++ b/src/features/background-agent/subagent-spawn-limits.test.ts
+@@ -19,13 +19,44 @@ function createMockClient(sessionGet: OpencodeClient["session"]["get"]): Opencod
+ }
+ 
+ describe("resolveSubagentSpawnContext", () => {
++  describe("#given a directory-scoped session lookup", () => {
++    test("passes query.directory to each session.get call", async () => {
++      // given
++      const sessionGetCalls: Array<Record<string, unknown>> = []
++      const client = createMockClient((async (input) => {
++        sessionGetCalls.push(input as Record<string, unknown>)
++        if (input.path.id === "child-session") {
++          return { data: { id: "child-session", parentID: "root-session" } }
++        }
++
++        return { data: { id: "root-session", parentID: undefined } }
++      }) as unknown as OpencodeClient["session"]["get"])
++
++      // when
++      const result = await resolveSubagentSpawnContext(client, "child-session", "/project/root")
++
++      // then
++      expect(result.rootSessionID).toBe("root-session")
++      expect(sessionGetCalls).toEqual([
++        {
++          path: { id: "child-session" },
++          query: { directory: "/project/root" },
++        },
++        {
++          path: { id: "root-session" },
++          query: { directory: "/project/root" },
++        },
++      ])
++    })
++  })
++
+   describe("#given session.get returns an SDK error response", () => {
+     test("throws a fail-closed spawn blocked error", async () => {
+       // given
+-      const client = createMockClient(async () => ({
++      const client = createMockClient((async () => ({
+         error: "lookup failed",
+         data: undefined,
+-      }))
++      })) as unknown as OpencodeClient["session"]["get"])
+ 
+       // when
+       const result = resolveSubagentSpawnContext(client, "parent-session")
+@@ -38,9 +69,9 @@ describe("resolveSubagentSpawnContext", () => {
+   describe("#given session.get returns no session data", () => {
+     test("throws a fail-closed spawn blocked error", async () => {
+       // given
+-      const client = createMockClient(async () => ({
++      const client = createMockClient((async () => ({
+         data: undefined,
+-      }))
++      })) as unknown as OpencodeClient["session"]["get"])
+ 
+       // when
+       const result = resolveSubagentSpawnContext(client, "parent-session")
+@@ -53,12 +84,12 @@ describe("resolveSubagentSpawnContext", () => {
+   describe("depth calculation smoke tests (regression guard)", () => {
+     test("root session (no parentID) reports depth 0 and childDepth 1", async () => {
+       // given - a root session with no parent
+-      const client = createMockClient(async (opts) => {
++      const client = createMockClient((async (opts) => {
+         if (opts.path.id === "root-session") {
+           return { data: { id: "root-session", parentID: undefined } }
+         }
+         return { error: "not found", data: undefined }
+-      })
++      }) as unknown as OpencodeClient["session"]["get"])
+ 
+       // when
+       const result = await resolveSubagentSpawnContext(client, "root-session")
+@@ -71,7 +102,7 @@ describe("resolveSubagentSpawnContext", () => {
+ 
+     test("depth-1 child reports childDepth 2", async () => {
+       // given - child -> root chain
+-      const client = createMockClient(async (opts) => {
++      const client = createMockClient((async (opts) => {
+         if (opts.path.id === "child-1") {
+           return { data: { id: "child-1", parentID: "root-session" } }
+         }
+@@ -79,7 +110,7 @@ describe("resolveSubagentSpawnContext", () => {
+           return { data: { id: "root-session", parentID: undefined } }
+         }
+         return { error: "not found", data: undefined }
+-      })
++      }) as unknown as OpencodeClient["session"]["get"])
+ 
+       // when
+       const result = await resolveSubagentSpawnContext(client, "child-1")
+@@ -92,7 +123,7 @@ describe("resolveSubagentSpawnContext", () => {
+ 
+     test("depth-2 grandchild reports childDepth 3", async () => {
+       // given - grandchild -> child -> root chain
+-      const client = createMockClient(async (opts) => {
++      const client = createMockClient((async (opts) => {
+         const sessions: Record<string, { id: string; parentID?: string }> = {
+           "grandchild": { id: "grandchild", parentID: "child" },
+           "child": { id: "child", parentID: "root" },
+@@ -101,7 +132,7 @@ describe("resolveSubagentSpawnContext", () => {
+         const session = sessions[opts.path.id]
+         if (session) return { data: session }
+         return { error: "not found", data: undefined }
+-      })
++      }) as unknown as OpencodeClient["session"]["get"])
+ 
+       // when
+       const result = await resolveSubagentSpawnContext(client, "grandchild")
+@@ -125,11 +156,11 @@ describe("resolveSubagentSpawnContext", () => {
+         }
+       }
+ 
+-      const client = createMockClient(async (opts) => {
++      const client = createMockClient((async (opts) => {
+         const session = sessions[opts.path.id]
+         if (session) return { data: session }
+         return { error: "not found", data: undefined }
+-      })
++      }) as unknown as OpencodeClient["session"]["get"])
+ 
+       // when - resolve from the deepest session
+       const deepest = `session-${DEFAULT_MAX_SUBAGENT_DEPTH}`
+@@ -142,7 +173,7 @@ describe("resolveSubagentSpawnContext", () => {
+ 
+     test("detects parent cycle and throws", async () => {
+       // given - A -> B -> A (cycle)
+-      const client = createMockClient(async (opts) => {
++      const client = createMockClient((async (opts) => {
+         const sessions: Record<string, { id: string; parentID?: string }> = {
+           "session-a": { id: "session-a", parentID: "session-b" },
+           "session-b": { id: "session-b", parentID: "session-a" },
+@@ -150,7 +181,7 @@ describe("resolveSubagentSpawnContext", () => {
+         const session = sessions[opts.path.id]
+         if (session) return { data: session }
+         return { error: "not found", data: undefined }
+-      })
++      }) as unknown as OpencodeClient["session"]["get"])
+ 
+       // when
+       const result = resolveSubagentSpawnContext(client, "session-a")
+diff --git a/src/features/background-agent/subagent-spawn-limits.ts b/src/features/background-agent/subagent-spawn-limits.ts
+index d8f3db4b..c53a0e35 100644
+--- a/src/features/background-agent/subagent-spawn-limits.ts
++++ b/src/features/background-agent/subagent-spawn-limits.ts
+@@ -20,7 +20,8 @@ export function getMaxRootSessionSpawnBudget(config?: BackgroundTaskConfig): num
+ 
+ export async function resolveSubagentSpawnContext(
+   client: OpencodeClient,
+-  parentSessionID: string
++  parentSessionID: string,
++  directory?: string
+ ): Promise<SubagentSpawnContext> {
+   const visitedSessionIDs = new Set<string>()
+   let rootSessionID = parentSessionID
+@@ -38,6 +39,7 @@ export async function resolveSubagentSpawnContext(
+     try {
+       const response = await client.session.get({
+         path: { id: currentSessionID },
++        ...(directory ? { query: { directory } } : {}),
+       })
+       if (response.error) {
+         throw new Error(String(response.error))
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index 45263cc4..73cb2ac4 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -103,6 +103,7 @@ export type SessionStatusMap = Record<string, { type: string }>
+ export async function checkAndInterruptStaleTasks(args: {
+   tasks: Iterable<BackgroundTask>
+   client: OpencodeClient
++  directory?: string
+   config: BackgroundTaskConfig | undefined
+   concurrencyManager: ConcurrencyManager
+   notifyParentSession: (task: BackgroundTask) => Promise<void>
+@@ -112,6 +113,7 @@ export async function checkAndInterruptStaleTasks(args: {
+   const {
+     tasks,
+     client,
++    directory,
+     config,
+     concurrencyManager,
+     notifyParentSession,
+@@ -151,7 +153,7 @@ export async function checkAndInterruptStaleTasks(args: {
+       const effectiveTimeout = sessionGone ? sessionGoneTimeoutMs : messageStalenessMs
+       if (runtime <= effectiveTimeout) continue
+ 
+-      if (sessionGone && await verifySessionExists(client, sessionID)) {
++      if (sessionGone && await verifySessionExists(client, sessionID, directory)) {
+         task.consecutiveMissedPolls = 0
+         continue
+       }
+@@ -189,7 +191,7 @@ export async function checkAndInterruptStaleTasks(args: {
+     if (timeSinceLastUpdate <= effectiveStaleTimeout) continue
+     if (task.status !== "running") continue
+ 
+-    if (sessionGone && await verifySessionExists(client, sessionID)) {
++    if (sessionGone && await verifySessionExists(client, sessionID, directory)) {
+       task.consecutiveMissedPolls = 0
+       continue
+     }
+-- 
+2.39.2
+

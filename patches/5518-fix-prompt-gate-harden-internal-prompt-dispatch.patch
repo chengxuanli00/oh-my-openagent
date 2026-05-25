@@ -1,0 +1,3094 @@
+From 1492bffd2032815acc463f5b4a2af160c8b830a6 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 19 May 2026 16:02:18 +0900
+Subject: [PATCH 5518/5749] fix(prompt-gate): harden internal prompt dispatch
+
+---
+ src/cli/run/runner.ts                         |   4 +-
+ src/features/background-agent/manager.ts      |  16 +-
+ .../background-agent/parent-wake-notifier.ts  |  28 +-
+ .../parent-wake-user-message-race.test.ts     |  80 ++++-
+ .../background-agent/session-route.ts         |   6 +-
+ .../team-mode/tools/messaging.test.ts         |  15 +-
+ src/features/team-mode/tools/messaging.ts     |  27 +-
+ .../aggressive-truncation-strategy.ts         |   4 +-
+ .../boulder-continuation-injector.test.ts     |  36 ++
+ .../atlas/boulder-continuation-injector.ts    |  14 +-
+ src/hooks/atlas/idle-event.test.ts            |  66 ++++
+ src/hooks/atlas/idle-event.ts                 |  11 +-
+ .../handlers/session-event-handler.ts         |   4 +-
+ .../recovery.test.ts                          |  72 +++-
+ .../compaction-context-injector/recovery.ts   |   8 +-
+ .../continuation-prompt-injector.test.ts      |  33 +-
+ .../continuation-prompt-injector.ts           |  11 +
+ src/hooks/runtime-fallback/auto-retry.ts      |  14 +-
+ src/hooks/runtime-fallback/index.test.ts      |  71 ++++
+ .../recover-tool-result-missing.test.ts       |  30 +-
+ .../recover-tool-result-missing.ts            |  10 +-
+ .../recover-unavailable-tool.test.ts          |  24 +-
+ .../recover-unavailable-tool.ts               |  10 +-
+ src/hooks/session-recovery/resume.test.ts     |  30 +-
+ src/hooks/session-recovery/resume.ts          |   9 +-
+ src/hooks/shared/prompt-async-gate.test.ts    | 265 ++++++++++++++-
+ .../team-idle-wake-hint.test.ts               |  43 +++
+ .../team-idle-wake-hint.ts                    |  37 +-
+ .../continuation-injection.test.ts            |  48 ++-
+ .../continuation-injection.ts                 |  12 +-
+ .../unstable-agent-babysitter/index.test.ts   |  51 ++-
+ .../unstable-agent-babysitter-hook.ts         |  20 +-
+ src/plugin/event.model-fallback.test.ts       |  55 +++
+ src/plugin/event.ts                           |  12 +-
+ src/plugin/unstable-agent-babysitter.ts       |   1 -
+ src/shared/index.ts                           |   1 +
+ src/shared/model-suggestion-retry.test.ts     |  24 +-
+ src/shared/model-suggestion-retry.ts          |  10 +-
+ src/shared/prompt-async-gate.ts               | 319 ++++++++++++++++++
+ src/shared/prompt-async-route-audit.test.ts   |  19 +-
+ src/shared/prompt-failure-classifier.test.ts  |  27 ++
+ src/shared/prompt-failure-classifier.ts       |  24 ++
+ src/shared/prompt-timeout-context.ts          |   1 +
+ src/shared/session-route.test.ts              |   6 +-
+ src/shared/session-route.ts                   |   6 +-
+ src/tools/call-omo-agent/sync-executor.ts     |   5 +-
+ src/tools/delegate-task/sync-continuation.ts  |   2 +
+ src/tools/delegate-task/sync-prompt-sender.ts |   6 +-
+ src/tools/look-at/look-at-session-runner.ts   |   2 +
+ 49 files changed, 1488 insertions(+), 141 deletions(-)
+ create mode 100644 src/shared/prompt-failure-classifier.test.ts
+ create mode 100644 src/shared/prompt-failure-classifier.ts
+
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index d02ac4da..02cf43d7 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -13,7 +13,7 @@ import { loadAgentProfileColors } from "./agent-profile-colors"
+ import { suppressRunInput } from "./stdin-suppression"
+ import { createTimestampedStdoutController } from "./timestamp-output"
+ import { createCliPostHog, getPostHogDistinctId } from "../../shared/posthog"
+-import { dispatchInternalPrompt } from "../../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../shared/prompt-async-gate"
+ 
+ export { resolveRunAgent }
+ 
+@@ -132,7 +132,7 @@ export async function run(options: RunOptions): Promise<number> {
+       if (promptResult.status === "failed") {
+         throw promptResult.error
+       }
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
+         throw new Error(`Session ${sessionID} is not idle; promptAsync skipped by gate: ${promptResult.status}`)
+       }
+       const exitCode = await pollForCompletion(ctx, eventState, abortController)
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 064d5fa6..7847b009 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -3,7 +3,10 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { BackgroundTaskConfig, TmuxConfig } from "../../config/schema"
+ import { setContinuationMarkerSource } from "../../features/run-continuation-state"
+ import type { ModelFallbackControllerAccessor } from "../../hooks/model-fallback"
+-import { dispatchInternalPrompt, type PromptAsyncGateResult } from "../../hooks/shared/prompt-async-gate"
++import {
++  dispatchInternalPrompt,
++  type PromptAsyncGateResult,
++} from "../../hooks/shared/prompt-async-gate"
+ import { isSessionActive as isOpenCodeSessionActive } from "../../hooks/shared/session-idle-settle"
+ import {
+   createInternalAgentTextPart,
+@@ -485,7 +488,7 @@ export class BackgroundManager {
+   private restoreTaskAfterSkippedResume(
+     task: BackgroundTask,
+     snapshot: ResumeTaskSnapshot,
+-    skippedStatus: Exclude<PromptAsyncGateResult["status"], "dispatched" | "failed">,
++    skippedStatus: Exclude<PromptAsyncGateResult["status"], "dispatched" | "queued" | "failed">,
+   ): void {
+     log("[background-agent] Restoring task after skipped resume prompt:", {
+       taskId: task.id,
+@@ -1306,6 +1309,7 @@ The fallback retry session is now created and can be inspected directly.
+       sessionID: existingTask.sessionId,
+       source: "background-agent-resume",
+       settleMs: 0,
++      queueBehavior: "defer",
+       input: {
+         path: { id: existingTask.sessionId },
+         body: {
+@@ -1332,6 +1336,14 @@ The fallback retry session is now created and can be inspected directly.
+       if (promptResult.status === "failed") {
+         throw promptResult.error
+       }
++      if (promptResult.status === "queued") {
++        log("[background-agent] resume prompt queued by prompt dispatcher:", {
++          taskId: existingTask.id,
++          sessionID: existingTask.sessionId,
++          queuedBy: promptResult.queuedBy,
++        })
++        return
++      }
+       if (promptResult.status !== "dispatched") {
+         log("[background-agent] resume prompt skipped by promptAsync gate:", {
+           taskId: existingTask.id,
+diff --git a/src/features/background-agent/parent-wake-notifier.ts b/src/features/background-agent/parent-wake-notifier.ts
+index e1b2e979..25dd939c 100644
+--- a/src/features/background-agent/parent-wake-notifier.ts
++++ b/src/features/background-agent/parent-wake-notifier.ts
+@@ -1,7 +1,14 @@
+ import { resolveRegisteredAgentName } from "../claude-code-session-state"
+-import { createInternalAgentTextPart, isSyntheticOrInternalUserMessage, log, messagesInDirectory, normalizeSDKResponse } from "../../shared"
++import {
++  createInternalAgentTextPart,
++  isAmbiguousPromptDispatchFailure,
++  isSyntheticOrInternalUserMessage,
++  log,
++  messagesInDirectory,
++  normalizeSDKResponse,
++} from "../../shared"
+ import { isSessionActive as isOpenCodeSessionActive, settleAfterSessionIdle } from "../../hooks/shared/session-idle-settle"
+-import { dispatchInternalPrompt } from "../../hooks/shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../hooks/shared/prompt-async-gate"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ 
+ type OpencodeClient = PluginInput["client"]
+@@ -180,8 +187,9 @@ export class ParentWakeNotifier {
+ 
+     const notificationContent = latestWake.notifications.join("\n\n")
+ 
++    let dispatchStartedAt = Date.now()
+     try {
+-      const dispatchStartedAt = Date.now()
++      dispatchStartedAt = Date.now()
+       const promptResult = await dispatchInternalPrompt({
+         mode: "async",
+         client: this.deps.client,
+@@ -209,7 +217,7 @@ export class ParentWakeNotifier {
+         })
+         return
+       }
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
+         this.requeueWake(sessionID, latestWake)
+         this.schedulePendingParentWakeFlush(sessionID)
+         log("[background-agent] Deferred parent wake skipped by promptAsync gate:", {
+@@ -221,6 +229,18 @@ export class ParentWakeNotifier {
+       log("[background-agent] Sent deferred parent wake:", { sessionID })
+       this.trackDispatchedParentWake(sessionID, latestWake, dispatchStartedAt)
+     } catch (error) {
++      if (isAmbiguousPromptDispatchFailure(error)) {
++        const dispatchedWake = this.cloneParentWake(latestWake)
++        dispatchedWake.dispatchedAt = dispatchStartedAt
++        if (await this.hasAcceptedMessageAfterDispatchedParentWake(sessionID, dispatchedWake)) {
++          this.trackDispatchedParentWake(sessionID, latestWake, dispatchStartedAt)
++          log("[background-agent] Treated failed parent wake prompt as accepted after observing session history:", {
++            sessionID,
++            error,
++          })
++          return
++        }
++      }
+       this.requeueWake(sessionID, latestWake)
+       this.schedulePendingParentWakeFlush(sessionID)
+       log("[background-agent] Failed to send deferred parent wake:", { sessionID, error })
+diff --git a/src/features/background-agent/parent-wake-user-message-race.test.ts b/src/features/background-agent/parent-wake-user-message-race.test.ts
+index e6d4d3ee..ac2690a6 100644
+--- a/src/features/background-agent/parent-wake-user-message-race.test.ts
++++ b/src/features/background-agent/parent-wake-user-message-race.test.ts
+@@ -1,6 +1,9 @@
+ import { describe, expect, test } from "bun:test"
+ import { ParentWakeNotifier } from "./parent-wake-notifier"
+-import { releaseAllPromptAsyncReservationsForTesting } from "../../hooks/shared/prompt-async-gate"
++import {
++  releaseAllPromptAsyncReservationsForTesting,
++  releasePromptAsyncReservation,
++} from "../../hooks/shared/prompt-async-gate"
+ 
+ type PromptAsyncCall = {
+   path: { id: string }
+@@ -693,6 +696,81 @@ describe("ParentWakeNotifier — user message race guard (issue #4120)", () => {
+     }
+   })
+ 
++  test("#given promptAsync stores the wake then reports EOF #when the gate hold expires #then parent wake is not requeued into a duplicate prompt", async () => {
++    // given
++    const originalDateNow = Date.now
++    let now = 1_000
++    Date.now = () => now
++    const sessionMessages: SessionMessageStub[] = [
++      {
++        info: {
++          role: "assistant",
++          finish: "stop",
++          time: { created: 500 },
++        },
++      },
++    ]
++    const promptAsyncCalls: PromptAsyncCall[] = []
++    const client = {
++      session: {
++        status: async () => ({ data: { "parent-eof-before-return": { type: "idle" } } }),
++        messages: async () => ({ data: sessionMessages }),
++        promptAsync: async (call: PromptAsyncCall) => {
++          promptAsyncCalls.push(call)
++          sessionMessages.push({
++            info: {
++              role: "user",
++              time: { created: 1_100 },
++            },
++            parts: [{ type: "text", text: "task complete\n<!-- OMO_INTERNAL_INITIATOR -->" }],
++          })
++          now = 2_000
++          throw new Error("JSON Parse error: Unexpected EOF")
++        },
++      },
++    } as unknown as ConstructorParameters<typeof ParentWakeNotifier>[0]["client"]
++    const notifier = new ParentWakeNotifier(
++      {
++        client,
++        directory: "/tmp/test-omo",
++        enqueueNotificationForParent: async (_sessionID, operation) => {
++          await operation()
++        },
++      },
++      {
++        pendingRetryMs: 1_000,
++        acceptedMessageSkewMs: 100,
++        toolCallDeferMaxMs: 5_000,
++        failureRequeueWindowMs: 5_000,
++        userMessageInProgressWindowMs: 0,
++      },
++    )
++    notifier.queuePendingParentWake(
++      "parent-eof-before-return",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    try {
++      // when
++      await notifier.flushPendingParentWake("parent-eof-before-return")
++      const released = releasePromptAsyncReservation("parent-eof-before-return", "test:simulate-expired-hold", {
++        reservedBy: "background-agent-parent-wake",
++      })
++      await notifier.flushPendingParentWake("parent-eof-before-return")
++
++      // then
++      expect(released).toBe(true)
++      expect(promptAsyncCalls).toHaveLength(1)
++      expect(notifier.getPendingParentWakes().has("parent-eof-before-return")).toBe(false)
++    } finally {
++      Date.now = originalDateNow
++      notifier.shutdown()
++      releaseAllPromptAsyncReservationsForTesting()
++    }
++  })
++
+   test("#given accepted wake produces sdk tool-call output #when late failure is requeued #then accepted dispatch is not duplicated", async () => {
+     // given
+     const originalDateNow = Date.now
+diff --git a/src/features/background-agent/session-route.ts b/src/features/background-agent/session-route.ts
+index a8cc7fdb..00b51442 100644
+--- a/src/features/background-agent/session-route.ts
++++ b/src/features/background-agent/session-route.ts
+@@ -1,7 +1,7 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ 
+ import { promptWithModelSuggestionRetry } from "../../shared"
+-import { dispatchInternalPrompt } from "../../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../shared/prompt-async-gate"
+ 
+ type OpencodeClient = PluginInput["client"]
+ 
+@@ -46,10 +46,10 @@ export function promptAsyncInDirectory(
+     if (result.status === "failed") {
+       throw result.error
+     }
+-    if (result.status !== "dispatched") {
++    if (!isInternalPromptDispatchAccepted(result)) {
+       throw new Error(`promptAsync skipped by gate: ${result.status}`)
+     }
+-    return result.response
++    return result.status === "dispatched" ? result.response : undefined
+   })
+ }
+ 
+diff --git a/src/features/team-mode/tools/messaging.test.ts b/src/features/team-mode/tools/messaging.test.ts
+index 13dca9c6..0bbc9118 100644
+--- a/src/features/team-mode/tools/messaging.test.ts
++++ b/src/features/team-mode/tools/messaging.test.ts
+@@ -285,7 +285,7 @@ describe("createTeamSendMessageTool", () => {
+     expect(calls[0]?.directory).toBe(resolveBaseDir(fixture.config))
+   })
+ 
+-  test("#given recipient OpenCode session is busy #when team_send_message attempts live delivery #then it leaves the message unread without starting another reply", async () => {
++  test("#given recipient OpenCode session is busy #when team_send_message attempts live delivery #then it reserves the message in the central prompt queue", async () => {
+     // given
+     const fixture = await createTeamFixture()
+     let promptCalls = 0
+@@ -309,11 +309,10 @@ describe("createTeamSendMessageTool", () => {
+     // then
+     expect(promptCalls).toBe(0)
+     const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
+-    expect(unread).toHaveLength(1)
+-    expect(unread[0]?.body).toBe("ping while busy")
++    expect(unread).toHaveLength(0)
+   })
+ 
+-  test("#given rapid live deliveries to one recipient #when the first prompt just dispatched #then the next message stays unread instead of starting another reply", async () => {
++  test("#given rapid live deliveries to one recipient #when the first prompt just dispatched #then the next message is queued instead of starting another reply", async () => {
+     // given
+     const fixture = await createTeamFixture()
+     const { client, calls } = createRecordingClient()
+@@ -335,11 +334,10 @@ describe("createTeamSendMessageTool", () => {
+     expect(calls).toHaveLength(1)
+     expect(calls[0]?.parts[0]?.text).toContain("first ping")
+     const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
+-    expect(unread).toHaveLength(1)
+-    expect(unread[0]?.body).toBe("second ping")
++    expect(unread).toHaveLength(0)
+   })
+ 
+-  test("#given live delivery left a rapid message unread #when recipient idle wake fires immediately #then the wake hint does not start a second reply", async () => {
++  test("#given live delivery queued a rapid message #when recipient idle wake fires immediately #then the wake hint does not start a second reply", async () => {
+     // given
+     const fixture = await createTeamFixture()
+     const { client, calls } = createRecordingClient()
+@@ -373,8 +371,7 @@ describe("createTeamSendMessageTool", () => {
+     expect(calls).toHaveLength(1)
+     expect(calls[0]?.parts[0]?.text).toContain("first ping")
+     const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
+-    expect(unread).toHaveLength(1)
+-    expect(unread[0]?.body).toBe("second ping")
++    expect(unread).toHaveLength(0)
+   })
+ 
+   test("live delivery pins the recipient's resolved subagent_type and model on promptAsync", async () => {
+diff --git a/src/features/team-mode/tools/messaging.ts b/src/features/team-mode/tools/messaging.ts
+index f1b03b4a..166d6a93 100644
+--- a/src/features/team-mode/tools/messaging.ts
++++ b/src/features/team-mode/tools/messaging.ts
+@@ -4,8 +4,9 @@ import { type ToolDefinition, tool } from "@opencode-ai/plugin/tool"
+ import { z } from "zod"
+ 
+ import type { TeamModeConfig } from "../../../config/schema/team-mode"
+-import { dispatchInternalPrompt } from "../../../hooks/shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../../hooks/shared/prompt-async-gate"
+ import { log } from "../../../shared/logger"
++import { isAmbiguousPromptDispatchFailure } from "../../../shared/prompt-failure-classifier"
+ import { applyMemberSessionRouting, buildMemberPromptBody } from "../member-session-routing"
+ import { buildEnvelope } from "../team-mailbox/poll"
+ import {
+@@ -68,26 +69,6 @@ const TeamSendMessageArgsSchema = z.object({
+ 
+ type DeliveryReservation = Awaited<ReturnType<typeof reserveMessageForDelivery>>
+ 
+-function extractPromptFailureMessage(error: unknown): string {
+-  if (typeof error === "string") return error
+-  if (error instanceof Error) return error.message
+-  if (typeof error === "object" && error !== null) {
+-    const record = error as Record<string, unknown>
+-    if (typeof record.message === "string") return record.message
+-    try {
+-      return JSON.stringify(error)
+-    } catch {
+-      return ""
+-    }
+-  }
+-  return String(error)
+-}
+-
+-function shouldKeepReservationAfterFailedLivePrompt(error: unknown): boolean {
+-  const message = extractPromptFailureMessage(error)
+-  return message.includes("Unexpected EOF") || message.includes("timed out")
+-}
+-
+ async function resolveTeamRuntimeDetails(
+   teamRunId: string,
+   sessionID: string,
+@@ -230,7 +211,7 @@ async function deliverLive(
+           query: { directory: recipientMember.worktreePath ?? directory },
+         },
+       })
+-      if (promptResult.status === "failed" && shouldKeepReservationAfterFailedLivePrompt(promptResult.error)) {
++      if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
+         await markLiveDeliveryPending(teamRunId, recipientName, message.messageId, config)
+         log("[team-mailbox] live delivery prompt failed after dispatch attempt, keeping reservation pending", {
+           teamRunId,
+@@ -241,7 +222,7 @@ async function deliverLive(
+         })
+         continue
+       }
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
+         log("[team-mailbox] live delivery skipped by promptAsync gate, falling back to inbox injection", {
+           status: promptResult.status,
+           teamRunId,
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+index be758013..e5d5f6ba 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+@@ -17,7 +17,7 @@ import {
+   findNearestMessageWithFields,
+   findNearestMessageWithFieldsFromSDK,
+ } from "../../features/hook-message-injector"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ 
+ export async function runAggressiveTruncationStrategy(params: {
+   sessionID: string
+@@ -106,7 +106,7 @@ export async function runAggressiveTruncationStrategy(params: {
+             query: { directory: params.directory },
+           } as never,
+         })
+-        if (promptResult.status !== "dispatched") {
++        if (!isInternalPromptDispatchAccepted(promptResult)) {
+           log("[auto-compact] delayed auto prompt skipped by promptAsync gate", {
+             sessionID: params.sessionID,
+             status: promptResult.status,
+diff --git a/src/hooks/atlas/boulder-continuation-injector.test.ts b/src/hooks/atlas/boulder-continuation-injector.test.ts
+index b04e0391..62bba8c1 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.test.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.test.ts
+@@ -161,6 +161,42 @@ describe("injectBoulderContinuation", () => {
+     expect(promptAsyncMock).not.toHaveBeenCalled()
+   })
+ 
++  test("#given promptAsync may have accepted boulder continuation before EOF #when injector observes the failure #then it records the continuation as injected", async () => {
++    // given
++    registerAgentName("atlas")
++    const promptAsyncMock = mock(async (_request: unknown) => {
++      throw new Error("JSON Parse error: Unexpected EOF")
++    })
++    const messagesMock = mock(async () => ({ data: [] }))
++    const sessionState = { promptFailureCount: 2 }
++
++    const ctx = unsafeTestValue<PluginInput>({
++      directory: "/tmp",
++      client: {
++        session: {
++          messages: messagesMock,
++          promptAsync: promptAsyncMock,
++        },
++      },
++    })
++
++    // when
++    const result = await injectBoulderContinuation({
++      ctx,
++      sessionID: "ses_test_eof",
++      planName: "test-plan",
++      remaining: 1,
++      total: 2,
++      agent: "atlas",
++      sessionState,
++    })
++
++    // then
++    expect(result).toBe("injected")
++    expect(promptAsyncMock).toHaveBeenCalledTimes(1)
++    expect(sessionState.promptFailureCount).toBe(0)
++  })
++
+   test("#given recent prompt context includes variant #when injecting boulder continuation #then promptAsync receives variant as a top-level field", async () => {
+     // given
+     registerAgentName("atlas")
+diff --git a/src/hooks/atlas/boulder-continuation-injector.ts b/src/hooks/atlas/boulder-continuation-injector.ts
+index 640db5b8..219d8ea9 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.ts
+@@ -6,7 +6,8 @@ import {
+ import { stripAgentListSortPrefix } from "../../shared/agent-display-names"
+ import { log } from "../../shared/logger"
+ import { createInternalAgentContinuationTextPart, resolveInheritedPromptTools } from "../../shared"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { isAmbiguousPromptDispatchFailure } from "../../shared/prompt-failure-classifier"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ import { HOOK_NAME } from "./hook-name"
+ import { BOULDER_CONTINUATION_PROMPT } from "./system-reminder-templates"
+ import { markContinuationInjectedAwaitingToolProgress } from "./tool-progress"
+@@ -114,7 +115,7 @@ export async function injectBoulderContinuation(input: {
+     if (promptResult.status === "failed") {
+       throw promptResult.error
+     }
+-    if (promptResult.status !== "dispatched") {
++    if (!isInternalPromptDispatchAccepted(promptResult)) {
+       log(`[${HOOK_NAME}] Boulder continuation skipped by promptAsync gate`, {
+         sessionID,
+         status: promptResult.status,
+@@ -127,6 +128,15 @@ export async function injectBoulderContinuation(input: {
+     log(`[${HOOK_NAME}] Boulder continuation injected`, { sessionID })
+     return "injected"
+   } catch (err) {
++    if (isAmbiguousPromptDispatchFailure(err)) {
++      sessionState.promptFailureCount = 0
++      markContinuationInjectedAwaitingToolProgress(sessionState)
++      log(`[${HOOK_NAME}] Boulder continuation prompt failed after dispatch may have been accepted`, {
++        sessionID,
++        error: String(err),
++      })
++      return "injected"
++    }
+     sessionState.promptFailureCount += 1
+     sessionState.lastFailureAt = Date.now()
+     log(`[${HOOK_NAME}] Boulder continuation failed`, {
+diff --git a/src/hooks/atlas/idle-event.test.ts b/src/hooks/atlas/idle-event.test.ts
+index ae3971b2..58a8c759 100644
+--- a/src/hooks/atlas/idle-event.test.ts
++++ b/src/hooks/atlas/idle-event.test.ts
+@@ -6,6 +6,10 @@ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ import { createBoulderState, readBoulderState, writeBoulderState } from "../../features/boulder-state"
+ import { _resetForTesting, registerAgentName } from "../../features/claude-code-session-state"
++import {
++  releaseAllPromptAsyncReservationsForTesting,
++  releasePromptAsyncReservation,
++} from "../shared/prompt-async-gate"
+ import { handleAtlasSessionIdle } from "./idle-event"
+ import type { SessionState } from "./types"
+ import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
+@@ -29,6 +33,7 @@ describe("handleAtlasSessionIdle completion nudge", () => {
+       rmSync(testDirectory, { recursive: true, force: true })
+     }
+     _resetForTesting()
++    releaseAllPromptAsyncReservationsForTesting()
+   })
+ 
+   it("injects BOULDER COMPLETE prompt once per work with substituted elapsed and task breakdown", async () => {
+@@ -144,4 +149,65 @@ describe("handleAtlasSessionIdle completion nudge", () => {
+     expect(persistedState.boulderCompletionNudgedAt?.[workId]).toBeNumber()
+     expect(readBoulderState(testDirectory)?.works?.[workId]?.status).toBe("completed")
+   })
++
++  it("#given completion nudge promptAsync may have been accepted before EOF #when idle repeats after the gate hold #then it does not send a duplicate completion nudge", async () => {
++    // given
++    const planPath = join(testDirectory, "plan.md")
++    writeFileSync(planPath, "## TODOs\n- [x] 1. Parse input\n")
++
++    const boulder = createBoulderState(planPath, SESSION_ID, "atlas")
++    const workId = boulder.active_work_id
++    if (!workId) {
++      throw new Error("Expected active_work_id")
++    }
++
++    const work = boulder.works?.[workId]
++    if (!work) {
++      throw new Error("Expected active work")
++    }
++    work.elapsed_ms = 1_000
++    boulder.elapsed_ms = 1_000
++    writeBoulderState(testDirectory, boulder)
++
++    const promptAsyncMock = mock(async () => {
++      throw new Error("JSON Parse error: Unexpected EOF")
++    })
++    const ctx = unsafeTestValue<PluginInput>({
++      directory: testDirectory,
++      client: {
++        session: {
++          promptAsync: promptAsyncMock,
++        },
++      },
++    })
++    const sessionStateById = new Map<string, SessionState>()
++    const getState = (sessionId: string): SessionState => {
++      let state = sessionStateById.get(sessionId)
++      if (!state) {
++        state = { promptFailureCount: 0 }
++        sessionStateById.set(sessionId, state)
++      }
++      return state
++    }
++
++    // when
++    await handleAtlasSessionIdle({
++      ctx,
++      sessionID: SESSION_ID,
++      getState,
++    })
++    const released = releasePromptAsyncReservation(SESSION_ID, "test:simulate-expired-hold", {
++      reservedBy: "atlas",
++    })
++    await handleAtlasSessionIdle({
++      ctx,
++      sessionID: SESSION_ID,
++      getState,
++    })
++
++    // then
++    expect(released).toBe(true)
++    expect(promptAsyncMock).toHaveBeenCalledTimes(1)
++    expect(getState(SESSION_ID).boulderCompletionNudgedAt?.[workId]).toBeNumber()
++  })
+ })
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 4cba2c83..5406464a 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -19,8 +19,9 @@ import { isSessionInBoulderLineage } from "./boulder-session-lineage"
+ import { createInternalAgentContinuationTextPart } from "../../shared"
+ import { getAgentConfigKey } from "../../shared/agent-display-names"
+ import { log } from "../../shared/logger"
++import { isAmbiguousPromptDispatchFailure } from "../../shared/prompt-failure-classifier"
+ import { shouldPromptAfterSessionIdle } from "../shared/session-idle-settle"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ import { injectBoulderContinuation } from "./boulder-continuation-injector"
+ import { HOOK_NAME } from "./hook-name"
+ import { resolveActiveBoulderSession } from "./resolve-active-boulder-session"
+@@ -313,7 +314,13 @@ export async function handleAtlasSessionIdle(input: {
+           query: { directory: ctx.directory },
+         },
+       })
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
++        if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
++          sessionState.boulderCompletionNudgedAt = {
++            ...(sessionState.boulderCompletionNudgedAt ?? {}),
++            [work.work_id]: Date.now(),
++          }
++        }
+         log(`[${HOOK_NAME}] Boulder completion nudge skipped by promptAsync gate`, {
+           sessionID,
+           status: promptResult.status,
+diff --git a/src/hooks/claude-code-hooks/handlers/session-event-handler.ts b/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
+index a9ed6deb..f558695b 100644
+--- a/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
++++ b/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
+@@ -8,7 +8,7 @@ import { clearToolInputCache, stopToolInputCacheCleanup } from "../tool-input-ca
+ import type { PluginConfig } from "../types"
+ import { createInternalAgentTextPart, isHookDisabled, log } from "../../../shared"
+ import { resolveSessionEventID } from "../../../shared/event-session-id"
+-import { dispatchInternalPrompt } from "../../../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../../shared/prompt-async-gate"
+ import {
+ 	clearAllSessionHookState,
+ 	clearSessionHookState,
+@@ -124,7 +124,7 @@ export function createSessionEventHandler(
+ 				})
+ 				if (promptResult.status === "failed") {
+ 					log("Failed to inject prompt from Stop hook", { error: String(promptResult.error) })
+-				} else if (promptResult.status !== "dispatched") {
++				} else if (!isInternalPromptDispatchAccepted(promptResult)) {
+ 					log("Skipped prompt injection from Stop hook", { sessionID, status: promptResult.status })
+ 				}
+ 			} else if (stopResult.block) {
+diff --git a/src/hooks/compaction-context-injector/recovery.test.ts b/src/hooks/compaction-context-injector/recovery.test.ts
+index 49cabe4b..3b5a0300 100644
+--- a/src/hooks/compaction-context-injector/recovery.test.ts
++++ b/src/hooks/compaction-context-injector/recovery.test.ts
+@@ -1,7 +1,11 @@
+ /// <reference path="../../../bun-test.d.ts" />
+ 
+-import { describe, expect, it } from "bun:test"
++import { afterEach, describe, expect, it } from "bun:test"
+ import { setCompactionAgentConfigCheckpoint } from "../../shared/compaction-agent-config-checkpoint"
++import {
++  releaseAllPromptAsyncReservationsForTesting,
++  releasePromptAsyncReservation,
++} from "../shared/prompt-async-gate"
+ import { createCompactionContextInjector } from "./index"
+ 
+ type SessionMessageResponse = Array<{
+@@ -98,6 +102,10 @@ function createMeaningfulPartUpdatedEvent(
+ }
+ 
+ describe("createCompactionContextInjector recovery", () => {
++  afterEach(() => {
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
+   it("re-injects after compaction when agent and model match but tools are missing", async () => {
+     //#given
+     const promptAsyncRecorder = createPromptAsyncRecorder()
+@@ -304,6 +312,68 @@ describe("createCompactionContextInjector recovery", () => {
+     expect(promptAsyncRecorder.calls.length).toBe(1)
+   })
+ 
++  it("#given recovery promptAsync may have been accepted before EOF #when compaction repeats after the gate hold #then recovery is not duplicated", async () => {
++    //#given
++    const calls: PromptAsyncInput[] = []
++    const checkpointedPromptConfig = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-5" },
++          tools: { bash: true },
++        },
++      },
++    ]
++    const incompletePromptConfig = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-5" },
++        },
++      },
++    ]
++    const ctx = createMockContext(
++      [
++        checkpointedPromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++      ],
++      async (input: PromptAsyncInput) => {
++        calls.push(input)
++        throw new Error("JSON Parse error: Unexpected EOF")
++      },
++    )
++    const injector = createCompactionContextInjector({ ctx })
++    const sessionID = "ses_recovery_eof_duplicate"
++
++    //#when
++    await injector.capture(sessionID)
++    await injector.event({
++      event: {
++        type: "session.compacted",
++        properties: { sessionID },
++      },
++    })
++    const released = releasePromptAsyncReservation(sessionID, "test:simulate-expired-hold", {
++      reservedBy: "compaction-context-injector",
++    })
++    await injector.event({
++      event: {
++        type: "session.compacted",
++        properties: { sessionID },
++      },
++    })
++
++    //#then
++    expect(released).toBe(true)
++    expect(calls.length).toBe(1)
++  })
++
+   it("does not treat reasoning-only assistant messages as a no-text tail", async () => {
+     //#given
+     const promptAsyncRecorder = createPromptAsyncRecorder()
+diff --git a/src/hooks/compaction-context-injector/recovery.ts b/src/hooks/compaction-context-injector/recovery.ts
+index e73a1158..2867fecd 100644
+--- a/src/hooks/compaction-context-injector/recovery.ts
++++ b/src/hooks/compaction-context-injector/recovery.ts
+@@ -7,6 +7,7 @@ import {
+ } from "../../shared/compaction-agent-config-checkpoint"
+ import { createInternalAgentContinuationTextPart } from "../../shared/internal-initiator-marker"
+ import { log } from "../../shared/logger"
++import { isAmbiguousPromptDispatchFailure } from "../../shared/prompt-failure-classifier"
+ import { setSessionModel } from "../../shared/session-model-state"
+ import { setSessionTools } from "../../shared/session-tools-store"
+ import {
+@@ -21,7 +22,7 @@ import {
+ import { AGENT_RECOVERY_PROMPT, NO_TEXT_TAIL_THRESHOLD, RECOVERY_COOLDOWN_MS, RECENT_COMPACTION_WINDOW_MS } from "./constants"
+ import type { CompactionContextClient } from "./types"
+ import type { TailMonitorState } from "./tail-monitor"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ 
+ export function createRecoveryLogic(
+   ctx: CompactionContextClient | undefined,
+@@ -99,7 +100,10 @@ export function createRecoveryLogic(
+           query: { directory: ctx.directory },
+         },
+       })
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
++        if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
++          tailState.lastRecoveryAt = now
++        }
+         log(`[compaction-context-injector] Recovery skipped by promptAsync gate`, {
+           sessionID,
+           reason,
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.test.ts b/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
+index 05d025aa..9a867488 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
+@@ -1,7 +1,12 @@
+-import { describe, expect, test } from "bun:test"
++import { afterEach, describe, expect, test } from "bun:test"
++import { releaseAllPromptAsyncReservationsForTesting } from "../shared/prompt-async-gate"
+ import { injectContinuationPrompt } from "./continuation-prompt-injector"
+ 
+ describe("ralph-loop continuation prompt injector", () => {
++  afterEach(() => {
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
+   test("#given promptAsync resolves SDK error #when injecting continuation prompt #then it returns rejection without throwing", async () => {
+     // given
+     const ctx = {
+@@ -59,6 +64,32 @@ describe("ralph-loop continuation prompt injector", () => {
+     }
+   })
+ 
++  test("#given promptAsync may have accepted before EOF #when injecting continuation prompt #then it returns dispatched", async () => {
++    // given
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++          promptAsync: async () => {
++            throw new Error("JSON Parse error: Unexpected EOF")
++          },
++        },
++      },
++    }
++
++    // when
++    const result = await injectContinuationPrompt(ctx as never, {
++      sessionID: "ses_ralph_eof",
++      prompt: "continue",
++      directory: "/tmp/test",
++      apiTimeoutMs: 50,
++    })
++
++    // then
++    expect(result.status).toBe("dispatched")
++  })
++
++
+   test("#given inherited message agent has ZWSP prefix #when injecting continuation prompt #then promptAsync receives registered display agent", async () => {
+     // given
+     let promptBody: { agent?: string; noReply?: boolean } | undefined
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.ts b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+index 30b12f8c..d8cc4b9e 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-injector.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+@@ -5,6 +5,7 @@ import { getMessageDir } from "./message-storage-directory"
+ import { withTimeout } from "./with-timeout"
+ import {
+ 	createInternalAgentContinuationTextPart,
++	isAmbiguousPromptDispatchFailure,
+ 	isRecord,
+ 	normalizeSDKResponse,
+ 	resolveInheritedPromptTools,
+@@ -145,6 +146,7 @@ export async function injectContinuationPrompt(
+ 			sessionID: options.sessionID,
+ 			source: "ralph-loop",
+ 			settleMs: options.idleSettleMs,
++			queueBehavior: "defer",
+ 			input: {
+ 				path: { id: options.sessionID },
+ 				body: {
+@@ -158,8 +160,14 @@ export async function injectContinuationPrompt(
+ 			},
+ 		})
+ 		if (promptResult.status === "failed") {
++			if (isAmbiguousPromptDispatchFailure(promptResult.error)) {
++				return { status: "dispatched" }
++			}
+ 			throw promptResult.error
+ 		}
++		if (promptResult.status === "queued") {
++			return { status: "deferred", reason: "reserved" }
++		}
+ 		if (promptResult.status === "active" || promptResult.status === "reserved") {
+ 			return { status: "deferred", reason: promptResult.status }
+ 		}
+@@ -171,6 +179,9 @@ export async function injectContinuationPrompt(
+ 		}
+ 		response = promptResult.response
+ 	} catch (error) {
++		if (isAmbiguousPromptDispatchFailure(error)) {
++			return { status: "dispatched" }
++		}
+ 		const promptError = error instanceof Error
+ 			? error
+ 			: createPromptAsyncError("promptAsync rejected", error)
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index d67d027a..3a5372a4 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -13,8 +13,10 @@ import { extractSessionMessages } from "./session-messages"
+ import { resolveRegisteredAgentName } from "../../features/claude-code-session-state"
+ import {
+   dispatchInternalPrompt,
++  isInternalPromptDispatchAccepted,
+   releasePromptAsyncReservation,
+ } from "../shared/prompt-async-gate"
++import { isAmbiguousPromptDispatchFailure } from "../../shared/prompt-failure-classifier"
+ 
+ const SESSION_TTL_MS = 30 * 60 * 1000
+ 
+@@ -141,6 +143,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+     const previousPendingFallbackModel = sessionStates.get(sessionID)?.pendingFallbackModel
+     sessionRetryInFlight.add(sessionID)
+     let retryDispatched = false
++    let retryMayHaveBeenAccepted = false
+     try {
+       const messagesResp = await ctx.client.session.messages({
+         path: { id: sessionID },
+@@ -180,9 +183,16 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+           },
+         })
+         if (promptResult.status === "failed") {
++          if (isAmbiguousPromptDispatchFailure(promptResult.error)) {
++            retryMayHaveBeenAccepted = true
++            log(`[${HOOK_NAME}] Auto-retry prompt failed after dispatch may have been accepted (${source}); preserving fallback state`, {
++              sessionID,
++              error: String(promptResult.error),
++            })
++          }
+           throw promptResult.error
+         }
+-        if (promptResult.status !== "dispatched") {
++        if (!isInternalPromptDispatchAccepted(promptResult)) {
+           log(`[${HOOK_NAME}] Auto-retry skipped by promptAsync gate (${source})`, {
+             sessionID,
+             status: promptResult.status,
+@@ -201,7 +211,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+       log(`[${HOOK_NAME}] Auto-retry failed (${source})`, { sessionID, error: String(retryError) })
+     } finally {
+       sessionRetryInFlight.delete(sessionID)
+-      if (!retryDispatched) {
++      if (!retryDispatched && !retryMayHaveBeenAccepted) {
+         if (hadAwaitingFallbackResult) {
+           sessionAwaitingFallbackResult.add(sessionID)
+         } else {
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index bb0dbb66..967e2251 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -8,6 +8,10 @@ import {
+ } from "../../shared/delegated-child-session-bootstrap"
+ import * as loggerModule from "../../shared/logger"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
++import {
++  releaseAllPromptAsyncReservationsForTesting,
++  releasePromptAsyncReservation,
++} from "../shared/prompt-async-gate"
+ import type { RuntimeFallbackPluginInput } from "./types"
+ 
+ type RuntimeFallbackModule = typeof import("./hook")
+@@ -23,6 +27,7 @@ describe("runtime-fallback", () => {
+     toastCalls = []
+     SessionCategoryRegistry.clear()
+     clearAllDelegatedChildSessionBootstrap()
++    releaseAllPromptAsyncReservationsForTesting()
+ 
+     const cacheBuster = `${Date.now()}-${Math.random()}`
+ 
+@@ -40,6 +45,7 @@ describe("runtime-fallback", () => {
+   afterEach(() => {
+     SessionCategoryRegistry.clear()
+     clearAllDelegatedChildSessionBootstrap()
++    releaseAllPromptAsyncReservationsForTesting()
+     mock.restore()
+   })
+ 
+@@ -1350,6 +1356,71 @@ describe("runtime-fallback", () => {
+       void sessionErrorPromise
+     })
+ 
++    test("#given promptAsync fails after fallback retry may have been accepted #when the gate hold expires and the same error repeats #then the pending fallback state prevents a duplicate retry prompt", async () => {
++      // given
++      let promptCalls = 0
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }],
++            }),
++            promptAsync: async () => {
++              promptCalls += 1
++              throw new Error("JSON Parse error: Unexpected EOF")
++            },
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: createMockPluginConfigWithCategoryFallback([
++            "provider-a/model-a",
++            "provider-b/model-b",
++          ]),
++        }
++      )
++      const sessionID = "test-runtime-fallback-eof-preserves-pending"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "google/gemini-2.5-pro" } },
++        },
++      })
++
++      // when
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: {
++            sessionID,
++            model: "google/gemini-2.5-pro",
++            error: { statusCode: 429, message: "Rate limit" },
++          },
++        },
++      })
++      const released = releasePromptAsyncReservation(sessionID, "test:simulate-expired-hold", {
++        reservedBy: "runtime-fallback:session.error",
++      })
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: {
++            sessionID,
++            model: "google/gemini-2.5-pro",
++            error: { statusCode: 429, message: "Rate limit" },
++          },
++        },
++      })
++
++      // then
++      expect(released).toBe(true)
++      expect(promptCalls).toBe(1)
++      const skipLog = logCalls.find((call) => call.msg.includes("session.error skipped - awaiting fallback result"))
++      expect(skipLog).toBeDefined()
++    })
++
+     test("should force advance fallback from message.updated when Copilot auto-retry signal appears during in-flight retry", async () => {
+       const retriedModels: string[] = []
+       const pending = new Promise<never>(() => {})
+diff --git a/src/hooks/session-recovery/recover-tool-result-missing.test.ts b/src/hooks/session-recovery/recover-tool-result-missing.test.ts
+index 56c26be0..3a65d408 100644
+--- a/src/hooks/session-recovery/recover-tool-result-missing.test.ts
++++ b/src/hooks/session-recovery/recover-tool-result-missing.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+ 
++import { releaseAllPromptAsyncReservationsForTesting } from "../shared/prompt-async-gate"
+ import type { MessageData } from "./types"
+ 
+ let sqliteBackend = false
+@@ -34,11 +35,14 @@ interface PromptAsyncInput {
+   }
+ }
+ 
+-function createMockClient(messages: MessageData[] = []) {
++function createMockClient(
++  messages: MessageData[] = [],
++  promptAsyncImpl?: (input: PromptAsyncInput) => Promise<unknown>,
++) {
+   const promptAsyncCalls: PromptAsyncInput[] = []
+   const promptAsync = mock((input: PromptAsyncInput) => {
+     promptAsyncCalls.push(input)
+-    return Promise.resolve({})
++    return promptAsyncImpl ? promptAsyncImpl(input) : Promise.resolve({})
+   })
+ 
+   return {
+@@ -69,6 +73,7 @@ describe("recoverToolResultMissing", () => {
+ 
+   afterEach(() => {
+     mock.restore()
++    releaseAllPromptAsyncReservationsForTesting()
+   })
+ 
+   it("returns false for sqlite fallback when tool part has no valid callID", async () => {
+@@ -286,6 +291,27 @@ describe("recoverToolResultMissing", () => {
+     expect(call.body).not.toHaveProperty("model")
+     expect(call.body).not.toHaveProperty("variant")
+   })
++
++  it("#given recovered tool result may have been accepted before EOF #when promptAsync fails ambiguously #then recovery is treated as started", async () => {
++    // given
++    storedParts = [{
++      type: "tool",
++      id: "prt_stored_eof_call",
++      callID: "toolu_eof",
++      tool: "bash",
++      state: { input: {} },
++    }]
++    const { client, promptAsync } = createMockClient([], async () => {
++      throw new Error("JSON Parse error: Unexpected EOF")
++    })
++
++    // when
++    const result = await recoverToolResultMissing(client, "ses_eof_recovery", failedAssistantMsg)
++
++    // then
++    expect(result).toBe(true)
++    expect(promptAsync).toHaveBeenCalledTimes(1)
++  })
+ })
+ 
+ export {}
+diff --git a/src/hooks/session-recovery/recover-tool-result-missing.ts b/src/hooks/session-recovery/recover-tool-result-missing.ts
+index 2f7e30b0..09203183 100644
+--- a/src/hooks/session-recovery/recover-tool-result-missing.ts
++++ b/src/hooks/session-recovery/recover-tool-result-missing.ts
+@@ -2,8 +2,8 @@ import type { createOpencodeClient } from "@opencode-ai/sdk"
+ import type { MessageData, ResumeConfig } from "./types"
+ import { readParts } from "./storage/parts-reader"
+ import { isSqliteBackend } from "../../shared/opencode-storage-detection"
+-import { normalizeSDKResponse } from "../../shared"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { isAmbiguousPromptDispatchFailure, normalizeSDKResponse } from "../../shared"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+ type ToolResultContent = { type: "text"; text: string }
+@@ -176,9 +176,13 @@ export async function recoverToolResultMissing(
+       source: options?.source ?? "session-recovery-tool-result-missing",
+       input: promptInput,
+       checkToolState: false,
++      queueBehavior: "defer",
+     })
+ 
+-    return promptResult.status === "dispatched"
++    if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
++      return true
++    }
++    return isInternalPromptDispatchAccepted(promptResult)
+   } catch {
+     return false
+   }
+diff --git a/src/hooks/session-recovery/recover-unavailable-tool.test.ts b/src/hooks/session-recovery/recover-unavailable-tool.test.ts
+index bed98498..cb95e01f 100644
+--- a/src/hooks/session-recovery/recover-unavailable-tool.test.ts
++++ b/src/hooks/session-recovery/recover-unavailable-tool.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+ 
++import { releaseAllPromptAsyncReservationsForTesting } from "../shared/prompt-async-gate"
+ import type { MessageData } from "./types"
+ 
+ let sqliteBackend = false
+@@ -24,8 +25,8 @@ const failedAssistantMsg: MessageData = {
+   parts: [],
+ }
+ 
+-function createMockClient(messages: MessageData[] = []) {
+-  const promptAsync = mock(() => Promise.resolve({}))
++function createMockClient(messages: MessageData[] = [], promptAsyncImpl?: () => Promise<unknown>) {
++  const promptAsync = mock(() => promptAsyncImpl ? promptAsyncImpl() : Promise.resolve({}))
+ 
+   return {
+     client: {
+@@ -46,6 +47,7 @@ describe("recoverUnavailableTool", () => {
+ 
+   afterEach(() => {
+     mock.restore()
++    releaseAllPromptAsyncReservationsForTesting()
+   })
+ 
+   it("sends a schema-compatible recovered tool result for sqlite fallback", async () => {
+@@ -109,4 +111,22 @@ describe("recoverUnavailableTool", () => {
+       },
+     })
+   })
++
++  it("#given unavailable-tool recovery may have been accepted before EOF #when promptAsync fails ambiguously #then recovery is treated as started", async () => {
++    //#given
++    const failedAssistantWithToolUse: MessageData = {
++      info: { id: "msg_failed_eof", role: "assistant", error: "No such tool: bash" },
++      parts: [{ type: "tool_use", id: "toolu_eof", name: "bash" }],
++    }
++    const { client, promptAsync } = createMockClient([], async () => {
++      throw new Error("JSON Parse error: Unexpected EOF")
++    })
++
++    //#when
++    const result = await recoverUnavailableTool(client, "ses_unavailable_eof", failedAssistantWithToolUse)
++
++    //#then
++    expect(result).toBe(true)
++    expect(promptAsync).toHaveBeenCalledTimes(1)
++  })
+ })
+diff --git a/src/hooks/session-recovery/recover-unavailable-tool.ts b/src/hooks/session-recovery/recover-unavailable-tool.ts
+index dd8631f4..841529a6 100644
+--- a/src/hooks/session-recovery/recover-unavailable-tool.ts
++++ b/src/hooks/session-recovery/recover-unavailable-tool.ts
+@@ -2,9 +2,9 @@ import type { createOpencodeClient } from "@opencode-ai/sdk"
+ import { extractUnavailableToolName } from "./detect-error-type"
+ import { readParts } from "./storage"
+ import type { MessageData } from "./types"
+-import { normalizeSDKResponse } from "../../shared"
++import { isAmbiguousPromptDispatchFailure, normalizeSDKResponse } from "../../shared"
+ import { isSqliteBackend } from "../../shared/opencode-storage-detection"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+ 
+@@ -126,9 +126,13 @@ export async function recoverUnavailableTool(
+       client,
+       sessionID,
+       source: "session-recovery-unavailable-tool",
++      queueBehavior: "defer",
+       input: promptInput,
+     })
+-    return promptResult.status === "dispatched"
++    if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
++      return true
++    }
++    return isInternalPromptDispatchAccepted(promptResult)
+   } catch {
+     return false
+   }
+diff --git a/src/hooks/session-recovery/resume.test.ts b/src/hooks/session-recovery/resume.test.ts
+index 1720870e..49848738 100644
+--- a/src/hooks/session-recovery/resume.test.ts
++++ b/src/hooks/session-recovery/resume.test.ts
+@@ -1,11 +1,16 @@
+ declare const require: (name: string) => any
+-const { describe, expect, test } = require("bun:test")
++const { afterEach, describe, expect, test } = require("bun:test")
+ 
+ import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
++import { releaseAllPromptAsyncReservationsForTesting } from "../shared/prompt-async-gate"
+ import { extractResumeConfig, findLastUserMessage, resumeSession } from "./resume"
+ import type { MessageData } from "./types"
+ 
+ describe("session-recovery resume", () => {
++  afterEach(() => {
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
+   test("findLastUserMessage skips synthetic and internally marked user messages", () => {
+     // given
+     const realUserMessage: MessageData = {
+@@ -123,4 +128,27 @@ describe("session-recovery resume", () => {
+     expect(firstPart?.metadata?.compaction_continue).toBe(true)
+     expect(promptBody?.noReply).toBeUndefined()
+   })
++
++  test("#given recovery resume may have been accepted before EOF #when promptAsync fails ambiguously #then resume is treated as started", async () => {
++    // given
++    let promptCalls = 0
++    const client = {
++      session: {
++        promptAsync: async () => {
++          promptCalls += 1
++          throw new Error("JSON Parse error: Unexpected EOF")
++        },
++      },
++    }
++
++    // when
++    const ok = await resumeSession(client as never, {
++      sessionID: "ses_resume_eof",
++      agent: "Hephaestus",
++    })
++
++    // then
++    expect(ok).toBe(true)
++    expect(promptCalls).toBe(1)
++  })
+ })
+diff --git a/src/hooks/session-recovery/resume.ts b/src/hooks/session-recovery/resume.ts
+index 2dd64164..328c4aed 100644
+--- a/src/hooks/session-recovery/resume.ts
++++ b/src/hooks/session-recovery/resume.ts
+@@ -1,10 +1,11 @@
+ import type { createOpencodeClient } from "@opencode-ai/sdk"
+ import {
+   createInternalAgentContinuationTextPart,
++  isAmbiguousPromptDispatchFailure,
+   isRealUserMessage,
+   resolveInheritedPromptTools,
+ } from "../../shared"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ import type { MessageData, ResumeConfig } from "./types"
+ 
+ const RECOVERY_RESUME_TEXT = "[session recovered - continuing previous task]"
+@@ -43,6 +44,7 @@ export async function resumeSession(client: Client, config: ResumeConfig): Promi
+       client,
+       sessionID: config.sessionID,
+       source: "session-recovery",
++      queueBehavior: "defer",
+       input: {
+         path: { id: config.sessionID },
+         body: {
+@@ -54,7 +56,10 @@ export async function resumeSession(client: Client, config: ResumeConfig): Promi
+         },
+       },
+     })
+-    return promptResult.status === "dispatched"
++    if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
++      return true
++    }
++    return isInternalPromptDispatchAccepted(promptResult)
+   } catch {
+     return false
+   }
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+index 813e79d7..bec0a42f 100644
+--- a/src/hooks/shared/prompt-async-gate.test.ts
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -7,6 +7,18 @@ import {
+   releasePromptAsyncReservation,
+ } from "./prompt-async-gate"
+ 
++function waitForPromise<T>(promise: Promise<T>, label: string): Promise<T> {
++  let timeoutID: ReturnType<typeof setTimeout> | undefined
++  const timeout = new Promise<never>((_, reject) => {
++    timeoutID = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 1_000)
++  })
++  return Promise.race([promise, timeout]).finally(() => {
++    if (timeoutID !== undefined) {
++      clearTimeout(timeoutID)
++    }
++  })
++}
++
+ describe("dispatchInternalPrompt", () => {
+   afterEach(() => {
+     // then
+@@ -119,9 +131,232 @@ describe("dispatchInternalPrompt", () => {
+ 
+     // then
+     expect(first.status).toBe("dispatched")
+-    expect(second).toEqual({ status: "reserved", reservedBy: "test:unified-shared:first" })
++    expect(second).toEqual({ status: "queued", queuedBy: "test:unified-shared:first", position: 1 })
+     expect(calls).toEqual(["async"])
+   })
++
++  test("#given a busy session #when an internal prompt is dispatched #then the unified dispatcher queues and sends after idle", async () => {
++    // given
++    let status = "busy"
++    let promptCalls = 0
++    let resolvePrompt: (() => void) | undefined
++    const promptSeen = new Promise<void>((resolve) => {
++      resolvePrompt = resolve
++    })
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_queue_busy: { type: status } } }),
++        promptAsync: async () => {
++          promptCalls += 1
++          resolvePrompt?.()
++        },
++      },
++    }
++
++    // when
++    const result = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_busy",
++      input: { path: { id: "ses_queue_busy" }, body: { parts: [{ type: "text", text: "queued" }] } },
++      source: "test:queue-busy",
++      settleMs: 0,
++      queueRetryMs: 1,
++    })
++    status = "idle"
++    await waitForPromise(promptSeen, "queued prompt to dispatch after idle")
++
++    // then
++    expect(result.status).toBe("queued")
++    expect(promptCalls).toBe(1)
++  })
++
++  test("#given duplicate queued prompts for one session #when the session becomes idle #then the dispatcher coalesces them into one prompt", async () => {
++    // given
++    let status = "busy"
++    let promptCalls = 0
++    let resolvePrompt: (() => void) | undefined
++    const promptSeen = new Promise<void>((resolve) => {
++      resolvePrompt = resolve
++    })
++    const input = { path: { id: "ses_queue_dedupe" }, body: { parts: [{ type: "text", text: "same" }] } }
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_queue_dedupe: { type: status } } }),
++        promptAsync: async () => {
++          promptCalls += 1
++          resolvePrompt?.()
++        },
++      },
++    }
++
++    // when
++    const first = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_dedupe",
++      input,
++      source: "test:queue-dedupe",
++      settleMs: 0,
++      queueRetryMs: 1,
++    })
++    const second = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_dedupe",
++      input,
++      source: "test:queue-dedupe",
++      settleMs: 0,
++      queueRetryMs: 1,
++    })
++    status = "idle"
++    await waitForPromise(promptSeen, "coalesced queued prompt")
++
++    // then
++    expect(first.status).toBe("queued")
++    expect(second.status).toBe("queued")
++    expect(promptCalls).toBe(1)
++  })
++
++  test("#given distinct queued prompts behind a dispatch hold #when the hold is released #then the dispatcher preserves FIFO order", async () => {
++    // given
++    const calls: string[] = []
++    let resolveSecondPrompt: (() => void) | undefined
++    const secondPromptSeen = new Promise<void>((resolve) => {
++      resolveSecondPrompt = resolve
++    })
++    const client = {
++      session: {
++        promptAsync: async (input: { body: { parts: Array<{ text: string }> } }) => {
++          const text = input.body.parts[0]?.text
++          if (text) {
++            calls.push(text)
++          }
++          if (calls.length === 2) {
++            resolveSecondPrompt?.()
++          }
++        },
++      },
++    }
++
++    // when
++    const first = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_fifo",
++      input: { path: { id: "ses_queue_fifo" }, body: { parts: [{ type: "text", text: "first" }] } },
++      source: "test:queue-fifo:first",
++      settleMs: 0,
++    })
++    const second = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_fifo",
++      input: { path: { id: "ses_queue_fifo" }, body: { parts: [{ type: "text", text: "second" }] } },
++      source: "test:queue-fifo:second",
++      settleMs: 0,
++    })
++    releasePromptAsyncReservation("ses_queue_fifo", "test:release-fifo", {
++      reservedBy: "test:queue-fifo:first",
++    })
++    await waitForPromise(secondPromptSeen, "second queued prompt")
++
++    // then
++    expect(first.status).toBe("dispatched")
++    expect(second.status).toBe("queued")
++    expect(calls).toEqual(["first", "second"])
++  })
++
++  test("#given a stateful route defers queued delivery #when a dispatch hold is active #then the prompt is not queued behind the hold", async () => {
++    // given
++    const calls: string[] = []
++    const client = {
++      session: {
++        promptAsync: async (input: { body: { parts: Array<{ text: string }> } }) => {
++          const text = input.body.parts[0]?.text
++          if (text) {
++            calls.push(text)
++          }
++        },
++      },
++    }
++
++    // when
++    const first = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_defer_hold",
++      input: { path: { id: "ses_queue_defer_hold" }, body: { parts: [{ type: "text", text: "first" }] } },
++      source: "test:queue-defer:first",
++      settleMs: 0,
++    })
++    const second = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_defer_hold",
++      input: { path: { id: "ses_queue_defer_hold" }, body: { parts: [{ type: "text", text: "second" }] } },
++      source: "test:queue-defer:second",
++      settleMs: 0,
++      queueBehavior: "defer",
++    })
++    releasePromptAsyncReservation("ses_queue_defer_hold", "test:queue-defer:release", {
++      reservedBy: "test:queue-defer:first",
++    })
++
++    // then
++    expect(first.status).toBe("dispatched")
++    expect(second).toEqual({ status: "reserved", reservedBy: "test:queue-defer:first" })
++    expect(calls).toEqual(["first"])
++  })
++
++  test("#given a queued prompt is waiting #when a stateful route defers queued delivery #then it does not cut ahead or enqueue", async () => {
++    // given
++    let status = "busy"
++    const calls: string[] = []
++    let resolvePrompt: (() => void) | undefined
++    const promptSeen = new Promise<void>((resolve) => {
++      resolvePrompt = resolve
++    })
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_queue_defer_existing: { type: status } } }),
++        promptAsync: async (input: { body: { parts: Array<{ text: string }> } }) => {
++          const text = input.body.parts[0]?.text
++          if (text) {
++            calls.push(text)
++          }
++          resolvePrompt?.()
++        },
++      },
++    }
++
++    // when
++    const first = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_defer_existing",
++      input: { path: { id: "ses_queue_defer_existing" }, body: { parts: [{ type: "text", text: "first" }] } },
++      source: "test:queue-defer-existing:first",
++      settleMs: 0,
++      queueRetryMs: 1,
++    })
++    const second = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_queue_defer_existing",
++      input: { path: { id: "ses_queue_defer_existing" }, body: { parts: [{ type: "text", text: "second" }] } },
++      source: "test:queue-defer-existing:second",
++      settleMs: 0,
++      queueBehavior: "defer",
++    })
++    status = "idle"
++    await waitForPromise(promptSeen, "first queued prompt after defer")
++
++    // then
++    expect(first.status).toBe("queued")
++    expect(second).toEqual({ status: "reserved", reservedBy: "test:queue-defer-existing:first" })
++    expect(calls).toEqual(["first"])
++  })
+ })
+ 
+ describe("dispatchInternalPrompt shared gate behavior", () => {
+@@ -173,7 +408,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(firstResult.status).toBe("dispatched")
+-    expect(second.status).toBe("reserved")
++    expect(second.status).toBe("queued")
+     expect(promptCalls).toBe(1)
+   })
+ 
+@@ -209,7 +444,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(firstResult.status).toBe("dispatched")
+-    expect(second.status).toBe("reserved")
++    expect(second.status).toBe("queued")
+     expect(promptCalls).toBe(1)
+   })
+ 
+@@ -284,7 +519,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     })
+ 
+     // then
+-    expect(result.status).toBe("active")
++    expect(result.status).toBe("queued")
+     expect(promptCalls).toBe(0)
+   })
+ 
+@@ -312,7 +547,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     })
+ 
+     // then
+-    expect(result.status).toBe("active")
++    expect(result.status).toBe("queued")
+     expect(promptCalls).toBe(0)
+   })
+ 
+@@ -352,7 +587,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     })
+ 
+     // then
+-    expect(result.status).toBe("active")
++    expect(result.status).toBe("queued")
+     expect(promptCalls).toBe(0)
+   })
+ 
+@@ -392,7 +627,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     })
+ 
+     // then
+-    expect(result.status).toBe("active")
++    expect(result.status).toBe("queued")
+     expect(promptCalls).toBe(0)
+   })
+ 
+@@ -432,7 +667,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     })
+ 
+     // then
+-    expect(result.status).toBe("active")
++    expect(result.status).toBe("queued")
+     expect(promptCalls).toBe(0)
+   })
+ 
+@@ -476,7 +711,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     })
+ 
+     // then
+-    expect(result.status).toBe("active")
++    expect(result.status).toBe("queued")
+     expect(promptCalls).toBe(0)
+   })
+ 
+@@ -520,7 +755,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     })
+ 
+     // then
+-    expect(result.status).toBe("active")
++    expect(result.status).toBe("queued")
+     expect(promptCalls).toBe(0)
+   })
+ 
+@@ -723,7 +958,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(first.status).toBe("dispatched")
+-    expect(second).toEqual({ status: "reserved", reservedBy: "team-live-delivery" })
++    expect(second).toEqual({ status: "queued", queuedBy: "team-live-delivery", position: 1 })
+     expect(promptCalls).toBe(1)
+   })
+ 
+@@ -847,7 +1082,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(first.status).toBe("failed")
+-    expect(second).toEqual({ status: "reserved", reservedBy: "test:reject:first" })
++    expect(second).toEqual({ status: "queued", queuedBy: "test:reject:first", position: 1 })
+     expect(promptCalls).toBe(1)
+   })
+ 
+@@ -895,7 +1130,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     // then
+     expect(first.status).toBe("dispatched")
+     expect(released).toBe(false)
+-    expect(second).toEqual({ status: "reserved", reservedBy: "model-fallbackx:message.updated" })
++    expect(second).toEqual({ status: "queued", queuedBy: "model-fallbackx:message.updated", position: 1 })
+     expect(promptCalls).toBe(1)
+   })
+ 
+@@ -935,7 +1170,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(firstResult.status).toBe("dispatched")
+-    expect(second.status).toBe("reserved")
++    expect(second.status).toBe("queued")
+     expect(promptCalls).toBe(1)
+   })
+ 
+@@ -965,7 +1200,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(firstResult.status).toBe("dispatched")
+-    expect(second.status).toBe("reserved")
++    expect(second.status).toBe("queued")
+     expect(promptCalls).toBe(1)
+   })
+ 
+diff --git a/src/hooks/team-session-events/team-idle-wake-hint.test.ts b/src/hooks/team-session-events/team-idle-wake-hint.test.ts
+index 905ea2cf..27d147cb 100644
+--- a/src/hooks/team-session-events/team-idle-wake-hint.test.ts
++++ b/src/hooks/team-session-events/team-idle-wake-hint.test.ts
+@@ -22,6 +22,10 @@ import {
+   clearAllSessionPromptParams,
+   getSessionPromptParams,
+ } from "../../shared/session-prompt-params-state"
++import {
++  releaseAllPromptAsyncReservationsForTesting,
++  releasePromptAsyncReservation,
++} from "../shared/prompt-async-gate"
+ import { createTeamIdleWakeHint } from "./team-idle-wake-hint"
+ 
+ type WakeHintPromptInput = {
+@@ -183,6 +187,7 @@ afterEach(async () => {
+   clearTeamSessionRegistry()
+   SessionCategoryRegistry.clear()
+   clearAllSessionPromptParams()
++  releaseAllPromptAsyncReservationsForTesting()
+   await Promise.all(temporaryDirectories.splice(0).map(async (directoryPath) => {
+     await rm(directoryPath, { recursive: true, force: true })
+   }))
+@@ -295,6 +300,44 @@ describe("createTeamIdleWakeHint", () => {
+     expect(promptAsyncSpy).toHaveBeenCalledTimes(0)
+   })
+ 
++  test("#given wake hint promptAsync may have been accepted before EOF #when idle repeats after the gate hold #then the same unread batch is not hinted twice", async () => {
++    // given
++    const baseDir = await createTemporaryBaseDir()
++    const config = createConfig(baseDir)
++    const teamRunId = randomUUID()
++    await seedRuntimeState(createRuntimeState(teamRunId), config)
++    await seedUnreadMessage(teamRunId, config, randomUUID(), "first message body", 100)
++
++    const promptAsyncSpy = mock(async (_input: WakeHintPromptInput) => {
++      throw new Error("JSON Parse error: Unexpected EOF")
++    })
++    const handler = createTeamIdleWakeHint({
++      directory: "/tmp/project",
++      client: { session: { promptAsync: promptAsyncSpy } },
++    }, config, { idleSettleMs: 0 })
++
++    // when
++    await handler({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: "member-session" },
++      },
++    })
++    const released = releasePromptAsyncReservation("member-session", "test:simulate-expired-hold", {
++      reservedBy: "team-idle-wake-hint",
++    })
++    await handler({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: "member-session" },
++      },
++    })
++
++    // then
++    expect(released).toBe(true)
++    expect(promptAsyncSpy).toHaveBeenCalledTimes(1)
++  })
++
+   test("pins the recipient's resolved subagent_type and model on the wake-hint promptAsync", async () => {
+     // given
+     const baseDir = await createTemporaryBaseDir()
+diff --git a/src/hooks/team-session-events/team-idle-wake-hint.ts b/src/hooks/team-session-events/team-idle-wake-hint.ts
+index 6c654dd1..fe880f16 100644
+--- a/src/hooks/team-session-events/team-idle-wake-hint.ts
++++ b/src/hooks/team-session-events/team-idle-wake-hint.ts
+@@ -8,8 +8,9 @@ import { ackMessages } from "../../features/team-mode/team-mailbox/ack"
+ import { listUnreadMessages } from "../../features/team-mode/team-mailbox/inbox"
+ import { loadRuntimeState, transitionRuntimeState } from "../../features/team-mode/team-state-store/store"
+ import { resolveSessionEventID } from "../../shared/event-session-id"
++import { isAmbiguousPromptDispatchFailure } from "../../shared/prompt-failure-classifier"
+ import { log } from "../../shared/logger"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ 
+ type PromptAsyncInput = {
+   path: { id: string }
+@@ -35,6 +36,7 @@ type TeamIdleWakeHintContext = {
+ type HookInput = { event: { type: string; properties?: unknown } }
+ export type HookImpl = (input: HookInput) => Promise<void>
+ type TeamIdleWakeHintOptions = { idleSettleMs?: number }
++const WAKE_HINT_DUPLICATE_SUPPRESSION_MS = 30_000
+ 
+ function getIdleSessionID(properties: unknown): string | undefined {
+   return resolveSessionEventID(properties)
+@@ -44,7 +46,13 @@ function buildWakeHint(unreadCount: number): string {
+   return `You have ${unreadCount} new team messages. They will be injected on your next turn.`
+ }
+ 
++function buildWakeHintBatchKey(teamRunId: string, memberName: string, messageIds: string[]): string {
++  return `${teamRunId}:${memberName}:${messageIds.toSorted().join(",")}`
++}
++
+ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: TeamModeConfig, options?: TeamIdleWakeHintOptions): HookImpl {
++  const recentWakeHintBatches = new Map<string, number>()
++
+   return async ({ event }: HookInput): Promise<void> => {
+     if (event.type !== "session.idle") return
+ 
+@@ -110,6 +118,27 @@ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: Tea
+         return
+       }
+ 
++      const now = Date.now()
++      const wakeHintBatchKey = buildWakeHintBatchKey(
++        runtimeState.teamRunId,
++        memberEntry.name,
++        unreadMessages.map((message) => message.messageId),
++      )
++      const suppressedUntil = recentWakeHintBatches.get(wakeHintBatchKey)
++      if (suppressedUntil !== undefined && suppressedUntil > now) {
++        log("team idle wake hint skipped for recently hinted unread batch", {
++          event: "team-mode-idle-wake-hint-duplicate-suppressed",
++          teamRunId: runtimeState.teamRunId,
++          memberName: memberEntry.name,
++          sessionID,
++          unreadCount: unreadMessages.length,
++        })
++        return
++      }
++      if (suppressedUntil !== undefined) {
++        recentWakeHintBatches.delete(wakeHintBatchKey)
++      }
++
+       applyMemberSessionRouting(sessionID, memberEntry)
+       const promptResult = await dispatchInternalPrompt({
+         mode: "async",
+@@ -123,7 +152,10 @@ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: Tea
+           query: { directory: ctx.directory },
+         },
+       })
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
++        if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
++          recentWakeHintBatches.set(wakeHintBatchKey, Date.now() + WAKE_HINT_DUPLICATE_SUPPRESSION_MS)
++        }
+         log("team idle wake hint skipped by promptAsync gate", {
+           event: "team-mode-idle-wake-hint-gated",
+           teamRunId: runtimeState.teamRunId,
+@@ -134,6 +166,7 @@ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: Tea
+         })
+         return
+       }
++      recentWakeHintBatches.set(wakeHintBatchKey, Date.now() + WAKE_HINT_DUPLICATE_SUPPRESSION_MS)
+ 
+       log("team idle wake hint sent", {
+         event: "team-mode-idle-wake-hint",
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
+index caf6ba91..f8f6f12d 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
+@@ -238,7 +238,7 @@ describe("injectContinuation", () => {
+     expect(capturedBody?.variant).toBe("max")
+   })
+ 
+-  test("#given a peer-message hold survives an unrelated release #when todo continuation injects #then it skips and clears in-flight state", async () => {
++  test("#given a peer-message hold survives an unrelated release #when todo continuation injects #then it queues behind the peer message", async () => {
+     // given
+     const sessionID = "ses_todo_reserved_by_peer_message"
+     let promptCalls = 0
+@@ -286,6 +286,50 @@ describe("injectContinuation", () => {
+     expect(peerMessageResult.status).toBe("dispatched")
+     expect(promptCalls).toBe(1)
+     expect(state.inFlight).toBe(false)
+-    expect(state.lastInjectedAt).toBe(0)
++    expect(state.lastInjectedAt).toBeGreaterThan(0)
++  })
++
++  test("#given promptAsync may have accepted before EOF #when continuation injection observes the failure #then it records an optimistic injection", async () => {
++    // given
++    const state = {
++      inFlight: false,
++      lastInjectedAt: 0,
++      awaitingPostInjectionProgressCheck: false,
++      consecutiveFailures: 2,
++    }
++    let promptCalls = 0
++    const ctx = {
++      directory: "/tmp/test",
++      client: {
++        session: {
++          todo: async () => ({ data: [{ id: "1", content: "todo", status: "pending", priority: "high" }] }),
++          promptAsync: async () => {
++            promptCalls += 1
++            throw new Error("JSON Parse error: Unexpected EOF")
++          },
++        },
++      },
++    }
++    const sessionStateStore = {
++      getExistingState: () => state,
++    }
++
++    // when
++    await injectContinuation({
++      ctx: ctx as never,
++      sessionID: "ses_continuation_eof",
++      resolvedInfo: {
++        agent: "Sisyphus - Ultraworker",
++        model: { providerID: "anthropic", modelID: "claude-sonnet-4-20250514" },
++      },
++      sessionStateStore: sessionStateStore as never,
++    })
++
++    // then
++    expect(promptCalls).toBe(1)
++    expect(state.inFlight).toBe(false)
++    expect(state.awaitingPostInjectionProgressCheck).toBe(true)
++    expect(state.consecutiveFailures).toBe(0)
++    expect(state.lastInjectedAt).toBeGreaterThan(0)
+   })
+ })
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index 8b121d6c..c3f33fee 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -7,6 +7,7 @@ import {
+ } from "../../features/claude-code-session-state"
+ import {
+   createInternalAgentContinuationTextPart,
++  isAmbiguousPromptDispatchFailure,
+   normalizeSDKResponse,
+   resolveInheritedPromptTools,
+ } from "../../shared"
+@@ -22,7 +23,7 @@ import {
+   normalizeAgentForPromptKey,
+   stripAgentListSortPrefix,
+ } from "../../shared/agent-display-names"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ 
+ import {
+   CONTINUATION_PROMPT,
+@@ -208,7 +209,7 @@ ${todoList}`
+     if (promptResult.status === "failed") {
+       throw promptResult.error
+     }
+-    if (promptResult.status !== "dispatched") {
++    if (!isInternalPromptDispatchAccepted(promptResult)) {
+       log(`[${HOOK_NAME}] Injection skipped by promptAsync gate`, { sessionID, status: promptResult.status })
+       if (injectionState) {
+         injectionState.inFlight = false
+@@ -216,7 +217,7 @@ ${todoList}`
+       return
+     }
+ 
+-    log(`[${HOOK_NAME}] Injection successful`, { sessionID })
++    log(`[${HOOK_NAME}] Injection successful`, { sessionID, status: promptResult.status })
+     if (injectionState) {
+       injectionState.inFlight = false
+       injectionState.lastInjectedAt = Date.now()
+@@ -228,6 +229,11 @@ ${todoList}`
+     if (injectionState) {
+       injectionState.inFlight = false
+       injectionState.lastInjectedAt = Date.now()
++      if (isAmbiguousPromptDispatchFailure(error)) {
++        injectionState.awaitingPostInjectionProgressCheck = true
++        injectionState.consecutiveFailures = 0
++        return
++      }
+       injectionState.consecutiveFailures = (injectionState.consecutiveFailures ?? 0) + 1
+ 
+       const errorObj = error instanceof Error
+diff --git a/src/hooks/unstable-agent-babysitter/index.test.ts b/src/hooks/unstable-agent-babysitter/index.test.ts
+index d90a258f..9ef5d910 100644
+--- a/src/hooks/unstable-agent-babysitter/index.test.ts
++++ b/src/hooks/unstable-agent-babysitter/index.test.ts
+@@ -2,7 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test"
+ import { _resetForTesting, setMainSession } from "../../features/claude-code-session-state"
+ import type { BackgroundTask } from "../../features/background-agent"
+ import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
+-import { releaseAllPromptAsyncReservationsForTesting } from "../shared/prompt-async-gate"
++import {
++  releaseAllPromptAsyncReservationsForTesting,
++  releasePromptAsyncReservation,
++} from "../shared/prompt-async-gate"
+ import { createUnstableAgentBabysitterHook } from "./index"
+ 
+ const projectDir = process.cwd()
+@@ -12,6 +15,7 @@ type BabysitterContext = Parameters<typeof createUnstableAgentBabysitterHook>[0]
+ function createMockPluginInput(options: {
+   messagesBySession: Record<string, unknown[]>
+   promptCalls: Array<{ input: unknown }>
++  promptAsyncImpl?: (input: unknown) => Promise<unknown>
+ }): BabysitterContext {
+   const { messagesBySession, promptCalls } = options
+   return {
+@@ -26,6 +30,9 @@ function createMockPluginInput(options: {
+         },
+         promptAsync: async (input: unknown) => {
+           promptCalls.push({ input })
++          if (options.promptAsyncImpl) {
++            return options.promptAsyncImpl(input)
++          }
+         },
+       },
+     },
+@@ -219,6 +226,48 @@ describe("unstable-agent-babysitter hook", () => {
+     Date.now = originalNow
+   })
+ 
++  test("#given reminder prompt may have been accepted before EOF #when the main session idles again inside cooldown #then no duplicate reminder is injected", async () => {
++    // #given
++    setMainSession("main-1")
++    const promptCalls: Array<{ input: unknown }> = []
++    const now = Date.now()
++    const originalNow = Date.now
++    Date.now = () => now
++    const ctx = createMockPluginInput({
++      messagesBySession: {
++        "main-1": [
++          { info: { agent: "sisyphus", model: { providerID: "openai", modelID: "gpt-4" } } },
++        ],
++        "bg-1": [
++          { info: { role: "assistant" }, parts: [{ type: "thinking", thinking: "deep thought" }] },
++        ],
++      },
++      promptCalls,
++      promptAsyncImpl: async () => {
++        throw new Error("JSON Parse error: Unexpected EOF")
++      },
++    })
++    const backgroundManager = createBackgroundManager([createTask()])
++    const hook = createUnstableAgentBabysitterHook(ctx, {
++      backgroundManager,
++      config: { timeout_ms: 120000 },
++    })
++
++    try {
++      // #when
++      await hook.event({ event: { type: "session.idle", properties: { sessionID: "main-1" } } })
++      releasePromptAsyncReservation("main-1", "test:simulate-expired-hold", {
++        reservedBy: "unstable-agent-babysitter",
++      })
++      await hook.event({ event: { type: "session.idle", properties: { sessionID: "main-1" } } })
++
++      // #then
++      expect(promptCalls.length).toBe(1)
++    } finally {
++      Date.now = originalNow
++    }
++  })
++
+   test("skips follow-up reminder after the main session is cancelled", async () => {
+     setMainSession("main-1")
+     const promptCalls: Array<{ input: unknown }> = []
+diff --git a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+index fe7806f2..d65ba1b1 100644
+--- a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
++++ b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+@@ -1,7 +1,7 @@
+ import type { BackgroundManager } from "../../features/background-agent"
+ import { getMainSessionID, getSessionAgent } from "../../features/claude-code-session-state"
+ import { log } from "../../shared/logger"
+-import { createInternalAgentTextPart, resolveInheritedPromptTools } from "../../shared"
++import { createInternalAgentTextPart, isAmbiguousPromptDispatchFailure, resolveInheritedPromptTools } from "../../shared"
+ import { resolveMessageEventSessionID, resolveSessionEventID } from "../../shared/event-session-id"
+ import { isAbortError } from "../../shared/is-abort-error"
+ import {
+@@ -13,7 +13,7 @@ import {
+   isUnstableTask,
+   THINKING_SUMMARY_MAX_CHARS,
+ } from "./task-message-analyzer"
+-import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../shared/prompt-async-gate"
+ 
+ const HOOK_NAME = "unstable-agent-babysitter"
+ const DEFAULT_TIMEOUT_MS = 120000
+@@ -29,17 +29,6 @@ type BabysitterContext = {
+   client: {
+     session: {
+       messages: (args: { path: { id: string } }) => Promise<{ data?: unknown } | unknown[]>
+-      prompt: (args: {
+-        path: { id: string }
+-        body: {
+-          parts: Array<{ type: "text"; text: string }>
+-          agent?: string
+-          variant?: string
+-          model?: { providerID: string; modelID: string }
+-          tools?: Record<string, boolean>
+-        }
+-        query?: { directory?: string }
+-      }) => Promise<unknown>
+       promptAsync: (args: {
+         path: { id: string }
+         body: {
+@@ -270,7 +259,10 @@ export function createUnstableAgentBabysitterHook(ctx: BabysitterContext, option
+             query: { directory: ctx.directory },
+           },
+         })
+-        if (promptResult.status !== "dispatched") {
++        if (!isInternalPromptDispatchAccepted(promptResult)) {
++          if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
++            reminderCooldowns.set(task.id, now)
++          }
+           log(`[${HOOK_NAME}] Reminder skipped by promptAsync gate`, {
+             taskId: task.id,
+             sessionID: mainSessionID,
+diff --git a/src/plugin/event.model-fallback.test.ts b/src/plugin/event.model-fallback.test.ts
+index 84b0219d..39106c60 100644
+--- a/src/plugin/event.model-fallback.test.ts
++++ b/src/plugin/event.model-fallback.test.ts
+@@ -6,6 +6,10 @@ import { createChatMessageHandler } from "./chat-message"
+ import { _resetForTesting, setMainSession } from "../features/claude-code-session-state"
+ import { createModelFallbackHook, clearPendingModelFallback } from "../hooks/model-fallback/hook"
+ import * as connectedProvidersCache from "../shared/connected-providers-cache"
++import {
++  releaseAllPromptAsyncReservationsForTesting,
++  releasePromptAsyncReservation,
++} from "../hooks/shared/prompt-async-gate"
+ import { unsafeTestValue } from "../../test-support/unsafe-test-value"
+ 
+ type EventInput = { event: { type: string; properties?: unknown } }
+@@ -95,6 +99,7 @@ describe("createEventHandler - model fallback", () => {
+     readConnectedProvidersCacheSpy = undefined
+     readProviderModelsCacheSpy = undefined
+     _resetForTesting()
++    releaseAllPromptAsyncReservationsForTesting()
+   })
+ 
+   test("triggers retry prompt for assistant message.updated APIError payloads (headless resume)", async () => {
+@@ -139,6 +144,56 @@ describe("createEventHandler - model fallback", () => {
+     expect(promptCalls).toEqual([sessionID])
+   })
+ 
++  test("#given model-fallback promptAsync may have been accepted before EOF #when the same assistant error repeats after the gate hold #then fallback continue is not duplicated", async () => {
++    //#given
++    const sessionID = "ses_message_updated_fallback_eof"
++    const modelFallback = createModelFallbackHook()
++    const { handler, abortCalls, promptAsyncCalls } = createHandler({
++      hooks: { modelFallback },
++      promptAsync: async () => {
++        throw new Error("JSON Parse error: Unexpected EOF")
++      },
++    })
++    const input: EventInput = {
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            id: "msg_err_eof",
++            sessionID,
++            role: "assistant",
++            time: { created: 1, completed: 2 },
++            error: {
++              name: "APIError",
++              data: {
++                message:
++                  "Bad Gateway: {\"error\":{\"message\":\"unknown provider for model claude-opus-4-7-thinking\"}}",
++                isRetryable: true,
++              },
++            },
++            parentID: "msg_user_eof",
++            modelID: "claude-opus-4-7-thinking",
++            providerID: "anthropic",
++            agent: "Sisyphus - Ultraworker",
++            path: { cwd: "/tmp", root: "/tmp" },
++          },
++        },
++      },
++    }
++
++    //#when
++    await handler(input)
++    const released = releasePromptAsyncReservation(sessionID, "test:simulate-expired-hold", {
++      reservedBy: "model-fallback:message.updated",
++    })
++    await handler(input)
++
++    //#then
++    expect(released).toBe(true)
++    expect(abortCalls).toEqual([sessionID])
++    expect(promptAsyncCalls).toEqual([sessionID])
++  })
++
+   test("triggers retry prompt for nested model error payloads", async () => {
+     //#given
+     const sessionID = "ses_main_fallback_nested"
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 3c4db534..adb711d6 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -42,7 +42,11 @@ import { buildTeamIdleWakeHintClient } from "./build-team-idle-wake-hint-client"
+ import { createTeamLeadOrphanHandler } from "../hooks/team-session-events/team-lead-orphan-handler";
+ import { createTeamMemberErrorHandler } from "../hooks/team-session-events/team-member-error-handler";
+ import { createTeamMemberStatusHandler } from "../hooks/team-session-events/team-member-status-handler";
+-import { dispatchInternalPrompt, releasePromptAsyncReservation } from "../hooks/shared/prompt-async-gate";
++import {
++  dispatchInternalPrompt,
++  isInternalPromptDispatchAccepted,
++  releasePromptAsyncReservation,
++} from "../hooks/shared/prompt-async-gate";
+ 
+ import type { CreatedHooks } from "../create-hooks";
+ import type { Managers } from "../create-managers";
+@@ -519,7 +523,7 @@ export function createEventHandler(args: {
+           source: `model-fallback:${source}`,
+           input: promptBody,
+         });
+-        if (promptResult.status === "dispatched") {
++        if (isInternalPromptDispatchAccepted(promptResult)) {
+           dispatched = true;
+         } else if (promptResult.status === "failed") {
+           const error = promptResult.error;
+@@ -537,7 +541,7 @@ export function createEventHandler(args: {
+         source: `model-fallback:${source}:sync`,
+         input: promptBody,
+       });
+-      if (promptResult.status === "dispatched") {
++      if (isInternalPromptDispatchAccepted(promptResult)) {
+         dispatched = true;
+       } else if (promptResult.status === "failed") {
+         log("[event] model-fallback prompt failed", { sessionID, source, error: promptResult.error });
+@@ -959,7 +963,7 @@ export function createEventHandler(args: {
+             });
+             if (promptResult.status === "failed") {
+               log("[event] recovery continue prompt failed", { sessionID, error: promptResult.error });
+-            } else if (promptResult.status !== "dispatched") {
++            } else if (!isInternalPromptDispatchAccepted(promptResult)) {
+               log("[event] recovery continue prompt skipped by gate", { sessionID, status: promptResult.status });
+             }
+           }
+diff --git a/src/plugin/unstable-agent-babysitter.ts b/src/plugin/unstable-agent-babysitter.ts
+index ee1f32ca..fd42d4c7 100644
+--- a/src/plugin/unstable-agent-babysitter.ts
++++ b/src/plugin/unstable-agent-babysitter.ts
+@@ -25,7 +25,6 @@ export function createUnstableAgentBabysitter(args: {
+             return []
+           },
+           status: async () => ctx.client.session.status(),
+-          prompt: async (promptArgs) => ctx.client.session.prompt(promptArgs),
+           promptAsync: async (promptArgs) => ctx.client.session.promptAsync(promptArgs),
+         },
+       },
+diff --git a/src/shared/index.ts b/src/shared/index.ts
+index 17ebfd0c..dd58561d 100644
+--- a/src/shared/index.ts
++++ b/src/shared/index.ts
+@@ -73,6 +73,7 @@ export * from "./record-type-guard"
+ export * from "./session-directory-resolver"
+ export * from "./session-route"
+ export * from "./prompt-tools"
++export * from "./prompt-failure-classifier"
+ export * from "./compaction-marker"
+ export * from "./internal-initiator-marker"
+ export * from "./plugin-command-discovery"
+diff --git a/src/shared/model-suggestion-retry.test.ts b/src/shared/model-suggestion-retry.test.ts
+index 5ddc0d8f..14afbf25 100644
+--- a/src/shared/model-suggestion-retry.test.ts
++++ b/src/shared/model-suggestion-retry.test.ts
+@@ -236,7 +236,7 @@ describe("promptWithModelSuggestionRetry", () => {
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
+-  it("should reject concurrent promptAsync retries for the same session after one dispatch is reserved", async () => {
++  it("should coalesce concurrent promptAsync retries for the same session after one dispatch is reserved", async () => {
+     // given two callers racing to send into one session
+     let releasePrompt: (() => void) | undefined
+     const promptGate = new Promise<void>((resolve) => {
+@@ -269,10 +269,10 @@ describe("promptWithModelSuggestionRetry", () => {
+     // then only the reserved dispatch is sent to OpenCode
+     expect(promptMock).toHaveBeenCalledTimes(1)
+     expect(results[0]?.status).toBe("fulfilled")
+-    expect(results[1]?.status).toBe("rejected")
++    expect(results[1]?.status).toBe("fulfilled")
+   })
+ 
+-  it("#given promptAsync retry just dispatched #when the same session is prompted again immediately #then the second caller is rejected by the gate", async () => {
++  it("#given promptAsync retry just dispatched #when the same session is prompted again immediately #then the second caller is coalesced by the queue", async () => {
+     // given
+     const promptMock = mock(async () => undefined)
+     const client = {
+@@ -290,14 +290,13 @@ describe("promptWithModelSuggestionRetry", () => {
+ 
+     // when
+     await promptWithModelSuggestionRetry(unsafeTestValue(client), args)
+-    const second = promptWithModelSuggestionRetry(unsafeTestValue(client), args)
++    await promptWithModelSuggestionRetry(unsafeTestValue(client), args)
+ 
+     // then
+-    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
+-  it("#given same-source retry observes a peer reservation #when it rejects #then the peer hold remains reserved", async () => {
++  it("#given same-source retry observes a peer reservation #when it coalesces #then a different prompt remains queued behind the hold", async () => {
+     // given
+     const promptMock = mock(async () => undefined)
+     const client = {
+@@ -315,9 +314,7 @@ describe("promptWithModelSuggestionRetry", () => {
+ 
+     // when
+     await promptWithModelSuggestionRetry(unsafeTestValue(client), args)
+-    await expect(
+-      promptWithModelSuggestionRetry(unsafeTestValue(client), args)
+-    ).rejects.toThrow("promptAsync skipped by gate: reserved")
++    await promptWithModelSuggestionRetry(unsafeTestValue(client), args)
+     const third = await dispatchInternalPrompt({
+       mode: "async",
+       client,
+@@ -329,7 +326,7 @@ describe("promptWithModelSuggestionRetry", () => {
+     })
+ 
+     // then
+-    expect(third).toEqual({ status: "reserved", reservedBy: "model-suggestion-retry" })
++    expect(third).toEqual({ status: "queued", queuedBy: "model-suggestion-retry", position: 1 })
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
+@@ -432,7 +429,7 @@ describe("promptWithModelSuggestionRetry", () => {
+     })
+ 
+     // then
+-    expect(second).toEqual({ status: "reserved", reservedBy: "model-suggestion-retry" })
++    expect(second).toEqual({ status: "queued", queuedBy: "model-suggestion-retry", position: 1 })
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
+@@ -564,7 +561,7 @@ describe("promptSyncWithModelSuggestionRetry", () => {
+     expect(promptAsyncMock).toHaveBeenCalledTimes(0)
+   })
+ 
+-  it("#given sync prompt retry just dispatched #when the same session is prompted again immediately #then the second caller is rejected by the gate", async () => {
++  it("#given sync prompt retry just dispatched #when the same session is prompted again immediately #then the second caller is coalesced by the queue", async () => {
+     // given
+     const promptMock = mock(async () => undefined)
+     const client = {
+@@ -582,10 +579,9 @@ describe("promptSyncWithModelSuggestionRetry", () => {
+ 
+     // when
+     await promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
+-    const second = promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
++    await promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
+ 
+     // then
+-    await expect(second).rejects.toThrow("prompt skipped by gate: reserved")
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
+diff --git a/src/shared/model-suggestion-retry.ts b/src/shared/model-suggestion-retry.ts
+index 48f93a3c..cb3b9db3 100644
+--- a/src/shared/model-suggestion-retry.ts
++++ b/src/shared/model-suggestion-retry.ts
+@@ -7,6 +7,7 @@ import {
+ } from "./prompt-timeout-context"
+ import {
+   dispatchInternalPrompt,
++  isInternalPromptDispatchAccepted,
+   releasePromptAsyncReservation,
+ } from "./prompt-async-gate"
+ 
+@@ -118,11 +119,12 @@ export async function promptWithModelSuggestionRetry(
+       } as Parameters<typeof client.session.promptAsync>[0],
+       source: "model-suggestion-retry",
+       settleMs: 0,
++      ...(options.queueBehavior ? { queueBehavior: options.queueBehavior } : {}),
+     })
+     if (promptResult.status === "failed") {
+       throw promptResult.error
+     }
+-    if (promptResult.status !== "dispatched") {
++    if (!isInternalPromptDispatchAccepted(promptResult)) {
+       throw new Error(`promptAsync skipped by gate: ${promptResult.status}`)
+     }
+     if (timeoutContext.wasTimedOut()) {
+@@ -162,11 +164,12 @@ export async function promptSyncWithModelSuggestionRetry(
+         source: "model-suggestion-retry:sync",
+         settleMs: 0,
+         checkStatus: false,
++        ...(options.queueBehavior ? { queueBehavior: options.queueBehavior } : {}),
+       })
+       if (promptResult.status === "failed") {
+         throw promptResult.error
+       }
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
+         throw new Error(`prompt skipped by gate: ${promptResult.status}`)
+       }
+       if (timeoutContext.wasTimedOut()) {
+@@ -220,11 +223,12 @@ export async function promptSyncWithModelSuggestionRetry(
+         source: "model-suggestion-retry:sync-retry",
+         settleMs: 0,
+         checkStatus: false,
++        ...(options.queueBehavior ? { queueBehavior: options.queueBehavior } : {}),
+       })
+       if (promptResult.status === "failed") {
+         throw promptResult.error
+       }
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
+         throw new Error(`prompt skipped by gate: ${promptResult.status}`)
+       }
+       if (timeoutContext.wasTimedOut()) {
+diff --git a/src/shared/prompt-async-gate.ts b/src/shared/prompt-async-gate.ts
+index c9a9ab37..02e324f3 100644
+--- a/src/shared/prompt-async-gate.ts
++++ b/src/shared/prompt-async-gate.ts
+@@ -13,6 +13,7 @@ import {
+ export const DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS = 250
+ export const DEFAULT_PROMPT_DISPATCH_TIMEOUT_MS = 30_000
+ export const DEFAULT_PROMPT_GATE_MESSAGES_FETCH_TIMEOUT_MS = 5_000
++export const DEFAULT_PROMPT_QUEUE_RETRY_MS = 250
+ 
+ type PromptAsyncInput = {
+   path?: { id?: string }
+@@ -44,11 +45,16 @@ type PromptClient<TInput> = {
+ }
+ 
+ export type InternalPromptDispatchMode = "async" | "sync"
++export type InternalPromptQueueBehavior = "enqueue" | "defer"
+ 
+ type InternalPromptDispatchCommonArgs<TInput> = {
+   sessionID: string
+   input: TInput
+   source: string
++  dedupeKey?: string
++  queueBehavior?: InternalPromptQueueBehavior
++  queue?: boolean
++  queueRetryMs?: number
+   settleMs?: number
+   postDispatchHoldMs?: number
+   dispatchTimeoutMs?: number
+@@ -63,6 +69,7 @@ export type InternalPromptDispatchArgs<TInput = PromptAsyncInput> = InternalProm
+ 
+ type PromptAsyncReservation = {
+   source: string
++  dedupeKey: string
+   reservedAt: number
+   token: symbol
+   expiresAt?: number
+@@ -75,6 +82,7 @@ let promptGateMessagesFetchTimeoutMsForTesting: number | undefined
+ 
+ export type InternalPromptDispatchResult =
+   | { status: "dispatched"; response: unknown }
++  | { status: "queued"; queuedBy: string; position: number }
+   | { status: "active" }
+   | { status: "reserved"; reservedBy: string }
+   | { status: "unavailable" }
+@@ -88,6 +96,35 @@ type PromptAsyncReservationReleaseOptions = {
+ }
+ 
+ const promptAsyncReservations = new Map<string, PromptAsyncReservation>()
++const promptQueues = new Map<string, QueuedInternalPrompt[]>()
++const promptQueueDraining = new Set<string>()
++const promptQueueInFlight = new Map<string, QueuedInternalPrompt>()
++const promptQueueTimers = new Map<string, unknown>()
++let promptQueueSequence = 0
++
++type PromptDispatchClient = {
++  session?: {
++    status?: () => Promise<unknown>
++    messages?: (input: { path: { id: string }; query: PromptMessagesQuery }) => Promise<unknown>
++  }
++}
++
++type QueuedInternalPrompt = {
++  id: number
++  sessionID: string
++  sessionName: "promptAsync" | "prompt"
++  client: PromptDispatchClient
++  input: unknown
++  source: string
++  dedupeKey: string
++  settleMs: number
++  postDispatchHoldMs: number
++  dispatchTimeoutMs: number
++  queueRetryMs: number
++  checkStatus: boolean
++  checkToolState: boolean
++  dispatch: (input: unknown) => Promise<unknown>
++}
+ 
+ export function _setPromptGateMessagesFetchTimeoutMsForTesting(value: number | undefined): void {
+   promptGateMessagesFetchTimeoutMsForTesting = value
+@@ -98,15 +135,20 @@ function getPromptGateMessagesFetchTimeoutMs(): number {
+ }
+ 
+ function pruneExpiredReservations(now = Date.now()): void {
++  const expiredSessionIDs: string[] = []
+   for (const [sessionID, reservation] of promptAsyncReservations) {
+     if (typeof reservation.expiresAt === "number" && reservation.expiresAt <= now) {
+       promptAsyncReservations.delete(sessionID)
++      expiredSessionIDs.push(sessionID)
+       log("[prompt-async-gate] expired reservation released", {
+         sessionID,
+         source: reservation.source,
+       })
+     }
+   }
++  for (const sessionID of expiredSessionIDs) {
++    schedulePromptQueueDrain(sessionID, 0)
++  }
+ }
+ 
+ function getActiveReservation(sessionID: string): PromptAsyncReservation | undefined {
+@@ -114,6 +156,102 @@ function getActiveReservation(sessionID: string): PromptAsyncReservation | undef
+   return promptAsyncReservations.get(sessionID)
+ }
+ 
++function getPromptQueue(sessionID: string): QueuedInternalPrompt[] {
++  const existing = promptQueues.get(sessionID)
++  if (existing) {
++    return existing
++  }
++
++  const queue: QueuedInternalPrompt[] = []
++  promptQueues.set(sessionID, queue)
++  return queue
++}
++
++function setPromptQueue(sessionID: string, queue: QueuedInternalPrompt[]): void {
++  if (queue.length === 0) {
++    promptQueues.delete(sessionID)
++    return
++  }
++  promptQueues.set(sessionID, queue)
++}
++
++function stringifyPromptInputForDedupe(input: unknown): string {
++  try {
++    const serialized = JSON.stringify(input, (key: string, value: unknown): unknown => {
++      if (key === "signal") {
++        return "[AbortSignal]"
++      }
++      if (typeof value === "function") {
++        return `[Function:${value.name}]`
++      }
++      return value
++    })
++    return serialized ?? String(input)
++  } catch {
++    return String(input)
++  }
++}
++
++function createDefaultDedupeKey(source: string, input: unknown): string {
++  const fingerprint = stringifyPromptInputForDedupe(input)
++  return `${source}:${fingerprint.length}:${fingerprint.slice(0, 8192)}`
++}
++
++function queuedResult(entry: QueuedInternalPrompt, position: number, queuedBy = entry.source): InternalPromptDispatchResult {
++  return {
++    status: "queued",
++    queuedBy,
++    position,
++  }
++}
++
++function clearPromptQueueTimer(sessionID: string): void {
++  const timer = promptQueueTimers.get(sessionID)
++  if (timer !== undefined) {
++    clearTimeout(timer)
++    promptQueueTimers.delete(sessionID)
++  }
++}
++
++function schedulePromptQueueDrain(sessionID: string, delayMs: number): void {
++  const queue = promptQueues.get(sessionID)
++  if (!queue || queue.length === 0) {
++    clearPromptQueueTimer(sessionID)
++    return
++  }
++
++  clearPromptQueueTimer(sessionID)
++  const timer = setTimeout(() => {
++    promptQueueTimers.delete(sessionID)
++    void drainPromptQueue(sessionID).catch((error: unknown) => {
++      log("[prompt-async-gate] queued prompt drain failed", {
++        sessionID,
++        error: String(error),
++      })
++    })
++  }, Math.max(0, delayMs))
++  promptQueueTimers.set(sessionID, timer)
++}
++
++function removePromptQueueEntry(sessionID: string, entry: QueuedInternalPrompt): void {
++  const queue = promptQueues.get(sessionID)
++  if (!queue) {
++    return
++  }
++  const nextQueue = queue.filter((queued) => queued.id !== entry.id)
++  setPromptQueue(sessionID, nextQueue)
++}
++
++function getQueuedPromptBlocker(sessionID: string): string | undefined {
++  const inFlight = promptQueueInFlight.get(sessionID)
++  if (inFlight) {
++    return inFlight.source
++  }
++
++  const queue = promptQueues.get(sessionID)
++  return queue?.[0]?.source
++}
++
+ function reservationSourceMatches(
+   reservationSource: string,
+   expectedSource: string | readonly string[],
+@@ -341,6 +479,7 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+   sessionID: string
+   input: TInput
+   source: string
++  dedupeKey: string
+   settleMs: number
+   postDispatchHoldMs: number
+   dispatchTimeoutMs: number
+@@ -354,6 +493,7 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+     sessionID,
+     input,
+     source,
++    dedupeKey,
+     settleMs,
+     postDispatchHoldMs,
+     dispatchTimeoutMs,
+@@ -375,6 +515,7 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+ 
+   const reservation: PromptAsyncReservation = {
+     source,
++    dedupeKey,
+     reservedAt: Date.now(),
+     token: Symbol(source),
+   }
+@@ -447,6 +588,117 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+   }
+ }
+ 
++async function drainPromptQueue(sessionID: string, awaitedEntry?: QueuedInternalPrompt): Promise<InternalPromptDispatchResult | undefined> {
++  if (promptQueueDraining.has(sessionID)) {
++    return awaitedEntry ? queuedResult(awaitedEntry, 1) : undefined
++  }
++
++  promptQueueDraining.add(sessionID)
++  clearPromptQueueTimer(sessionID)
++
++  let awaitedResult: InternalPromptDispatchResult | undefined
++  try {
++    while (true) {
++      const queue = promptQueues.get(sessionID)
++      const entry = queue?.[0]
++      if (!entry) {
++        break
++      }
++
++      promptQueueInFlight.set(sessionID, entry)
++      const result = await dispatchAfterSessionIdle({
++        sessionName: entry.sessionName,
++        client: entry.client,
++        sessionID: entry.sessionID,
++        input: entry.input,
++        source: entry.source,
++        dedupeKey: entry.dedupeKey,
++        settleMs: entry.settleMs,
++        postDispatchHoldMs: entry.postDispatchHoldMs,
++        dispatchTimeoutMs: entry.dispatchTimeoutMs,
++        checkStatus: entry.checkStatus,
++        checkToolState: entry.checkToolState,
++        dispatch: entry.dispatch,
++      })
++      if (promptQueueInFlight.get(sessionID)?.id === entry.id) {
++        promptQueueInFlight.delete(sessionID)
++      }
++
++      if (result.status === "active" || result.status === "reserved") {
++        const queued = queuedResult(
++          entry,
++          1,
++          result.status === "reserved" ? result.reservedBy : entry.source,
++        )
++        if (awaitedEntry?.id === entry.id) {
++          awaitedResult = queued
++        }
++        schedulePromptQueueDrain(sessionID, entry.queueRetryMs)
++        break
++      }
++
++      removePromptQueueEntry(sessionID, entry)
++      if (awaitedEntry?.id === entry.id) {
++        awaitedResult = result
++      }
++
++      const remainingQueue = promptQueues.get(sessionID)
++      if (!remainingQueue || remainingQueue.length === 0) {
++        break
++      }
++
++      schedulePromptQueueDrain(sessionID, entry.postDispatchHoldMs)
++      break
++    }
++  } finally {
++    promptQueueDraining.delete(sessionID)
++  }
++
++  return awaitedResult
++}
++
++async function enqueueInternalPrompt(entry: QueuedInternalPrompt): Promise<InternalPromptDispatchResult> {
++  const activeReservation = getActiveReservation(entry.sessionID)
++  if (activeReservation?.dedupeKey === entry.dedupeKey) {
++    log("[prompt-async-gate] queued prompt coalesced with recent dispatch", {
++      sessionID: entry.sessionID,
++      source: entry.source,
++      queuedBy: activeReservation.source,
++    })
++    return queuedResult(entry, 0, activeReservation.source)
++  }
++
++  const queue = getPromptQueue(entry.sessionID)
++  const existingIndex = queue.findIndex((queued) => queued.dedupeKey === entry.dedupeKey)
++  if (existingIndex >= 0) {
++    const existing = queue[existingIndex]
++    if (existing) {
++      log("[prompt-async-gate] queued prompt coalesced with pending dispatch", {
++        sessionID: entry.sessionID,
++        source: entry.source,
++        queuedBy: existing.source,
++        position: existingIndex + 1,
++      })
++      return queuedResult(existing, existingIndex + 1)
++    }
++  }
++
++  queue.push(entry)
++  log("[prompt-async-gate] queued prompt accepted", {
++    sessionID: entry.sessionID,
++    source: entry.source,
++    position: queue.length,
++  })
++
++  if (queue.length > 1 || promptQueueDraining.has(entry.sessionID)) {
++    schedulePromptQueueDrain(entry.sessionID, 0)
++    return queuedResult(entry, queue.length)
++  }
++
++  const result = await drainPromptQueue(entry.sessionID, entry)
++  return result ?? queuedResult(entry, 1)
++}
++
+ export async function dispatchInternalPrompt<TInput = PromptAsyncInput>(
+   args: InternalPromptDispatchArgs<TInput>,
+ ): Promise<InternalPromptDispatchResult> {
+@@ -457,6 +709,8 @@ export async function dispatchInternalPrompt<TInput = PromptAsyncInput>(
+     source,
+     settleMs = DEFAULT_SESSION_IDLE_SETTLE_MS,
+   } = args
++  const dedupeKey = args.dedupeKey ?? createDefaultDedupeKey(source, input)
++  const queueRetryMs = args.queueRetryMs ?? DEFAULT_PROMPT_QUEUE_RETRY_MS
+   const postDispatchHoldMs = args.postDispatchHoldMs ?? DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS
+   const dispatchTimeoutMs = args.dispatchTimeoutMs ?? DEFAULT_PROMPT_DISPATCH_TIMEOUT_MS
+   const sessionName = args.mode === "async" ? "promptAsync" : "prompt"
+@@ -483,12 +737,59 @@ export async function dispatchInternalPrompt<TInput = PromptAsyncInput>(
+     return { status: "unavailable" }
+   }
+ 
++  if (args.queueBehavior === "defer") {
++    const activeReservation = getActiveReservation(sessionID)
++    if (activeReservation) {
++      return { status: "reserved", reservedBy: activeReservation.source }
++    }
++
++    const queuedBy = getQueuedPromptBlocker(sessionID)
++    if (queuedBy !== undefined || promptQueueDraining.has(sessionID)) {
++      return { status: "reserved", reservedBy: queuedBy ?? source }
++    }
++
++    return dispatchAfterSessionIdle({
++      sessionName,
++      client,
++      sessionID,
++      input,
++      source,
++      dedupeKey,
++      settleMs,
++      postDispatchHoldMs,
++      dispatchTimeoutMs,
++      checkStatus: args.checkStatus !== false,
++      checkToolState: args.checkToolState !== false,
++      dispatch,
++    })
++  }
++
++  if (args.queue !== false) {
++    return enqueueInternalPrompt({
++      id: promptQueueSequence += 1,
++      sessionID,
++      sessionName,
++      client,
++      input,
++      source,
++      dedupeKey,
++      settleMs,
++      postDispatchHoldMs,
++      dispatchTimeoutMs,
++      queueRetryMs,
++      checkStatus: args.checkStatus !== false,
++      checkToolState: args.checkToolState !== false,
++      dispatch: dispatch as (dispatchInput: unknown) => Promise<unknown>,
++    })
++  }
++
+   return dispatchAfterSessionIdle({
+     sessionName,
+     client,
+     sessionID,
+     input,
+     source,
++    dedupeKey,
+     settleMs,
+     postDispatchHoldMs,
+     dispatchTimeoutMs,
+@@ -500,9 +801,20 @@ export async function dispatchInternalPrompt<TInput = PromptAsyncInput>(
+ 
+ export function releaseAllPromptAsyncReservationsForTesting(): void {
+   promptAsyncReservations.clear()
++  promptQueues.clear()
++  promptQueueDraining.clear()
++  promptQueueInFlight.clear()
++  for (const timer of promptQueueTimers.values()) {
++    clearTimeout(timer)
++  }
++  promptQueueTimers.clear()
+   promptGateMessagesFetchTimeoutMsForTesting = undefined
+ }
+ 
++export function isInternalPromptDispatchAccepted(result: InternalPromptDispatchResult): boolean {
++  return result.status === "dispatched" || result.status === "queued"
++}
++
+ export function releasePromptAsyncReservation(
+   sessionID: string,
+   source: string,
+@@ -524,6 +836,13 @@ export function releasePromptAsyncReservation(
+   }
+ 
+   promptAsyncReservations.delete(sessionID)
++  const inFlight = promptQueueInFlight.get(sessionID)
++  if (inFlight?.dedupeKey === existing.dedupeKey) {
++    removePromptQueueEntry(sessionID, inFlight)
++    promptQueueInFlight.delete(sessionID)
++    promptQueueDraining.delete(sessionID)
++  }
++  schedulePromptQueueDrain(sessionID, 0)
+   log("[prompt-async-gate] promptAsync reservation released", {
+     sessionID,
+     source,
+diff --git a/src/shared/prompt-async-route-audit.test.ts b/src/shared/prompt-async-route-audit.test.ts
+index dab7324b..0c5aba76 100644
+--- a/src/shared/prompt-async-route-audit.test.ts
++++ b/src/shared/prompt-async-route-audit.test.ts
+@@ -16,7 +16,7 @@ const RAW_PROMPT_ALLOWLIST = new Map<string, string>([
+   ],
+   [
+     path.join(SOURCE_ROOT, "plugin", "unstable-agent-babysitter.ts"),
+-    "binds SDK Session.prompt/.promptAsync into a narrow facade consumed only by gate-routed unstable-agent-babysitter dispatch; performs no direct dispatch itself",
++    "binds SDK Session.promptAsync into a narrow facade consumed only by gate-routed unstable-agent-babysitter dispatch; performs no direct dispatch itself",
+   ],
+   [
+     path.join(SOURCE_ROOT, "hooks", "session-recovery", "recover-unavailable-tool.ts"),
+@@ -287,4 +287,21 @@ describe("production prompt injection routes", () => {
+     // then
+     expect(offenders).toEqual([])
+   })
++
++  test("#given production TypeScript sources #when prompt gate callers are audited #then callers cannot bypass the central prompt queue", async () => {
++    // given
++    const files = await listSourceFiles(SOURCE_ROOT)
++    const offenders: string[] = []
++
++    // when
++    for (const filePath of files) {
++      const contents = await readFile(filePath, "utf8")
++      if (/queue\s*:\s*false\b/.test(contents)) {
++        offenders.push(relativeSourcePath(filePath))
++      }
++    }
++
++    // then
++    expect(offenders).toEqual([])
++  })
+ })
+diff --git a/src/shared/prompt-failure-classifier.test.ts b/src/shared/prompt-failure-classifier.test.ts
+new file mode 100644
+index 00000000..4121fc11
+--- /dev/null
++++ b/src/shared/prompt-failure-classifier.test.ts
+@@ -0,0 +1,27 @@
++import { describe, expect, test } from "bun:test"
++
++import { isAmbiguousPromptDispatchFailure } from "./prompt-failure-classifier"
++
++describe("prompt failure classifier", () => {
++  test("#given prompt dispatch reports a generic JSON parse error #when classifying ambiguity #then it treats the dispatch as possibly accepted", () => {
++    // given
++    const error = new Error("JSON Parse error: Unexpected end of JSON input")
++
++    // when
++    const ambiguous = isAmbiguousPromptDispatchFailure(error)
++
++    // then
++    expect(ambiguous).toBe(true)
++  })
++
++  test("#given prompt dispatch timeout casing varies #when classifying ambiguity #then it treats the dispatch as possibly accepted", () => {
++    // given
++    const error = "PromptAsync Timed Out after 30000ms"
++
++    // when
++    const ambiguous = isAmbiguousPromptDispatchFailure(error)
++
++    // then
++    expect(ambiguous).toBe(true)
++  })
++})
+diff --git a/src/shared/prompt-failure-classifier.ts b/src/shared/prompt-failure-classifier.ts
+new file mode 100644
+index 00000000..96a617cd
+--- /dev/null
++++ b/src/shared/prompt-failure-classifier.ts
+@@ -0,0 +1,24 @@
++export function extractPromptFailureMessage(error: unknown): string {
++  if (typeof error === "string") return error
++  if (error instanceof Error) return error.message
++  if (typeof error === "object" && error !== null) {
++    const record = error as Record<string, unknown>
++    if (typeof record.message === "string") return record.message
++    try {
++      return JSON.stringify(error)
++    } catch {
++      return ""
++    }
++  }
++  return String(error)
++}
++
++export function isAmbiguousPromptDispatchFailure(error: unknown): boolean {
++  const message = extractPromptFailureMessage(error).toLowerCase()
++  return (
++    message.includes("unexpected eof")
++    || message.includes("json parse error")
++    || message.includes("unexpected end of json input")
++    || message.includes("timed out")
++  )
++}
+diff --git a/src/shared/prompt-timeout-context.ts b/src/shared/prompt-timeout-context.ts
+index 99f08127..8c843625 100644
+--- a/src/shared/prompt-timeout-context.ts
++++ b/src/shared/prompt-timeout-context.ts
+@@ -4,6 +4,7 @@ export interface PromptTimeoutArgs {
+ 
+ export interface PromptRetryOptions {
+   timeoutMs?: number
++  queueBehavior?: "enqueue" | "defer"
+ }
+ 
+ export const PROMPT_TIMEOUT_MS = 120000
+diff --git a/src/shared/session-route.test.ts b/src/shared/session-route.test.ts
+index e4e0eae1..c14d3c9c 100644
+--- a/src/shared/session-route.test.ts
++++ b/src/shared/session-route.test.ts
+@@ -27,7 +27,7 @@ describe("promptAsyncInDirectory", () => {
+     expect(promptAsync).toHaveBeenCalledTimes(0)
+   })
+ 
+-  test("#given a routed prompt just dispatched #when the same session is prompted again immediately #then the route keeps the session reserved", async () => {
++  test("#given a routed prompt just dispatched #when the same session is prompted again immediately #then the route coalesces the duplicate", async () => {
+     // given
+     const promptAsync = mock(async () => ({ data: "sent" }))
+     const client = {
+@@ -46,7 +46,7 @@ describe("promptAsyncInDirectory", () => {
+       unsafeTestValue(args),
+       "/workspace/project",
+     )
+-    const second = promptAsyncInDirectory(
++    const second = await promptAsyncInDirectory(
+       unsafeTestValue(client),
+       unsafeTestValue(args),
+       "/workspace/project",
+@@ -54,7 +54,7 @@ describe("promptAsyncInDirectory", () => {
+ 
+     // then
+     expect(first).toEqual({ data: "sent" })
+-    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
++    expect(second).toBeUndefined()
+     expect(promptAsync).toHaveBeenCalledTimes(1)
+     expect(promptAsync.mock.calls[0]?.[0].query).toEqual({ directory: "/workspace/project" })
+   })
+diff --git a/src/shared/session-route.ts b/src/shared/session-route.ts
+index d94ce496..643745e0 100644
+--- a/src/shared/session-route.ts
++++ b/src/shared/session-route.ts
+@@ -3,7 +3,7 @@ import {
+   promptSyncWithModelSuggestionRetry,
+   promptWithModelSuggestionRetry,
+ } from "./model-suggestion-retry"
+-import { dispatchInternalPrompt } from "./prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "./prompt-async-gate"
+ 
+ type OpencodeClient = PluginInput["client"]
+ 
+@@ -70,10 +70,10 @@ export function promptAsyncInDirectory(
+     if (result.status === "failed") {
+       throw result.error
+     }
+-    if (result.status !== "dispatched") {
++    if (!isInternalPromptDispatchAccepted(result)) {
+       throw new Error(`promptAsync skipped by gate: ${result.status}`)
+     }
+-    return result.response
++    return result.status === "dispatched" ? result.response : undefined
+   })
+ }
+ 
+diff --git a/src/tools/call-omo-agent/sync-executor.ts b/src/tools/call-omo-agent/sync-executor.ts
+index 5459e0ee..a7f6f119 100644
+--- a/src/tools/call-omo-agent/sync-executor.ts
++++ b/src/tools/call-omo-agent/sync-executor.ts
+@@ -1,6 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { clearSessionAgent, setSessionAgent, subagentSessions, syncSubagentSessions } from "../../features/claude-code-session-state"
+-import { dispatchInternalPrompt } from "../../hooks/shared/prompt-async-gate"
++import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../hooks/shared/prompt-async-gate"
+ import { getAgentToolRestrictions, log } from "../../shared"
+ import { getAgentDisplayName, stripAgentListSortPrefix } from "../../shared/agent-display-names"
+ import {
+@@ -140,6 +140,7 @@ export async function executeSync(
+         sessionID,
+         source: "call-omo-agent:sync",
+         settleMs: 0,
++        queueBehavior: "defer",
+         input: {
+           path: { id: sessionID },
+           body: {
+@@ -155,7 +156,7 @@ export async function executeSync(
+       if (promptResult.status === "failed") {
+         throw promptResult.error
+       }
+-      if (promptResult.status !== "dispatched") {
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
+         throw new Error(`promptAsync skipped by gate: ${promptResult.status}`)
+       }
+     } catch (error) {
+diff --git a/src/tools/delegate-task/sync-continuation.ts b/src/tools/delegate-task/sync-continuation.ts
+index 37b22db9..ce6bf0e9 100644
+--- a/src/tools/delegate-task/sync-continuation.ts
++++ b/src/tools/delegate-task/sync-continuation.ts
+@@ -170,6 +170,8 @@ export async function executeSyncContinuation(
+         tools,
+         parts: [{ type: "text", text: effectivePrompt }],
+       },
++    }, {
++      queueBehavior: "defer",
+     })
+    } catch (promptError) {
+      if (toastManager) {
+diff --git a/src/tools/delegate-task/sync-prompt-sender.ts b/src/tools/delegate-task/sync-prompt-sender.ts
+index 2d1af32c..833c0388 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.ts
+@@ -110,11 +110,13 @@ export async function sendSyncPrompt(
+ 
+   try {
+     const routedPromptArgs = routePromptRetry(promptArgs, input.directory)
+-    await deps.promptWithModelSuggestionRetry(client, routedPromptArgs)
++    await deps.promptWithModelSuggestionRetry(client, routedPromptArgs, { queueBehavior: "defer" })
+   } catch (promptError) {
+     if (isOracleAgent(input.agentToUse) && isUnexpectedEofError(promptError)) {
+       try {
+-        await deps.promptSyncWithModelSuggestionRetry(client, routePromptSyncRetry(promptArgs, input.directory))
++        await deps.promptSyncWithModelSuggestionRetry(client, routePromptSyncRetry(promptArgs, input.directory), {
++          queueBehavior: "defer",
++        })
+         return null
+       } catch (oracleRetryError) {
+         if (!isPromptGateReservedError(oracleRetryError)) {
+diff --git a/src/tools/look-at/look-at-session-runner.ts b/src/tools/look-at/look-at-session-runner.ts
+index 5b87a785..ee14c572 100644
+--- a/src/tools/look-at/look-at-session-runner.ts
++++ b/src/tools/look-at/look-at-session-runner.ts
+@@ -78,6 +78,8 @@ Original error: ${createResult.error}`
+         ...(agentModel ? { model: { providerID: agentModel.providerID, modelID: agentModel.modelID } } : {}),
+         ...(agentVariant ? { variant: agentVariant } : {}),
+       },
++    }, {
++      queueBehavior: "defer",
+     })
+   } catch (promptError) {
+     log("[look_at] Prompt error (ignored, will still fetch messages):", promptError)
+-- 
+2.39.2
+

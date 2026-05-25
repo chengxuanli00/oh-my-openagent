@@ -1,0 +1,577 @@
+From 36169c83fbb98f7033c3e29b780059f81a39ae18 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 5 Dec 2025 20:01:35 +0900
+Subject: [PATCH 0087/5749] feat(ast-grep): add CLI path resolution and
+ auto-download functionality
+
+- Add automatic CLI binary path detection and resolution
+- Implement lazy binary download with caching
+- Add environment check utilities for CLI and NAPI availability
+- Improve error handling and fallback mechanisms
+- Export new utilities from index.ts
+---
+ src/tools/ast-grep/cli.ts        | 118 ++++++++++++++++++++++--
+ src/tools/ast-grep/constants.ts  | 149 ++++++++++++++++++++++++++++--
+ src/tools/ast-grep/downloader.ts | 151 +++++++++++++++++++++++++++++++
+ src/tools/ast-grep/index.ts      |  14 ++-
+ src/tools/ast-grep/napi.ts       |  12 ++-
+ 5 files changed, 417 insertions(+), 27 deletions(-)
+ create mode 100644 src/tools/ast-grep/downloader.ts
+
+diff --git a/src/tools/ast-grep/cli.ts b/src/tools/ast-grep/cli.ts
+index 66f8f056..861d10c1 100644
+--- a/src/tools/ast-grep/cli.ts
++++ b/src/tools/ast-grep/cli.ts
+@@ -1,5 +1,7 @@
+ import { spawn } from "bun"
+-import { SG_CLI_PATH } from "./constants"
++import { existsSync } from "fs"
++import { getSgCliPath, setSgCliPath, findSgCliPathSync } from "./constants"
++import { ensureAstGrepBinary } from "./downloader"
+ import type { CliMatch, CliLanguage } from "./types"
+ 
+ export interface RunOptions {
+@@ -12,6 +14,65 @@ export interface RunOptions {
+   updateAll?: boolean
+ }
+ 
++let resolvedCliPath: string | null = null
++let initPromise: Promise<string | null> | null = null
++
++export async function getAstGrepPath(): Promise<string | null> {
++  if (resolvedCliPath !== null && existsSync(resolvedCliPath)) {
++    return resolvedCliPath
++  }
++
++  if (initPromise) {
++    return initPromise
++  }
++
++  initPromise = (async () => {
++    const syncPath = findSgCliPathSync()
++    if (syncPath && existsSync(syncPath)) {
++      resolvedCliPath = syncPath
++      setSgCliPath(syncPath)
++      return syncPath
++    }
++
++    const downloadedPath = await ensureAstGrepBinary()
++    if (downloadedPath) {
++      resolvedCliPath = downloadedPath
++      setSgCliPath(downloadedPath)
++      return downloadedPath
++    }
++
++    return null
++  })()
++
++  return initPromise
++}
++
++export function startBackgroundInit(): void {
++  if (!initPromise) {
++    initPromise = getAstGrepPath()
++    initPromise.catch(() => {})
++  }
++}
++
++interface SpawnResult {
++  stdout: string
++  stderr: string
++  exitCode: number
++}
++
++async function spawnSg(cliPath: string, args: string[]): Promise<SpawnResult> {
++  const proc = spawn([cliPath, ...args], {
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++
++  const stdout = await new Response(proc.stdout).text()
++  const stderr = await new Response(proc.stderr).text()
++  const exitCode = await proc.exited
++
++  return { stdout, stderr, exitCode }
++}
++
+ export async function runSg(options: RunOptions): Promise<CliMatch[]> {
+   const args = ["run", "-p", options.pattern, "--lang", options.lang, "--json=compact"]
+ 
+@@ -35,14 +96,45 @@ export async function runSg(options: RunOptions): Promise<CliMatch[]> {
+   const paths = options.paths && options.paths.length > 0 ? options.paths : ["."]
+   args.push(...paths)
+ 
+-  const proc = spawn([SG_CLI_PATH, ...args], {
+-    stdout: "pipe",
+-    stderr: "pipe",
+-  })
++  let cliPath = getSgCliPath()
+ 
+-  const stdout = await new Response(proc.stdout).text()
+-  const stderr = await new Response(proc.stderr).text()
+-  const exitCode = await proc.exited
++  if (!existsSync(cliPath) && cliPath !== "sg") {
++    const downloadedPath = await getAstGrepPath()
++    if (downloadedPath) {
++      cliPath = downloadedPath
++    }
++  }
++
++  let result: SpawnResult
++  try {
++    result = await spawnSg(cliPath, args)
++  } catch (e) {
++    const error = e as NodeJS.ErrnoException
++    if (
++      error.code === "ENOENT" ||
++      error.message?.includes("ENOENT") ||
++      error.message?.includes("not found")
++    ) {
++      const downloadedPath = await ensureAstGrepBinary()
++      if (downloadedPath) {
++        resolvedCliPath = downloadedPath
++        setSgCliPath(downloadedPath)
++        result = await spawnSg(downloadedPath, args)
++      } else {
++        throw new Error(
++          `ast-grep CLI binary not found.\n\n` +
++            `Auto-download failed. Manual install options:\n` +
++            `  bun add -D @ast-grep/cli\n` +
++            `  cargo install ast-grep --locked\n` +
++            `  brew install ast-grep`
++        )
++      }
++    } else {
++      throw new Error(`Failed to spawn ast-grep: ${error.message}`)
++    }
++  }
++
++  const { stdout, stderr, exitCode } = result
+ 
+   if (exitCode !== 0 && stdout.trim() === "") {
+     if (stderr.includes("No files found")) {
+@@ -64,3 +156,13 @@ export async function runSg(options: RunOptions): Promise<CliMatch[]> {
+     return []
+   }
+ }
++
++export function isCliAvailable(): boolean {
++  const path = findSgCliPathSync()
++  return path !== null && existsSync(path)
++}
++
++export async function ensureCliAvailable(): Promise<boolean> {
++  const path = await getAstGrepPath()
++  return path !== null && existsSync(path)
++}
+diff --git a/src/tools/ast-grep/constants.ts b/src/tools/ast-grep/constants.ts
+index 24a43ff6..68cbe50b 100644
+--- a/src/tools/ast-grep/constants.ts
++++ b/src/tools/ast-grep/constants.ts
+@@ -1,6 +1,7 @@
+ import { createRequire } from "module"
+ import { dirname, join } from "path"
+ import { existsSync } from "fs"
++import { getCachedBinaryPath } from "./downloader"
+ 
+ type Platform = "darwin" | "linux" | "win32" | "unsupported"
+ 
+@@ -21,30 +22,30 @@ function getPlatformPackageName(): string | null {
+   return platformMap[`${platform}-${arch}`] ?? null
+ }
+ 
+-function findSgCliPath(): string {
+-  // 1. Try to find from @ast-grep/cli package (installed via npm)
++export function findSgCliPathSync(): string | null {
++  const binaryName = process.platform === "win32" ? "sg.exe" : "sg"
++
+   try {
+     const require = createRequire(import.meta.url)
+     const cliPkgPath = require.resolve("@ast-grep/cli/package.json")
+     const cliDir = dirname(cliPkgPath)
+-    const sgPath = join(cliDir, process.platform === "win32" ? "sg.exe" : "sg")
++    const sgPath = join(cliDir, binaryName)
+ 
+     if (existsSync(sgPath)) {
+       return sgPath
+     }
+   } catch {
+-    // @ast-grep/cli not installed, try platform-specific package
++    // @ast-grep/cli not installed
+   }
+ 
+-  // 2. Try platform-specific package directly
+   const platformPkg = getPlatformPackageName()
+   if (platformPkg) {
+     try {
+       const require = createRequire(import.meta.url)
+       const pkgPath = require.resolve(`${platformPkg}/package.json`)
+       const pkgDir = dirname(pkgPath)
+-      const binaryName = process.platform === "win32" ? "ast-grep.exe" : "ast-grep"
+-      const binaryPath = join(pkgDir, binaryName)
++      const astGrepName = process.platform === "win32" ? "ast-grep.exe" : "ast-grep"
++      const binaryPath = join(pkgDir, astGrepName)
+ 
+       if (existsSync(binaryPath)) {
+         return binaryPath
+@@ -54,12 +55,44 @@ function findSgCliPath(): string {
+     }
+   }
+ 
+-  // 3. Fallback to system PATH
++  if (process.platform === "darwin") {
++    const homebrewPaths = ["/opt/homebrew/bin/sg", "/usr/local/bin/sg"]
++    for (const path of homebrewPaths) {
++      if (existsSync(path)) {
++        return path
++      }
++    }
++  }
++
++  const cachedPath = getCachedBinaryPath()
++  if (cachedPath) {
++    return cachedPath
++  }
++
++  return null
++}
++
++let resolvedCliPath: string | null = null
++
++export function getSgCliPath(): string {
++  if (resolvedCliPath !== null) {
++    return resolvedCliPath
++  }
++
++  const syncPath = findSgCliPathSync()
++  if (syncPath) {
++    resolvedCliPath = syncPath
++    return syncPath
++  }
++
+   return "sg"
+ }
+ 
+-// ast-grep CLI path (auto-detected from node_modules or system PATH)
+-export const SG_CLI_PATH = findSgCliPath()
++export function setSgCliPath(path: string): void {
++  resolvedCliPath = path
++}
++
++export const SG_CLI_PATH = getSgCliPath()
+ 
+ // CLI supported languages (25 total)
+ export const CLI_LANGUAGES = [
+@@ -121,3 +154,99 @@ export const LANG_EXTENSIONS: Record<string, string[]> = {
+   tsx: [".tsx"],
+   yaml: [".yml", ".yaml"],
+ }
++
++export interface EnvironmentCheckResult {
++  cli: {
++    available: boolean
++    path: string
++    error?: string
++  }
++  napi: {
++    available: boolean
++    error?: string
++  }
++}
++
++/**
++ * Check if ast-grep CLI and NAPI are available.
++ * Call this at startup to provide early feedback about missing dependencies.
++ */
++export function checkEnvironment(): EnvironmentCheckResult {
++  const result: EnvironmentCheckResult = {
++    cli: {
++      available: false,
++      path: SG_CLI_PATH,
++    },
++    napi: {
++      available: false,
++    },
++  }
++
++  // Check CLI availability
++  if (existsSync(SG_CLI_PATH)) {
++    result.cli.available = true
++  } else if (SG_CLI_PATH === "sg") {
++    // Fallback path - try which/where to find in PATH
++    try {
++      const { spawnSync } = require("child_process")
++      const whichResult = spawnSync(process.platform === "win32" ? "where" : "which", ["sg"], {
++        encoding: "utf-8",
++        timeout: 5000,
++      })
++      result.cli.available = whichResult.status === 0 && !!whichResult.stdout?.trim()
++      if (!result.cli.available) {
++        result.cli.error = "sg binary not found in PATH"
++      }
++    } catch {
++      result.cli.error = "Failed to check sg availability"
++    }
++  } else {
++    result.cli.error = `Binary not found: ${SG_CLI_PATH}`
++  }
++
++  // Check NAPI availability
++  try {
++    require("@ast-grep/napi")
++    result.napi.available = true
++  } catch (e) {
++    result.napi.available = false
++    result.napi.error = `@ast-grep/napi not installed: ${e instanceof Error ? e.message : String(e)}`
++  }
++
++  return result
++}
++
++/**
++ * Format environment check result as user-friendly message.
++ */
++export function formatEnvironmentCheck(result: EnvironmentCheckResult): string {
++  const lines: string[] = ["ast-grep Environment Status:", ""]
++
++  // CLI status
++  if (result.cli.available) {
++    lines.push(`✓ CLI: Available (${result.cli.path})`)
++  } else {
++    lines.push(`✗ CLI: Not available`)
++    if (result.cli.error) {
++      lines.push(`  Error: ${result.cli.error}`)
++    }
++    lines.push(`  Install: bun add -D @ast-grep/cli`)
++  }
++
++  // NAPI status
++  if (result.napi.available) {
++    lines.push(`✓ NAPI: Available`)
++  } else {
++    lines.push(`✗ NAPI: Not available`)
++    if (result.napi.error) {
++      lines.push(`  Error: ${result.napi.error}`)
++    }
++    lines.push(`  Install: bun add -D @ast-grep/napi`)
++  }
++
++  lines.push("")
++  lines.push(`CLI supports ${CLI_LANGUAGES.length} languages`)
++  lines.push(`NAPI supports ${NAPI_LANGUAGES.length} languages: ${NAPI_LANGUAGES.join(", ")}`)
++
++  return lines.join("\n")
++}
+diff --git a/src/tools/ast-grep/downloader.ts b/src/tools/ast-grep/downloader.ts
+new file mode 100644
+index 00000000..dfad78fc
+--- /dev/null
++++ b/src/tools/ast-grep/downloader.ts
+@@ -0,0 +1,151 @@
++import { spawn } from "bun"
++import { existsSync, mkdirSync, chmodSync, unlinkSync } from "fs"
++import { join } from "path"
++import { homedir } from "os"
++import { createRequire } from "module"
++
++const REPO = "ast-grep/ast-grep"
++
++// IMPORTANT: Update this when bumping @ast-grep/cli in package.json
++// This is only used as fallback when @ast-grep/cli package.json cannot be read
++const DEFAULT_VERSION = "0.40.0"
++
++function getAstGrepVersion(): string {
++  try {
++    const require = createRequire(import.meta.url)
++    const pkg = require("@ast-grep/cli/package.json")
++    return pkg.version
++  } catch {
++    return DEFAULT_VERSION
++  }
++}
++
++interface PlatformInfo {
++  arch: string
++  os: string
++}
++
++const PLATFORM_MAP: Record<string, PlatformInfo> = {
++  "darwin-arm64": { arch: "aarch64", os: "apple-darwin" },
++  "darwin-x64": { arch: "x86_64", os: "apple-darwin" },
++  "linux-arm64": { arch: "aarch64", os: "unknown-linux-gnu" },
++  "linux-x64": { arch: "x86_64", os: "unknown-linux-gnu" },
++  "win32-x64": { arch: "x86_64", os: "pc-windows-msvc" },
++  "win32-arm64": { arch: "aarch64", os: "pc-windows-msvc" },
++  "win32-ia32": { arch: "i686", os: "pc-windows-msvc" },
++}
++
++export function getCacheDir(): string {
++  if (process.platform === "win32") {
++    const localAppData = process.env.LOCALAPPDATA || process.env.APPDATA
++    const base = localAppData || join(homedir(), "AppData", "Local")
++    return join(base, "oh-my-opencode", "bin")
++  }
++
++  const xdgCache = process.env.XDG_CACHE_HOME
++  const base = xdgCache || join(homedir(), ".cache")
++  return join(base, "oh-my-opencode", "bin")
++}
++
++export function getBinaryName(): string {
++  return process.platform === "win32" ? "sg.exe" : "sg"
++}
++
++export function getCachedBinaryPath(): string | null {
++  const binaryPath = join(getCacheDir(), getBinaryName())
++  return existsSync(binaryPath) ? binaryPath : null
++}
++
++async function extractZip(archivePath: string, destDir: string): Promise<void> {
++  const proc =
++    process.platform === "win32"
++      ? spawn(
++          [
++            "powershell",
++            "-command",
++            `Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force`,
++          ],
++          { stdout: "pipe", stderr: "pipe" }
++        )
++      : spawn(["unzip", "-o", archivePath, "-d", destDir], { stdout: "pipe", stderr: "pipe" })
++
++  const exitCode = await proc.exited
++
++  if (exitCode !== 0) {
++    const stderr = await new Response(proc.stderr).text()
++    const toolHint =
++      process.platform === "win32"
++        ? "Ensure PowerShell is available on your system."
++        : "Please install 'unzip' (e.g., apt install unzip, brew install unzip)."
++    throw new Error(`zip extraction failed (exit ${exitCode}): ${stderr}\n\n${toolHint}`)
++  }
++}
++
++export async function downloadAstGrep(version: string = DEFAULT_VERSION): Promise<string | null> {
++  const platformKey = `${process.platform}-${process.arch}`
++  const platformInfo = PLATFORM_MAP[platformKey]
++
++  if (!platformInfo) {
++    console.error(`[oh-my-opencode] Unsupported platform for ast-grep: ${platformKey}`)
++    return null
++  }
++
++  const cacheDir = getCacheDir()
++  const binaryName = getBinaryName()
++  const binaryPath = join(cacheDir, binaryName)
++
++  if (existsSync(binaryPath)) {
++    return binaryPath
++  }
++
++  const { arch, os } = platformInfo
++  const assetName = `app-${arch}-${os}.zip`
++  const downloadUrl = `https://github.com/${REPO}/releases/download/${version}/${assetName}`
++
++  console.log(`[oh-my-opencode] Downloading ast-grep binary...`)
++
++  try {
++    if (!existsSync(cacheDir)) {
++      mkdirSync(cacheDir, { recursive: true })
++    }
++
++    const response = await fetch(downloadUrl, { redirect: "follow" })
++
++    if (!response.ok) {
++      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
++    }
++
++    const archivePath = join(cacheDir, assetName)
++    const arrayBuffer = await response.arrayBuffer()
++    await Bun.write(archivePath, arrayBuffer)
++
++    await extractZip(archivePath, cacheDir)
++
++    if (existsSync(archivePath)) {
++      unlinkSync(archivePath)
++    }
++
++    if (process.platform !== "win32" && existsSync(binaryPath)) {
++      chmodSync(binaryPath, 0o755)
++    }
++
++    console.log(`[oh-my-opencode] ast-grep binary ready.`)
++
++    return binaryPath
++  } catch (err) {
++    console.error(
++      `[oh-my-opencode] Failed to download ast-grep: ${err instanceof Error ? err.message : err}`
++    )
++    return null
++  }
++}
++
++export async function ensureAstGrepBinary(): Promise<string | null> {
++  const cachedPath = getCachedBinaryPath()
++  if (cachedPath) {
++    return cachedPath
++  }
++
++  const version = getAstGrepVersion()
++  return downloadAstGrep(version)
++}
+diff --git a/src/tools/ast-grep/index.ts b/src/tools/ast-grep/index.ts
+index 0281566d..109b4aa5 100644
+--- a/src/tools/ast-grep/index.ts
++++ b/src/tools/ast-grep/index.ts
+@@ -1,14 +1,12 @@
+-import {
+-  ast_grep_search,
+-  ast_grep_replace,
+-} from "./tools"
++import { ast_grep_search, ast_grep_replace } from "./tools"
+ 
+ export const builtinTools = {
+   ast_grep_search,
+   ast_grep_replace,
+ }
+ 
+-export {
+-  ast_grep_search,
+-  ast_grep_replace,
+-}
++export { ast_grep_search, ast_grep_replace }
++export { ensureAstGrepBinary, getCachedBinaryPath, getCacheDir } from "./downloader"
++export { getAstGrepPath, isCliAvailable, ensureCliAvailable, startBackgroundInit } from "./cli"
++export { checkEnvironment, formatEnvironmentCheck } from "./constants"
++export type { EnvironmentCheckResult } from "./constants"
+diff --git a/src/tools/ast-grep/napi.ts b/src/tools/ast-grep/napi.ts
+index 62e178fd..c8d3880b 100644
+--- a/src/tools/ast-grep/napi.ts
++++ b/src/tools/ast-grep/napi.ts
+@@ -1,4 +1,5 @@
+ import { parse, Lang } from "@ast-grep/napi"
++import { NAPI_LANGUAGES } from "./constants"
+ import type { NapiLanguage, AnalyzeResult, MetaVariable, Range } from "./types"
+ 
+ const LANG_MAP: Record<NapiLanguage, Lang> = {
+@@ -10,7 +11,16 @@ const LANG_MAP: Record<NapiLanguage, Lang> = {
+ }
+ 
+ export function parseCode(code: string, lang: NapiLanguage) {
+-  return parse(LANG_MAP[lang], code)
++  const parseLang = LANG_MAP[lang]
++  if (!parseLang) {
++    const supportedLangs = NAPI_LANGUAGES.join(", ")
++    throw new Error(
++      `Unsupported language for NAPI: "${lang}"\n` +
++        `Supported languages: ${supportedLangs}\n\n` +
++        `Use ast_grep_search for other languages (25 supported via CLI).`
++    )
++  }
++  return parse(parseLang, code)
+ }
+ 
+ export function findPattern(root: ReturnType<typeof parseCode>, pattern: string) {
+-- 
+2.39.2
+

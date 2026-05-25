@@ -1,0 +1,595 @@
+From e8a640883a022753c612fc8e5d8a90215bdd1c05 Mon Sep 17 00:00:00 2001
+From: PeterPonyu <fuzeyu99@126.com>
+Date: Thu, 14 May 2026 21:40:02 -0400
+Subject: [PATCH 5165/5749] feat(config): add disabled_providers schema +
+ helper
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds an opt-in `disabled_providers` config field plus the `shared/disabled-providers`
+helper (`isProviderDisabled`, `filterDisabledProviderModels`, `applyDisabledProviders`)
+that the plugin-config layer applies to resolved providers.
+
+The routing changes in team-mode (team-runtime, tools/lifecycle, plugin/tool-registry)
+are NOT in this PR — those are entangled with the `MemberSelectionMode` /
+`ShutdownActor` refactors from the closed PR #3871 and need their own extraction
+once those refactors land independently. This PR isolates the parts that are
+cleanly independent: schema, helper, and config-layer wiring.
+
+Companion to #4024 (live-tail tailer), both extracted from the closed PR #3871.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/config/schema/oh-my-opencode-config.ts |   8 +
+ src/plugin-config.test.ts                  | 133 ++++++++++++++
+ src/plugin-config.ts                       |  21 +++
+ src/shared/disabled-providers.test.ts      | 192 +++++++++++++++++++++
+ src/shared/disabled-providers.ts           | 123 +++++++++++++
+ 5 files changed, 477 insertions(+)
+ create mode 100644 src/shared/disabled-providers.test.ts
+ create mode 100644 src/shared/disabled-providers.ts
+
+diff --git a/src/config/schema/oh-my-opencode-config.ts b/src/config/schema/oh-my-opencode-config.ts
+index 197948bc..b06bcec5 100644
+--- a/src/config/schema/oh-my-opencode-config.ts
++++ b/src/config/schema/oh-my-opencode-config.ts
+@@ -43,6 +43,14 @@ export const OhMyOpenCodeConfigSchema = z.object({
+   disabled_commands: z.array(BuiltinCommandNameSchema).optional(),
+   /** Disable specific tools by name (e.g., ["todowrite", "todoread"]) */
+   disabled_tools: z.array(z.string()).optional(),
++  /**
++   * Provider prefixes to exclude from every agent/category fallback chain at
++   * load time. Each entry matches the first slash-separated segment of a model
++   * id (e.g., "github-copilot" matches "github-copilot/gpt-5.5"). If a primary
++   * `model` references a disabled provider, it is replaced with the first
++   * allowed entry from the same chain.
++   */
++  disabled_providers: z.array(z.string()).optional(),
+   mcp_env_allowlist: z.array(z.string()).optional(),
+   /** Enable hashline_edit tool/hook integrations (default: false) */
+   hashline_edit: z.boolean().optional(),
+diff --git a/src/plugin-config.test.ts b/src/plugin-config.test.ts
+index c98ab715..6aaebda4 100644
+--- a/src/plugin-config.test.ts
++++ b/src/plugin-config.test.ts
+@@ -204,6 +204,41 @@ describe("mergeConfigs", () => {
+       expect(result.disabled_tools).toContain("look_at");
+       expect(result.disabled_tools?.length).toBe(3);
+     });
++
++    it("should union disabled_providers from base and override without duplicates", () => {
++      const base = createConfig({
++        disabled_providers: ["github-copilot", "vercel"],
++      });
++
++      const override = createConfig({
++        disabled_providers: ["vercel", "anthropic"],
++      });
++
++      const result = mergeConfigs(base, override);
++
++      expect(result.disabled_providers).toContain("github-copilot");
++      expect(result.disabled_providers).toContain("vercel");
++      expect(result.disabled_providers).toContain("anthropic");
++      expect(result.disabled_providers?.length).toBe(3);
++    });
++
++    it("should dedupe disabled_providers case-insensitively, preserving first-seen casing", () => {
++      const base = createConfig({
++        disabled_providers: ["GitHub-Copilot", "vercel"],
++      });
++
++      const override = createConfig({
++        disabled_providers: ["github-copilot", "VERCEL", "anthropic"],
++      });
++
++      const result = mergeConfigs(base, override);
++
++      expect(result.disabled_providers).toEqual([
++        "GitHub-Copilot",
++        "vercel",
++        "anthropic",
++      ]);
++    });
+   });
+ });
+ 
+@@ -1042,4 +1077,102 @@ describe("loadPluginConfig", () => {
+     expect(existsSync(ancestorCanonicalPath)).toBe(true)
+     expect(config.agents?.oracle?.model).toBe("ancestor-legacy/model")
+   })
++
++  it("applies disabled_providers to agent and category chains at load time", async () => {
++    // given - a project config that disables github-copilot + vercel and has
++    // agents/categories whose primary or fallback chains reference them.
++    const { userConfigDir, projectDir, projectConfigDir } =
++      createLoadPluginConfigTestContext("omo-plugin-config-disabled-providers-")
++
++    writeFileSync(
++      join(projectConfigDir, "oh-my-openagent.jsonc"),
++      JSON.stringify({
++        disabled_providers: ["github-copilot", "vercel"],
++        agents: {
++          hephaestus: {
++            model: "github-copilot/gpt-5.5",
++            fallback_models: [
++              "github-copilot/gpt-5.4-mini",
++              "openai/gpt-5.5",
++              "vercel/openai/gpt-5.5",
++              "opencode/gpt-5.5",
++            ],
++          },
++          oracle: {
++            model: "anthropic/claude-opus-4-7",
++            fallback_models: [
++              "github-copilot/claude-sonnet-4.6",
++              "opencode-go/glm-5.1",
++            ],
++          },
++        },
++        categories: {
++          deep: {
++            model: "github-copilot/gpt-5.5",
++            fallback_models: ["openai/gpt-5.5", "github-copilot/claude-sonnet-4.6"],
++          },
++        },
++      }),
++    )
++
++    process.env.OPENCODE_CONFIG_DIR = userConfigDir
++
++    // when
++    const { loadPluginConfig } = await importFreshPluginConfigModule()
++    const config = loadPluginConfig(projectDir, {})
++
++    // then - primary models that referenced a disabled provider are
++    // substituted from the first allowed chain entry, and every disabled
++    // provider has been filtered out of every chain.
++    const hephaestus = config.agents?.hephaestus as
++      | { model?: string; fallback_models?: Array<string | { model: string }> }
++      | undefined
++    expect(hephaestus?.model).toBe("openai/gpt-5.5")
++    expect(hephaestus?.fallback_models).toEqual([
++      "openai/gpt-5.5",
++      "opencode/gpt-5.5",
++    ])
++
++    const oracle = config.agents?.oracle as
++      | { model?: string; fallback_models?: Array<string | { model: string }> }
++      | undefined
++    // Primary is allowed -> untouched. Chain has the disabled entry removed.
++    expect(oracle?.model).toBe("anthropic/claude-opus-4-7")
++    expect(oracle?.fallback_models).toEqual(["opencode-go/glm-5.1"])
++
++    const deep = config.categories?.deep as
++      | { model?: string; fallback_models?: Array<string | { model: string }> }
++      | undefined
++    expect(deep?.model).toBe("openai/gpt-5.5")
++    expect(deep?.fallback_models).toEqual(["openai/gpt-5.5"])
++
++    // And the disabled_providers list itself survives merging unchanged.
++    expect(config.disabled_providers).toEqual(["github-copilot", "vercel"])
++  })
++
++  it("is a no-op for chains when disabled_providers is absent", async () => {
++    const { userConfigDir, projectDir, projectConfigDir } =
++      createLoadPluginConfigTestContext("omo-plugin-config-disabled-providers-noop-")
++
++    writeFileSync(
++      join(projectConfigDir, "oh-my-openagent.jsonc"),
++      JSON.stringify({
++        agents: {
++          hephaestus: {
++            model: "github-copilot/gpt-5.5",
++            fallback_models: ["openai/gpt-5.5"],
++          },
++        },
++      }),
++    )
++
++    process.env.OPENCODE_CONFIG_DIR = userConfigDir
++
++    const { loadPluginConfig } = await importFreshPluginConfigModule()
++    const config = loadPluginConfig(projectDir, {})
++
++    const hephaestus = config.agents?.hephaestus as { model?: string; fallback_models?: unknown }
++    expect(hephaestus?.model).toBe("github-copilot/gpt-5.5")
++    expect(hephaestus?.fallback_models).toEqual(["openai/gpt-5.5"])
++  })
+ })
+diff --git a/src/plugin-config.ts b/src/plugin-config.ts
+index 0914be7b..56abe6e8 100644
+--- a/src/plugin-config.ts
++++ b/src/plugin-config.ts
+@@ -17,6 +17,7 @@ import {
+ import { migrateLegacyConfigFile } from "./shared/migrate-legacy-config-file";
+ import { CONFIG_BASENAME, LEGACY_CONFIG_BASENAME } from "./shared/plugin-identity";
+ import { validateAgentOrder } from "./shared/agent-ordering";
++import { applyDisabledProviders } from "./shared/disabled-providers";
+ 
+ const CONTROL_CHARACTERS_REGEX = /[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g;
+ const MAX_AGENT_ORDER_WARNING_VALUES = 10;
+@@ -116,6 +117,7 @@ const PARTIAL_STRING_ARRAY_KEYS = new Set([
+   "disabled_hooks",
+   "disabled_commands",
+   "disabled_tools",
++  "disabled_providers",
+   "mcp_env_allowlist",
+   "agent_definitions",
+ ]);
+@@ -209,6 +211,18 @@ export function loadConfigFromPath(
+   return null;
+ }
+ 
++function dedupeCaseInsensitive(values: readonly string[]): string[] {
++  const seen = new Set<string>()
++  const result: string[] = []
++  for (const value of values) {
++    const key = value.toLowerCase()
++    if (seen.has(key)) continue
++    seen.add(key)
++    result.push(value)
++  }
++  return result
++}
++
+ export function mergeConfigs(
+   base: OhMyOpenCodeConfig,
+   override: OhMyOpenCodeConfig
+@@ -261,6 +275,10 @@ export function mergeConfigs(
+         ...(override.disabled_tools ?? []),
+       ]),
+     ],
++    disabled_providers: dedupeCaseInsensitive([
++      ...(base.disabled_providers ?? []),
++      ...(override.disabled_providers ?? []),
++    ]),
+     mcp_env_allowlist: [
+       ...new Set([
+         ...(base.mcp_env_allowlist ?? []),
+@@ -392,11 +410,14 @@ export function loadPluginConfig(
+     mcp_env_allowlist: userConfig?.mcp_env_allowlist ?? [],
+   };
+ 
++  applyDisabledProviders(config);
++
+   log("Final merged config", {
+     agents: config.agents,
+     disabled_agents: config.disabled_agents,
+     disabled_mcps: config.disabled_mcps,
+     disabled_hooks: config.disabled_hooks,
++    disabled_providers: config.disabled_providers,
+     claude_code: config.claude_code,
+   });
+   return config;
+diff --git a/src/shared/disabled-providers.test.ts b/src/shared/disabled-providers.test.ts
+new file mode 100644
+index 00000000..ba705bbc
+--- /dev/null
++++ b/src/shared/disabled-providers.test.ts
+@@ -0,0 +1,192 @@
++import { beforeEach, describe, expect, mock, test } from "bun:test"
++
++mock.module("./logger", () => ({ log: (..._args: unknown[]) => {} }))
++
++import {
++  applyDisabledProviders,
++  filterDisabledProviderModels,
++  getModelProvider,
++  isProviderDisabled,
++} from "./disabled-providers"
++import { clearConfigLoadErrors, getConfigLoadErrors } from "./config-errors"
++import type { OhMyOpenCodeConfig } from "../config"
++
++beforeEach(() => {
++  clearConfigLoadErrors()
++})
++
++describe("getModelProvider", () => {
++  test("returns the first segment before the slash", () => {
++    expect(getModelProvider("github-copilot/gpt-5.5")).toBe("github-copilot")
++    expect(getModelProvider("anthropic/claude-opus-4-7")).toBe("anthropic")
++    expect(getModelProvider("vercel/openai/gpt-5.5")).toBe("vercel")
++  })
++
++  test("returns undefined when the string has no provider prefix", () => {
++    expect(getModelProvider("gpt-5.5")).toBeUndefined()
++    expect(getModelProvider("")).toBeUndefined()
++    expect(getModelProvider("/foo")).toBeUndefined()
++  })
++})
++
++describe("isProviderDisabled", () => {
++  test("returns true only when the model's provider exactly matches a disabled entry", () => {
++    expect(isProviderDisabled("github-copilot/foo", ["github-copilot"])).toBe(true)
++    expect(isProviderDisabled("github-copilot-extra/foo", ["github-copilot"])).toBe(false)
++    expect(isProviderDisabled("opencode-go/glm-5.1", ["github-copilot", "vercel"])).toBe(false)
++  })
++
++  test("short-circuits when the disabled list is empty", () => {
++    expect(isProviderDisabled("github-copilot/foo", [])).toBe(false)
++  })
++
++  test("handles undefined model", () => {
++    expect(isProviderDisabled(undefined, ["github-copilot"])).toBe(false)
++  })
++
++  test("is case-insensitive: matches regardless of casing on either side", () => {
++    expect(isProviderDisabled("GitHub-Copilot/gpt-5.5", ["github-copilot"])).toBe(true)
++    expect(isProviderDisabled("github-copilot/gpt-5.5", ["GitHub-Copilot"])).toBe(true)
++    expect(isProviderDisabled("OPENAI/gpt-5.5", ["openai"])).toBe(true)
++    expect(isProviderDisabled("openai/gpt-5.5", ["VERCEL"])).toBe(false)
++  })
++})
++
++describe("filterDisabledProviderModels", () => {
++  test("preserves entries whose provider is not disabled, dropping the rest", () => {
++    const input = [
++      "github-copilot/gpt-5.5",
++      "openai/gpt-5.5",
++      { model: "vercel/openai/gpt-5.5", variant: "medium" },
++      { model: "opencode/gpt-5.5", variant: "medium" },
++    ]
++    const result = filterDisabledProviderModels(input, ["github-copilot", "vercel"])
++    expect(result).toEqual([
++      "openai/gpt-5.5",
++      { model: "opencode/gpt-5.5", variant: "medium" },
++    ])
++  })
++
++  test("returns a fresh copy when the disabled list is empty", () => {
++    const input = ["openai/gpt-5.5"]
++    const result = filterDisabledProviderModels(input, [])
++    expect(result).toEqual(input)
++    expect(result).not.toBe(input)
++  })
++})
++
++describe("applyDisabledProviders", () => {
++  test("no-op when disabled_providers is unset or empty", () => {
++    const config = {
++      agents: {
++        hephaestus: {
++          model: "github-copilot/gpt-5.5",
++          fallback_models: ["github-copilot/gpt-5.4-mini", "openai/gpt-5.5"],
++        },
++      },
++    } as unknown as OhMyOpenCodeConfig
++
++    applyDisabledProviders(config)
++    const agents = config.agents as Record<string, { model?: string; fallback_models?: unknown }>
++    expect(agents.hephaestus.model).toBe("github-copilot/gpt-5.5")
++    expect(agents.hephaestus.fallback_models).toEqual(["github-copilot/gpt-5.4-mini", "openai/gpt-5.5"])
++  })
++
++  test("filters fallback chain and substitutes primary from the first allowed entry", () => {
++    const config = {
++      disabled_providers: ["github-copilot", "vercel"],
++      agents: {
++        hephaestus: {
++          model: "github-copilot/gpt-5.5",
++          fallback_models: [
++            "github-copilot/gpt-5.4-mini",
++            { model: "openai/gpt-5.5", variant: "medium" },
++            { model: "vercel/openai/gpt-5.5", variant: "medium" },
++            "opencode/gpt-5.5",
++          ],
++        },
++        sisyphus: {
++          model: "anthropic/claude-opus-4-7",
++          fallback_models: [{ model: "github-copilot/claude-sonnet-4.6" }, "opencode-go/glm-5.1"],
++        },
++      },
++    } as unknown as OhMyOpenCodeConfig
++
++    applyDisabledProviders(config)
++
++    const agents = config.agents as Record<string, { model?: string; fallback_models?: unknown }>
++    expect(agents.hephaestus.model).toBe("openai/gpt-5.5")
++    expect(agents.hephaestus.fallback_models).toEqual([
++      { model: "openai/gpt-5.5", variant: "medium" },
++      "opencode/gpt-5.5",
++    ])
++
++    expect(agents.sisyphus.model).toBe("anthropic/claude-opus-4-7")
++    expect(agents.sisyphus.fallback_models).toEqual(["opencode-go/glm-5.1"])
++  })
++
++  test("leaves primary unchanged but records a config-load error when every chain entry is also disabled", () => {
++    const config = {
++      disabled_providers: ["github-copilot"],
++      agents: {
++        oracle: {
++          model: "github-copilot/gpt-5.5",
++          fallback_models: ["github-copilot/gpt-5.4-mini", { model: "github-copilot/gemini-3" }],
++        },
++      },
++    } as unknown as OhMyOpenCodeConfig
++
++    applyDisabledProviders(config)
++
++    const agents = config.agents as Record<string, { model?: string; fallback_models?: unknown }>
++    expect(agents.oracle.model).toBe("github-copilot/gpt-5.5")
++    // Empty chain is normalized to undefined so "no chain declared" and
++    // "empty chain declared" stay semantically distinct downstream.
++    expect(agents.oracle.fallback_models).toBeUndefined()
++
++    const errors = getConfigLoadErrors()
++    expect(errors.length).toBe(1)
++    expect(errors[0]!.path).toBe("disabled_providers:agents.oracle")
++    expect(errors[0]!.error).toContain("github-copilot/gpt-5.5")
++    expect(errors[0]!.error).toContain("disabled provider")
++  })
++
++  test("treats provider names case-insensitively across primary and chain entries", () => {
++    const config = {
++      disabled_providers: ["GitHub-Copilot"],
++      agents: {
++        hephaestus: {
++          model: "github-copilot/gpt-5.5",
++          fallback_models: [
++            "GITHUB-COPILOT/gpt-5.4-mini",
++            "openai/gpt-5.5",
++          ],
++        },
++      },
++    } as unknown as OhMyOpenCodeConfig
++
++    applyDisabledProviders(config)
++
++    const agents = config.agents as Record<string, { model?: string; fallback_models?: unknown }>
++    expect(agents.hephaestus.model).toBe("openai/gpt-5.5")
++    expect(agents.hephaestus.fallback_models).toEqual(["openai/gpt-5.5"])
++  })
++
++  test("applies the same rules to categories", () => {
++    const config = {
++      disabled_providers: ["github-copilot"],
++      categories: {
++        deep: {
++          model: "github-copilot/gpt-5.5",
++          fallback_models: ["openai/gpt-5.5", "github-copilot/claude-sonnet-4.6"],
++        },
++      },
++    } as unknown as OhMyOpenCodeConfig
++
++    applyDisabledProviders(config)
++
++    const cats = config.categories as Record<string, { model?: string; fallback_models?: unknown }>
++    expect(cats.deep.model).toBe("openai/gpt-5.5")
++    expect(cats.deep.fallback_models).toEqual(["openai/gpt-5.5"])
++  })
++})
+diff --git a/src/shared/disabled-providers.ts b/src/shared/disabled-providers.ts
+new file mode 100644
+index 00000000..ec54d1fc
+--- /dev/null
++++ b/src/shared/disabled-providers.ts
+@@ -0,0 +1,123 @@
++import type { OhMyOpenCodeConfig } from "../config"
++import type { FallbackModelObject } from "../config/schema/fallback-models"
++import { addConfigLoadError } from "./config-errors"
++import { log } from "./logger"
++import { normalizeFallbackModels } from "./model-resolver"
++
++const HOOK_NAME = "disabled-providers"
++
++export function getModelProvider(model: string): string | undefined {
++  const slash = model.indexOf("/")
++  if (slash <= 0) return undefined
++  return model.slice(0, slash)
++}
++
++export function isProviderDisabled(
++  model: string | undefined,
++  disabled: readonly string[],
++): boolean {
++  if (!model || disabled.length === 0) return false
++  const provider = getModelProvider(model)
++  if (provider === undefined) return false
++  const providerLower = provider.toLowerCase()
++  return disabled.some((entry) => entry.toLowerCase() === providerLower)
++}
++
++export function filterDisabledProviderModels<T extends string | FallbackModelObject>(
++  models: readonly T[],
++  disabled: readonly string[],
++): T[] {
++  if (disabled.length === 0) return [...models]
++  return models.filter((entry) => {
++    const model = typeof entry === "string" ? entry : entry.model
++    return !isProviderDisabled(model, disabled)
++  })
++}
++
++type ModelHolder = {
++  model?: string | unknown
++  fallback_models?: string | (string | FallbackModelObject)[]
++}
++
++function findFirstAllowedReplacement(
++  chain: (string | FallbackModelObject)[] | undefined,
++  disabled: readonly string[],
++): string | undefined {
++  if (!chain) return undefined
++  for (const entry of chain) {
++    const model = typeof entry === "string" ? entry : entry.model
++    if (!isProviderDisabled(model, disabled)) return model
++  }
++  return undefined
++}
++
++function applyToHolder(label: string, holder: ModelHolder, disabled: readonly string[]): void {
++  const normalizedChain = normalizeFallbackModels(holder.fallback_models)
++  if (normalizedChain) {
++    const filteredChain = filterDisabledProviderModels(normalizedChain, disabled)
++    if (filteredChain.length !== normalizedChain.length) {
++      log(`[${HOOK_NAME}] Filtered disabled-provider entries from fallback chain`, {
++        label,
++        removed: normalizedChain.length - filteredChain.length,
++        remaining: filteredChain.length,
++      })
++    }
++    // Normalize empty chain to undefined so downstream "no chain declared"
++    // and "empty chain declared" stay semantically distinct.
++    holder.fallback_models = filteredChain.length === 0 ? undefined : filteredChain
++  }
++
++  if (typeof holder.model === "string" && isProviderDisabled(holder.model, disabled)) {
++    const replacement = findFirstAllowedReplacement(
++      normalizeFallbackModels(holder.fallback_models),
++      disabled,
++    )
++    if (replacement) {
++      log(`[${HOOK_NAME}] Substituted primary model from fallback chain`, {
++        label,
++        from: holder.model,
++        to: replacement,
++      })
++      holder.model = replacement
++    } else {
++      // Surface to the user-facing config-error channel so this does not
++      // hide as a runtime ProviderModelNotFoundError on first delegation.
++      const message =
++        `${label} primary model "${holder.model}" uses a disabled provider and no allowed entry is available in fallback_models. ` +
++        `Either remove the provider from disabled_providers or add an allowed entry to fallback_models.`
++      addConfigLoadError({ path: `disabled_providers:${label}`, error: message })
++      log(`[${HOOK_NAME}] ${message}`, { label, primary: holder.model })
++    }
++  }
++}
++
++/**
++ * Filters `disabled_providers`-listed entries out of every agent/category
++ * fallback chain and substitutes any primary `model` referencing a disabled
++ * provider with the first allowed entry from the same chain.
++ *
++ * Returns the same config reference (mutated in place). Safe to call when
++ * `disabled_providers` is unset or empty - it becomes a no-op.
++ */
++export function applyDisabledProviders(config: OhMyOpenCodeConfig): OhMyOpenCodeConfig {
++  const disabled = config.disabled_providers ?? []
++  if (disabled.length === 0) return config
++
++  if (config.agents) {
++    for (const [name, agentConfig] of Object.entries(config.agents)) {
++      if (agentConfig && typeof agentConfig === "object") {
++        applyToHolder(`agents.${name}`, agentConfig as ModelHolder, disabled)
++      }
++    }
++  }
++
++  if (config.categories) {
++    for (const [name, categoryConfig] of Object.entries(config.categories)) {
++      if (categoryConfig && typeof categoryConfig === "object") {
++        applyToHolder(`categories.${name}`, categoryConfig as ModelHolder, disabled)
++      }
++    }
++  }
++
++  return config
++}
+-- 
+2.39.2
+

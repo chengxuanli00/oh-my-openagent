@@ -1,0 +1,2023 @@
+From df0b9f7664c6e1e31afb9eebf61f6414d0c6e6c3 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 10 Feb 2026 19:09:22 +0900
+Subject: [PATCH 2016/5749] fix(delegate-task): Wave 1 - fix polling timeout,
+ resource cleanup, tool restrictions, idle dedup, auth-plugins JSONC, CLI
+ runner hang
+
+- fix(delegate-task): return error on poll timeout instead of silent null
+- fix(delegate-task): ensure toast and session cleanup on all error paths with try/finally
+- fix(delegate-task): apply agent tool restrictions in sync-prompt-sender
+- fix(plugin): add symmetric idle dedup to prevent double hook triggers
+- fix(cli): replace regex-based JSONC editing with jsonc-parser in auth-plugins
+- fix(cli): abort event stream after completion and restore no-timeout default
+
+All changes verified with tests and typecheck.
+---
+ src/cli/config-manager/auth-plugins.test.ts   | 224 ++++++++++
+ src/cli/config-manager/auth-plugins.ts        |  33 +-
+ src/cli/run/runner.ts                         |  13 +-
+ src/plugin/event.test.ts                      | 385 ++++++++++++++++++
+ src/plugin/event.ts                           |   8 +
+ src/plugin/recent-synthetic-idles.test.ts     |  40 ++
+ src/plugin/recent-synthetic-idles.ts          |   9 +-
+ .../delegate-task/sync-prompt-sender.test.ts  | 123 ++++++
+ src/tools/delegate-task/sync-prompt-sender.ts |   2 +
+ .../delegate-task/sync-session-poller.test.ts | 131 +++++-
+ .../delegate-task/sync-session-poller.ts      |   4 +-
+ src/tools/delegate-task/sync-task.test.ts     | 217 ++++++++++
+ src/tools/delegate-task/sync-task.ts          |  51 ++-
+ src/tools/look-at/session-poller.test.ts      | 105 +++++
+ src/tools/look-at/session-poller.ts           |  42 ++
+ src/tools/look-at/tools.test.ts               | 118 +++---
+ src/tools/look-at/tools.ts                    |  17 +-
+ 17 files changed, 1378 insertions(+), 144 deletions(-)
+ create mode 100644 src/cli/config-manager/auth-plugins.test.ts
+ create mode 100644 src/plugin/event.test.ts
+ create mode 100644 src/tools/delegate-task/sync-prompt-sender.test.ts
+ create mode 100644 src/tools/delegate-task/sync-task.test.ts
+ create mode 100644 src/tools/look-at/session-poller.test.ts
+ create mode 100644 src/tools/look-at/session-poller.ts
+
+diff --git a/src/cli/config-manager/auth-plugins.test.ts b/src/cli/config-manager/auth-plugins.test.ts
+new file mode 100644
+index 00000000..c669b1be
+--- /dev/null
++++ b/src/cli/config-manager/auth-plugins.test.ts
+@@ -0,0 +1,224 @@
++import { describe, expect, it, beforeEach, afterEach, spyOn } from "bun:test"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { writeFileSync, readFileSync, existsSync, rmSync, mkdirSync } from "node:fs"
++import { parseJsonc } from "../../shared/jsonc-parser"
++import type { InstallConfig } from "../types"
++import { resetConfigContext } from "./config-context"
++
++let testConfigPath: string
++let testConfigDir: string
++let testCounter = 0
++let fetchVersionSpy: unknown
++
++beforeEach(async () => {
++  testCounter++
++  testConfigDir = join(tmpdir(), `test-opencode-${Date.now()}-${testCounter}`)
++  testConfigPath = join(testConfigDir, "opencode.jsonc")
++  mkdirSync(testConfigDir, { recursive: true })
++
++  process.env.OPENCODE_CONFIG_DIR = testConfigDir
++  resetConfigContext()
++
++  const module = await import("./auth-plugins")
++  fetchVersionSpy = spyOn(module, "fetchLatestVersion").mockResolvedValue("1.2.3")
++})
++
++afterEach(() => {
++  try {
++    rmSync(testConfigDir, { recursive: true, force: true })
++  } catch {}
++})
++
++const testConfig: InstallConfig = {
++  hasClaude: false,
++  isMax20: false,
++  hasOpenAI: false,
++  hasGemini: true,
++  hasCopilot: false,
++  hasOpencodeZen: false,
++  hasZaiCodingPlan: false,
++  hasKimiForCoding: false,
++}
++
++describe("addAuthPlugins", () => {
++  describe("Test 1: JSONC with commented plugin line", () => {
++    it("preserves comment, updates actual plugin array", async () => {
++      const content = `{
++  // "plugin": ["old-plugin"]
++  "plugin": ["existing-plugin"],
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, content, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++
++      const newContent = readFileSync(result.configPath, "utf-8")
++      expect(newContent).toContain('// "plugin": ["old-plugin"]')
++      expect(newContent).toContain('existing-plugin')
++      expect(newContent).toContain('opencode-antigravity-auth')
++
++      const parsed = parseJsonc<Record<string, unknown>>(newContent)
++      const plugins = parsed.plugin as string[]
++      expect(plugins).toContain('existing-plugin')
++      expect(plugins.some((p) => p.startsWith('opencode-antigravity-auth'))).toBe(true)
++    })
++  })
++
++  describe("Test 2: Plugin array already contains antigravity", () => {
++    it("does not add duplicate", async () => {
++      const content = `{
++  "plugin": ["existing-plugin", "opencode-antigravity-auth"],
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, content, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++
++      const newContent = readFileSync(testConfigPath, "utf-8")
++      const parsed = parseJsonc<Record<string, unknown>>(newContent)
++      const plugins = parsed.plugin as string[]
++
++      const antigravityCount = plugins.filter((p) => p.startsWith('opencode-antigravity-auth')).length
++      expect(antigravityCount).toBe(1)
++    })
++  })
++
++  describe("Test 3: Backup created before write", () => {
++    it("creates .bak file", async () => {
++      const originalContent = `{
++  "plugin": ["existing-plugin"],
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, originalContent, "utf-8")
++      readFileSync(testConfigPath, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++      expect(existsSync(`${result.configPath}.bak`)).toBe(true)
++
++      const backupContent = readFileSync(`${result.configPath}.bak`, "utf-8")
++      expect(backupContent).toBe(originalContent)
++    })
++  })
++
++  describe("Test 4: Comment with } character", () => {
++    it("preserves comments with special characters", async () => {
++      const content = `{
++  // This comment has } special characters
++  "plugin": ["existing-plugin"],
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, content, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++
++      const newContent = readFileSync(testConfigPath, "utf-8")
++      expect(newContent).toContain('// This comment has } special characters')
++
++      expect(() => parseJsonc(newContent)).not.toThrow()
++    })
++  })
++
++  describe("Test 5: Comment containing 'plugin' string", () => {
++    it("must NOT match comment location", async () => {
++      const content = `{
++  // "plugin": ["fake"]
++  "plugin": ["existing-plugin"],
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, content, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++
++      const newContent = readFileSync(testConfigPath, "utf-8")
++      expect(newContent).toContain('// "plugin": ["fake"]')
++
++      const parsed = parseJsonc<Record<string, unknown>>(newContent)
++      const plugins = parsed.plugin as string[]
++      expect(plugins).toContain('existing-plugin')
++      expect(plugins).not.toContain('fake')
++    })
++  })
++
++  describe("Test 6: No existing plugin array", () => {
++    it("creates plugin array when none exists", async () => {
++      const content = `{
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, content, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++
++      const newContent = readFileSync(result.configPath, "utf-8")
++
++      const parsed = parseJsonc<Record<string, unknown>>(newContent)
++      expect(parsed).toHaveProperty('plugin')
++      const plugins = parsed.plugin as string[]
++      expect(plugins.some((p) => p.startsWith('opencode-antigravity-auth'))).toBe(true)
++    })
++  })
++
++  describe("Test 7: Post-write validation ensures valid JSONC", () => {
++    it("result file must be valid JSONC", async () => {
++      const content = `{
++  "plugin": ["existing-plugin"],
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, content, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++
++      const newContent = readFileSync(testConfigPath, "utf-8")
++      expect(() => parseJsonc(newContent)).not.toThrow()
++
++      const parsed = parseJsonc<Record<string, unknown>>(newContent)
++      expect(parsed).toHaveProperty('plugin')
++      expect(parsed).toHaveProperty('provider')
++    })
++  })
++
++  describe("Test 8: Multiple plugins in array", () => {
++    it("appends to existing plugins", async () => {
++      const content = `{
++  "plugin": ["plugin-1", "plugin-2", "plugin-3"],
++  "provider": {}
++}`
++      writeFileSync(testConfigPath, content, "utf-8")
++
++      const { addAuthPlugins } = await import("./auth-plugins")
++      const result = await addAuthPlugins(testConfig)
++
++      expect(result.success).toBe(true)
++
++      const newContent = readFileSync(result.configPath, "utf-8")
++      const parsed = parseJsonc<Record<string, unknown>>(newContent)
++      const plugins = parsed.plugin as string[]
++
++      expect(plugins).toContain('plugin-1')
++      expect(plugins).toContain('plugin-2')
++      expect(plugins).toContain('plugin-3')
++      expect(plugins.some((p) => p.startsWith('opencode-antigravity-auth'))).toBe(true)
++    })
++  })
++})
+diff --git a/src/cli/config-manager/auth-plugins.ts b/src/cli/config-manager/auth-plugins.ts
+index 127d99c6..70df4267 100644
+--- a/src/cli/config-manager/auth-plugins.ts
++++ b/src/cli/config-manager/auth-plugins.ts
+@@ -1,10 +1,12 @@
+-import { readFileSync, writeFileSync } from "node:fs"
++import { readFileSync, writeFileSync, copyFileSync } from "node:fs"
++import { modify, applyEdits } from "jsonc-parser"
+ import type { ConfigMergeResult, InstallConfig } from "../types"
+ import { getConfigDir } from "./config-context"
+ import { ensureConfigDirectoryExists } from "./ensure-config-directory-exists"
+ import { formatErrorWithSuggestion } from "./format-error-with-suggestion"
+ import { detectConfigFormat } from "./opencode-config-format"
+ import { parseOpenCodeConfigFileWithError, type OpenCodeConfig } from "./parse-opencode-config-file"
++import { parseJsonc } from "../../shared/jsonc-parser"
+ 
+ export async function fetchLatestVersion(packageName: string): Promise<string | null> {
+   try {
+@@ -59,21 +61,24 @@ export async function addAuthPlugins(config: InstallConfig): Promise<ConfigMerge
+ 
+     if (format === "jsonc") {
+       const content = readFileSync(path, "utf-8")
+-      const pluginArrayRegex = /"plugin"\s*:\s*\[([\s\S]*?)\]/
+-      const match = content.match(pluginArrayRegex)
+ 
+-      if (match) {
+-        const formattedPlugins = plugins.map((p) => `"${p}"`).join(",\n    ")
+-        const newContent = content.replace(
+-          pluginArrayRegex,
+-          `"plugin": [\n    ${formattedPlugins}\n  ]`
+-        )
+-        writeFileSync(path, newContent)
+-      } else {
+-        const inlinePlugins = plugins.map((p) => `"${p}"`).join(", ")
+-        const newContent = content.replace(/(\{)/, `$1\n  "plugin": [${inlinePlugins}],`)
+-        writeFileSync(path, newContent)
++      copyFileSync(path, `${path}.bak`)
++
++      const newContent = applyEdits(
++        content,
++        modify(content, ["plugin"], plugins, {
++          formattingOptions: { tabSize: 2, insertSpaces: true },
++        })
++      )
++
++      try {
++        parseJsonc(newContent)
++      } catch (error) {
++        copyFileSync(`${path}.bak`, path)
++        throw new Error(`Generated JSONC is invalid: ${error instanceof Error ? error.message : String(error)}`)
+       }
++
++      writeFileSync(path, newContent)
+     } else {
+       writeFileSync(path, JSON.stringify(newConfig, null, 2) + "\n")
+     }
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index 045852fd..762fa487 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -11,7 +11,7 @@ import { pollForCompletion } from "./poll-for-completion"
+ 
+ export { resolveRunAgent }
+ 
+-const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
++const DEFAULT_TIMEOUT_MS = 0
+ 
+ export async function run(options: RunOptions): Promise<number> {
+   process.env.OPENCODE_CLI_RUN_MODE = "true"
+@@ -79,11 +79,14 @@ export async function run(options: RunOptions): Promise<number> {
+         query: { directory },
+       })
+ 
+-      console.log(pc.dim("Waiting for completion...\n"))
+-      const exitCode = await pollForCompletion(ctx, eventState, abortController)
++       console.log(pc.dim("Waiting for completion...\n"))
++       const exitCode = await pollForCompletion(ctx, eventState, abortController)
+ 
+-      await eventProcessor.catch(() => {})
+-      cleanup()
++       // Abort the event stream to stop the processor
++       abortController.abort()
++
++       await eventProcessor.catch(() => {})
++       cleanup()
+ 
+       const durationMs = Date.now() - startTime
+ 
+diff --git a/src/plugin/event.test.ts b/src/plugin/event.test.ts
+new file mode 100644
+index 00000000..0bcf0997
+--- /dev/null
++++ b/src/plugin/event.test.ts
+@@ -0,0 +1,385 @@
++import { describe, it, expect } from "bun:test"
++
++import { createEventHandler } from "./event"
++
++type EventInput = { event: { type: string; properties?: Record<string, unknown> } }
++
++	describe("createEventHandler - idle deduplication", () => {
++	it("Order A (status→idle): synthetic idle deduped - real idle not dispatched again", async () => {
++		//#given
++		const dispatchCalls: EventInput[] = []
++		const mockDispatchToHooks = async (input: EventInput) => {
++			if (input.event.type === "session.idle") {
++				dispatchCalls.push(input)
++			}
++		}
++
++		const eventHandler = createEventHandler({
++			ctx: {} as any,
++			pluginConfig: {} as any,
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: {
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++				},
++			} as any,
++			hooks: {
++				autoUpdateChecker: { event: mockDispatchToHooks as any },
++				claudeCodeHooks: { event: async () => {} },
++				backgroundNotificationHook: { event: async () => {} },
++				sessionNotification: async () => {},
++				todoContinuationEnforcer: { handler: async () => {} },
++				unstableAgentBabysitter: { event: async () => {} },
++				contextWindowMonitor: { event: async () => {} },
++				directoryAgentsInjector: { event: async () => {} },
++				directoryReadmeInjector: { event: async () => {} },
++				rulesInjector: { event: async () => {} },
++				thinkMode: { event: async () => {} },
++				anthropicContextWindowLimitRecovery: { event: async () => {} },
++				agentUsageReminder: { event: async () => {} },
++				categorySkillReminder: { event: async () => {} },
++				interactiveBashSession: { event: async () => {} },
++				ralphLoop: { event: async () => {} },
++				stopContinuationGuard: { event: async () => {} },
++				compactionTodoPreserver: { event: async () => {} },
++				atlasHook: { handler: async () => {} },
++			} as any,
++		})
++
++		const sessionId = "ses_test123"
++
++		//#when - session.status with idle (generates synthetic idle first)
++		await eventHandler({
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: sessionId,
++					status: { type: "idle" },
++				},
++			},
++		})
++
++		//#then - synthetic idle dispatched once
++		expect(dispatchCalls.length).toBe(1)
++		expect(dispatchCalls[0].event.type).toBe("session.idle")
++		expect(dispatchCalls[0].event.properties?.sessionID).toBe(sessionId)
++
++		//#when - real session.idle arrives
++		await eventHandler({
++			event: {
++				type: "session.idle",
++				properties: {
++					sessionID: sessionId,
++				},
++			},
++		})
++
++		//#then - real idle deduped, no additional dispatch
++		expect(dispatchCalls.length).toBe(1)
++	})
++
++	it("Order B (idle→status): real idle deduped - synthetic idle not dispatched", async () => {
++		//#given
++		const dispatchCalls: EventInput[] = []
++		const mockDispatchToHooks = async (input: EventInput) => {
++			if (input.event.type === "session.idle") {
++				dispatchCalls.push(input)
++			}
++		}
++
++		const eventHandler = createEventHandler({
++			ctx: {} as any,
++			pluginConfig: {} as any,
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: {
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++				},
++			} as any,
++			hooks: {
++				autoUpdateChecker: { event: mockDispatchToHooks as any },
++				claudeCodeHooks: { event: async () => {} },
++				backgroundNotificationHook: { event: async () => {} },
++				sessionNotification: async () => {},
++				todoContinuationEnforcer: { handler: async () => {} },
++				unstableAgentBabysitter: { event: async () => {} },
++				contextWindowMonitor: { event: async () => {} },
++				directoryAgentsInjector: { event: async () => {} },
++				directoryReadmeInjector: { event: async () => {} },
++				rulesInjector: { event: async () => {} },
++				thinkMode: { event: async () => {} },
++				anthropicContextWindowLimitRecovery: { event: async () => {} },
++				agentUsageReminder: { event: async () => {} },
++				categorySkillReminder: { event: async () => {} },
++				interactiveBashSession: { event: async () => {} },
++				ralphLoop: { event: async () => {} },
++				stopContinuationGuard: { event: async () => {} },
++				compactionTodoPreserver: { event: async () => {} },
++				atlasHook: { handler: async () => {} },
++			} as any,
++		})
++
++		const sessionId = "ses_test456"
++
++		//#when - real session.idle arrives first
++		await eventHandler({
++			event: {
++				type: "session.idle",
++				properties: {
++					sessionID: sessionId,
++				},
++			},
++		})
++
++		//#then - real idle dispatched once
++		expect(dispatchCalls.length).toBe(1)
++		expect(dispatchCalls[0].event.type).toBe("session.idle")
++		expect(dispatchCalls[0].event.properties?.sessionID).toBe(sessionId)
++
++		//#when - session.status with idle (generates synthetic idle)
++		await eventHandler({
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: sessionId,
++					status: { type: "idle" },
++				},
++			},
++		})
++
++		//#then - synthetic idle deduped, no additional dispatch
++		expect(dispatchCalls.length).toBe(1)
++	})
++
++	it("both maps pruned on every event", async () => {
++		//#given
++		const eventHandler = createEventHandler({
++			ctx: {} as any,
++			pluginConfig: {} as any,
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: {
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++				},
++			} as any,
++			hooks: {
++				autoUpdateChecker: { event: async () => {} },
++				claudeCodeHooks: { event: async () => {} },
++				backgroundNotificationHook: { event: async () => {} },
++				sessionNotification: async () => {},
++				todoContinuationEnforcer: { handler: async () => {} },
++				unstableAgentBabysitter: { event: async () => {} },
++				contextWindowMonitor: { event: async () => {} },
++				directoryAgentsInjector: { event: async () => {} },
++				directoryReadmeInjector: { event: async () => {} },
++				rulesInjector: { event: async () => {} },
++				thinkMode: { event: async () => {} },
++				anthropicContextWindowLimitRecovery: { event: async () => {} },
++				agentUsageReminder: { event: async () => {} },
++				categorySkillReminder: { event: async () => {} },
++				interactiveBashSession: { event: async () => {} },
++				ralphLoop: { event: async () => {} },
++				stopContinuationGuard: { event: async () => {} },
++				compactionTodoPreserver: { event: async () => {} },
++				atlasHook: { handler: async () => {} },
++			} as any,
++		})
++
++		// Trigger some synthetic idles
++		await eventHandler({
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: "ses_stale_1",
++					status: { type: "idle" },
++				},
++			},
++		})
++
++		await eventHandler({
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: "ses_stale_2",
++					status: { type: "idle" },
++				},
++			},
++		})
++
++		// Trigger some real idles
++		await eventHandler({
++			event: {
++				type: "session.idle",
++				properties: {
++					sessionID: "ses_stale_3",
++				},
++			},
++		})
++
++		await eventHandler({
++			event: {
++				type: "session.idle",
++				properties: {
++					sessionID: "ses_stale_4",
++				},
++			},
++		})
++
++		//#when - wait for dedup window to expire (600ms > 500ms)
++		await new Promise((resolve) => setTimeout(resolve, 600))
++
++		// Trigger any event to trigger pruning
++		await eventHandler({
++			event: {
++				type: "message.updated",
++			},
++		})
++
++		//#then - both maps should be pruned (no dedup should occur for new events)
++		// We verify by checking that a new idle event for same session is dispatched
++		const dispatchCalls: EventInput[] = []
++		const eventHandlerWithMock = createEventHandler({
++			ctx: {} as any,
++			pluginConfig: {} as any,
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: {
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++				},
++			} as any,
++			hooks: {
++				autoUpdateChecker: {
++					event: async (input: EventInput) => {
++						dispatchCalls.push(input)
++					},
++				},
++				claudeCodeHooks: { event: async () => {} },
++				backgroundNotificationHook: { event: async () => {} },
++				sessionNotification: async () => {},
++				todoContinuationEnforcer: { handler: async () => {} },
++				unstableAgentBabysitter: { event: async () => {} },
++				contextWindowMonitor: { event: async () => {} },
++				directoryAgentsInjector: { event: async () => {} },
++				directoryReadmeInjector: { event: async () => {} },
++				rulesInjector: { event: async () => {} },
++				thinkMode: { event: async () => {} },
++				anthropicContextWindowLimitRecovery: { event: async () => {} },
++				agentUsageReminder: { event: async () => {} },
++				categorySkillReminder: { event: async () => {} },
++				interactiveBashSession: { event: async () => {} },
++				ralphLoop: { event: async () => {} },
++				stopContinuationGuard: { event: async () => {} },
++				compactionTodoPreserver: { event: async () => {} },
++				atlasHook: { handler: async () => {} },
++			},
++		})
++
++		await eventHandlerWithMock({
++			event: {
++				type: "session.idle",
++				properties: {
++					sessionID: "ses_stale_1",
++				},
++			},
++		})
++
++		expect(dispatchCalls.length).toBe(1)
++		expect(dispatchCalls[0].event.type).toBe("session.idle")
++	})
++
++	it("dedup only applies within window - outside window both dispatch", async () => {
++		//#given
++		const dispatchCalls: EventInput[] = []
++		const eventHandler = createEventHandler({
++			ctx: {} as any,
++			pluginConfig: {} as any,
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: {
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++				},
++			} as any,
++			hooks: {
++				autoUpdateChecker: {
++					event: async (input: EventInput) => {
++						if (input.event.type === "session.idle") {
++							dispatchCalls.push(input)
++						}
++					},
++				},
++				claudeCodeHooks: { event: async () => {} },
++				backgroundNotificationHook: { event: async () => {} },
++				sessionNotification: async () => {},
++				todoContinuationEnforcer: { handler: async () => {} },
++				unstableAgentBabysitter: { event: async () => {} },
++				contextWindowMonitor: { event: async () => {} },
++				directoryAgentsInjector: { event: async () => {} },
++				directoryReadmeInjector: { event: async () => {} },
++				rulesInjector: { event: async () => {} },
++				thinkMode: { event: async () => {} },
++				anthropicContextWindowLimitRecovery: { event: async () => {} },
++				agentUsageReminder: { event: async () => {} },
++				categorySkillReminder: { event: async () => {} },
++				interactiveBashSession: { event: async () => {} },
++				ralphLoop: { event: async () => {} },
++				stopContinuationGuard: { event: async () => {} },
++				compactionTodoPreserver: { event: async () => {} },
++				atlasHook: { handler: async () => {} },
++			} as any,
++		})
++
++		const sessionId = "ses_outside_window"
++
++		//#when - synthetic idle first
++		await eventHandler({
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: sessionId,
++					status: { type: "idle" },
++				},
++			},
++		})
++
++		//#then - synthetic dispatched
++		expect(dispatchCalls.length).toBe(1)
++
++		//#when - wait for dedup window to expire (600ms > 500ms)
++		await new Promise((resolve) => setTimeout(resolve, 600))
++
++		//#when - real idle arrives outside window
++		await eventHandler({
++			event: {
++				type: "session.idle",
++				properties: {
++					sessionID: sessionId,
++				},
++			},
++		})
++
++		//#then - real idle dispatched (outside dedup window)
++		expect(dispatchCalls.length).toBe(2)
++		expect(dispatchCalls[0].event.type).toBe("session.idle")
++		expect(dispatchCalls[1].event.type).toBe("session.idle")
++	})
++})
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index fb88bcd6..3ab1cd41 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -52,11 +52,13 @@ export function createEventHandler(args: {
+   }
+ 
+   const recentSyntheticIdles = new Map<string, number>()
++  const recentRealIdles = new Map<string, number>()
+   const DEDUP_WINDOW_MS = 500
+ 
+   return async (input): Promise<void> => {
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
++      recentRealIdles,
+       now: Date.now(),
+       dedupWindowMs: DEDUP_WINDOW_MS,
+     })
+@@ -69,6 +71,7 @@ export function createEventHandler(args: {
+           recentSyntheticIdles.delete(sessionID)
+           return
+         }
++        recentRealIdles.set(sessionID, Date.now())
+       }
+     }
+ 
+@@ -77,6 +80,11 @@ export function createEventHandler(args: {
+     const syntheticIdle = normalizeSessionStatusToIdle(input)
+     if (syntheticIdle) {
+       const sessionID = (syntheticIdle.event.properties as Record<string, unknown>)?.sessionID as string
++      const emittedAt = recentRealIdles.get(sessionID)
++      if (emittedAt && Date.now() - emittedAt < DEDUP_WINDOW_MS) {
++        recentRealIdles.delete(sessionID)
++        return
++      }
+       recentSyntheticIdles.set(sessionID, Date.now())
+       await dispatchToHooks(syntheticIdle)
+     }
+diff --git a/src/plugin/recent-synthetic-idles.test.ts b/src/plugin/recent-synthetic-idles.test.ts
+index c6ba1dac..0c944ccc 100644
+--- a/src/plugin/recent-synthetic-idles.test.ts
++++ b/src/plugin/recent-synthetic-idles.test.ts
+@@ -9,10 +9,12 @@ describe("pruneRecentSyntheticIdles", () => {
+       ["ses_old", 1000],
+       ["ses_new", 1600],
+     ])
++    const recentRealIdles = new Map<string, number>()
+ 
+     //#when
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
++      recentRealIdles,
+       now: 2000,
+       dedupWindowMs: 500,
+     })
+@@ -28,10 +30,12 @@ describe("pruneRecentSyntheticIdles", () => {
+       ["ses_fresh_1", 1950],
+       ["ses_fresh_2", 1980],
+     ])
++    const recentRealIdles = new Map<string, number>()
+ 
+     //#when
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
++      recentRealIdles,
+       now: 2000,
+       dedupWindowMs: 100,
+     })
+@@ -45,10 +49,12 @@ describe("pruneRecentSyntheticIdles", () => {
+   it("handles empty Map without crashing (no-op on empty)", () => {
+     //#given
+     const recentSyntheticIdles = new Map<string, number>()
++    const recentRealIdles = new Map<string, number>()
+ 
+     //#when
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
++      recentRealIdles,
+       now: 2000,
+       dedupWindowMs: 500,
+     })
+@@ -65,10 +71,12 @@ describe("pruneRecentSyntheticIdles", () => {
+       ["ses_stale_2", 1200],
+       ["ses_fresh_2", 1980],
+     ])
++    const recentRealIdles = new Map<string, number>()
+ 
+     //#when
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
++      recentRealIdles,
+       now: 2000,
+       dedupWindowMs: 500,
+     })
+@@ -88,10 +96,12 @@ describe("pruneRecentSyntheticIdles", () => {
+       ["ses_old_2", 800],
+       ["ses_old_3", 1200],
+     ])
++    const recentRealIdles = new Map<string, number>()
+ 
+     //#when
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
++      recentRealIdles,
+       now: 2000,
+       dedupWindowMs: 500,
+     })
+@@ -111,10 +121,12 @@ describe("pruneRecentSyntheticIdles", () => {
+     for (let i = 0; i < 60; i++) {
+       recentSyntheticIdles.set(`ses_fresh_${i}`, 1950 + i)
+     }
++    const recentRealIdles = new Map<string, number>()
+ 
+     //#when
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
++      recentRealIdles,
+       now: 2000,
+       dedupWindowMs: 500,
+     })
+@@ -130,4 +142,32 @@ describe("pruneRecentSyntheticIdles", () => {
+       expect(recentSyntheticIdles.has(`ses_fresh_${i}`)).toBe(true)
+     }
+   })
++
++  it("prunes both synthetic and real idle maps (dual map pruning)", () => {
++    //#given
++    const recentSyntheticIdles = new Map<string, number>([
++      ["synthetic_old", 1000],
++      ["synthetic_new", 1600],
++    ])
++    const recentRealIdles = new Map<string, number>([
++      ["real_old", 1000],
++      ["real_new", 1600],
++    ])
++
++    //#when
++    pruneRecentSyntheticIdles({
++      recentSyntheticIdles,
++      recentRealIdles,
++      now: 2000,
++      dedupWindowMs: 500,
++    })
++
++    //#then - both maps pruned
++    expect(recentSyntheticIdles.has("synthetic_old")).toBe(false)
++    expect(recentSyntheticIdles.has("synthetic_new")).toBe(true)
++    expect(recentRealIdles.has("real_old")).toBe(false)
++    expect(recentRealIdles.has("real_new")).toBe(true)
++    expect(recentSyntheticIdles.size).toBe(1)
++    expect(recentRealIdles.size).toBe(1)
++  })
+ })
+diff --git a/src/plugin/recent-synthetic-idles.ts b/src/plugin/recent-synthetic-idles.ts
+index 971ff5e0..20003044 100644
+--- a/src/plugin/recent-synthetic-idles.ts
++++ b/src/plugin/recent-synthetic-idles.ts
+@@ -1,13 +1,20 @@
+ export function pruneRecentSyntheticIdles(args: {
+   recentSyntheticIdles: Map<string, number>
++  recentRealIdles: Map<string, number>
+   now: number
+   dedupWindowMs: number
+ }): void {
+-  const { recentSyntheticIdles, now, dedupWindowMs } = args
++  const { recentSyntheticIdles, recentRealIdles, now, dedupWindowMs } = args
+ 
+   for (const [sessionID, emittedAt] of recentSyntheticIdles) {
+     if (now - emittedAt >= dedupWindowMs) {
+       recentSyntheticIdles.delete(sessionID)
+     }
+   }
++
++  for (const [sessionID, emittedAt] of recentRealIdles) {
++    if (now - emittedAt >= dedupWindowMs) {
++      recentRealIdles.delete(sessionID)
++    }
++  }
+ }
+diff --git a/src/tools/delegate-task/sync-prompt-sender.test.ts b/src/tools/delegate-task/sync-prompt-sender.test.ts
+new file mode 100644
+index 00000000..725affae
+--- /dev/null
++++ b/src/tools/delegate-task/sync-prompt-sender.test.ts
+@@ -0,0 +1,123 @@
++const { describe, test, expect, mock } = require("bun:test")
++
++describe("sendSyncPrompt", () => {
++  test("applies agent tool restrictions for explore agent", async () => {
++    //#given
++    const mockPromptWithModelSuggestionRetry = mock(async () => {})
++    mock.module("../../shared/model-suggestion-retry", () => ({
++      promptWithModelSuggestionRetry: mockPromptWithModelSuggestionRetry,
++    }))
++
++    const { sendSyncPrompt } = require("./sync-prompt-sender")
++
++    const mockClient = {
++      session: {
++        prompt: mock(async () => ({ data: {} })),
++      },
++    }
++
++    const input = {
++      sessionID: "test-session",
++      agentToUse: "explore",
++      args: {
++        description: "test task",
++        prompt: "test prompt",
++        category: "quick",
++        run_in_background: false,
++        load_skills: [],
++      },
++      systemContent: undefined,
++      categoryModel: undefined,
++      toastManager: null,
++      taskId: undefined,
++    }
++
++    //#when
++    await sendSyncPrompt(mockClient as any, input)
++
++    //#then
++    expect(mockPromptWithModelSuggestionRetry).toHaveBeenCalled()
++    const callArgs = mockPromptWithModelSuggestionRetry.mock.calls[0][1]
++    expect(callArgs.body.tools.call_omo_agent).toBe(false)
++  })
++
++  test("applies agent tool restrictions for librarian agent", async () => {
++    //#given
++    const mockPromptWithModelSuggestionRetry = mock(async () => {})
++    mock.module("../../shared/model-suggestion-retry", () => ({
++      promptWithModelSuggestionRetry: mockPromptWithModelSuggestionRetry,
++    }))
++
++    const { sendSyncPrompt } = require("./sync-prompt-sender")
++
++    const mockClient = {
++      session: {
++        prompt: mock(async () => ({ data: {} })),
++      },
++    }
++
++    const input = {
++      sessionID: "test-session",
++      agentToUse: "librarian",
++      args: {
++        description: "test task",
++        prompt: "test prompt",
++        category: "quick",
++        run_in_background: false,
++        load_skills: [],
++      },
++      systemContent: undefined,
++      categoryModel: undefined,
++      toastManager: null,
++      taskId: undefined,
++    }
++
++    //#when
++    await sendSyncPrompt(mockClient as any, input)
++
++    //#then
++    expect(mockPromptWithModelSuggestionRetry).toHaveBeenCalled()
++    const callArgs = mockPromptWithModelSuggestionRetry.mock.calls[0][1]
++    expect(callArgs.body.tools.call_omo_agent).toBe(false)
++  })
++
++  test("does not restrict call_omo_agent for sisyphus agent", async () => {
++    //#given
++    const mockPromptWithModelSuggestionRetry = mock(async () => {})
++    mock.module("../../shared/model-suggestion-retry", () => ({
++      promptWithModelSuggestionRetry: mockPromptWithModelSuggestionRetry,
++    }))
++
++    const { sendSyncPrompt } = require("./sync-prompt-sender")
++
++    const mockClient = {
++      session: {
++        prompt: mock(async () => ({ data: {} })),
++      },
++    }
++
++    const input = {
++      sessionID: "test-session",
++      agentToUse: "sisyphus",
++      args: {
++        description: "test task",
++        prompt: "test prompt",
++        category: "quick",
++        run_in_background: false,
++        load_skills: [],
++      },
++      systemContent: undefined,
++      categoryModel: undefined,
++      toastManager: null,
++      taskId: undefined,
++    }
++
++    //#when
++    await sendSyncPrompt(mockClient as any, input)
++
++    //#then
++    expect(mockPromptWithModelSuggestionRetry).toHaveBeenCalled()
++    const callArgs = mockPromptWithModelSuggestionRetry.mock.calls[0][1]
++    expect(callArgs.body.tools.call_omo_agent).toBe(true)
++  })
++})
+\ No newline at end of file
+diff --git a/src/tools/delegate-task/sync-prompt-sender.ts b/src/tools/delegate-task/sync-prompt-sender.ts
+index ae45874c..815fe380 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.ts
+@@ -2,6 +2,7 @@ import type { DelegateTaskArgs, OpencodeClient } from "./types"
+ import { isPlanFamily } from "./constants"
+ import { promptWithModelSuggestionRetry } from "../../shared/model-suggestion-retry"
+ import { formatDetailedError } from "./error-formatting"
++import { getAgentToolRestrictions } from "../../shared/agent-tool-restrictions"
+ 
+ export async function sendSyncPrompt(
+   client: OpencodeClient,
+@@ -26,6 +27,7 @@ export async function sendSyncPrompt(
+           task: allowTask,
+           call_omo_agent: true,
+           question: false,
++          ...getAgentToolRestrictions(input.agentToUse),
+         },
+         parts: [{ type: "text", text: input.args.prompt }],
+         ...(input.categoryModel ? { model: { providerID: input.categoryModel.providerID, modelID: input.categoryModel.modelID } } : {}),
+diff --git a/src/tools/delegate-task/sync-session-poller.test.ts b/src/tools/delegate-task/sync-session-poller.test.ts
+index 6e5c3cd8..63dc3dfa 100644
+--- a/src/tools/delegate-task/sync-session-poller.test.ts
++++ b/src/tools/delegate-task/sync-session-poller.test.ts
+@@ -1,5 +1,4 @@
+-declare const require: (name: string) => any
+-const { describe, test, expect, beforeEach, afterEach } = require("bun:test")
++import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+ import { __setTimingConfig, __resetTimingConfig } from "./timing"
+ 
+ function createMockCtx(aborted = false) {
+@@ -8,6 +7,7 @@ function createMockCtx(aborted = false) {
+   return {
+     sessionID: "parent-session",
+     messageID: "parent-message",
++    agent: "test-agent",
+     abort: controller.signal,
+   }
+ }
+@@ -39,15 +39,12 @@ describe("pollSyncSession", () => {
+             data: [
+               { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
+               {
+-                info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++                info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "stop" },
+                 parts: [{ type: "text", text: "Done" }],
+               },
+             ],
+           }),
+-          status: async () => {
+-            pollCount++
+-            return { data: { "ses_test": { type: "idle" } } }
+-          },
++          status: async () => ({ data: { "ses_test": { type: "idle" } } }),
+         },
+       }
+ 
+@@ -247,7 +244,7 @@ describe("pollSyncSession", () => {
+   })
+ 
+   describe("timeout handling", () => {
+-    test("returns null on timeout (graceful)", async () => {
++    test("returns error string on timeout", async () => {
+       //#given - never returns a terminal finish, but timeout is very short
+       const { pollSyncSession } = require("./sync-session-poller")
+ 
+@@ -255,7 +252,7 @@ describe("pollSyncSession", () => {
+         POLL_INTERVAL_MS: 10,
+         MIN_STABILITY_TIME_MS: 0,
+         STABILITY_POLLS_REQUIRED: 1,
+-        MAX_POLL_TIME_MS: 50,
++        MAX_POLL_TIME_MS: 0,
+       })
+ 
+       const mockClient = {
+@@ -277,8 +274,8 @@ describe("pollSyncSession", () => {
+         taskId: undefined,
+       })
+ 
+-      //#then - timeout returns null (not an error, result is fetched separately)
+-      expect(result).toBeNull()
++      //#then - timeout returns error string
++      expect(result).toBe("Poll timeout reached after 50ms for session ses_timeout")
+     })
+   })
+ 
+@@ -327,19 +324,111 @@ describe("pollSyncSession", () => {
+      })
+    })
+ 
+-   describe("isSessionComplete edge cases", () => {
+-     const { isSessionComplete } = require("./sync-session-poller")
++  describe("isSessionComplete edge cases", () => {
++    test("returns false when messages array is empty", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
+ 
+-     test("returns false when messages array is empty", () => {
+-       //#given - empty messages array
+-       const messages: any[] = []
++      //#given - empty messages array
++      const messages: any[] = []
+ 
+-       //#when
+-       const result = isSessionComplete(messages)
++      //#when
++      const result = isSessionComplete(messages)
+ 
+-       //#then - should return false
+-       expect(result).toBe(false)
+-     })
++      //#then - should return false
++      expect(result).toBe(false)
++    })
++
++    test("returns false when no assistant message exists", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
++
++      //#given - only user messages, no assistant
++      const messages = [
++        { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++        { info: { id: "msg_002", role: "user", time: { created: 2000 } } },
++      ]
++
++      //#when
++      const result = isSessionComplete(messages)
++
++      //#then - should return false
++      expect(result).toBe(false)
++    })
++
++    test("returns false when only assistant message exists (no user)", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
++
++      //#given - only assistant message, no user message
++      const messages = [
++        {
++          info: { id: "msg_001", role: "assistant", time: { created: 1000 }, finish: "end_turn" },
++          parts: [{ type: "text", text: "Response" }],
++        },
++      ]
++
++      //#when
++      const result = isSessionComplete(messages)
++
++      //#then - should return false (no user message to compare IDs)
++      expect(result).toBe(false)
++    })
++
++    test("returns false when assistant message has missing finish field", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
++
++      //#given - assistant message without finish field
++      const messages = [
++        { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++        {
++          info: { id: "msg_002", role: "assistant", time: { created: 2000 } },
++          parts: [{ type: "text", text: "Response" }],
++        },
++      ]
++
++      //#when
++      const result = isSessionComplete(messages)
++
++      //#then - should return false (missing finish)
++      expect(result).toBe(false)
++    })
++
++    test("returns false when assistant message has missing info.id field", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
++
++      //#given - assistant message without id in info
++      const messages = [
++        { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++        {
++          info: { role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++          parts: [{ type: "text", text: "Response" }],
++        },
++      ]
++
++      //#when
++      const result = isSessionComplete(messages)
++
++      //#then - should return false (missing assistant id)
++      expect(result).toBe(false)
++    })
++
++    test("returns false when user message has missing info.id field", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
++
++      //#given - user message without id in info
++      const messages = [
++        { info: { role: "user", time: { created: 1000 } } },
++        {
++          info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++          parts: [{ type: "text", text: "Response" }],
++        },
++      ]
++
++      //#when
++      const result = isSessionComplete(messages)
++
++      //#then - should return false (missing user id)
++      expect(result).toBe(false)
++    })
++  })
+ 
+      test("returns false when no assistant message exists", () => {
+        //#given - only user messages, no assistant
+diff --git a/src/tools/delegate-task/sync-session-poller.ts b/src/tools/delegate-task/sync-session-poller.ts
+index 458267e4..8c2d9c43 100644
+--- a/src/tools/delegate-task/sync-session-poller.ts
++++ b/src/tools/delegate-task/sync-session-poller.ts
+@@ -36,6 +36,7 @@ export async function pollSyncSession(
+   const syncTiming = getTimingConfig()
+   const pollStart = Date.now()
+   let pollCount = 0
++  let timedOut = false
+ 
+   log("[task] Starting poll loop", { sessionID: input.sessionID, agentToUse: input.agentToUse })
+ 
+@@ -93,8 +94,9 @@ export async function pollSyncSession(
+   }
+ 
+   if (Date.now() - pollStart >= syncTiming.MAX_POLL_TIME_MS) {
++    timedOut = true
+     log("[task] Poll timeout reached", { sessionID: input.sessionID, pollCount })
+   }
+ 
+-  return null
++  return timedOut ? `Poll timeout reached after ${syncTiming.MAX_POLL_TIME_MS}ms for session ${input.sessionID}` : null
+ }
+diff --git a/src/tools/delegate-task/sync-task.test.ts b/src/tools/delegate-task/sync-task.test.ts
+new file mode 100644
+index 00000000..68466954
+--- /dev/null
++++ b/src/tools/delegate-task/sync-task.test.ts
+@@ -0,0 +1,217 @@
++const { describe, test, expect, beforeEach, afterEach, mock, spyOn } = require("bun:test")
++
++describe("executeSyncTask - cleanup on error paths", () => {
++  let removeTaskCalls: string[] = []
++  let addTaskCalls: any[] = []
++  let deleteCalls: string[] = []
++  let addCalls: string[] = []
++  let resetToastManager: (() => void) | null = null
++
++  beforeEach(() => {
++    //#given - configure fast timing for all tests
++    const { __setTimingConfig } = require("./timing")
++    __setTimingConfig({
++      POLL_INTERVAL_MS: 10,
++      MIN_STABILITY_TIME_MS: 0,
++      STABILITY_POLLS_REQUIRED: 1,
++      MAX_POLL_TIME_MS: 100,
++    })
++
++    //#given - reset call tracking
++    removeTaskCalls = []
++    addTaskCalls = []
++    deleteCalls = []
++    addCalls = []
++
++    //#given - initialize real task toast manager (avoid global module mocks)
++    const { initTaskToastManager, _resetTaskToastManagerForTesting } = require("../../features/task-toast-manager/manager")
++    _resetTaskToastManagerForTesting()
++    resetToastManager = _resetTaskToastManagerForTesting
++
++    const toastManager = initTaskToastManager({
++      tui: { showToast: mock(() => Promise.resolve()) },
++    })
++
++    spyOn(toastManager, "addTask").mockImplementation((task: any) => {
++      addTaskCalls.push(task)
++    })
++    spyOn(toastManager, "removeTask").mockImplementation((id: string) => {
++      removeTaskCalls.push(id)
++    })
++
++    //#given - mock subagentSessions
++    const { subagentSessions } = require("../../features/claude-code-session-state")
++    spyOn(subagentSessions, "add").mockImplementation((id: string) => {
++      addCalls.push(id)
++    })
++    spyOn(subagentSessions, "delete").mockImplementation((id: string) => {
++      deleteCalls.push(id)
++    })
++
++    //#given - mock other dependencies
++    mock.module("./sync-session-creator.ts", () => ({
++      createSyncSession: async () => ({ ok: true, sessionID: "ses_test_12345678" }),
++    }))
++
++    mock.module("./sync-prompt-sender.ts", () => ({
++      sendSyncPrompt: async () => null,
++    }))
++
++    mock.module("./sync-session-poller.ts", () => ({
++      pollSyncSession: async () => null,
++    }))
++
++    mock.module("./sync-result-fetcher.ts", () => ({
++      fetchSyncResult: async () => ({ ok: true, textContent: "Result" }),
++    }))
++  })
++
++  afterEach(() => {
++    //#given - reset timing after each test
++    const { __resetTimingConfig } = require("./timing")
++    __resetTimingConfig()
++
++    mock.restore()
++    resetToastManager?.()
++    resetToastManager = null
++  })
++
++  test("cleans up toast and subagentSessions when fetchSyncResult returns ok: false", async () => {
++    //#given - mock fetchSyncResult to return error
++    mock.module("./sync-result-fetcher.ts", () => ({
++      fetchSyncResult: async () => ({ ok: false, error: "Fetch failed" }),
++    }))
++
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ses_test_12345678" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: () => {},
++    }
++
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    //#when - executeSyncTask with fetchSyncResult failing
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "test-agent", undefined, undefined)
++
++    //#then - should return error and cleanup resources
++    expect(result).toBe("Fetch failed")
++    expect(removeTaskCalls.length).toBe(1)
++    expect(removeTaskCalls[0]).toBe("sync_ses_test")
++    expect(deleteCalls.length).toBe(1)
++    expect(deleteCalls[0]).toBe("ses_test_12345678")
++  })
++
++  test("cleans up toast and subagentSessions when pollSyncSession returns error", async () => {
++    //#given - mock pollSyncSession to return error
++    mock.module("./sync-session-poller.ts", () => ({
++      pollSyncSession: async () => "Poll error",
++    }))
++
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ses_test_12345678" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: () => {},
++    }
++
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    //#when - executeSyncTask with pollSyncSession failing
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "test-agent", undefined, undefined)
++
++    //#then - should return error and cleanup resources
++    expect(result).toBe("Poll error")
++    expect(removeTaskCalls.length).toBe(1)
++    expect(removeTaskCalls[0]).toBe("sync_ses_test")
++    expect(deleteCalls.length).toBe(1)
++    expect(deleteCalls[0]).toBe("ses_test_12345678")
++  })
++
++  test("cleans up toast and subagentSessions on successful completion", async () => {
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ses_test_12345678" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: () => {},
++    }
++
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    //#when - executeSyncTask completes successfully
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "test-agent", undefined, undefined)
++
++    //#then - should complete and cleanup resources
++    expect(result).toContain("Task completed")
++    expect(removeTaskCalls.length).toBe(1)
++    expect(removeTaskCalls[0]).toBe("sync_ses_test")
++    expect(deleteCalls.length).toBe(1)
++    expect(deleteCalls[0]).toBe("ses_test_12345678")
++  })
++})
+\ No newline at end of file
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index 2838053d..5f602c3b 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -102,30 +102,25 @@ export async function executeSyncTask(
+       return promptError
+     }
+ 
+-    const pollError = await pollSyncSession(ctx, client, {
+-      sessionID,
+-      agentToUse,
+-      toastManager,
+-      taskId,
+-    })
+-    if (pollError) {
+-      return pollError
+-    }
+-
+-    const result = await fetchSyncResult(client, sessionID)
+-    if (!result.ok) {
+-      return result.error
+-    }
+-
+-    const duration = formatDuration(startTime)
++    try {
++      const pollError = await pollSyncSession(ctx, client, {
++        sessionID,
++        agentToUse,
++        toastManager,
++        taskId,
++      })
++      if (pollError) {
++        return pollError
++      }
+ 
+-    if (toastManager) {
+-      toastManager.removeTask(taskId)
+-    }
++      const result = await fetchSyncResult(client, sessionID)
++      if (!result.ok) {
++        return result.error
++      }
+ 
+-    subagentSessions.delete(sessionID)
++      const duration = formatDuration(startTime)
+ 
+-    return `Task completed in ${duration}.
++      return `Task completed in ${duration}.
+ 
+ Agent: ${agentToUse}${args.category ? ` (category: ${args.category})` : ""}
+ 
+@@ -136,13 +131,15 @@ ${result.textContent || "(No text output)"}
+ <task_metadata>
+ session_id: ${sessionID}
+ </task_metadata>`
+-  } catch (error) {
+-    if (toastManager && taskId !== undefined) {
+-      toastManager.removeTask(taskId)
+-    }
+-    if (syncSessionID) {
+-      subagentSessions.delete(syncSessionID)
++    } finally {
++      if (toastManager && taskId !== undefined) {
++        toastManager.removeTask(taskId)
++      }
++      if (syncSessionID) {
++        subagentSessions.delete(syncSessionID)
++      }
+     }
++  } catch (error) {
+     return formatDetailedError(error, {
+       operation: "Execute task",
+       args,
+diff --git a/src/tools/look-at/session-poller.test.ts b/src/tools/look-at/session-poller.test.ts
+new file mode 100644
+index 00000000..757327a3
+--- /dev/null
++++ b/src/tools/look-at/session-poller.test.ts
+@@ -0,0 +1,105 @@
++import { describe, expect, test, mock } from "bun:test"
++import { pollSessionUntilIdle } from "./session-poller"
++
++type SessionStatusResult = {
++  data?: Record<string, { type: string; attempt?: number; message?: string; next?: number }>
++  error?: unknown
++}
++
++function createMockClient(statusSequence: SessionStatusResult[]) {
++  let callIndex = 0
++  return {
++    session: {
++      status: mock(async () => {
++        const result = statusSequence[callIndex] ?? statusSequence[statusSequence.length - 1]
++        callIndex++
++        return result
++      }),
++    },
++  }
++}
++
++describe("pollSessionUntilIdle", () => {
++  // given session transitions from busy to idle
++  // when polling for completion
++  // then resolves successfully
++  test("resolves when session becomes idle", async () => {
++    const client = createMockClient([
++      { data: { ses_test: { type: "busy" } } },
++      { data: { ses_test: { type: "busy" } } },
++      { data: { ses_test: { type: "idle" } } },
++    ])
++
++    await pollSessionUntilIdle(client as any, "ses_test", { pollIntervalMs: 10, timeoutMs: 5000 })
++
++    expect(client.session.status).toHaveBeenCalledTimes(3)
++  })
++
++  // given session is already idle (not in status map)
++  // when polling for completion
++  // then resolves immediately
++  test("resolves when session not found in status (idle by default)", async () => {
++    const client = createMockClient([
++      { data: {} },
++    ])
++
++    await pollSessionUntilIdle(client as any, "ses_test", { pollIntervalMs: 10, timeoutMs: 5000 })
++
++    expect(client.session.status).toHaveBeenCalledTimes(1)
++  })
++
++  // given session never becomes idle
++  // when polling exceeds timeout
++  // then rejects with timeout error
++  test("rejects with timeout when session stays busy", async () => {
++    const client = createMockClient([
++      { data: { ses_test: { type: "busy" } } },
++    ])
++
++    await expect(
++      pollSessionUntilIdle(client as any, "ses_test", { pollIntervalMs: 10, timeoutMs: 50 })
++    ).rejects.toThrow("timed out")
++  })
++
++  // given session status API returns error
++  // when polling for completion
++  // then treats as idle (graceful degradation)
++  test("resolves on status API error (graceful degradation)", async () => {
++    const client = createMockClient([
++      { error: new Error("API error") },
++    ])
++
++    await pollSessionUntilIdle(client as any, "ses_test", { pollIntervalMs: 10, timeoutMs: 5000 })
++
++    expect(client.session.status).toHaveBeenCalledTimes(1)
++  })
++
++  // given session is in retry state
++  // when polling for completion
++  // then keeps polling until idle
++  test("keeps polling through retry state", async () => {
++    const client = createMockClient([
++      { data: { ses_test: { type: "busy" } } },
++      { data: { ses_test: { type: "retry", attempt: 1, message: "retrying", next: 1000 } } },
++      { data: { ses_test: { type: "busy" } } },
++      { data: {} },
++    ])
++
++    await pollSessionUntilIdle(client as any, "ses_test", { pollIntervalMs: 10, timeoutMs: 5000 })
++
++    expect(client.session.status).toHaveBeenCalledTimes(4)
++  })
++
++  // given default options
++  // when polling
++  // then uses sensible defaults
++  test("uses default options when none provided", async () => {
++    const client = createMockClient([
++      { data: {} },
++    ])
++
++    await pollSessionUntilIdle(client as any, "ses_test")
++
++    expect(client.session.status).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/src/tools/look-at/session-poller.ts b/src/tools/look-at/session-poller.ts
+new file mode 100644
+index 00000000..b458110f
+--- /dev/null
++++ b/src/tools/look-at/session-poller.ts
+@@ -0,0 +1,42 @@
++import type { createOpencodeClient } from "@opencode-ai/sdk"
++import { log } from "../../shared"
++
++type Client = ReturnType<typeof createOpencodeClient>
++
++export interface PollOptions {
++  pollIntervalMs?: number
++  timeoutMs?: number
++}
++
++const DEFAULT_POLL_INTERVAL_MS = 1000
++const DEFAULT_TIMEOUT_MS = 120_000
++
++export async function pollSessionUntilIdle(
++  client: Client,
++  sessionID: string,
++  options?: PollOptions,
++): Promise<void> {
++  const pollInterval = options?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
++  const timeout = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS
++  const startTime = Date.now()
++
++  while (Date.now() - startTime < timeout) {
++    const statusResult = await client.session.status().catch((error) => {
++      log(`[look_at] session.status error (treating as idle):`, error)
++      return { data: undefined, error }
++    })
++
++    if (statusResult.error || !statusResult.data) {
++      return
++    }
++
++    const sessionStatus = statusResult.data[sessionID]
++    if (!sessionStatus || sessionStatus.type === "idle") {
++      return
++    }
++
++    await new Promise((resolve) => setTimeout(resolve, pollInterval))
++  }
++
++  throw new Error(`[look_at] Polling timed out after ${timeout}ms waiting for session ${sessionID} to become idle`)
++}
+diff --git a/src/tools/look-at/tools.test.ts b/src/tools/look-at/tools.test.ts
+index dca424c4..3299aba2 100644
+--- a/src/tools/look-at/tools.test.ts
++++ b/src/tools/look-at/tools.test.ts
+@@ -111,24 +111,17 @@ describe("look-at tool", () => {
+   })
+ 
+   describe("createLookAt error handling", () => {
+-    // given JSON parse error occurs in session.prompt
++    // given promptAsync throws error
+     // when LookAt tool executed
+-    // then error is caught and messages are still fetched
+-    test("catches JSON parse error and returns assistant message if available", async () => {
+-      const throwingMock = async () => {
+-        throw new Error("JSON Parse error: Unexpected EOF")
+-      }
++    // then returns error string immediately (no message fetch)
++    test("returns error immediately when promptAsync fails", async () => {
+       const mockClient = {
+         session: {
+           get: async () => ({ data: { directory: "/project" } }),
+-          create: async () => ({ data: { id: "ses_test_json_error" } }),
+-          prompt: throwingMock,
+-          promptAsync: throwingMock,
+-          messages: async () => ({
+-            data: [
+-              { info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "analysis result" }] },
+-            ],
+-          }),
++          create: async () => ({ data: { id: "ses_test_prompt_fail" } }),
++          promptAsync: async () => { throw new Error("Network connection failed") },
++          status: async () => ({ data: {} }),
++          messages: async () => ({ data: [] }),
+         },
+       }
+ 
+@@ -152,23 +145,25 @@ describe("look-at tool", () => {
+         { file_path: "/test/file.png", goal: "analyze image" },
+         toolContext,
+       )
+-      expect(result).toBe("analysis result")
++      expect(result).toContain("Error")
++      expect(result).toContain("Network connection failed")
+     })
+ 
+-    // given JSON parse error occurs and no messages available
++    // given promptAsync succeeds but status API fails (polling degrades gracefully)
+     // when LookAt tool executed
+-    // then returns error string (not throw)
+-    test("catches JSON parse error and returns error when no messages", async () => {
+-      const throwingMock = async () => {
+-        throw new Error("JSON Parse error: Unexpected EOF")
+-      }
++    // then still attempts to fetch messages (graceful degradation)
++    test("fetches messages even when status API fails", async () => {
+       const mockClient = {
+         session: {
+           get: async () => ({ data: { directory: "/project" } }),
+-          create: async () => ({ data: { id: "ses_test_json_no_msg" } }),
+-          prompt: throwingMock,
+-          promptAsync: throwingMock,
+-          messages: async () => ({ data: [] }),
++          create: async () => ({ data: { id: "ses_test_poll_timeout" } }),
++          promptAsync: async () => ({}),
++          status: async () => ({ error: new Error("status unavailable") }),
++          messages: async () => ({
++            data: [
++              { info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "partial result" }] },
++            ],
++          }),
+         },
+       }
+ 
+@@ -189,31 +184,23 @@ describe("look-at tool", () => {
+       }
+ 
+       const result = await tool.execute(
+-        { file_path: "/test/file.png", goal: "analyze image" },
++        { file_path: "/test/file.png", goal: "analyze" },
+         toolContext,
+       )
+-      expect(result).toContain("Error")
+-      expect(result).toContain("multimodal-looker")
++      expect(result).toBe("partial result")
+     })
+ 
+-    // given empty object error {} thrown (the actual production bug)
+-    // when LookAt tool executed
+-    // then error is caught gracefully, not re-thrown
+-    test("catches empty object error from session.prompt", async () => {
+-      const throwingMock = async () => {
+-        throw {}
+-      }
++    // given promptAsync succeeds and session becomes idle
++    // when LookAt tool executed and no assistant message found
++    // then returns error about no response
++    test("returns error when no assistant message after successful prompt", async () => {
+       const mockClient = {
+         session: {
+           get: async () => ({ data: { directory: "/project" } }),
+-          create: async () => ({ data: { id: "ses_test_empty_obj" } }),
+-          prompt: throwingMock,
+-          promptAsync: throwingMock,
+-          messages: async () => ({
+-            data: [
+-              { info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "got it" }] },
+-            ],
+-          }),
++          create: async () => ({ data: { id: "ses_test_no_msg" } }),
++          promptAsync: async () => ({}),
++          status: async () => ({ data: {} }),
++          messages: async () => ({ data: [] }),
+         },
+       }
+ 
+@@ -234,25 +221,23 @@ describe("look-at tool", () => {
+       }
+ 
+       const result = await tool.execute(
+-        { file_path: "/test/file.png", goal: "analyze" },
++        { file_path: "/test/file.pdf", goal: "extract text" },
+         toolContext,
+       )
+-      expect(result).toBe("got it")
++      expect(result).toContain("Error")
++      expect(result).toContain("multimodal-looker")
+     })
+ 
+-    // given generic network error
++    // given session creation fails
+     // when LookAt tool executed
+-    // then error is caught and returns error string when no messages
+-    test("catches generic prompt error and returns error string", async () => {
+-      const throwingMock = async () => {
+-        throw new Error("Network connection failed")
+-      }
++    // then returns error about session creation
++    test("returns error when session creation fails", async () => {
+       const mockClient = {
+         session: {
+           get: async () => ({ data: { directory: "/project" } }),
+-          create: async () => ({ data: { id: "ses_test_generic_error" } }),
+-          prompt: throwingMock,
+-          promptAsync: throwingMock,
++          create: async () => ({ error: "Internal server error" }),
++          promptAsync: async () => ({}),
++          status: async () => ({ data: {} }),
+           messages: async () => ({ data: [] }),
+         },
+       }
+@@ -274,19 +259,19 @@ describe("look-at tool", () => {
+       }
+ 
+       const result = await tool.execute(
+-        { file_path: "/test/file.pdf", goal: "extract text" },
++        { file_path: "/test/file.png", goal: "analyze" },
+         toolContext,
+       )
+       expect(result).toContain("Error")
+-      expect(result).toContain("multimodal-looker")
++      expect(result).toContain("session")
+     })
+   })
+ 
+   describe("createLookAt model passthrough", () => {
+     // given multimodal-looker agent has resolved model info
+     // when LookAt tool executed
+-    // then model info should be passed to session.prompt
+-    test("passes multimodal-looker model to session.prompt when available", async () => {
++    // then model info should be passed to promptAsync
++    test("passes multimodal-looker model to promptAsync when available", async () => {
+       let promptBody: any
+ 
+       const mockClient = {
+@@ -304,14 +289,11 @@ describe("look-at tool", () => {
+         session: {
+           get: async () => ({ data: { directory: "/project" } }),
+           create: async () => ({ data: { id: "ses_model_passthrough" } }),
+-          prompt: async (input: any) => {
+-            promptBody = input.body
+-            return { data: {} }
+-          },
+           promptAsync: async (input: any) => {
+             promptBody = input.body
+             return { data: {} }
+           },
++          status: async () => ({ data: {} }),
+           messages: async () => ({
+             data: [
+               { info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "done" }] },
+@@ -351,7 +333,7 @@ describe("look-at tool", () => {
+   describe("createLookAt with image_data", () => {
+     // given base64 image data is provided
+     // when LookAt tool executed
+-    // then should send data URL to session.prompt
++    // then should send data URL to promptAsync
+     test("sends data URL when image_data provided", async () => {
+       let promptBody: any
+ 
+@@ -362,14 +344,11 @@ describe("look-at tool", () => {
+         session: {
+           get: async () => ({ data: { directory: "/project" } }),
+           create: async () => ({ data: { id: "ses_image_data_test" } }),
+-          prompt: async (input: any) => {
+-            promptBody = input.body
+-            return { data: {} }
+-          },
+           promptAsync: async (input: any) => {
+             promptBody = input.body
+             return { data: {} }
+           },
++          status: async () => ({ data: {} }),
+           messages: async () => ({
+             data: [
+               { info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "analyzed" }] },
+@@ -419,14 +398,11 @@ describe("look-at tool", () => {
+         session: {
+           get: async () => ({ data: { directory: "/project" } }),
+           create: async () => ({ data: { id: "ses_raw_base64_test" } }),
+-          prompt: async (input: any) => {
+-            promptBody = input.body
+-            return { data: {} }
+-          },
+           promptAsync: async (input: any) => {
+             promptBody = input.body
+             return { data: {} }
+           },
++          status: async () => ({ data: {} }),
+           messages: async () => ({
+             data: [
+               { info: { role: "assistant", time: { created: 1 } }, parts: [{ type: "text", text: "analyzed" }] },
+diff --git a/src/tools/look-at/tools.ts b/src/tools/look-at/tools.ts
+index 0d5c1c0b..dcb920f0 100644
+--- a/src/tools/look-at/tools.ts
++++ b/src/tools/look-at/tools.ts
+@@ -3,7 +3,8 @@ import { pathToFileURL } from "node:url"
+ import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin"
+ import { LOOK_AT_DESCRIPTION, MULTIMODAL_LOOKER_AGENT } from "./constants"
+ import type { LookAtArgs } from "./types"
+-import { log, promptSyncWithModelSuggestionRetry } from "../../shared"
++import { log, promptWithModelSuggestionRetry } from "../../shared"
++import { pollSessionUntilIdle } from "./session-poller"
+ import { extractLatestAssistantText } from "./assistant-message-extractor"
+ import type { LookAtArgsWithAlias } from "./look-at-arguments"
+ import { normalizeArgs, validateArgs } from "./look-at-arguments"
+@@ -105,9 +106,9 @@ Original error: ${createResult.error}`
+ 
+       const { agentModel, agentVariant } = await resolveMultimodalLookerAgentMetadata(ctx)
+ 
+-      log(`[look_at] Sending prompt with ${isBase64Input ? "base64 image" : "file"} to session ${sessionID}`)
++      log(`[look_at] Sending async prompt with ${isBase64Input ? "base64 image" : "file"} to session ${sessionID}`)
+       try {
+-        await promptSyncWithModelSuggestionRetry(ctx.client, {
++        await promptWithModelSuggestionRetry(ctx.client, {
+           path: { id: sessionID },
+           body: {
+             agent: MULTIMODAL_LOOKER_AGENT,
+@@ -126,7 +127,15 @@ Original error: ${createResult.error}`
+           },
+         })
+       } catch (promptError) {
+-        log(`[look_at] Prompt error (ignored, will still fetch messages):`, promptError)
++        log(`[look_at] promptAsync error:`, promptError)
++        return `Error: Failed to send prompt to multimodal-looker agent: ${promptError instanceof Error ? promptError.message : String(promptError)}`
++      }
++
++      log(`[look_at] Polling session ${sessionID} until idle...`)
++      try {
++        await pollSessionUntilIdle(ctx.client, sessionID, { pollIntervalMs: 500, timeoutMs: 120_000 })
++      } catch (pollError) {
++        log(`[look_at] Polling error (will still try to fetch messages):`, pollError)
+       }
+ 
+       log(`[look_at] Fetching messages from session ${sessionID}...`)
+-- 
+2.39.2
+

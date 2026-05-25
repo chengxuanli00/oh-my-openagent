@@ -1,0 +1,509 @@
+From 688bb551b2325b0f6f99927e07a58ce6f2d233ff Mon Sep 17 00:00:00 2001
+From: Disaster-Terminator <2557058999@qq.com>
+Date: Sat, 18 Apr 2026 13:19:14 +0800
+Subject: [PATCH 5254/5749] fix(tmux): defer subagent attach until pane focus
+
+---
+ src/features/tmux-subagent/manager.ts         |   9 +-
+ .../tmux-subagent/polling-manager.test.ts     | 101 +++++++++++++++++-
+ src/features/tmux-subagent/polling-manager.ts |  46 +++++++-
+ .../tmux-subagent/tracked-session-state.ts    |   1 +
+ src/features/tmux-subagent/types.ts           |   1 +
+ src/shared/tmux/tmux-utils.ts                 |   2 +
+ src/shared/tmux/tmux-utils/pane-activate.ts   |  33 ++++++
+ .../tmux/tmux-utils/pane-command.test.ts      |  32 ++++++
+ src/shared/tmux/tmux-utils/pane-command.ts    |  15 +++
+ src/shared/tmux/tmux-utils/pane-replace.ts    |  11 +-
+ src/shared/tmux/tmux-utils/pane-spawn.ts      |   9 +-
+ 11 files changed, 245 insertions(+), 15 deletions(-)
+ create mode 100644 src/shared/tmux/tmux-utils/pane-activate.ts
+ create mode 100644 src/shared/tmux/tmux-utils/pane-command.test.ts
+ create mode 100644 src/shared/tmux/tmux-utils/pane-command.ts
+
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index e97273e7..f07f82c8 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -12,6 +12,7 @@ import {
+   killTmuxSessionIfExists,
+   getIsolatedSessionName,
+   sweepStaleOmoAgentSessions,
++  activateTmuxPane,
+ } from "../../shared/tmux"
+ import { queryWindowState as defaultQueryWindowState } from "./pane-state-querier"
+ import { decideSpawnActions, decideCloseAction, type SessionMapping } from "./decision-engine"
+@@ -133,7 +134,9 @@ export class TmuxSessionManager {
+       this.client,
+       this.sessions,
+       this.closeSessionFromPolling.bind(this),
+-      this.retryPendingCloses.bind(this)
++      this.retryPendingCloses.bind(this),
++      this.queryWindowStateSafely.bind(this),
++      this.activateTrackedSessionPane.bind(this),
+     )
+     this.deps.log("[tmux-session-manager] initialized", {
+       configEnabled: this.tmuxConfig.enabled,
+@@ -337,6 +340,10 @@ export class TmuxSessionManager {
+     }
+   }
+ 
++  private async activateTrackedSessionPane(tracked: TrackedSession): Promise<boolean> {
++    return activateTmuxPane(tracked.paneId, tracked.sessionId, this.serverUrl, this.projectDirectory)
++  }
++
+   private windowStateContainsPane(state: WindowState, paneId: string): boolean {
+     return state.mainPane?.paneId === paneId
+       || state.agentPanes.some((pane) => pane.paneId === paneId)
+diff --git a/src/features/tmux-subagent/polling-manager.test.ts b/src/features/tmux-subagent/polling-manager.test.ts
+index 7c0d3cd1..e3ed4e76 100644
+--- a/src/features/tmux-subagent/polling-manager.test.ts
++++ b/src/features/tmux-subagent/polling-manager.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, test, expect } from "bun:test"
+ import { TmuxPollingManager } from "./polling-manager"
+-import type { TrackedSession } from "./types"
++import type { TrackedSession, WindowState } from "./types"
+ import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
+ 
+ describe("TmuxPollingManager overlap", () => {
+@@ -11,6 +11,7 @@ describe("TmuxPollingManager overlap", () => {
+       sessionId: "ses-1",
+       paneId: "%1",
+       description: "test",
++      attachActivated: true,
+       createdAt: new Date(),
+       lastSeenAt: new Date(),
+       closePending: false,
+@@ -64,6 +65,7 @@ describe("TmuxPollingManager overlap", () => {
+       sessionId: "ses-1",
+       paneId: "%1",
+       description: "test",
++      attachActivated: true,
+       createdAt: new Date(Date.now() - 15_000),
+       lastSeenAt: new Date(),
+       closePending: false,
+@@ -117,6 +119,7 @@ describe("TmuxPollingManager overlap", () => {
+       sessionId: "ses-1",
+       paneId: "%1",
+       description: "test",
++      attachActivated: true,
+       createdAt: new Date(now - 1_000),
+       lastSeenAt: new Date(now - 7_000),
+       closePending: false,
+@@ -156,6 +159,7 @@ describe("TmuxPollingManager overlap", () => {
+       sessionId: "ses-1",
+       paneId: "%1",
+       description: "test",
++      attachActivated: true,
+       createdAt: new Date(now - 11 * 60 * 1000),
+       lastSeenAt: new Date(now),
+       closePending: false,
+@@ -194,6 +198,7 @@ describe("TmuxPollingManager overlap", () => {
+       sessionId: "ses-1",
+       paneId: "%1",
+       description: "test",
++      attachActivated: true,
+       createdAt: new Date(Date.now() - 15_000),
+       lastSeenAt: new Date(),
+       closePending: false,
+@@ -237,4 +242,98 @@ describe("TmuxPollingManager overlap", () => {
+     // then
+     expect(closedSessionIds).toEqual([])
+   })
++
++  test("activates focused panes once before polling statuses", async () => {
++    //#given
++    const sessions = new Map<string, TrackedSession>()
++    const tracked: TrackedSession = {
++      sessionId: "ses-1",
++      paneId: "%1",
++      description: "test",
++      attachActivated: false,
++      createdAt: new Date(),
++      lastSeenAt: new Date(),
++      closePending: false,
++      closeRetryCount: 0,
++      activityVersion: 0,
++    }
++    sessions.set("ses-1", tracked)
++
++    const activatedSessionIds: string[] = []
++    const client = {
++      session: {
++        status: async () => ({ data: { "ses-1": { type: "running" } } }),
++        messages: async () => ({ data: [] }),
++      },
++    }
++    const windowState: WindowState = {
++      windowWidth: 160,
++      windowHeight: 48,
++      mainPane: null,
++      agentPanes: [
++        { paneId: "%1", width: 80, height: 24, left: 0, top: 0, title: "agent", isActive: true },
++      ],
++    }
++    const manager = new TmuxPollingManager(
++      unsafeTestValue<import("../../tools/delegate-task/types").OpencodeClient>(client),
++      sessions,
++      async () => {},
++      undefined,
++      async () => windowState,
++      async (session) => {
++        activatedSessionIds.push(session.sessionId)
++        return true
++      },
++    )
++    const pollSessions = unsafeTestValue<{ pollSessions: () => Promise<void> }>(manager).pollSessions
++
++    //#when
++    await pollSessions.call(manager)
++    await pollSessions.call(manager)
++
++    //#then
++    expect(activatedSessionIds).toEqual(["ses-1"])
++    expect(tracked.attachActivated).toBe(true)
++  })
++
++  test("does not close non-activated panes before focus activation", async () => {
++    //#given
++    const sessions = new Map<string, TrackedSession>()
++    sessions.set("ses-1", {
++      sessionId: "ses-1",
++      paneId: "%1",
++      description: "test",
++      attachActivated: false,
++      createdAt: new Date(Date.now() - 15_000),
++      lastSeenAt: new Date(),
++      closePending: false,
++      closeRetryCount: 0,
++      activityVersion: 0,
++      stableIdlePolls: 3,
++      observedIdleActivityVersion: 0,
++    })
++
++    const closedSessionIds: string[] = []
++    const client = {
++      session: {
++        status: async () => ({ data: { "ses-1": { type: "idle" } } }),
++        messages: async () => ({ data: [] }),
++      },
++    }
++    const manager = new TmuxPollingManager(
++      unsafeTestValue<import("../../tools/delegate-task/types").OpencodeClient>(client),
++      sessions,
++      async (sessionId) => {
++        closedSessionIds.push(sessionId)
++      },
++    )
++    const pollSessions = unsafeTestValue<{ pollSessions: () => Promise<void> }>(manager).pollSessions
++
++    //#when
++    await pollSessions.call(manager)
++
++    //#then
++    expect(closedSessionIds).toEqual([])
++    expect(sessions.has("ses-1")).toBe(true)
++  })
+ })
+diff --git a/src/features/tmux-subagent/polling-manager.ts b/src/features/tmux-subagent/polling-manager.ts
+index c34e126a..384ef7c2 100644
+--- a/src/features/tmux-subagent/polling-manager.ts
++++ b/src/features/tmux-subagent/polling-manager.ts
+@@ -4,7 +4,7 @@ import {
+   SESSION_MISSING_GRACE_MS,
+   SESSION_TIMEOUT_MS,
+ } from "../../shared/tmux"
+-import type { TrackedSession } from "./types"
++import type { TrackedSession, WindowState } from "./types"
+ import { log } from "../../shared"
+ import { normalizeSDKResponse } from "../../shared"
+ import { resolveMessageEventSessionID } from "../../shared/event-session-id"
+@@ -20,7 +20,9 @@ export class TmuxPollingManager {
+     private client: OpencodeClient,
+     private sessions: Map<string, TrackedSession>,
+     private closeSessionById: (sessionId: string) => Promise<void>,
+-    private retryPendingCloses?: () => Promise<void>
++    private retryPendingCloses?: () => Promise<void>,
++    private getWindowState?: () => Promise<WindowState | null>,
++    private activateSessionPane?: (tracked: TrackedSession) => Promise<boolean>,
+   ) {}
+ 
+   handleEvent(event: { type: string; properties?: Record<string, unknown> }): void {
+@@ -60,6 +62,8 @@ export class TmuxPollingManager {
+         return
+       }
+ 
++      await this.activateFocusedPanes()
++
+       const statusResult = await this.client.session.status({ path: undefined })
+       const allStatuses = normalizeSDKResponse(statusResult, {} as Record<string, { type: string }>)
+ 
+@@ -72,6 +76,14 @@ export class TmuxPollingManager {
+       const sessionsToClose: string[] = []
+ 
+       for (const [sessionId, tracked] of this.sessions.entries()) {
++        if (!tracked.attachActivated) {
++          log("[tmux-session-manager] skipping close checks for non-activated pane", {
++            sessionId,
++            paneId: tracked.paneId,
++          })
++          continue
++        }
++
+         const status = allStatuses[sessionId]
+         const isIdle = status?.type === "idle"
+ 
+@@ -185,4 +197,34 @@ export class TmuxPollingManager {
+ 
+     return undefined
+   }
++
++  private async activateFocusedPanes(): Promise<void> {
++    if (!this.getWindowState || !this.activateSessionPane || this.sessions.size === 0) {
++      return
++    }
++
++    const state = await this.getWindowState().catch(() => null)
++    if (!state) return
++
++    const panes = [state.mainPane, ...state.agentPanes].filter((pane): pane is NonNullable<typeof pane> => Boolean(pane))
++    const activePaneIds = new Set(panes.filter((pane) => pane.isActive).map((pane) => pane.paneId))
++    if (activePaneIds.size === 0) return
++
++    for (const tracked of this.sessions.values()) {
++      if (tracked.attachActivated) continue
++      if (!activePaneIds.has(tracked.paneId)) continue
++
++      const activated = await this.activateSessionPane(tracked)
++      if (activated) {
++        tracked.attachActivated = true
++        tracked.lastSeenAt = new Date()
++        tracked.stableIdlePolls = 0
++        tracked.observedIdleActivityVersion = tracked.activityVersion
++        log("[tmux-session-manager] activated focused pane", {
++          sessionId: tracked.sessionId,
++          paneId: tracked.paneId,
++        })
++      }
++    }
++  }
+ }
+diff --git a/src/features/tmux-subagent/tracked-session-state.ts b/src/features/tmux-subagent/tracked-session-state.ts
+index 9bcf9467..9def399e 100644
+--- a/src/features/tmux-subagent/tracked-session-state.ts
++++ b/src/features/tmux-subagent/tracked-session-state.ts
+@@ -12,6 +12,7 @@ export function createTrackedSession(params: {
+     sessionId: params.sessionId,
+     paneId: params.paneId,
+     description: params.description,
++    attachActivated: false,
+     createdAt: now,
+     lastSeenAt: now,
+     closePending: false,
+diff --git a/src/features/tmux-subagent/types.ts b/src/features/tmux-subagent/types.ts
+index db8f88d6..36cc4939 100644
+--- a/src/features/tmux-subagent/types.ts
++++ b/src/features/tmux-subagent/types.ts
+@@ -2,6 +2,7 @@ export interface TrackedSession {
+   sessionId: string
+   paneId: string
+   description: string
++  attachActivated: boolean
+   createdAt: Date
+   lastSeenAt: Date
+   closePending: boolean
+diff --git a/src/shared/tmux/tmux-utils.ts b/src/shared/tmux/tmux-utils.ts
+index 58f033bc..d62025df 100644
+--- a/src/shared/tmux/tmux-utils.ts
++++ b/src/shared/tmux/tmux-utils.ts
+@@ -9,9 +9,11 @@ export type { PaneDimensions } from "./tmux-utils/pane-dimensions"
+ export { spawnTmuxPane } from "./tmux-utils/pane-spawn"
+ export { closeTmuxPane } from "./tmux-utils/pane-close"
+ export { replaceTmuxPane } from "./tmux-utils/pane-replace"
++export { activateTmuxPane } from "./tmux-utils/pane-activate"
+ export { spawnTmuxWindow } from "./tmux-utils/window-spawn"
+ export { spawnTmuxSession, getIsolatedSessionName } from "./tmux-utils/session-spawn"
+ export { killTmuxSessionIfExists } from "./tmux-utils/session-kill"
+ export { sweepStaleOmoAgentSessions, sweepTmuxSessionsWith } from "./tmux-utils/stale-session-sweep"
++export { buildTmuxAttachCommand, buildTmuxPlaceholderCommand } from "./tmux-utils/pane-command"
+ 
+ export { applyLayout, enforceMainPaneWidth } from "./tmux-utils/layout"
+diff --git a/src/shared/tmux/tmux-utils/pane-activate.ts b/src/shared/tmux/tmux-utils/pane-activate.ts
+new file mode 100644
+index 00000000..cb2e7810
+--- /dev/null
++++ b/src/shared/tmux/tmux-utils/pane-activate.ts
+@@ -0,0 +1,33 @@
++import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
++import { log } from "../../logger"
++import { runTmuxCommand } from "../runner"
++import { isInsideTmux } from "./environment"
++import { buildTmuxAttachCommand } from "./pane-command"
++
++export async function activateTmuxPane(
++  paneId: string,
++  sessionId: string,
++  serverUrl: string,
++  directory: string,
++): Promise<boolean> {
++  if (!isInsideTmux()) {
++    log("[activateTmuxPane] SKIP: not inside tmux", { paneId, sessionId })
++    return false
++  }
++
++  const tmux = await getTmuxPath()
++  if (!tmux) {
++    log("[activateTmuxPane] SKIP: tmux not found", { paneId, sessionId })
++    return false
++  }
++
++  const opencodeCmd = buildTmuxAttachCommand(serverUrl, sessionId, directory)
++  const result = await runTmuxCommand(tmux, ["respawn-pane", "-k", "-t", paneId, opencodeCmd])
++  if (result.exitCode !== 0) {
++    log("[activateTmuxPane] FAILED", { paneId, sessionId, exitCode: result.exitCode, stderr: result.stderr.trim() })
++    return false
++  }
++
++  log("[activateTmuxPane] SUCCESS", { paneId, sessionId })
++  return true
++}
+diff --git a/src/shared/tmux/tmux-utils/pane-command.test.ts b/src/shared/tmux/tmux-utils/pane-command.test.ts
+new file mode 100644
+index 00000000..00c19201
+--- /dev/null
++++ b/src/shared/tmux/tmux-utils/pane-command.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "bun:test"
++import { buildTmuxAttachCommand, buildTmuxPlaceholderCommand } from "./pane-command"
++
++describe("buildTmuxAttachCommand", () => {
++  it("escapes serverUrl shell metacharacters", () => {
++    const cmd = buildTmuxAttachCommand("http://localhost:3000$(whoami);rm -rf /", "ses_abc123")
++    expect(cmd).toContain("\\$")
++    expect(cmd).toContain("\\;")
++    expect(cmd).not.toMatch(/[^\\];\s*rm/)
++  })
++
++  it("escapes session id shell metacharacters", () => {
++    const cmd = buildTmuxAttachCommand("http://localhost:3000", 'ses_abc"$(whoami)"')
++    expect(cmd).toContain('\\"')
++    expect(cmd).toContain("\\$")
++  })
++})
++
++describe("buildTmuxPlaceholderCommand", () => {
++  it("produces inert placeholder command instead of immediate attach", () => {
++    const cmd = buildTmuxPlaceholderCommand("My Task")
++    expect(cmd).toContain("Focus this pane to attach.")
++    expect(cmd).toContain("tail -f /dev/null")
++    expect(cmd).not.toContain("opencode attach")
++  })
++
++  it("keeps single quotes and percent signs inside safe printf arguments", () => {
++    const cmd = buildTmuxPlaceholderCommand("Fix Bob's 100% broken pane")
++    expect(cmd).toContain(`printf '%s\\n%s\\n'`)
++    expect(cmd).toContain(`"OMO subagent pane ready: Fix Bob's 100% broken pane"`)
++  })
++})
+diff --git a/src/shared/tmux/tmux-utils/pane-command.ts b/src/shared/tmux/tmux-utils/pane-command.ts
+new file mode 100644
+index 00000000..7de8efbb
+--- /dev/null
++++ b/src/shared/tmux/tmux-utils/pane-command.ts
+@@ -0,0 +1,15 @@
++import { shellEscapeForDoubleQuotedCommand } from "../../shell-env"
++
++const TMUX_COMMAND_SHELL = "/bin/sh"
++
++export function buildTmuxAttachCommand(serverUrl: string, sessionId: string, directory: string): string {
++  const escapedUrl = shellEscapeForDoubleQuotedCommand(serverUrl)
++  const escapedSessionId = shellEscapeForDoubleQuotedCommand(sessionId)
++  const escapedDirectory = shellEscapeForDoubleQuotedCommand(directory || process.cwd())
++  return `${TMUX_COMMAND_SHELL} -c "opencode attach ${escapedUrl} --session ${escapedSessionId} --dir ${escapedDirectory}"`
++}
++
++export function buildTmuxPlaceholderCommand(description: string): string {
++  const escapedDescription = shellEscapeForDoubleQuotedCommand(description)
++  return `${TMUX_COMMAND_SHELL} -c "printf '%s\\n%s\\n' \"OMO subagent pane ready: ${escapedDescription}\" \"Focus this pane to attach.\"; exec tail -f /dev/null"`
++}
+diff --git a/src/shared/tmux/tmux-utils/pane-replace.ts b/src/shared/tmux/tmux-utils/pane-replace.ts
+index 623de69a..c6213c98 100644
+--- a/src/shared/tmux/tmux-utils/pane-replace.ts
++++ b/src/shared/tmux/tmux-utils/pane-replace.ts
+@@ -3,7 +3,7 @@ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ import type { SpawnPaneResult } from "../types"
+ import type { runTmuxCommand as RunTmuxCommand } from "../runner"
+ import { isInsideTmux } from "./environment"
+-import { shellSingleQuote } from "../../shell-env"
++import { buildTmuxPlaceholderCommand } from "./pane-command"
+ 
+ type ReplaceTmuxPaneDeps = {
+ 	log: (message: string, data?: unknown) => void
+@@ -32,8 +32,8 @@ export async function replaceTmuxPane(
+ 	sessionId: string,
+ 	description: string,
+ 	config: TmuxConfig,
+-	serverUrl: string,
+-	directory: string,
++	_serverUrl: string,
++	_directory: string,
+ 	depsInput?: Partial<ReplaceTmuxPaneDeps>,
+ ): Promise<SpawnPaneResult> {
+ 	const deps = await resolveReplaceTmuxPaneDeps(depsInput)
+@@ -56,10 +56,9 @@ export async function replaceTmuxPane(
+ 	log("[replaceTmuxPane] sending Ctrl+C for graceful shutdown", { paneId })
+ 	await runTmuxCommand(tmux, ["send-keys", "-t", paneId, "C-c"])
+ 
+-	const effectiveDirectory = directory || process.cwd()
+-	const opencodeCmd = `opencode attach ${shellSingleQuote(serverUrl)} --session ${shellSingleQuote(sessionId)} --dir ${shellSingleQuote(effectiveDirectory)}`
++	const placeholderCmd = buildTmuxPlaceholderCommand(description)
+ 
+-	const result = await runTmuxCommand(tmux, ["respawn-pane", "-k", "-t", paneId, opencodeCmd])
++	const result = await runTmuxCommand(tmux, ["respawn-pane", "-k", "-t", paneId, placeholderCmd])
+ 
+ 	if (result.exitCode !== 0) {
+ 		log("[replaceTmuxPane] FAILED", { paneId, exitCode: result.exitCode, stderr: result.stderr.trim() })
+diff --git a/src/shared/tmux/tmux-utils/pane-spawn.ts b/src/shared/tmux/tmux-utils/pane-spawn.ts
+index 87e845a7..97fb8ec2 100644
+--- a/src/shared/tmux/tmux-utils/pane-spawn.ts
++++ b/src/shared/tmux/tmux-utils/pane-spawn.ts
+@@ -5,7 +5,7 @@ import type { runTmuxCommand as RunTmuxCommand } from "../runner"
+ import type { SplitDirection } from "./environment"
+ import { isInsideTmux } from "./environment"
+ import { isServerRunning } from "./server-health"
+-import { shellSingleQuote } from "../../shell-env"
++import { buildTmuxPlaceholderCommand } from "./pane-command"
+ 
+ type SpawnTmuxPaneDeps = {
+ 	log: (message: string, data?: unknown) => void
+@@ -36,7 +36,7 @@ export async function spawnTmuxPane(
+ 	description: string,
+ 	config: TmuxConfig,
+ 	serverUrl: string,
+-	directory: string,
++	_directory: string,
+ 	targetPaneId?: string,
+ 	splitDirection: SplitDirection = "-h",
+ 	depsInput?: Partial<SpawnTmuxPaneDeps>,
+@@ -76,8 +76,7 @@ export async function spawnTmuxPane(
+ 
+ 	log("[spawnTmuxPane] all checks passed, spawning...")
+ 
+-	const effectiveDirectory = directory || process.cwd()
+-	const opencodeCmd = `opencode attach ${shellSingleQuote(serverUrl)} --session ${shellSingleQuote(sessionId)} --dir ${shellSingleQuote(effectiveDirectory)}`
++	const placeholderCmd = buildTmuxPlaceholderCommand(description)
+ 
+ 	const args = [
+ 		"split-window",
+@@ -87,7 +86,7 @@ export async function spawnTmuxPane(
+ 		"-F",
+ 		"#{pane_id}",
+ 		...(targetPaneId ? ["-t", targetPaneId] : []),
+-		opencodeCmd,
++		placeholderCmd,
+ 	]
+ 
+ 	const result = await runTmuxCommand(tmux, args)
+-- 
+2.39.2
+

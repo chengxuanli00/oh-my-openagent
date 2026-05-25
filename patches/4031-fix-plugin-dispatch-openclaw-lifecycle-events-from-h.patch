@@ -1,0 +1,471 @@
+From 21ab1a647571627a9649571418eb8ebf32e3bdf5 Mon Sep 17 00:00:00 2001
+From: "GeonWoo Jeon (Jay)" <wjsrjsdn12@gmail.com>
+Date: Tue, 7 Apr 2026 22:49:37 +0900
+Subject: [PATCH 4031/5749] fix(plugin): dispatch openclaw lifecycle events
+ from handlers
+
+---
+ src/plugin/event.test.ts         |  90 +++++++++++++++++++-
+ src/plugin/event.ts              |  50 +++++++++++
+ src/plugin/tool-registry.test.ts | 140 +++++++++++++++++++++++++++++--
+ src/plugin/tool-registry.ts      |  13 +++
+ 4 files changed, 283 insertions(+), 10 deletions(-)
+
+diff --git a/src/plugin/event.test.ts b/src/plugin/event.test.ts
+index 2fc453dc..1d39b1ed 100644
+--- a/src/plugin/event.test.ts
++++ b/src/plugin/event.test.ts
+@@ -1,7 +1,8 @@
+-import { describe, it, expect, afterEach } from "bun:test"
++import { describe, it, expect, afterEach, mock, spyOn } from "bun:test"
+ 
+ import { createEventHandler } from "./event"
+ import { createChatMessageHandler } from "./chat-message"
++import * as openclawRuntimeDispatch from "../openclaw/runtime-dispatch"
+ import { _resetForTesting, setMainSession } from "../features/claude-code-session-state"
+ import { clearPendingModelFallback, createModelFallbackHook } from "../hooks/model-fallback/hook"
+ import { getSessionPromptParams, setSessionPromptParams } from "../shared/session-prompt-params-state"
+@@ -63,6 +64,7 @@ function createChatMessageHandlerHooks(
+ }
+ 
+ afterEach(() => {
++	mock.restore()
+ 	_resetForTesting()
+ })
+ 
+@@ -588,6 +590,54 @@ describe("createEventHandler - event forwarding", () => {
+ 		expect(createdSessions).toHaveLength(0)
+ 	})
+ 
++	it("dispatches OpenClaw after session.created using tracked pane metadata", async () => {
++		const openClawSpy = spyOn(openclawRuntimeDispatch, "dispatchOpenClawEvent").mockResolvedValue(null)
++		const eventHandler = createEventHandler({
++			ctx: asEventHandlerContext({ directory: "/tmp/project-created" }),
++			pluginConfig: asPluginConfig({
++				openclaw: { enabled: true, gateways: {}, hooks: {} },
++				tmux: {
++					enabled: true,
++					layout: "main-vertical",
++					main_pane_size: 60,
++					main_pane_min_width: 120,
++					agent_pane_min_width: 40,
++					isolation: "inline",
++				},
++			}),
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: createEventHandlerManagers({
++				skillMcpManager: { disconnectSession: async () => {} },
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++					getTrackedPaneId: (sessionID: string) => (sessionID === "ses_openclaw_created" ? "%9" : undefined),
++				},
++			}),
++			hooks: createEventHandlerHooks({}),
++		})
++
++		await eventHandler(asEventHandlerInput({
++			event: {
++				type: "session.created",
++				properties: { info: { id: "ses_openclaw_created", parentID: "ses_parent" } },
++			},
++		}))
++
++		const [call] = openClawSpy.mock.calls[0] ?? []
++		expect(call).toMatchObject({
++			rawEvent: "session.created",
++			context: {
++				sessionId: "ses_openclaw_created",
++				projectPath: "/tmp/project-created",
++				tmuxPaneId: "%9",
++			},
++		})
++	})
++
+ 	it("forwards session.deleted to write-existing-file-guard hook", async () => {
+ 		//#given
+ 		const forwardedEvents: EventInput[] = []
+@@ -647,6 +697,44 @@ describe("createEventHandler - event forwarding", () => {
+ 		expect(deletedSessions).toEqual([sessionID])
+ 	})
+ 
++	it("dispatches OpenClaw for synthetic session.idle events", async () => {
++		const openClawSpy = spyOn(openclawRuntimeDispatch, "dispatchOpenClawEvent").mockResolvedValue(null)
++		const eventHandler = createEventHandler({
++			ctx: asEventHandlerContext({ directory: "/tmp/project-idle" }),
++			pluginConfig: asPluginConfig({ openclaw: { enabled: true, gateways: {}, hooks: {} } }),
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: createEventHandlerManagers({
++				skillMcpManager: { disconnectSession: async () => {} },
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async () => {},
++					getTrackedPaneId: (sessionID: string) => (sessionID === "ses_openclaw_idle" ? "%3" : undefined),
++				},
++			}),
++			hooks: createEventHandlerHooks({}),
++		})
++
++		await eventHandler(asEventHandlerInput({
++			event: {
++				type: "session.status",
++				properties: { sessionID: "ses_openclaw_idle", status: { type: "idle" } },
++			},
++		}))
++
++		const [call] = openClawSpy.mock.calls[0] ?? []
++		expect(call).toMatchObject({
++			rawEvent: "session.idle",
++			context: {
++				sessionId: "ses_openclaw_idle",
++				projectPath: "/tmp/project-idle",
++				tmuxPaneId: "%3",
++			},
++		})
++	})
++
+ 	it("clears stored prompt params on session.deleted", async () => {
+ 		//#given
+ 		const eventHandler = createEventHandler({
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 0124fb8a..10c1da6d 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -33,6 +33,7 @@ import { clearSessionModel, getSessionModel, setSessionModel } from "../shared/s
+ import { clearSessionPromptParams } from "../shared/session-prompt-params-state";
+ import { deleteSessionTools } from "../shared/session-tools-store";
+ import { lspManager } from "../tools";
++import { dispatchOpenClawEvent } from "../openclaw/runtime-dispatch";
+ 
+ import type { CreatedHooks } from "../create-hooks";
+ import type { Managers } from "../create-managers";
+@@ -341,6 +342,17 @@ export function createEventHandler(args: {
+       }
+       recentSyntheticIdles.set(sessionID, Date.now());
+       await dispatchToHooks(syntheticIdle as EventInput);
++      if (pluginConfig.openclaw) {
++        await dispatchOpenClawEvent({
++          config: pluginConfig.openclaw,
++          rawEvent: "session.idle",
++          context: {
++            sessionId: sessionID,
++            projectPath: pluginContext.directory,
++            tmuxPaneId: managers.tmuxSessionManager.getTrackedPaneId?.(sessionID) ?? process.env.TMUX_PANE,
++          },
++        });
++      }
+     }
+ 
+     const { event } = input;
+@@ -369,6 +381,18 @@ export function createEventHandler(args: {
+           },
+         );
+       }
++
++      if (pluginConfig.openclaw && sessionInfo?.id) {
++        await dispatchOpenClawEvent({
++          config: pluginConfig.openclaw,
++          rawEvent: event.type,
++          context: {
++            sessionId: sessionInfo.id,
++            projectPath: pluginContext.directory,
++            tmuxPaneId: managers.tmuxSessionManager.getTrackedPaneId?.(sessionInfo.id) ?? process.env.TMUX_PANE,
++          },
++        });
++      }
+     }
+ 
+     if (event.type === "session.deleted") {
+@@ -392,6 +416,17 @@ export function createEventHandler(args: {
+         clearSessionModel(sessionInfo.id);
+         clearSessionPromptParams(sessionInfo.id);
+         syncSubagentSessions.delete(sessionInfo.id);
++        if (pluginConfig.openclaw) {
++          await dispatchOpenClawEvent({
++            config: pluginConfig.openclaw,
++            rawEvent: event.type,
++            context: {
++              sessionId: sessionInfo.id,
++              projectPath: pluginContext.directory,
++              tmuxPaneId: managers.tmuxSessionManager.getTrackedPaneId?.(sessionInfo.id) ?? process.env.TMUX_PANE,
++            },
++          });
++        }
+         if (wasSyncSubagentSession) {
+           subagentSessions.delete(sessionInfo.id);
+         }
+@@ -412,6 +447,21 @@ export function createEventHandler(args: {
+       restoreBackgroundOutputConsumption(sessionID, messageID);
+     }
+ 
++    if (event.type === "session.idle" && pluginConfig.openclaw) {
++      const sessionID = props?.sessionID as string | undefined;
++      if (sessionID) {
++        await dispatchOpenClawEvent({
++          config: pluginConfig.openclaw,
++          rawEvent: event.type,
++          context: {
++            sessionId: sessionID,
++            projectPath: pluginContext.directory,
++            tmuxPaneId: managers.tmuxSessionManager.getTrackedPaneId?.(sessionID) ?? process.env.TMUX_PANE,
++          },
++        });
++      }
++    }
++
+     if (event.type === "message.updated") {
+       const info = props?.info as Record<string, unknown> | undefined;
+       const sessionID = info?.sessionID as string | undefined;
+diff --git a/src/plugin/tool-registry.test.ts b/src/plugin/tool-registry.test.ts
+index 07588b0c..4c52b5b7 100644
+--- a/src/plugin/tool-registry.test.ts
++++ b/src/plugin/tool-registry.test.ts
+@@ -1,8 +1,9 @@
+-import { describe, expect, test } from "bun:test"
++import { describe, expect, mock, spyOn, test } from "bun:test"
+ import { tool } from "@opencode-ai/plugin"
+ 
++import type { OhMyOpenCodeConfig } from "../config"
++import * as openclawRuntimeDispatch from "../openclaw/runtime-dispatch"
+ import type { ToolsRecord } from "./types"
+-import { createToolRegistry, trimToolsToCap } from "./tool-registry"
+ 
+ const fakeTool = tool({
+   description: "test tool",
+@@ -12,6 +13,58 @@ const fakeTool = tool({
+   },
+ })
+ 
++const delegateTaskTool = tool({
++  description: "task tool",
++  args: {},
++  async execute(): Promise<string> {
++    return "ok"
++  },
++})
++
++const syncSessionCreatedCallbacks: Array<
++  ((event: { sessionID: string; parentID: string; title: string }) => Promise<void>) | undefined
++> = []
++
++mock.module("../tools", () => ({
++  builtinTools: { bash: fakeTool, read: fakeTool },
++  createBackgroundTools: mock(() => ({})),
++  createCallOmoAgent: mock(() => fakeTool),
++  createLookAt: mock(() => fakeTool),
++  createSkillMcpTool: mock(() => fakeTool),
++  createSkillTool: mock(() => fakeTool),
++  createGrepTools: mock(() => ({})),
++  createGlobTools: mock(() => ({})),
++  createAstGrepTools: mock(() => ({})),
++  createSessionManagerTools: mock(() => ({})),
++  createDelegateTask: mock((options: { onSyncSessionCreated?: typeof syncSessionCreatedCallbacks[number] }) => {
++    syncSessionCreatedCallbacks.push(options.onSyncSessionCreated)
++    return delegateTaskTool
++  }),
++  discoverCommandsSync: mock(() => []),
++  interactive_bash: fakeTool,
++  createTaskCreateTool: mock(() => fakeTool),
++  createTaskGetTool: mock(() => fakeTool),
++  createTaskList: mock(() => fakeTool),
++  createTaskUpdateTool: mock(() => fakeTool),
++  createHashlineEditTool: mock(() => fakeTool),
++}))
++
++const trackedPaneBySession = new Map<string, string>()
++
++const { createToolRegistry, trimToolsToCap } = await import("./tool-registry")
++const dispatchOpenClawEvent = spyOn(openclawRuntimeDispatch, "dispatchOpenClawEvent")
++
++function createPluginConfig(overrides: Partial<OhMyOpenCodeConfig> = {}): OhMyOpenCodeConfig {
++  return {
++    git_master: {
++      commit_footer: false,
++      include_co_authored_by: false,
++      git_env_prefix: "",
++    },
++    ...overrides,
++  }
++}
++
+ describe("#given tool trimming prioritization", () => {
+   test("#when max_tools trims a hashline edit registration named edit #then edit is removed before higher-priority tools", () => {
+     const filteredTools = {
+@@ -30,9 +83,11 @@ describe("#given tool trimming prioritization", () => {
+ 
+ describe("#given task_system configuration", () => {
+   test("#when task_system is omitted #then task tools are not registered by default", () => {
++    syncSessionCreatedCallbacks.length = 0
++
+     const result = createToolRegistry({
+       ctx: { directory: "/tmp" } as Parameters<typeof createToolRegistry>[0]["ctx"],
+-      pluginConfig: {},
++      pluginConfig: createPluginConfig(),
+       managers: {
+         backgroundManager: {},
+         tmuxSessionManager: {},
+@@ -55,11 +110,13 @@ describe("#given task_system configuration", () => {
+   })
+ 
+   test("#when task_system is enabled #then task tools are registered", () => {
++    syncSessionCreatedCallbacks.length = 0
++
+     const result = createToolRegistry({
+       ctx: { directory: "/tmp" } as Parameters<typeof createToolRegistry>[0]["ctx"],
+-      pluginConfig: {
++      pluginConfig: createPluginConfig({
+         experimental: { task_system: true },
+-      },
++      }),
+       managers: {
+         backgroundManager: {},
+         tmuxSessionManager: {},
+@@ -84,9 +141,11 @@ describe("#given task_system configuration", () => {
+ 
+ describe("#given tmux integration is disabled", () => {
+   test("#when system tmux is available #then interactive_bash remains registered", () => {
++    syncSessionCreatedCallbacks.length = 0
++
+     const result = createToolRegistry({
+       ctx: { directory: "/tmp" } as Parameters<typeof createToolRegistry>[0]["ctx"],
+-      pluginConfig: {
++      pluginConfig: createPluginConfig({
+         tmux: {
+           enabled: false,
+           layout: "main-vertical",
+@@ -95,7 +154,7 @@ describe("#given tmux integration is disabled", () => {
+           agent_pane_min_width: 40,
+           isolation: "inline",
+         },
+-      },
++      }),
+       managers: {
+         backgroundManager: {},
+         tmuxSessionManager: {},
+@@ -115,9 +174,11 @@ describe("#given tmux integration is disabled", () => {
+   })
+ 
+   test("#when system tmux is unavailable #then interactive_bash is not registered", () => {
++    syncSessionCreatedCallbacks.length = 0
++
+     const result = createToolRegistry({
+       ctx: { directory: "/tmp" } as Parameters<typeof createToolRegistry>[0]["ctx"],
+-      pluginConfig: {
++      pluginConfig: createPluginConfig({
+         tmux: {
+           enabled: false,
+           layout: "main-vertical",
+@@ -126,7 +187,7 @@ describe("#given tmux integration is disabled", () => {
+           agent_pane_min_width: 40,
+           isolation: "inline",
+         },
+-      },
++      }),
+       managers: {
+         backgroundManager: {},
+         tmuxSessionManager: {},
+@@ -145,3 +206,64 @@ describe("#given tmux integration is disabled", () => {
+     expect(result.filteredTools).not.toHaveProperty("interactive_bash")
+   })
+ })
++
++describe("#given openclaw is enabled for sync task sessions", () => {
++  test("#when the sync session-created callback runs #then it dispatches openclaw with the tracked pane id", async () => {
++    syncSessionCreatedCallbacks.length = 0
++    dispatchOpenClawEvent.mockReset()
++    trackedPaneBySession.clear()
++
++    const tmuxSessionManager = {
++      async onSessionCreated(event: { properties?: { info?: { id?: string } } }): Promise<void> {
++        const sessionID = event.properties?.info?.id
++        if (sessionID) {
++          trackedPaneBySession.set(sessionID, `%pane-${sessionID}`)
++        }
++      },
++      getTrackedPaneId(sessionID: string): string | undefined {
++        return trackedPaneBySession.get(sessionID)
++      },
++    }
++
++    const openclawConfig = {
++      enabled: true,
++      gateways: {},
++      hooks: {},
++    }
++
++    createToolRegistry({
++      ctx: { directory: "/tmp/project" } as Parameters<typeof createToolRegistry>[0]["ctx"],
++      pluginConfig: createPluginConfig({ openclaw: openclawConfig }),
++      managers: {
++        backgroundManager: {},
++        tmuxSessionManager,
++        skillMcpManager: {},
++      } as Parameters<typeof createToolRegistry>[0]["managers"],
++      skillContext: {
++        mergedSkills: [],
++        availableSkills: [],
++        browserProvider: "playwright",
++        disabledSkills: new Set(),
++      },
++      availableCategories: [],
++    })
++
++    const onSyncSessionCreated = syncSessionCreatedCallbacks[syncSessionCreatedCallbacks.length - 1]
++    await onSyncSessionCreated?.({
++      sessionID: "ses-sync-1",
++      parentID: "ses-parent",
++      title: "sync task",
++    })
++
++    expect(dispatchOpenClawEvent).toHaveBeenCalledTimes(1)
++    expect(dispatchOpenClawEvent).toHaveBeenCalledWith({
++      config: openclawConfig,
++      rawEvent: "session.created",
++      context: {
++        sessionId: "ses-sync-1",
++        projectPath: "/tmp/project",
++        tmuxPaneId: "%pane-ses-sync-1",
++      },
++    })
++  })
++})
+diff --git a/src/plugin/tool-registry.ts b/src/plugin/tool-registry.ts
+index ed99f7c2..98bd4c9a 100644
+--- a/src/plugin/tool-registry.ts
++++ b/src/plugin/tool-registry.ts
+@@ -6,6 +6,7 @@ import type {
+ } from "../agents/dynamic-agent-prompt-builder"
+ import type { OhMyOpenCodeConfig } from "../config"
+ import { isInteractiveBashEnabled } from "../create-runtime-tmux-config"
++import * as openclawRuntimeDispatch from "../openclaw/runtime-dispatch"
+ import type { PluginContext, ToolsRecord } from "./types"
+ 
+ import {
+@@ -158,6 +159,18 @@ export function createToolRegistry(args: {
+           },
+         },
+       })
++
++      if (pluginConfig.openclaw) {
++        await openclawRuntimeDispatch.dispatchOpenClawEvent({
++          config: pluginConfig.openclaw,
++          rawEvent: "session.created",
++          context: {
++            sessionId: event.sessionID,
++            projectPath: ctx.directory,
++            tmuxPaneId: managers.tmuxSessionManager.getTrackedPaneId?.(event.sessionID) ?? process.env.TMUX_PANE,
++          },
++        })
++      }
+     },
+   })
+ 
+-- 
+2.39.2
+

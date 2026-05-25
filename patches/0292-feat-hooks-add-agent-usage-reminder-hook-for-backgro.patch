@@ -1,0 +1,341 @@
+From 2c6dfeadce1dca287764c886f79ac488bc900552 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 13 Dec 2025 21:42:05 +0900
+Subject: [PATCH 0292/5749] feat(hooks): add agent-usage-reminder hook for
+ background agent recommendations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements hook that tracks whether explore/librarian agents have been used in a session.
+When target tools (Grep, Glob, WebFetch, context7, websearch_exa, grep_app) are called
+without prior agent usage, appends reminder message recommending parallel background_task calls.
+
+State persists across tool calls and resets on session compaction, allowing fresh reminders
+after context compaction - similar to directory-readme-injector pattern.
+
+Files:
+- src/hooks/agent-usage-reminder/: New hook implementation
+  - types.ts: AgentUsageState interface
+  - constants.ts: TARGET_TOOLS, AGENT_TOOLS, REMINDER_MESSAGE
+  - storage.ts: File-based state persistence with compaction handling
+  - index.ts: Hook implementation with tool.execute.after and event handlers
+- src/config/schema.ts: Add 'agent-usage-reminder' to HookNameSchema
+- src/hooks/index.ts: Export createAgentUsageReminderHook
+- src/index.ts: Instantiate and register hook handlers
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/config/schema.ts                        |   1 +
+ src/hooks/agent-usage-reminder/constants.ts |  52 +++++++++
+ src/hooks/agent-usage-reminder/index.ts     | 114 ++++++++++++++++++++
+ src/hooks/agent-usage-reminder/storage.ts   |  42 ++++++++
+ src/hooks/agent-usage-reminder/types.ts     |   6 ++
+ src/hooks/index.ts                          |   1 +
+ src/index.ts                                |   6 ++
+ 7 files changed, 222 insertions(+)
+ create mode 100644 src/hooks/agent-usage-reminder/constants.ts
+ create mode 100644 src/hooks/agent-usage-reminder/index.ts
+ create mode 100644 src/hooks/agent-usage-reminder/storage.ts
+ create mode 100644 src/hooks/agent-usage-reminder/types.ts
+
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index d823181f..883770b0 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -41,6 +41,7 @@ export const HookNameSchema = z.enum([
+   "background-notification",
+   "auto-update-checker",
+   "ultrawork-mode",
++  "agent-usage-reminder",
+ ])
+ 
+ export const AgentOverrideConfigSchema = z.object({
+diff --git a/src/hooks/agent-usage-reminder/constants.ts b/src/hooks/agent-usage-reminder/constants.ts
+new file mode 100644
+index 00000000..904914ad
+--- /dev/null
++++ b/src/hooks/agent-usage-reminder/constants.ts
+@@ -0,0 +1,52 @@
++import { join } from "node:path";
++import { xdgData } from "xdg-basedir";
++
++export const OPENCODE_STORAGE = join(xdgData ?? "", "opencode", "storage");
++export const AGENT_USAGE_REMINDER_STORAGE = join(
++  OPENCODE_STORAGE,
++  "agent-usage-reminder",
++);
++
++export const TARGET_TOOLS = [
++  "Grep",
++  "safe_grep",
++  "Glob",
++  "safe_glob",
++  "WebFetch",
++  "context7_resolve-library-id",
++  "context7_get-library-docs",
++  "websearch_exa_web_search_exa",
++  "grep_app_searchGitHub",
++] as const;
++
++export const AGENT_TOOLS = [
++  "Task",
++  "call_omo_agent",
++  "background_task",
++] as const;
++
++export const REMINDER_MESSAGE = `
++[Agent Usage Reminder]
++
++You called a search/fetch tool directly without leveraging specialized agents.
++
++RECOMMENDED: Use background_task with explore/librarian agents for better results:
++
++\`\`\`
++// Parallel exploration - fire multiple agents simultaneously
++background_task(agent="explore", prompt="Find all files matching pattern X")
++background_task(agent="explore", prompt="Search for implementation of Y") 
++background_task(agent="librarian", prompt="Lookup documentation for Z")
++
++// Then continue your work while they run in background
++// System will notify you when each completes
++\`\`\`
++
++WHY:
++- Agents can perform deeper, more thorough searches
++- Background tasks run in parallel, saving time
++- Specialized agents have domain expertise
++- Reduces context window usage in main session
++
++ALWAYS prefer: Multiple parallel background_task calls > Direct tool calls
++`;
+diff --git a/src/hooks/agent-usage-reminder/index.ts b/src/hooks/agent-usage-reminder/index.ts
+new file mode 100644
+index 00000000..97284ca4
+--- /dev/null
++++ b/src/hooks/agent-usage-reminder/index.ts
+@@ -0,0 +1,114 @@
++import type { PluginInput } from "@opencode-ai/plugin";
++import {
++  loadAgentUsageState,
++  saveAgentUsageState,
++  clearAgentUsageState,
++} from "./storage";
++import { TARGET_TOOLS, AGENT_TOOLS, REMINDER_MESSAGE } from "./constants";
++import type { AgentUsageState } from "./types";
++
++interface ToolExecuteInput {
++  tool: string;
++  sessionID: string;
++  callID: string;
++  parentSessionID?: string;
++}
++
++interface ToolExecuteOutput {
++  title: string;
++  output: string;
++  metadata: unknown;
++}
++
++interface EventInput {
++  event: {
++    type: string;
++    properties?: unknown;
++  };
++}
++
++export function createAgentUsageReminderHook(_ctx: PluginInput) {
++  const sessionStates = new Map<string, AgentUsageState>();
++
++  function getOrCreateState(sessionID: string): AgentUsageState {
++    if (!sessionStates.has(sessionID)) {
++      const persisted = loadAgentUsageState(sessionID);
++      const state: AgentUsageState = persisted ?? {
++        sessionID,
++        agentUsed: false,
++        reminderCount: 0,
++        updatedAt: Date.now(),
++      };
++      sessionStates.set(sessionID, state);
++    }
++    return sessionStates.get(sessionID)!;
++  }
++
++  function markAgentUsed(sessionID: string): void {
++    const state = getOrCreateState(sessionID);
++    state.agentUsed = true;
++    state.updatedAt = Date.now();
++    saveAgentUsageState(state);
++  }
++
++  function resetState(sessionID: string): void {
++    sessionStates.delete(sessionID);
++    clearAgentUsageState(sessionID);
++  }
++
++  const toolExecuteAfter = async (
++    input: ToolExecuteInput,
++    output: ToolExecuteOutput,
++  ) => {
++    const { tool, sessionID, parentSessionID } = input;
++
++    // Only run in root sessions (no parent = main session)
++    if (parentSessionID) {
++      return;
++    }
++
++    if ((AGENT_TOOLS as readonly string[]).includes(tool)) {
++      markAgentUsed(sessionID);
++      return;
++    }
++
++    if (!(TARGET_TOOLS as readonly string[]).includes(tool)) {
++      return;
++    }
++
++    const state = getOrCreateState(sessionID);
++
++    if (state.agentUsed) {
++      return;
++    }
++
++    output.output += REMINDER_MESSAGE;
++    state.reminderCount++;
++    state.updatedAt = Date.now();
++    saveAgentUsageState(state);
++  };
++
++  const eventHandler = async ({ event }: EventInput) => {
++    const props = event.properties as Record<string, unknown> | undefined;
++
++    if (event.type === "session.deleted") {
++      const sessionInfo = props?.info as { id?: string } | undefined;
++      if (sessionInfo?.id) {
++        resetState(sessionInfo.id);
++      }
++    }
++
++    if (event.type === "session.compacted") {
++      const sessionID = (props?.sessionID ??
++        (props?.info as { id?: string } | undefined)?.id) as string | undefined;
++      if (sessionID) {
++        resetState(sessionID);
++      }
++    }
++  };
++
++  return {
++    "tool.execute.after": toolExecuteAfter,
++    event: eventHandler,
++  };
++}
+diff --git a/src/hooks/agent-usage-reminder/storage.ts b/src/hooks/agent-usage-reminder/storage.ts
+new file mode 100644
+index 00000000..d6b86d3e
+--- /dev/null
++++ b/src/hooks/agent-usage-reminder/storage.ts
+@@ -0,0 +1,42 @@
++import {
++  existsSync,
++  mkdirSync,
++  readFileSync,
++  writeFileSync,
++  unlinkSync,
++} from "node:fs";
++import { join } from "node:path";
++import { AGENT_USAGE_REMINDER_STORAGE } from "./constants";
++import type { AgentUsageState } from "./types";
++
++function getStoragePath(sessionID: string): string {
++  return join(AGENT_USAGE_REMINDER_STORAGE, `${sessionID}.json`);
++}
++
++export function loadAgentUsageState(sessionID: string): AgentUsageState | null {
++  const filePath = getStoragePath(sessionID);
++  if (!existsSync(filePath)) return null;
++
++  try {
++    const content = readFileSync(filePath, "utf-8");
++    return JSON.parse(content) as AgentUsageState;
++  } catch {
++    return null;
++  }
++}
++
++export function saveAgentUsageState(state: AgentUsageState): void {
++  if (!existsSync(AGENT_USAGE_REMINDER_STORAGE)) {
++    mkdirSync(AGENT_USAGE_REMINDER_STORAGE, { recursive: true });
++  }
++
++  const filePath = getStoragePath(state.sessionID);
++  writeFileSync(filePath, JSON.stringify(state, null, 2));
++}
++
++export function clearAgentUsageState(sessionID: string): void {
++  const filePath = getStoragePath(sessionID);
++  if (existsSync(filePath)) {
++    unlinkSync(filePath);
++  }
++}
+diff --git a/src/hooks/agent-usage-reminder/types.ts b/src/hooks/agent-usage-reminder/types.ts
+new file mode 100644
+index 00000000..ffbd8f0c
+--- /dev/null
++++ b/src/hooks/agent-usage-reminder/types.ts
+@@ -0,0 +1,6 @@
++export interface AgentUsageState {
++  sessionID: string;
++  agentUsed: boolean;
++  reminderCount: number;
++  updatedAt: number;
++}
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 12666d72..ea1f607a 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -14,3 +14,4 @@ export { createRulesInjectorHook } from "./rules-injector";
+ export { createBackgroundNotificationHook } from "./background-notification"
+ export { createAutoUpdateCheckerHook } from "./auto-update-checker";
+ export { createUltraworkModeHook } from "./ultrawork-mode";
++export { createAgentUsageReminderHook } from "./agent-usage-reminder";
+diff --git a/src/index.ts b/src/index.ts
+index 502e69e1..3e529802 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -17,6 +17,7 @@ import {
+   createBackgroundNotificationHook,
+   createAutoUpdateCheckerHook,
+   createUltraworkModeHook,
++  createAgentUsageReminderHook,
+ } from "./hooks";
+ import { createGoogleAntigravityAuthPlugin } from "./auth/antigravity";
+ import {
+@@ -207,6 +208,9 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const ultraworkMode = isHookEnabled("ultrawork-mode")
+     ? createUltraworkModeHook()
+     : null;
++  const agentUsageReminder = isHookEnabled("agent-usage-reminder")
++    ? createAgentUsageReminderHook(ctx)
++    : null;
+ 
+   updateTerminalTitle({ sessionId: "main" });
+ 
+@@ -320,6 +324,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       await thinkMode?.event(input);
+       await anthropicAutoCompact?.event(input);
+       await ultraworkMode?.event(input);
++      await agentUsageReminder?.event(input);
+ 
+       const { event } = input;
+       const props = event.properties as Record<string, unknown> | undefined;
+@@ -439,6 +444,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       await directoryReadmeInjector?.["tool.execute.after"](input, output);
+       await rulesInjector?.["tool.execute.after"](input, output);
+       await emptyTaskResponseDetector?.["tool.execute.after"](input, output);
++      await agentUsageReminder?.["tool.execute.after"](input, output);
+ 
+       if (input.sessionID === getMainSessionID()) {
+         updateTerminalTitle({
+-- 
+2.39.2
+

@@ -1,0 +1,559 @@
+From e1554c088e2ed82ee41bf76888f367006897e134 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 18 May 2026 13:56:18 +0900
+Subject: [PATCH 5432/5749] fix(ralph-loop): preserve prompt dispatch holds
+ through activity
+
+---
+ src/hooks/ralph-loop/completion-handler.ts    |   4 +
+ src/hooks/ralph-loop/index.test.ts            | 190 ++++++++++------
+ .../non-abort-error-continuation.test.ts      | 215 +++++++++++++-----
+ .../ralph-loop/ralph-loop-event-handler.ts    |   4 -
+ 4 files changed, 280 insertions(+), 133 deletions(-)
+
+diff --git a/src/hooks/ralph-loop/completion-handler.ts b/src/hooks/ralph-loop/completion-handler.ts
+index e7bbb9ae..9272c0b6 100644
+--- a/src/hooks/ralph-loop/completion-handler.ts
++++ b/src/hooks/ralph-loop/completion-handler.ts
+@@ -4,6 +4,7 @@ import { buildContinuationPrompt } from "./continuation-prompt-builder"
+ import { HOOK_NAME } from "./constants"
+ import { injectContinuationPrompt } from "./continuation-prompt-injector"
+ import type { RalphLoopState } from "./types"
++import { releasePromptAsyncReservation } from "../shared/prompt-async-gate"
+ 
+ type LoopStateController = {
+ 	clear: () => boolean
+@@ -45,6 +46,9 @@ export async function handleDetectedCompletion(
+ 			return
+ 		}
+ 
++		releasePromptAsyncReservation(sessionID, "ralph-loop:completion-detected", {
++			reservedBy: HOOK_NAME,
++		})
+ 		const promptResult = await injectContinuationPrompt(ctx, {
+ 			sessionID,
+ 			prompt: buildContinuationPrompt(verificationState),
+diff --git a/src/hooks/ralph-loop/index.test.ts b/src/hooks/ralph-loop/index.test.ts
+index 98856f0d..b849eb80 100644
+--- a/src/hooks/ralph-loop/index.test.ts
++++ b/src/hooks/ralph-loop/index.test.ts
+@@ -7,6 +7,7 @@ import { createRalphLoopHook } from "./index"
+ import { readState, writeState, clearState } from "./storage"
+ import type { RalphLoopState } from "./types"
+ import { parseRalphLoopArguments } from "./command-arguments"
++import { DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS } from "../shared/prompt-async-gate"
+ 
+ describe("ralph-loop", () => {
+   const TEST_DIR = join(tmpdir(), "ralph-loop-test-" + Date.now())
+@@ -331,33 +332,41 @@ describe("ralph-loop", () => {
+ 
+     test("#given new activity after an idle continuation #when session idles again #then next iteration can continue", async () => {
+       // given
++      const originalDateNow = Date.now
++      let currentNow = originalDateNow()
++      Date.now = () => currentNow
+       const hook = createRalphLoopHook(createMockPluginInput(), { idleSettleMs: 0 })
+-      hook.startLoop("session-123", "Build a feature", { maxIterations: 10 })
++      try {
++        hook.startLoop("session-123", "Build a feature", { maxIterations: 10 })
+ 
+-      await hook.event({
+-        event: {
+-          type: "session.idle",
+-          properties: { sessionID: "session-123" },
+-        },
+-      })
++        await hook.event({
++          event: {
++            type: "session.idle",
++            properties: { sessionID: "session-123" },
++          },
++        })
+ 
+-      // when
+-      await hook.event({
+-        event: {
+-          type: "message.part.updated",
+-          properties: { sessionID: "session-123" },
+-        },
+-      })
+-      await hook.event({
+-        event: {
+-          type: "session.idle",
+-          properties: { sessionID: "session-123" },
+-        },
+-      })
++        // when
++        await hook.event({
++          event: {
++            type: "message.part.updated",
++            properties: { sessionID: "session-123" },
++          },
++        })
++        currentNow += DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS + 1
++        await hook.event({
++          event: {
++            type: "session.idle",
++            properties: { sessionID: "session-123" },
++          },
++        })
+ 
+-      // then
+-      expect(promptCalls.length).toBe(2)
+-      expect(hook.getState()?.iteration).toBe(3)
++        // then
++        expect(promptCalls.length).toBe(2)
++        expect(hook.getState()?.iteration).toBe(3)
++      } finally {
++        Date.now = originalDateNow
++      }
+     })
+ 
+     test("should inject continuation when idle event carries session id in info", async () => {
+@@ -889,25 +898,62 @@ describe("ralph-loop", () => {
+       expect(promptCalls.length).toBe(1)
+     })
+ 
++    test("#given assistant activity follows an idle continuation #when stale idle arrives before dispatch hold expires #then no duplicate prompt is sent", async () => {
++      // given - active loop with deterministic dispatch hold time
++      const originalDateNow = Date.now
++      let currentNow = originalDateNow()
++      Date.now = () => currentNow
++      const hook = createRalphLoopHook(createMockPluginInput(), { idleSettleMs: 0 })
++      hook.startLoop("session-123", "Build feature", { maxIterations: 5 })
++
++      try {
++        await hook.event({
++          event: { type: "session.idle", properties: { sessionID: "session-123" } },
++        })
++
++        // when - assistant activity arrives, followed by an immediate stale idle
++        await hook.event({
++          event: { type: "message.part.updated", properties: { sessionID: "session-123" } },
++        })
++        await hook.event({
++          event: { type: "session.idle", properties: { sessionID: "session-123" } },
++        })
++
++        // then - activity did not release the prompt gate reservation
++        expect(hook.getState()?.iteration).toBe(2)
++        expect(promptCalls.length).toBe(1)
++      } finally {
++        Date.now = originalDateNow
++      }
++    })
++
+     test("should handle multiple iterations correctly", async () => {
+       // given - active loop
++      const originalDateNow = Date.now
++      let currentNow = originalDateNow()
++      Date.now = () => currentNow
+       const hook = createRalphLoopHook(createMockPluginInput())
+       hook.startLoop("session-123", "Build feature", { maxIterations: 5 })
+ 
+-      // when - multiple idle events
+-      await hook.event({
+-        event: { type: "session.idle", properties: { sessionID: "session-123" } },
+-      })
+-      await hook.event({
+-        event: { type: "message.part.updated", properties: { sessionID: "session-123" } },
+-      })
+-      await hook.event({
+-        event: { type: "session.idle", properties: { sessionID: "session-123" } },
+-      })
++      try {
++        // when - multiple idle events separated by the dispatch hold expiring
++        await hook.event({
++          event: { type: "session.idle", properties: { sessionID: "session-123" } },
++        })
++        await hook.event({
++          event: { type: "message.part.updated", properties: { sessionID: "session-123" } },
++        })
++        currentNow += DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS + 1
++        await hook.event({
++          event: { type: "session.idle", properties: { sessionID: "session-123" } },
++        })
+ 
+-      // then - iteration incremented correctly
+-      expect(hook.getState()?.iteration).toBe(3)
+-      expect(promptCalls.length).toBe(2)
++        // then - iteration incremented correctly
++        expect(hook.getState()?.iteration).toBe(3)
++        expect(promptCalls.length).toBe(2)
++      } finally {
++        Date.now = originalDateNow
++      }
+     })
+ 
+     test("should include prompt and promise in continuation message", async () => {
+@@ -1141,41 +1187,49 @@ describe("ralph-loop", () => {
+ 
+     test("should allow starting new loop in same session (restart)", async () => {
+       // given - active loop in session A at iteration 5
++      const originalDateNow = Date.now
++      let currentNow = originalDateNow()
++      Date.now = () => currentNow
+       const hook = createRalphLoopHook(createMockPluginInput())
+-      hook.startLoop("session-A", "First task", { maxIterations: 10 })
++      try {
++        hook.startLoop("session-A", "First task", { maxIterations: 10 })
+       
+-      // Simulate some iterations
+-      await hook.event({
+-        event: { type: "session.idle", properties: { sessionID: "session-A" } },
+-      })
+-      await hook.event({
+-        event: { type: "message.part.updated", properties: { sessionID: "session-A" } },
+-      })
+-      await hook.event({
+-        event: { type: "session.idle", properties: { sessionID: "session-A" } },
+-      })
+-      expect(hook.getState()?.iteration).toBe(3)
+-      expect(promptCalls.length).toBe(2)
+-
+-      // when - start NEW loop in same session (restart)
+-      hook.startLoop("session-A", "Restarted task", { maxIterations: 50 })
+-
+-      // then - state should be reset to iteration 1 with new prompt
+-      expect(hook.getState()?.session_id).toBe("session-A")
+-      expect(hook.getState()?.prompt).toBe("Restarted task")
+-      expect(hook.getState()?.max_iterations).toBe(50)
+-      expect(hook.getState()?.iteration).toBe(1)
+-
+-      // when - session goes idle
+-      promptCalls = [] // Reset to check new continuation
+-      await hook.event({
+-        event: { type: "session.idle", properties: { sessionID: "session-A" } },
+-      })
++        // Simulate some iterations
++        await hook.event({
++          event: { type: "session.idle", properties: { sessionID: "session-A" } },
++        })
++        await hook.event({
++          event: { type: "message.part.updated", properties: { sessionID: "session-A" } },
++        })
++        currentNow += DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS + 1
++        await hook.event({
++          event: { type: "session.idle", properties: { sessionID: "session-A" } },
++        })
++        expect(hook.getState()?.iteration).toBe(3)
++        expect(promptCalls.length).toBe(2)
++
++        // when - start NEW loop in same session (restart)
++        hook.startLoop("session-A", "Restarted task", { maxIterations: 50 })
++
++        // then - state should be reset to iteration 1 with new prompt
++        expect(hook.getState()?.session_id).toBe("session-A")
++        expect(hook.getState()?.prompt).toBe("Restarted task")
++        expect(hook.getState()?.max_iterations).toBe(50)
++        expect(hook.getState()?.iteration).toBe(1)
++
++        // when - session goes idle
++        promptCalls = [] // Reset to check new continuation
++        await hook.event({
++          event: { type: "session.idle", properties: { sessionID: "session-A" } },
++        })
+ 
+-      // then - continuation should use new task
+-      expect(promptCalls.length).toBe(1)
+-      expect(promptCalls[0].text).toContain("Restarted task")
+-      expect(promptCalls[0].text).toContain("2/50")
++        // then - continuation should use new task
++        expect(promptCalls.length).toBe(1)
++        expect(promptCalls[0].text).toContain("Restarted task")
++        expect(promptCalls[0].text).toContain("2/50")
++      } finally {
++        Date.now = originalDateNow
++      }
+     })
+ 
+     test("should NOT detect completion from user message in transcript (issue #622)", async () => {
+diff --git a/src/hooks/ralph-loop/non-abort-error-continuation.test.ts b/src/hooks/ralph-loop/non-abort-error-continuation.test.ts
+index 66c51f96..c0b3a63d 100644
+--- a/src/hooks/ralph-loop/non-abort-error-continuation.test.ts
++++ b/src/hooks/ralph-loop/non-abort-error-continuation.test.ts
+@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ import { createRalphLoopHook } from "./index"
+ import { clearState } from "./storage"
++import { DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS } from "../shared/prompt-async-gate"
+ 
+ describe("ralph-loop non-abort error continuation", () => {
+ 	const testDirectory = join(tmpdir(), `ralph-loop-non-abort-error-${Date.now()}`)
+@@ -144,8 +145,11 @@ describe("ralph-loop non-abort error continuation", () => {
+ 		expect(hook.getState()?.iteration).toBe(2)
+ 	})
+ 
+-	test("continues after retry run activity when no stale idle arrived", async () => {
++	test("keeps runtime retry dispatch reserved when activity is followed by immediate stale idle", async () => {
+ 		// given - an active loop retries a recoverable runtime error
++		const originalDateNow = Date.now
++		let currentNow = originalDateNow()
++		Date.now = () => currentNow
+ 		const hook = createRalphLoopHook({
+ 			directory: testDirectory,
+ 			project: testDirectory,
+@@ -176,45 +180,52 @@ describe("ralph-loop non-abort error continuation", () => {
+ 			},
+ 		} as never)
+ 
+-		hook.startLoop("session-123", "Keep working", {
+-			messageCountAtStart: 0,
+-			maxIterations: 5,
+-		})
++		try {
++			hook.startLoop("session-123", "Keep working", {
++				messageCountAtStart: 0,
++				maxIterations: 5,
++			})
+ 
+-		await hook.event({
+-			event: {
+-				type: "session.error",
+-				properties: {
+-					sessionID: "session-123",
+-					error: { name: "RuntimeError" },
++			await hook.event({
++				event: {
++					type: "session.error",
++					properties: {
++						sessionID: "session-123",
++						error: { name: "RuntimeError" },
++					},
+ 				},
+-			},
+-		})
++			})
+ 
+-		// when - the retried run emits real assistant activity before any stale idle
+-		await hook.event({
+-			event: {
+-				type: "message.part.delta",
+-				properties: {
+-					sessionID: "session-123",
+-					messageID: "msg-1",
+-					partID: "part-1",
+-					field: "text",
+-					delta: "working",
++			// when - retried-run activity is followed by a stale idle before the hold expires
++			await hook.event({
++				event: {
++					type: "message.part.delta",
++					properties: {
++						sessionID: "session-123",
++						messageID: "msg-1",
++						partID: "part-1",
++						field: "text",
++						delta: "working",
++					},
+ 				},
+-			},
+-		})
+-		await hook.event({
+-			event: { type: "session.idle", properties: { sessionID: "session-123" } },
+-		})
++			})
++			await hook.event({
++				event: { type: "session.idle", properties: { sessionID: "session-123" } },
++			})
+ 
+-		// then - the real idle is allowed to continue the loop
+-		expect(promptCalls).toHaveLength(2)
+-		expect(hook.getState()?.iteration).toBe(3)
++			// then - the immediate stale idle is deferred by the prompt gate reservation
++			expect(promptCalls).toHaveLength(1)
++			expect(hook.getState()?.iteration).toBe(2)
++		} finally {
++			Date.now = originalDateNow
++		}
+ 	})
+ 
+-	test("continues after retry run activity from legacy message.part.updated part session id", async () => {
++	test("continues after retry run activity when no stale idle arrived", async () => {
+ 		// given - an active loop retries a recoverable runtime error
++		const originalDateNow = Date.now
++		let currentNow = originalDateNow()
++		Date.now = () => currentNow
+ 		const hook = createRalphLoopHook({
+ 			directory: testDirectory,
+ 			project: testDirectory,
+@@ -245,43 +256,125 @@ describe("ralph-loop non-abort error continuation", () => {
+ 			},
+ 		} as never)
+ 
+-		hook.startLoop("session-123", "Keep working", {
+-			messageCountAtStart: 0,
+-			maxIterations: 5,
+-		})
++		try {
++			hook.startLoop("session-123", "Keep working", {
++				messageCountAtStart: 0,
++				maxIterations: 5,
++			})
+ 
+-		await hook.event({
+-			event: {
+-				type: "session.error",
+-				properties: {
+-					sessionID: "session-123",
+-					error: { name: "RuntimeError" },
++			await hook.event({
++				event: {
++					type: "session.error",
++					properties: {
++						sessionID: "session-123",
++						error: { name: "RuntimeError" },
++					},
+ 				},
+-			},
+-		})
++			})
+ 
+-		// when - the retried run emits legacy assistant activity before any stale idle
+-		await hook.event({
+-			event: {
+-				type: "message.part.updated",
+-				properties: {
+-					part: {
+-						id: "part-1",
+-						messageID: "msg-1",
++			// when - retried-run activity is followed by an idle after the hold expires
++			await hook.event({
++				event: {
++					type: "message.part.delta",
++					properties: {
+ 						sessionID: "session-123",
+-						type: "text",
+-						text: "working",
++						messageID: "msg-1",
++						partID: "part-1",
++						field: "text",
++						delta: "working",
+ 					},
+ 				},
++			})
++			currentNow += DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS + 1
++			await hook.event({
++				event: { type: "session.idle", properties: { sessionID: "session-123" } },
++			})
++
++			// then - the later real idle is allowed to continue the loop
++			expect(promptCalls).toHaveLength(2)
++			expect(hook.getState()?.iteration).toBe(3)
++		} finally {
++			Date.now = originalDateNow
++		}
++	})
++
++	test("continues after retry run activity from legacy message.part.updated part session id", async () => {
++		// given - an active loop retries a recoverable runtime error
++		const originalDateNow = Date.now
++		let currentNow = originalDateNow()
++		Date.now = () => currentNow
++		const hook = createRalphLoopHook({
++			directory: testDirectory,
++			project: testDirectory,
++			worktree: testDirectory,
++			serverUrl: "http://localhost:4096",
++			$: async () => ({}),
++			client: {
++				session: {
++					messages: async (options: { path: { id: string } }) => {
++						messagesCalls.push({ sessionID: options.path.id })
++						return { data: [] }
++					},
++					promptAsync: async (options: {
++						path: { id: string }
++						body: { parts: Array<{ type: string; text: string }> }
++					}) => {
++						promptCalls.push({
++							sessionID: options.path.id,
++							text: options.body.parts[0]?.text ?? "",
++						})
++						return {}
++					},
++					prompt: async () => ({}),
++				},
++				tui: {
++					showToast: async () => ({}),
++				},
+ 			},
+-		})
+-		await hook.event({
+-			event: { type: "session.idle", properties: { sessionID: "session-123" } },
+-		})
++		} as never)
++
++		try {
++			hook.startLoop("session-123", "Keep working", {
++				messageCountAtStart: 0,
++				maxIterations: 5,
++			})
+ 
+-		// then - the real idle is allowed to continue the loop
+-		expect(promptCalls).toHaveLength(2)
+-		expect(hook.getState()?.iteration).toBe(3)
++			await hook.event({
++				event: {
++					type: "session.error",
++					properties: {
++						sessionID: "session-123",
++						error: { name: "RuntimeError" },
++					},
++				},
++			})
++
++			// when - legacy retried-run activity is followed by an idle after the hold expires
++			await hook.event({
++				event: {
++					type: "message.part.updated",
++					properties: {
++						part: {
++							id: "part-1",
++							messageID: "msg-1",
++							sessionID: "session-123",
++							type: "text",
++							text: "working",
++						},
++					},
++				},
++			})
++			currentNow += DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS + 1
++			await hook.event({
++				event: { type: "session.idle", properties: { sessionID: "session-123" } },
++			})
++
++			// then - the later real idle is allowed to continue the loop
++			expect(promptCalls).toHaveLength(2)
++			expect(hook.getState()?.iteration).toBe(3)
++		} finally {
++			Date.now = originalDateNow
++		}
+ 	})
+ 
+ 	test("skips immediate runtime retry while background tasks are running", async () => {
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index 4128f1f7..d4ec9ab9 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -2,7 +2,6 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { log } from "../../shared/logger"
+ import { resolveMessageEventSessionID, resolveSessionEventID } from "../../shared/event-session-id"
+ import { isSessionActive } from "../shared/session-idle-settle"
+-import { releasePromptAsyncReservation } from "../shared/prompt-async-gate"
+ import type { IterationCommitExpectation, RalphLoopOptions, RalphLoopState } from "./types"
+ import { HOOK_NAME } from "./constants"
+ import { handleDetectedCompletion } from "./completion-handler"
+@@ -197,9 +196,6 @@ export function createRalphLoopEventHandler(
+ 		const props = event.properties as Record<string, unknown> | undefined
+ 		const runtimeRetryActivitySessionID = getRuntimeRetryActivitySessionID(event.type, props)
+ 		if (runtimeRetryActivitySessionID) {
+-			releasePromptAsyncReservation(runtimeRetryActivitySessionID, "ralph-loop:activity", {
+-				reservedBy: HOOK_NAME,
+-			})
+ 			runtimeErrorRetriedSessions.delete(runtimeRetryActivitySessionID)
+ 			recentHandledSyntheticIdleAt.delete(runtimeRetryActivitySessionID)
+ 		}
+-- 
+2.39.2
+

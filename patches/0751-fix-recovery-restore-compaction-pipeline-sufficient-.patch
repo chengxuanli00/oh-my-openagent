@@ -1,0 +1,196 @@
+From dc057e9910c3bb36716a7cec75168b94a68ca2ed Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 2 Jan 2026 11:34:33 +0900
+Subject: [PATCH 0751/5749] fix(recovery): restore compaction pipeline
+ sufficient check and conservative charsPerToken
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fixes critical v2.10.0 compaction regression where truncation ALWAYS returned early
+without checking if it was sufficient, causing PHASE 3 (Summarize) to be skipped.
+This led to "history disappears" symptom where all context was lost after compaction.
+
+Changes:
+- Restored aggressiveResult.sufficient check before early return in executor
+- Only return from Truncate phase if truncation successfully reduced tokens below limit
+- Otherwise fall through to Summarize phase when truncation is insufficient
+- Restored conservative charsPerToken=4 (was changed to 2, too aggressive)
+- Added 2 regression tests:
+  * Test 1: Verify Summarize is called when truncation is insufficient
+  * Test 2: Verify Summarize is skipped when truncation is sufficient
+
+Regression details:
+- v2.10.0 changed charsPerToken from 4 to 2, making truncation too aggressive
+- Early return removed sufficient check, skipping fallback to Summarize
+- Users reported complete loss of conversation history after compaction
+
+🤖 Generated with assistance of OhMyOpenCode (https://github.com/code-yeongyu/oh-my-opencode)
+---
+ .../executor.test.ts                          | 85 ++++++++++++++++++-
+ .../executor.ts                               | 34 +++++---
+ .../types.ts                                  |  2 +-
+ 3 files changed, 107 insertions(+), 14 deletions(-)
+
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts b/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
+index 8c958aa6..8ddd3974 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
+@@ -1,6 +1,7 @@
+-import { describe, test, expect, mock, beforeEach } from "bun:test"
++import { describe, test, expect, mock, beforeEach, spyOn } from "bun:test"
+ import { executeCompact } from "./executor"
+ import type { AutoCompactState } from "./types"
++import * as storage from "./storage"
+ 
+ describe("executeCompact lock management", () => {
+   let autoCompactState: AutoCompactState
+@@ -224,4 +225,86 @@ describe("executeCompact lock management", () => {
+     // The continuation happens in setTimeout, but lock is cleared in finally before that
+     expect(autoCompactState.compactionInProgress.has(sessionID)).toBe(false)
+   })
++
++  test("falls through to summarize when truncation is insufficient", async () => {
++    // #given: Over token limit with truncation returning insufficient
++    autoCompactState.errorDataBySession.set(sessionID, {
++      errorType: "token_limit",
++      currentTokens: 250000,
++      maxTokens: 200000,
++    })
++
++    const truncateSpy = spyOn(storage, "truncateUntilTargetTokens").mockReturnValue({
++      success: true,
++      sufficient: false,
++      truncatedCount: 3,
++      totalBytesRemoved: 10000,
++      targetBytesToRemove: 50000,
++      truncatedTools: [
++        { toolName: "Grep", originalSize: 5000 },
++        { toolName: "Read", originalSize: 3000 },
++        { toolName: "Bash", originalSize: 2000 },
++      ],
++    })
++
++    // #when: Execute compaction
++    await executeCompact(sessionID, msg, autoCompactState, mockClient, directory)
++
++    // #then: Truncation was attempted
++    expect(truncateSpy).toHaveBeenCalled()
++
++    // #then: Summarize should be called (fall through from insufficient truncation)
++    expect(mockClient.session.summarize).toHaveBeenCalledWith(
++      expect.objectContaining({
++        path: { id: sessionID },
++        body: { providerID: "anthropic", modelID: "claude-opus-4-5" },
++      }),
++    )
++
++    // #then: Lock should be cleared
++    expect(autoCompactState.compactionInProgress.has(sessionID)).toBe(false)
++
++    truncateSpy.mockRestore()
++  })
++
++  test("does NOT call summarize when truncation is sufficient", async () => {
++    // #given: Over token limit with truncation returning sufficient
++    autoCompactState.errorDataBySession.set(sessionID, {
++      errorType: "token_limit",
++      currentTokens: 250000,
++      maxTokens: 200000,
++    })
++
++    const truncateSpy = spyOn(storage, "truncateUntilTargetTokens").mockReturnValue({
++      success: true,
++      sufficient: true,
++      truncatedCount: 5,
++      totalBytesRemoved: 60000,
++      targetBytesToRemove: 50000,
++      truncatedTools: [
++        { toolName: "Grep", originalSize: 30000 },
++        { toolName: "Read", originalSize: 30000 },
++      ],
++    })
++
++    // #when: Execute compaction
++    await executeCompact(sessionID, msg, autoCompactState, mockClient, directory)
++
++    // Wait for setTimeout callback
++    await new Promise((resolve) => setTimeout(resolve, 600))
++
++    // #then: Truncation was attempted
++    expect(truncateSpy).toHaveBeenCalled()
++
++    // #then: Summarize should NOT be called (early return from sufficient truncation)
++    expect(mockClient.session.summarize).not.toHaveBeenCalled()
++
++    // #then: prompt_async should be called (Continue after successful truncation)
++    expect(mockClient.session.prompt_async).toHaveBeenCalled()
++
++    // #then: Lock should be cleared
++    expect(autoCompactState.compactionInProgress.has(sessionID)).toBe(false)
++
++    truncateSpy.mockRestore()
++  })
+ })
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/executor.ts b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+index 09608f42..1c5abd6d 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/executor.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+@@ -401,21 +401,31 @@ export async function executeCompact(
+ 
+         log("[auto-compact] aggressive truncation completed", aggressiveResult);
+ 
+-        clearSessionState(autoCompactState, sessionID);
+-        setTimeout(async () => {
+-          try {
+-            await (client as Client).session.prompt_async({
+-              path: { sessionID },
+-              body: { parts: [{ type: "text", text: "Continue" }] },
+-              query: { directory },
+-            });
+-          } catch {}
+-        }, 500);
+-        return;
++        // Only return early if truncation was sufficient to get under token limit
++        // Otherwise fall through to PHASE 3 (Summarize)
++        if (aggressiveResult.sufficient) {
++          clearSessionState(autoCompactState, sessionID);
++          setTimeout(async () => {
++            try {
++              await (client as Client).session.prompt_async({
++                path: { sessionID },
++                body: { parts: [{ type: "text", text: "Continue" }] },
++                query: { directory },
++              });
++            } catch {}
++          }, 500);
++          return;
++        }
++        // Truncation was insufficient - fall through to Summarize
++        log("[auto-compact] truncation insufficient, falling through to summarize", {
++          sessionID,
++          truncatedCount: aggressiveResult.truncatedCount,
++          sufficient: aggressiveResult.sufficient,
++        });
+       }
+     }
+ 
+-    // PHASE 3: Summarize - fallback when no tool outputs to truncate
++    // PHASE 3: Summarize - fallback when truncation insufficient or no tool outputs
+     const retryState = getOrCreateRetryState(autoCompactState, sessionID);
+ 
+     if (errorData?.errorType?.includes("non-empty content")) {
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/types.ts b/src/hooks/anthropic-context-window-limit-recovery/types.ts
+index 5a3ec73c..024fd544 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/types.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/types.ts
+@@ -44,5 +44,5 @@ export const TRUNCATE_CONFIG = {
+   maxTruncateAttempts: 20,
+   minOutputSizeToTruncate: 500,
+   targetTokenRatio: 0.5,
+-  charsPerToken: 2,
++  charsPerToken: 4,
+ } as const
+-- 
+2.39.2
+

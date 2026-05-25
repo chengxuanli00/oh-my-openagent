@@ -1,0 +1,282 @@
+From e3f6c12347503f593da4c28292fb48411d6182df Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 13 Mar 2026 10:53:45 +0900
+Subject: [PATCH 3238/5749] fix(atlas): restrict idle-event session append to
+ boulder-owned subagent sessions only
+
+---
+ src/hooks/atlas/boulder-session-lineage.ts |  44 ++++++++
+ src/hooks/atlas/idle-event-lineage.test.ts | 122 +++++++++++++++++++++
+ src/hooks/atlas/idle-event.ts              |  20 +++-
+ src/hooks/atlas/index.test.ts              |   1 +
+ src/hooks/atlas/tsconfig.json              |   9 ++
+ 5 files changed, 192 insertions(+), 4 deletions(-)
+ create mode 100644 src/hooks/atlas/boulder-session-lineage.ts
+ create mode 100644 src/hooks/atlas/idle-event-lineage.test.ts
+ create mode 100644 src/hooks/atlas/tsconfig.json
+
+diff --git a/src/hooks/atlas/boulder-session-lineage.ts b/src/hooks/atlas/boulder-session-lineage.ts
+new file mode 100644
+index 00000000..0868f3bb
+--- /dev/null
++++ b/src/hooks/atlas/boulder-session-lineage.ts
+@@ -0,0 +1,44 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared/logger"
++import { HOOK_NAME } from "./hook-name"
++
++export async function isSessionInBoulderLineage(input: {
++  client: PluginInput["client"]
++  sessionID: string
++  boulderSessionIDs: string[]
++}): Promise<boolean> {
++  const visitedSessionIDs = new Set<string>()
++  let currentSessionID = input.sessionID
++
++  while (!visitedSessionIDs.has(currentSessionID)) {
++    visitedSessionIDs.add(currentSessionID)
++
++    const sessionResult = await input.client.session
++      .get({ path: { id: currentSessionID } })
++      .catch((error: unknown) => {
++        log(`[${HOOK_NAME}] Failed to resolve session lineage`, {
++          sessionID: input.sessionID,
++          currentSessionID,
++          error,
++        })
++        return null
++      })
++
++    if (!sessionResult || sessionResult.error) {
++      return false
++    }
++
++    const parentSessionID = sessionResult.data?.parentID
++    if (!parentSessionID) {
++      return false
++    }
++
++    if (input.boulderSessionIDs.includes(parentSessionID)) {
++      return true
++    }
++
++    currentSessionID = parentSessionID
++  }
++
++  return false
++}
+diff --git a/src/hooks/atlas/idle-event-lineage.test.ts b/src/hooks/atlas/idle-event-lineage.test.ts
+new file mode 100644
+index 00000000..e31e670d
+--- /dev/null
++++ b/src/hooks/atlas/idle-event-lineage.test.ts
+@@ -0,0 +1,122 @@
++import { afterEach, beforeEach, describe, it } from "bun:test"
++import assert from "node:assert/strict"
++import { randomUUID } from "node:crypto"
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { clearBoulderState, readBoulderState, writeBoulderState } from "../../features/boulder-state"
++import type { BoulderState } from "../../features/boulder-state"
++import { _resetForTesting, subagentSessions } from "../../features/claude-code-session-state"
++
++const { createAtlasHook } = await import("./index")
++
++describe("atlas hook idle-event session lineage", () => {
++  const MAIN_SESSION_ID = "main-session-123"
++
++  let testDirectory = ""
++  let promptCalls: Array<unknown> = []
++
++  function writeIncompleteBoulder(): void {
++    const planPath = join(testDirectory, "test-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++    const state: BoulderState = {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [MAIN_SESSION_ID],
++      plan_name: "test-plan",
++    }
++
++    writeBoulderState(testDirectory, state)
++  }
++
++  function createHook(parentSessionIDs?: Record<string, string | undefined>) {
++    return createAtlasHook({
++      directory: testDirectory,
++      client: {
++        session: {
++          get: async (input: { path: { id: string } }) => ({
++            data: {
++              parentID: parentSessionIDs?.[input.path.id],
++            },
++          }),
++          messages: async () => ({ data: [] }),
++          prompt: async (input: unknown) => {
++            promptCalls.push(input)
++            return { data: {} }
++          },
++          promptAsync: async (input: unknown) => {
++            promptCalls.push(input)
++            return { data: {} }
++          },
++        },
++      },
++    } as unknown as Parameters<typeof createAtlasHook>[0])
++  }
++
++  beforeEach(() => {
++    testDirectory = join(tmpdir(), `atlas-idle-lineage-${randomUUID()}`)
++    if (!existsSync(testDirectory)) {
++      mkdirSync(testDirectory, { recursive: true })
++    }
++
++    promptCalls = []
++    clearBoulderState(testDirectory)
++    _resetForTesting()
++    subagentSessions.clear()
++  })
++
++  afterEach(() => {
++    clearBoulderState(testDirectory)
++    if (existsSync(testDirectory)) {
++      rmSync(testDirectory, { recursive: true, force: true })
++    }
++
++    _resetForTesting()
++  })
++
++  it("does not append unrelated subagent sessions during idle", async () => {
++    const unrelatedSubagentSessionID = "subagent-session-unrelated"
++    const unrelatedParentSessionID = "unrelated-parent-session"
++
++    writeIncompleteBoulder()
++    subagentSessions.add(unrelatedSubagentSessionID)
++
++    const hook = createHook({
++      [unrelatedSubagentSessionID]: unrelatedParentSessionID,
++    })
++
++    await hook.handler({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: unrelatedSubagentSessionID },
++      },
++    })
++
++    assert.equal(readBoulderState(testDirectory)?.session_ids.includes(unrelatedSubagentSessionID), false)
++    assert.equal(promptCalls.length, 0)
++  })
++
++  it("appends boulder-owned subagent sessions during idle when lineage reaches tracked session", async () => {
++    const subagentSessionID = "subagent-session-456"
++    const intermediateParentSessionID = "subagent-parent-789"
++
++    writeIncompleteBoulder()
++    subagentSessions.add(subagentSessionID)
++
++    const hook = createHook({
++      [subagentSessionID]: intermediateParentSessionID,
++      [intermediateParentSessionID]: MAIN_SESSION_ID,
++    })
++
++    await hook.handler({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: subagentSessionID },
++      },
++    })
++
++    assert.equal(readBoulderState(testDirectory)?.session_ids.includes(subagentSessionID), true)
++    assert.equal(promptCalls.length, 1)
++  })
++})
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 50fd532b..77b153da 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -3,6 +3,7 @@ import { appendSessionId, getPlanProgress, readBoulderState } from "../../featur
+ import type { BoulderState, PlanProgress } from "../../features/boulder-state"
+ import { subagentSessions } from "../../features/claude-code-session-state"
+ import { log } from "../../shared/logger"
++import { isSessionInBoulderLineage } from "./boulder-session-lineage"
+ import { injectBoulderContinuation } from "./boulder-continuation-injector"
+ import { HOOK_NAME } from "./hook-name"
+ import type { AtlasHookOptions, SessionState } from "./types"
+@@ -18,14 +19,15 @@ function hasRunningBackgroundTasks(sessionID: string, options?: AtlasHookOptions
+     : false
+ }
+ 
+-function resolveActiveBoulderSession(input: {
++async function resolveActiveBoulderSession(input: {
++  client: PluginInput["client"]
+   directory: string
+   sessionID: string
+-}): {
++}): Promise<{
+   boulderState: BoulderState
+   progress: PlanProgress
+   appendedSession: boolean
+-} | null {
++} | null> {
+   const boulderState = readBoulderState(input.directory)
+   if (!boulderState) {
+     return null
+@@ -44,6 +46,15 @@ function resolveActiveBoulderSession(input: {
+     return null
+   }
+ 
++  const belongsToActiveBoulder = await isSessionInBoulderLineage({
++    client: input.client,
++    sessionID: input.sessionID,
++    boulderSessionIDs: boulderState.session_ids,
++  })
++  if (!belongsToActiveBoulder) {
++    return null
++  }
++
+   const updatedBoulderState = appendSessionId(input.directory, input.sessionID)
+   if (!updatedBoulderState?.session_ids.includes(input.sessionID)) {
+     return null
+@@ -136,7 +147,8 @@ export async function handleAtlasSessionIdle(input: {
+ 
+   log(`[${HOOK_NAME}] session.idle`, { sessionID })
+ 
+-  const activeBoulderSession = resolveActiveBoulderSession({
++  const activeBoulderSession = await resolveActiveBoulderSession({
++    client: ctx.client,
+     directory: ctx.directory,
+     sessionID,
+   })
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index 22ca44c4..269d7928 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -45,6 +45,7 @@ describe("atlas hook", () => {
+       directory: TEST_DIR,
+       client: {
+         session: {
++          get: async () => ({ data: { parentID: "main-session-123" } }),
+           prompt: promptMock,
+           promptAsync: promptMock,
+         },
+diff --git a/src/hooks/atlas/tsconfig.json b/src/hooks/atlas/tsconfig.json
+new file mode 100644
+index 00000000..f68402a7
+--- /dev/null
++++ b/src/hooks/atlas/tsconfig.json
+@@ -0,0 +1,9 @@
++{
++  "extends": "../../../tsconfig.json",
++  "compilerOptions": {
++    "noEmit": true,
++    "types": ["bun-types"]
++  },
++  "include": ["./**/*.ts", "./**/*.d.ts"],
++  "exclude": []
++}
+-- 
+2.39.2
+

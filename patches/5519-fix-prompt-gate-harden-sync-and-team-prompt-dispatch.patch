@@ -1,0 +1,2100 @@
+From bcea4a9d28b0e5387b51f1f4457d73d494668b20 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 19 May 2026 17:43:37 +0900
+Subject: [PATCH 5519/5749] fix(prompt-gate): harden sync and team prompt
+ dispatch
+
+---
+ src/cli/run/runner.ts                         |   1 +
+ src/features/background-agent/manager.test.ts |   1 +
+ .../background-agent/parent-wake-notifier.ts  |   1 +
+ .../parent-wake-user-message-race.test.ts     |  47 +++++++
+ .../background-agent/session-route.test.ts    |  74 +++++++++++
+ .../background-agent/session-route.ts         |   3 +-
+ src/features/team-mode/integration.test.ts    |   6 +
+ .../team-mode/tools/messaging.test.ts         |  27 ++--
+ src/features/team-mode/tools/messaging.ts     |  38 +++++-
+ .../aggressive-truncation-strategy.ts         |   1 +
+ .../atlas/boulder-continuation-injector.ts    |   1 +
+ src/hooks/atlas/idle-event.ts                 |   1 +
+ .../handlers/session-event-handler.ts         |   1 +
+ .../recovery.test.ts                          |  58 +++++++++
+ .../compaction-context-injector/recovery.ts   |   1 +
+ src/hooks/ralph-loop/index.test.ts            |   4 +-
+ .../ralph-loop/user-message-race.test.ts      |   2 +-
+ src/hooks/runtime-fallback/auto-retry.ts      |   1 +
+ .../recover-unavailable-tool.ts               |   1 +
+ src/hooks/shared/prompt-async-gate.test.ts    |  48 ++++++-
+ .../team-idle-wake-hint.test.ts               |  43 +++++++
+ .../team-idle-wake-hint.ts                    |   8 ++
+ .../continuation-injection.test.ts            |   5 +-
+ .../continuation-injection.ts                 |   1 +
+ .../todo-continuation-enforcer.test.ts        |  42 +++----
+ .../unstable-agent-babysitter/index.test.ts   |  46 ++++++-
+ .../unstable-agent-babysitter-hook.ts         |   1 +
+ src/plugin/event.ts                           |   3 +
+ src/plugin/unstable-agent-babysitter.test.ts  |   1 +
+ src/shared/model-suggestion-retry.test.ts     |   5 +-
+ src/shared/model-suggestion-retry.ts          |   2 +
+ src/shared/prompt-async-gate.ts               |  24 ++--
+ src/shared/prompt-async-route-audit.test.ts   | 118 ++++++++++++++++++
+ src/shared/session-route.test.ts              |  52 +++++++-
+ src/shared/session-route.ts                   |   5 +-
+ .../call-omo-agent/sync-executor-leak.test.ts |   1 +
+ .../call-omo-agent/sync-executor.test.ts      |  10 +-
+ src/tools/call-omo-agent/sync-executor.ts     |  16 +--
+ .../delegate-task/oracle-gap-closure.test.ts  |   6 +
+ .../delegate-task/sync-continuation.test.ts   |  23 ++++
+ src/tools/delegate-task/sync-continuation.ts  |   4 +-
+ .../delegate-task/sync-prompt-route.test.ts   |  19 +--
+ .../delegate-task/sync-prompt-sender.test.ts  |  48 +++----
+ src/tools/delegate-task/sync-prompt-sender.ts |  26 +---
+ 44 files changed, 687 insertions(+), 139 deletions(-)
+ create mode 100644 src/features/background-agent/session-route.test.ts
+
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index 02cf43d7..10688e54 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -116,6 +116,7 @@ export async function run(options: RunOptions): Promise<number> {
+         sessionID,
+         source: "cli-run",
+         settleMs: 0,
++        queueBehavior: "defer",
+         input: {
+           path: { id: sessionID },
+           body: {
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 3db7d9c0..55125416 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -5704,6 +5704,7 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+           {
+             info: {
+               role: "assistant",
++              finish: "end_turn",
+               time: { created: 2_000 },
+             },
+             parts: [{ type: "text", text: "wake was already accepted" }],
+diff --git a/src/features/background-agent/parent-wake-notifier.ts b/src/features/background-agent/parent-wake-notifier.ts
+index 25dd939c..28379139 100644
+--- a/src/features/background-agent/parent-wake-notifier.ts
++++ b/src/features/background-agent/parent-wake-notifier.ts
+@@ -197,6 +197,7 @@ export class ParentWakeNotifier {
+         source: "background-agent-parent-wake",
+         settleMs: 0,
+         postDispatchHoldMs: 250,
++        queueBehavior: "defer",
+         checkToolState: !toolWaitDecision.skipPromptGateToolStateCheck,
+         input: {
+           path: { id: sessionID },
+diff --git a/src/features/background-agent/parent-wake-user-message-race.test.ts b/src/features/background-agent/parent-wake-user-message-race.test.ts
+index ac2690a6..ffcc7256 100644
+--- a/src/features/background-agent/parent-wake-user-message-race.test.ts
++++ b/src/features/background-agent/parent-wake-user-message-race.test.ts
+@@ -220,6 +220,53 @@ describe("ParentWakeNotifier — user message race guard (issue #4120)", () => {
+     releaseAllPromptAsyncReservationsForTesting()
+   })
+ 
++  test("#given all-complete wake arrives while prior assistant turn is still streaming #when the parent status is stale-idle #then the wake stays pending", async () => {
++    // given
++    const sessionMessages: SessionMessageStub[] = [
++      {
++        info: {
++          role: "user",
++          time: { created: Date.now() - 20_000 },
++        },
++        parts: [{ type: "text", text: "start work" }],
++      },
++      {
++        info: {
++          role: "assistant",
++          time: { created: Date.now() - 5_000 },
++        },
++        parts: [{ type: "reasoning", text: "still gathering background results" }],
++      },
++      {
++        info: {
++          role: "user",
++          time: { created: Date.now() - 4_000 },
++        },
++        parts: [{ type: "text", text: "partial wake\n<!-- OMO_INTERNAL_INITIATOR -->" }],
++      },
++    ]
++    const { notifier, promptAsyncCalls } = createNotifier({
++      sessionStatuses: { "parent-stale-idle": { type: "idle" } },
++      sessionMessages,
++    })
++    notifier.queuePendingParentWake(
++      "parent-stale-idle",
++      "<system-reminder>\n[ALL BACKGROUND TASKS COMPLETE]\n</system-reminder>",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    // when
++    await notifier.flushPendingParentWake("parent-stale-idle")
++
++    // then
++    expect(promptAsyncCalls).toHaveLength(0)
++    expect(notifier.getPendingParentWakes().has("parent-stale-idle")).toBe(true)
++
++    notifier.shutdown()
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
+   test("#given latest message is a user message just added #when flushing pending wake #then dispatch is deferred (no promptAsync)", async () => {
+     // given
+     const { notifier, promptAsyncCalls } = createNotifier({
+diff --git a/src/features/background-agent/session-route.test.ts b/src/features/background-agent/session-route.test.ts
+new file mode 100644
+index 00000000..809ba226
+--- /dev/null
++++ b/src/features/background-agent/session-route.test.ts
+@@ -0,0 +1,74 @@
++import { afterEach, describe, expect, mock, test } from "bun:test"
++
++import { releaseAllPromptAsyncReservationsForTesting } from "../../shared/prompt-async-gate"
++import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import { promptAsyncInDirectory, promptWithRetryInDirectory } from "./session-route"
++
++describe("background-agent session routing", () => {
++  afterEach(() => {
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
++  test("#given a routed prompt just dispatched #when the same child session is prompted again immediately #then promptAsync routing defers instead of enqueueing", async () => {
++    // given
++    const promptAsync = mock(async () => ({ data: "sent" }))
++    const client = {
++      session: {
++        promptAsync,
++      },
++    }
++    const args = {
++      path: { id: "ses_background_route_hold" },
++      body: { parts: [{ type: "text", text: "continue" }] },
++    }
++
++    // when
++    const first = await promptAsyncInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++    const second = promptAsyncInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++
++    // then
++    expect(first).toEqual({ data: "sent" })
++    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
++    expect(promptAsync).toHaveBeenCalledTimes(1)
++    expect(promptAsync.mock.calls[0]?.[0].query).toEqual({ directory: "/workspace/project" })
++  })
++
++  test("#given a background retry prompt just dispatched #when the same child session is prompted again immediately #then retry routing defers instead of enqueueing", async () => {
++    // given
++    const promptAsync = mock(async () => undefined)
++    const client = {
++      session: {
++        promptAsync,
++      },
++    }
++    const args = {
++      path: { id: "ses_background_retry_route_hold" },
++      body: { parts: [{ type: "text", text: "continue" }] },
++    }
++
++    // when
++    await promptWithRetryInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++    const second = promptWithRetryInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++
++    // then
++    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
++    expect(promptAsync).toHaveBeenCalledTimes(1)
++    expect(promptAsync.mock.calls[0]?.[0].query).toEqual({ directory: "/workspace/project" })
++  })
++})
+diff --git a/src/features/background-agent/session-route.ts b/src/features/background-agent/session-route.ts
+index 00b51442..292337e1 100644
+--- a/src/features/background-agent/session-route.ts
++++ b/src/features/background-agent/session-route.ts
+@@ -42,6 +42,7 @@ export function promptAsyncInDirectory(
+     input: routedArgs,
+     source: "background-agent-session-route",
+     settleMs: 0,
++    queueBehavior: "defer",
+   }).then((result) => {
+     if (result.status === "failed") {
+       throw result.error
+@@ -58,7 +59,7 @@ export function promptWithRetryInDirectory(
+   args: PromptRetryArgs,
+   directory: string,
+ ): Promise<void> {
+-  return promptWithModelSuggestionRetry(client, routePromptRetry(args, directory))
++  return promptWithModelSuggestionRetry(client, routePromptRetry(args, directory), { queueBehavior: "defer" })
+ }
+ 
+ export function messagesInDirectory(
+diff --git a/src/features/team-mode/integration.test.ts b/src/features/team-mode/integration.test.ts
+index fb307a64..0f11cff5 100644
+--- a/src/features/team-mode/integration.test.ts
++++ b/src/features/team-mode/integration.test.ts
+@@ -230,6 +230,12 @@ describe("team-mode integration", () => {
+     if (!leadMember?.sessionId || !workerMember?.sessionId) {
+       throw new Error("expected both team members to hold sessionIds")
+     }
++    await saveRuntimeState({
++      ...runtime,
++      members: runtime.members.map((member) => (
++        member.name === "worker" ? { ...member, status: "idle" } : member
++      )),
++    }, config)
+ 
+     const { createTeamSendMessageTool } = await import("./tools/messaging")
+     const tool = createTeamSendMessageTool(config, recordingClient)
+diff --git a/src/features/team-mode/tools/messaging.test.ts b/src/features/team-mode/tools/messaging.test.ts
+index 0bbc9118..0c12b29b 100644
+--- a/src/features/team-mode/tools/messaging.test.ts
++++ b/src/features/team-mode/tools/messaging.test.ts
+@@ -257,7 +257,7 @@ describe("createTeamSendMessageTool", () => {
+     expect(calls[0]?.directory).toBe("/tmp/team-worker-m2")
+   })
+ 
+-  test("live-delivers to running recipients so active teammates receive messages immediately", async () => {
++  test("#given runtime marks recipient running #when team_send_message sends a peer message #then it leaves the unread mailbox path without promptAsync", async () => {
+     // given
+     const fixture = await createTeamFixture()
+     const { loadRuntimeState: loadState, saveRuntimeState: saveState } = await import("../team-state-store/store")
+@@ -280,12 +280,16 @@ describe("createTeamSendMessageTool", () => {
+ 
+     // then
+     expect(parsedResult.deliveredTo).toEqual(["m2"])
+-    expect(calls).toHaveLength(1)
+-    expect(calls[0]?.sessionId).toBe(fixture.memberTwoSessionId)
+-    expect(calls[0]?.directory).toBe(resolveBaseDir(fixture.config))
++    expect(calls).toHaveLength(0)
++    const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
++    expect(unread).toHaveLength(1)
++    expect(unread[0]?.body).toBe("ping")
++    const inboxEntries = await readdir(getInboxDir(resolveBaseDir(fixture.config), fixture.teamRunId, "m2"))
++    expect(inboxEntries.filter((entry) => entry.endsWith(".json") && !entry.startsWith("."))).toHaveLength(1)
++    expect(inboxEntries.some((entry) => entry.startsWith(".delivering-"))).toBe(false)
+   })
+ 
+-  test("#given recipient OpenCode session is busy #when team_send_message attempts live delivery #then it reserves the message in the central prompt queue", async () => {
++  test("#given recipient OpenCode session is busy #when team_send_message attempts live delivery #then it releases the message for later mailbox injection", async () => {
+     // given
+     const fixture = await createTeamFixture()
+     let promptCalls = 0
+@@ -309,10 +313,11 @@ describe("createTeamSendMessageTool", () => {
+     // then
+     expect(promptCalls).toBe(0)
+     const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
+-    expect(unread).toHaveLength(0)
++    expect(unread).toHaveLength(1)
++    expect(unread[0]?.body).toBe("ping while busy")
+   })
+ 
+-  test("#given rapid live deliveries to one recipient #when the first prompt just dispatched #then the next message is queued instead of starting another reply", async () => {
++  test("#given rapid live deliveries to one recipient #when the first prompt just dispatched #then the next message waits for mailbox injection", async () => {
+     // given
+     const fixture = await createTeamFixture()
+     const { client, calls } = createRecordingClient()
+@@ -334,10 +339,11 @@ describe("createTeamSendMessageTool", () => {
+     expect(calls).toHaveLength(1)
+     expect(calls[0]?.parts[0]?.text).toContain("first ping")
+     const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
+-    expect(unread).toHaveLength(0)
++    expect(unread).toHaveLength(1)
++    expect(unread[0]?.body).toBe("second ping")
+   })
+ 
+-  test("#given live delivery queued a rapid message #when recipient idle wake fires immediately #then the wake hint does not start a second reply", async () => {
++  test("#given live delivery deferred a rapid message #when recipient idle wake fires immediately #then the wake hint does not start a second reply", async () => {
+     // given
+     const fixture = await createTeamFixture()
+     const { client, calls } = createRecordingClient()
+@@ -371,7 +377,8 @@ describe("createTeamSendMessageTool", () => {
+     expect(calls).toHaveLength(1)
+     expect(calls[0]?.parts[0]?.text).toContain("first ping")
+     const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
+-    expect(unread).toHaveLength(0)
++    expect(unread).toHaveLength(1)
++    expect(unread[0]?.body).toBe("second ping")
+   })
+ 
+   test("live delivery pins the recipient's resolved subagent_type and model on promptAsync", async () => {
+diff --git a/src/features/team-mode/tools/messaging.ts b/src/features/team-mode/tools/messaging.ts
+index 166d6a93..c0c0027c 100644
+--- a/src/features/team-mode/tools/messaging.ts
++++ b/src/features/team-mode/tools/messaging.ts
+@@ -16,7 +16,7 @@ import {
+ import { BroadcastNotPermittedError, sendMessage } from "../team-mailbox/send"
+ import { lookupTeamSession } from "../team-session-registry"
+ import { loadRuntimeState, transitionRuntimeState } from "../team-state-store/store"
+-import type { Message } from "../types"
++import type { Message, RuntimeState } from "../types"
+ import { MessageSchema } from "../types"
+ 
+ const MESSAGE_TOOL_KINDS = ["message", "announcement"] as const
+@@ -68,6 +68,14 @@ const TeamSendMessageArgsSchema = z.object({
+ })
+ 
+ type DeliveryReservation = Awaited<ReturnType<typeof reserveMessageForDelivery>>
++type RuntimeMember = RuntimeState["members"][number]
++
++function canPreReserveForLiveDelivery(member: RuntimeMember, senderName: string): boolean {
++  return member.name !== senderName
++    && member.sessionId !== undefined
++    && member.status === "idle"
++    && member.pendingInjectedMessageIds.length === 0
++}
+ 
+ async function resolveTeamRuntimeDetails(
+   teamRunId: string,
+@@ -181,6 +189,31 @@ async function deliverLive(
+       continue
+     }
+ 
++    if (recipientMember.pendingInjectedMessageIds.length > 0) {
++      await releaseReservationSafely(reservation, {
++        teamRunId,
++        recipient: recipientName,
++        messageId: message.messageId,
++      })
++      continue
++    }
++
++    if (recipientMember.status !== "idle") {
++      log("[team-mailbox] live delivery unavailable, recipient is not idle", {
++        reason: "recipient-not-idle",
++        teamRunId,
++        recipient: recipientName,
++        status: recipientMember.status,
++        messageId: message.messageId,
++      })
++      await releaseReservationSafely(reservation, {
++        teamRunId,
++        recipient: recipientName,
++        messageId: message.messageId,
++      })
++      continue
++    }
++
+     const recipientSessionId = recipientMember.sessionId
+     if (!recipientSessionId) {
+       log("[team-mailbox] live delivery unavailable, falling back to inbox injection", {
+@@ -205,6 +238,7 @@ async function deliverLive(
+         client,
+         sessionID: recipientSessionId,
+         source: "team-live-delivery",
++        queueBehavior: "defer",
+         input: {
+           path: { id: recipientSessionId },
+           body: buildMemberPromptBody(recipientMember, envelope),
+@@ -315,7 +349,7 @@ export function createTeamSendMessageTool(
+       const runtimeState = await deps.loadRuntimeState(teamRuntime.teamRunId, config)
+       const reservedRecipients = new Set<string>(
+         runtimeState.members
+-          .filter((member) => member.sessionId !== undefined && member.name !== teamRuntime.senderName)
++          .filter((member) => canPreReserveForLiveDelivery(member, teamRuntime.senderName))
+           .map((member) => member.name),
+       )
+ 
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+index e5d5f6ba..451f67e2 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+@@ -94,6 +94,7 @@ export async function runAggressiveTruncationStrategy(params: {
+           sessionID: params.sessionID,
+           source: "auto-compact",
+           settleMs: 0,
++          queueBehavior: "defer",
+           input: {
+             path: { id: params.sessionID },
+             body: {
+diff --git a/src/hooks/atlas/boulder-continuation-injector.ts b/src/hooks/atlas/boulder-continuation-injector.ts
+index 219d8ea9..e90cf307 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.ts
+@@ -100,6 +100,7 @@ export async function injectBoulderContinuation(input: {
+       sessionID,
+       source: HOOK_NAME,
+       settleMs: idleSettleMs,
++      queueBehavior: "defer",
+       input: {
+         path: { id: sessionID },
+         body: {
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 5406464a..5d88de08 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -305,6 +305,7 @@ export async function handleAtlasSessionIdle(input: {
+         sessionID,
+         source: HOOK_NAME,
+         settleMs: options?.idleSettleMs,
++        queueBehavior: "defer",
+         input: {
+           path: { id: sessionID },
+           body: {
+diff --git a/src/hooks/claude-code-hooks/handlers/session-event-handler.ts b/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
+index f558695b..849803aa 100644
+--- a/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
++++ b/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
+@@ -114,6 +114,7 @@ export function createSessionEventHandler(
+ 					client: ctx.client,
+ 					sessionID,
+ 					source: "claude-code-stop-hook:inject-prompt",
++					queueBehavior: "defer",
+ 					input: {
+ 						path: { id: sessionID },
+ 						body: {
+diff --git a/src/hooks/compaction-context-injector/recovery.test.ts b/src/hooks/compaction-context-injector/recovery.test.ts
+index 3b5a0300..8df57aad 100644
+--- a/src/hooks/compaction-context-injector/recovery.test.ts
++++ b/src/hooks/compaction-context-injector/recovery.test.ts
+@@ -3,6 +3,7 @@
+ import { afterEach, describe, expect, it } from "bun:test"
+ import { setCompactionAgentConfigCheckpoint } from "../../shared/compaction-agent-config-checkpoint"
+ import {
++  dispatchInternalPrompt,
+   releaseAllPromptAsyncReservationsForTesting,
+   releasePromptAsyncReservation,
+ } from "../shared/prompt-async-gate"
+@@ -155,6 +156,63 @@ describe("createCompactionContextInjector recovery", () => {
+     expect(promptAsyncRecorder.calls[0]?.body.tools).toEqual({ bash: true })
+   })
+ 
++  it("#given recovery is blocked by a peer prompt hold #when compaction fires again after the hold is released #then queued recovery is not treated as completed", async () => {
++    //#given
++    const promptAsyncRecorder = createPromptAsyncRecorder()
++    const sessionID = "ses_recovery_peer_hold"
++    setCompactionAgentConfigCheckpoint(sessionID, {
++      agent: "atlas",
++      model: { providerID: "openai", modelID: "gpt-5" },
++      tools: { bash: true },
++    })
++    const incompletePromptConfig = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-5" },
++        },
++      },
++    ]
++    const ctx = createMockContext(
++      [incompletePromptConfig],
++      promptAsyncRecorder.promptAsync,
++    )
++    const hook = createCompactionContextInjector({ ctx })
++    const peerHold = await dispatchInternalPrompt({
++      mode: "async",
++      client: ctx.client,
++      sessionID,
++      source: "test-peer-hold",
++      settleMs: 0,
++      postDispatchHoldMs: 1000,
++      input: {
++        path: { id: sessionID },
++        body: {
++          parts: [{ type: "text", text: "peer message" }],
++        },
++      },
++    })
++    promptAsyncRecorder.calls.splice(0)
++
++    //#when
++    await hook.event({
++      event: { type: "session.compacted", properties: { sessionID } },
++    })
++    const released = releasePromptAsyncReservation(sessionID, "test-release", {
++      reservedBy: "test-peer-hold",
++    })
++    await hook.event({
++      event: { type: "session.compacted", properties: { sessionID } },
++    })
++
++    //#then
++    expect(peerHold.status).toBe("dispatched")
++    expect(released).toBe(true)
++    expect(promptAsyncRecorder.calls).toHaveLength(1)
++    expect(promptAsyncRecorder.calls[0]?.body.parts[0]?.text).toContain("restore checkpointed session agent configuration")
++  })
++
+   it("marks the recovery prompt as synthetic compaction continuation", async () => {
+     //#given
+     const promptAsyncRecorder = createPromptAsyncRecorder()
+diff --git a/src/hooks/compaction-context-injector/recovery.ts b/src/hooks/compaction-context-injector/recovery.ts
+index 2867fecd..f3e711ab 100644
+--- a/src/hooks/compaction-context-injector/recovery.ts
++++ b/src/hooks/compaction-context-injector/recovery.ts
+@@ -88,6 +88,7 @@ export function createRecoveryLogic(
+         client: ctx.client,
+         sessionID,
+         source: "compaction-context-injector",
++        queueBehavior: "defer",
+         input: {
+           path: { id: sessionID },
+           body: {
+diff --git a/src/hooks/ralph-loop/index.test.ts b/src/hooks/ralph-loop/index.test.ts
+index b849eb80..5ae17afd 100644
+--- a/src/hooks/ralph-loop/index.test.ts
++++ b/src/hooks/ralph-loop/index.test.ts
+@@ -849,7 +849,7 @@ describe("ralph-loop", () => {
+       mockSessionMessages = [
+         { info: { role: "user" }, parts: [{ type: "text", text: "Build something" }] },
+         {
+-          info: { role: "assistant" },
++          info: { role: "assistant", finish: "end_turn" },
+           parts: [
+             { type: "reasoning", text: "I am done now. <promise>REASONING_DONE</promise>" },
+           ],
+@@ -1398,7 +1398,7 @@ Original task: Build something`
+ 
+       mockSessionMessages = [
+         {
+-          info: { role: "assistant" },
++          info: { role: "assistant", finish: "end_turn" },
+           parts: [{ type: "text", text: "All work is complete. <promise>DONE</promise>" }],
+         },
+       ]
+diff --git a/src/hooks/ralph-loop/user-message-race.test.ts b/src/hooks/ralph-loop/user-message-race.test.ts
+index 611623fa..adc53112 100644
+--- a/src/hooks/ralph-loop/user-message-race.test.ts
++++ b/src/hooks/ralph-loop/user-message-race.test.ts
+@@ -109,7 +109,7 @@ describe("ralph-loop user message race guard", () => {
+ 		})
+ 		messagesBySession["session-123"] = [
+ 			{ info: { role: "user", time: { created: Date.now() - 1_000 } } },
+-			{ info: { role: "assistant", agent: "sisyphus", time: { created: Date.now() - 500 } } },
++			{ info: { role: "assistant", finish: "end_turn", agent: "sisyphus", time: { created: Date.now() - 500 } } },
+ 		]
+ 
+ 		try {
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index 3a5372a4..4eb04c45 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -170,6 +170,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+           sessionID,
+           source: `runtime-fallback:${source}`,
+           settleMs: 0,
++          queueBehavior: "defer",
+           input: {
+             path: { id: sessionID },
+             body: {
+diff --git a/src/hooks/session-recovery/recover-unavailable-tool.ts b/src/hooks/session-recovery/recover-unavailable-tool.ts
+index 841529a6..90729d33 100644
+--- a/src/hooks/session-recovery/recover-unavailable-tool.ts
++++ b/src/hooks/session-recovery/recover-unavailable-tool.ts
+@@ -127,6 +127,7 @@ export async function recoverUnavailableTool(
+       sessionID,
+       source: "session-recovery-unavailable-tool",
+       queueBehavior: "defer",
++      checkToolState: false,
+       input: promptInput,
+     })
+     if (promptResult.status === "failed" && isAmbiguousPromptDispatchFailure(promptResult.error)) {
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+index bec0a42f..159b8b0f 100644
+--- a/src/hooks/shared/prompt-async-gate.test.ts
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -96,7 +96,7 @@ describe("dispatchInternalPrompt", () => {
+     expect(calls).toEqual(["sync:ses_unified_sync"])
+   })
+ 
+-  test("#given async dispatch holds a session reservation #when sync mode targets the same session #then the unified service suppresses the duplicate", async () => {
++  test("#given async dispatch holds a session reservation #when sync mode targets the same session #then the unified service defers the duplicate", async () => {
+     // given
+     const calls: string[] = []
+     const client = {
+@@ -131,7 +131,7 @@ describe("dispatchInternalPrompt", () => {
+ 
+     // then
+     expect(first.status).toBe("dispatched")
+-    expect(second).toEqual({ status: "queued", queuedBy: "test:unified-shared:first", position: 1 })
++    expect(second).toEqual({ status: "reserved", reservedBy: "test:unified-shared:first" })
+     expect(calls).toEqual(["async"])
+   })
+ 
+@@ -671,6 +671,46 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+     expect(promptCalls).toBe(0)
+   })
+ 
++  test("#given latest assistant turn is still streaming without a finish reason #when an internal promptAsync is requested #then no prompt is sent", async () => {
++    // given
++    let promptCalls = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_streaming_assistant: { type: "idle" } } }),
++        messages: async () => ({
++          data: [
++            {
++              info: { id: "msg_user", role: "user" },
++              parts: [{ type: "text", text: "run work" }],
++            },
++            {
++              info: { id: "msg_assistant", role: "assistant" },
++              parts: [{ type: "reasoning", text: "still thinking" }],
++            },
++          ],
++        }),
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++
++    // when
++    const result = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "ses_streaming_assistant",
++      input: { path: { id: "ses_streaming_assistant" }, body: { parts: [] } },
++      source: "test:streaming-assistant",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(result.status).toBe("queued")
++    expect(promptCalls).toBe(0)
++  })
++
+   test("#given internal user tail follows an assistant waiting on tools #when an internal promptAsync is requested #then no prompt is sent", async () => {
+     // given
+     let promptCalls = 0
+@@ -1170,7 +1210,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(firstResult.status).toBe("dispatched")
+-    expect(second.status).toBe("queued")
++    expect(second.status).toBe("reserved")
+     expect(promptCalls).toBe(1)
+   })
+ 
+@@ -1200,7 +1240,7 @@ describe("dispatchInternalPrompt shared gate behavior", () => {
+ 
+     // then
+     expect(firstResult.status).toBe("dispatched")
+-    expect(second.status).toBe("queued")
++    expect(second.status).toBe("reserved")
+     expect(promptCalls).toBe(1)
+   })
+ 
+diff --git a/src/hooks/team-session-events/team-idle-wake-hint.test.ts b/src/hooks/team-session-events/team-idle-wake-hint.test.ts
+index 27d147cb..cdad22a0 100644
+--- a/src/hooks/team-session-events/team-idle-wake-hint.test.ts
++++ b/src/hooks/team-session-events/team-idle-wake-hint.test.ts
+@@ -567,6 +567,49 @@ describe("createTeamIdleWakeHint", () => {
+     expect(processedEntries).toContain(`${messageId}.json`)
+   })
+ 
++  test("#given a pending live-delivery ack and later unread message #when member idles after the live reply #then it wakes the member for the unread message", async () => {
++    // given
++    const baseDir = await createTemporaryBaseDir()
++    const config = createConfig(baseDir)
++    const teamRunId = randomUUID()
++    const pendingMessageId = randomUUID()
++    const unreadMessageId = randomUUID()
++    await seedRuntimeState(createRuntimeState(teamRunId, [pendingMessageId]), config)
++    await seedReservedUnreadMessage(teamRunId, config, pendingMessageId, "already live delivered", 100)
++    await seedUnreadMessage(teamRunId, config, unreadMessageId, "waiting in inbox", 200)
++
++    const promptInputs: WakeHintPromptInput[] = []
++    const promptAsyncSpy = mock(async (input: WakeHintPromptInput) => {
++      promptInputs.push(input)
++      return {}
++    })
++    const handler = createTeamIdleWakeHint({
++      directory: "/tmp/project",
++      client: { session: { promptAsync: promptAsyncSpy } },
++    }, config)
++
++    // when
++    await handler({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: "member-session" },
++      },
++    })
++
++    // then
++    expect(promptAsyncSpy).toHaveBeenCalledTimes(1)
++    expect(promptInputs[0]?.body.parts[0]?.text).toContain("1 new team messages")
++
++    const runtimeState = await loadRuntimeState(teamRunId, config)
++    expect(runtimeState.members[0]?.pendingInjectedMessageIds).toEqual([])
++
++    const inboxDir = getInboxDir(resolveBaseDir(config), teamRunId, "worker")
++    const processedEntries = await readdir(path.join(inboxDir, "processed"))
++    expect(processedEntries).toContain(`${pendingMessageId}.json`)
++    const inboxEntries = await readdir(inboxDir)
++    expect(inboxEntries).toContain(`${unreadMessageId}.json`)
++  })
++
+   test("acks pending lead messages on idle without sending a wake hint", async () => {
+     // given
+     const baseDir = await createTemporaryBaseDir()
+diff --git a/src/hooks/team-session-events/team-idle-wake-hint.ts b/src/hooks/team-session-events/team-idle-wake-hint.ts
+index fe880f16..16a1a128 100644
+--- a/src/hooks/team-session-events/team-idle-wake-hint.ts
++++ b/src/hooks/team-session-events/team-idle-wake-hint.ts
+@@ -82,6 +82,13 @@ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: Tea
+               : member
+           )),
+         }), config)
++        log("team idle handled pending live delivery ack", {
++          event: "team-mode-idle-pending-ack",
++          teamRunId: runtimeState.teamRunId,
++          memberName: memberEntry.name,
++          sessionID,
++          ackedCount: pendingInjectedMessageIds.length,
++        })
+       }
+ 
+       const unreadMessages = await listUnreadMessages(runtimeState.teamRunId, memberEntry.name, config)
+@@ -146,6 +153,7 @@ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: Tea
+         sessionID,
+         source: "team-idle-wake-hint",
+         settleMs: options?.idleSettleMs,
++        queueBehavior: "defer",
+         input: {
+           path: { id: sessionID },
+           body: buildMemberPromptBody(memberEntry, buildWakeHint(unreadMessages.length)),
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
+index f8f6f12d..ab308708 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
+@@ -238,7 +238,7 @@ describe("injectContinuation", () => {
+     expect(capturedBody?.variant).toBe("max")
+   })
+ 
+-  test("#given a peer-message hold survives an unrelated release #when todo continuation injects #then it queues behind the peer message", async () => {
++  test("#given a peer-message hold survives an unrelated release #when todo continuation injects #then it does not record a queued prompt as injected", async () => {
+     // given
+     const sessionID = "ses_todo_reserved_by_peer_message"
+     let promptCalls = 0
+@@ -286,7 +286,8 @@ describe("injectContinuation", () => {
+     expect(peerMessageResult.status).toBe("dispatched")
+     expect(promptCalls).toBe(1)
+     expect(state.inFlight).toBe(false)
+-    expect(state.lastInjectedAt).toBeGreaterThan(0)
++    expect(state.lastInjectedAt).toBe(0)
++    expect(state.awaitingPostInjectionProgressCheck).not.toBe(true)
+   })
+ 
+   test("#given promptAsync may have accepted before EOF #when continuation injection observes the failure #then it records an optimistic injection", async () => {
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index c3f33fee..2e74eaba 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -194,6 +194,7 @@ ${todoList}`
+       sessionID,
+       source: HOOK_NAME,
+       settleMs: 0,
++      queueBehavior: "defer",
+       input: {
+         path: { id: sessionID },
+         body: {
+diff --git a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+index 442ef008..a1d04f0a 100644
+--- a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
++++ b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+@@ -1225,7 +1225,7 @@ describe("todo-continuation-enforcer", () => {
+ 
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1248,7 +1248,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+ 
+     mockMessages = [
+-      { info: { id: "msg-1", role: "assistant" } },
++      { info: { id: "msg-1", role: "assistant", finish: "stop" } },
+       { info: { id: "msg-2", role: "user" } },
+     ]
+ 
+@@ -1294,7 +1294,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1324,7 +1324,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1355,7 +1355,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1387,7 +1387,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1426,7 +1426,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1465,7 +1465,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1504,7 +1504,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1542,7 +1542,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -1619,7 +1619,7 @@ describe("todo-continuation-enforcer", () => {
+     // OpenCode returns assistant messages with flat modelID/providerID, not nested model object
+     const mockMessagesWithAssistant = [
+       { info: { id: "msg-1", role: "user", agent: "sisyphus", model: { providerID: "openai", modelID: "gpt-5.4" } } },
+-      { info: { id: "msg-2", role: "assistant", agent: "sisyphus", modelID: "gpt-5.4", providerID: "openai" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop", agent: "sisyphus", modelID: "gpt-5.4", providerID: "openai" } },
+     ]
+ 
+     const mockInput = {
+@@ -1677,8 +1677,8 @@ describe("todo-continuation-enforcer", () => {
+ 
+     const mockMessagesWithCompaction = [
+       { info: { id: "msg-1", role: "user", agent: "sisyphus", model: { providerID: "anthropic", modelID: "claude-sonnet-4-6" } } },
+-      { info: { id: "msg-2", role: "assistant", agent: "sisyphus", modelID: "claude-sonnet-4-6", providerID: "anthropic" } },
+-      { info: { id: "msg-3", role: "assistant", agent: "compaction", modelID: "claude-sonnet-4-6", providerID: "anthropic" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop", agent: "sisyphus", modelID: "claude-sonnet-4-6", providerID: "anthropic" } },
++      { info: { id: "msg-3", role: "assistant", finish: "stop", agent: "compaction", modelID: "claude-sonnet-4-6", providerID: "anthropic" } },
+     ]
+ 
+     const mockInput = {
+@@ -1730,7 +1730,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+ 
+     const mockMessagesOnlyCompaction = [
+-      { info: { id: "msg-1", role: "assistant", agent: "compaction" } },
++      { info: { id: "msg-1", role: "assistant", finish: "stop", agent: "compaction" } },
+     ]
+ 
+     const mockInput = {
+@@ -1783,7 +1783,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+ 
+     const mockMessagesWithCompactionMarker = [
+-      { info: { id: "msg-1", role: "assistant", agent: "sisyphus", modelID: "claude-sonnet-4-6", providerID: "anthropic" } },
++      { info: { id: "msg-1", role: "assistant", finish: "stop", agent: "sisyphus", modelID: "claude-sonnet-4-6", providerID: "anthropic" } },
+       {
+         info: { id: "msg-2", role: "user", agent: "atlas", model: { providerID: "openai", modelID: "gpt-5.4" } },
+         parts: [{ type: "compaction" }],
+@@ -1840,8 +1840,8 @@ describe("todo-continuation-enforcer", () => {
+ 
+     const mockMessagesPrometheusCompacted = [
+       { info: { id: "msg-1", role: "user", agent: "prometheus" } },
+-      { info: { id: "msg-2", role: "assistant", agent: "prometheus" } },
+-      { info: { id: "msg-3", role: "assistant", agent: "compaction" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop", agent: "prometheus" } },
++      { info: { id: "msg-3", role: "assistant", finish: "stop", agent: "compaction" } },
+     ]
+ 
+     const mockInput = {
+@@ -1896,7 +1896,7 @@ describe("todo-continuation-enforcer", () => {
+ 
+     const mockMessagesNoAgent = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const mockInput = {
+@@ -2103,7 +2103,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -2136,7 +2136,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+@@ -2240,7 +2240,7 @@ describe("todo-continuation-enforcer", () => {
+     setMainSession(sessionID)
+     mockMessages = [
+       { info: { id: "msg-1", role: "user" } },
+-      { info: { id: "msg-2", role: "assistant" } },
++      { info: { id: "msg-2", role: "assistant", finish: "stop" } },
+     ]
+ 
+     const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
+diff --git a/src/hooks/unstable-agent-babysitter/index.test.ts b/src/hooks/unstable-agent-babysitter/index.test.ts
+index 9ef5d910..ec311631 100644
+--- a/src/hooks/unstable-agent-babysitter/index.test.ts
++++ b/src/hooks/unstable-agent-babysitter/index.test.ts
+@@ -383,7 +383,7 @@ describe("unstable-agent-babysitter hook", () => {
+     }
+   })
+ 
+-  test("#given the latest main-session message is assistant output after a fresh user message #when it becomes idle #then babysitter may inject a reminder", async () => {
++  test("#given the latest main-session assistant output has finished after a fresh user message #when it becomes idle #then babysitter may inject a reminder", async () => {
+     // given
+     const originalNow = Date.now
+     Date.now = () => 10 * 60 * 1000
+@@ -393,7 +393,7 @@ describe("unstable-agent-babysitter hook", () => {
+       messagesBySession: {
+         "main-1": [
+           { info: { role: "user", time: { created: Date.now() - 1_500 } } },
+-          { info: { role: "assistant", time: { created: Date.now() - 500 }, agent: "sisyphus" } },
++          { info: { role: "assistant", time: { created: Date.now() - 500 }, agent: "sisyphus", finish: "stop" } },
+         ],
+         "bg-1": [
+           { info: { role: "assistant" }, parts: [{ type: "thinking", thinking: "deep thought" }] },
+@@ -425,6 +425,48 @@ describe("unstable-agent-babysitter hook", () => {
+     }
+   })
+ 
++  test("#given the latest main-session assistant output is still streaming after a fresh user message #when it becomes idle #then babysitter does not inject a reminder", async () => {
++    // given
++    const originalNow = Date.now
++    Date.now = () => 10 * 60 * 1000
++    setMainSession("main-1")
++    const promptCalls: Array<{ input: unknown }> = []
++    const ctx = createMockPluginInput({
++      messagesBySession: {
++        "main-1": [
++          { info: { role: "user", time: { created: Date.now() - 1_500 } } },
++          { info: { role: "assistant", time: { created: Date.now() - 500 }, agent: "sisyphus" } },
++        ],
++        "bg-1": [
++          { info: { role: "assistant" }, parts: [{ type: "thinking", thinking: "deep thought" }] },
++        ],
++      },
++      promptCalls,
++    })
++    const backgroundManager = createBackgroundManager([createTask({
++      progress: {
++        toolCalls: 1,
++        lastUpdate: new Date(0),
++        lastMessage: "still working",
++        lastMessageAt: new Date(0),
++      },
++    })])
++    const hook = createUnstableAgentBabysitterHook(ctx, {
++      backgroundManager,
++      config: { timeout_ms: 120000 },
++    })
++
++    try {
++      // when
++      await hook.event({ event: { type: "session.idle", properties: { sessionID: "main-1" } } })
++
++      // then
++      expect(promptCalls.length).toBe(0)
++    } finally {
++      Date.now = originalNow
++    }
++  })
++
+   test("#given an unstable task has a fresh progress update after its last message #when the main session idles #then babysitter does not treat it as hung", async () => {
+     // given
+     const originalNow = Date.now
+diff --git a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+index d65ba1b1..2563e625 100644
+--- a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
++++ b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+@@ -247,6 +247,7 @@ export function createUnstableAgentBabysitterHook(ctx: BabysitterContext, option
+           sessionID: mainSessionID,
+           source: HOOK_NAME,
+           settleMs: options.idleSettleMs,
++          queueBehavior: "defer",
+           input: {
+             path: { id: mainSessionID },
+             body: {
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index adb711d6..93730972 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -521,6 +521,7 @@ export function createEventHandler(args: {
+           client: pluginContext.client,
+           sessionID,
+           source: `model-fallback:${source}`,
++          queueBehavior: "defer",
+           input: promptBody,
+         });
+         if (isInternalPromptDispatchAccepted(promptResult)) {
+@@ -539,6 +540,7 @@ export function createEventHandler(args: {
+         client: pluginContext.client,
+         sessionID,
+         source: `model-fallback:${source}:sync`,
++        queueBehavior: "defer",
+         input: promptBody,
+       });
+       if (isInternalPromptDispatchAccepted(promptResult)) {
+@@ -955,6 +957,7 @@ export function createEventHandler(args: {
+               client: pluginContext.client,
+               sessionID,
+               source: "session-recovery:post-compaction-continue",
++              queueBehavior: "defer",
+               input: {
+                 path: { id: sessionID },
+                 body: { parts: [createInternalAgentContinuationTextPart("continue")] },
+diff --git a/src/plugin/unstable-agent-babysitter.test.ts b/src/plugin/unstable-agent-babysitter.test.ts
+index 69b8d23b..09f67661 100644
+--- a/src/plugin/unstable-agent-babysitter.test.ts
++++ b/src/plugin/unstable-agent-babysitter.test.ts
+@@ -46,6 +46,7 @@ describe("createUnstableAgentBabysitter", () => {
+                     {
+                       info: {
+                         role: "assistant",
++                        finish: "end_turn",
+                         agent: "sisyphus",
+                         model: { providerID: "openai", modelID: "gpt-4" },
+                       },
+diff --git a/src/shared/model-suggestion-retry.test.ts b/src/shared/model-suggestion-retry.test.ts
+index 14afbf25..3694079f 100644
+--- a/src/shared/model-suggestion-retry.test.ts
++++ b/src/shared/model-suggestion-retry.test.ts
+@@ -561,7 +561,7 @@ describe("promptSyncWithModelSuggestionRetry", () => {
+     expect(promptAsyncMock).toHaveBeenCalledTimes(0)
+   })
+ 
+-  it("#given sync prompt retry just dispatched #when the same session is prompted again immediately #then the second caller is coalesced by the queue", async () => {
++  it("#given sync prompt retry just dispatched #when the same session is prompted again immediately #then the second caller is deferred instead of queued", async () => {
+     // given
+     const promptMock = mock(async () => undefined)
+     const client = {
+@@ -579,9 +579,10 @@ describe("promptSyncWithModelSuggestionRetry", () => {
+ 
+     // when
+     await promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
+-    await promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
++    const second = promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
+ 
+     // then
++    await expect(second).rejects.toThrow("prompt skipped by gate: reserved")
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
+diff --git a/src/shared/model-suggestion-retry.ts b/src/shared/model-suggestion-retry.ts
+index cb3b9db3..55994be7 100644
+--- a/src/shared/model-suggestion-retry.ts
++++ b/src/shared/model-suggestion-retry.ts
+@@ -164,6 +164,7 @@ export async function promptSyncWithModelSuggestionRetry(
+         source: "model-suggestion-retry:sync",
+         settleMs: 0,
+         checkStatus: false,
++        checkToolState: false,
+         ...(options.queueBehavior ? { queueBehavior: options.queueBehavior } : {}),
+       })
+       if (promptResult.status === "failed") {
+@@ -223,6 +224,7 @@ export async function promptSyncWithModelSuggestionRetry(
+         source: "model-suggestion-retry:sync-retry",
+         settleMs: 0,
+         checkStatus: false,
++        checkToolState: false,
+         ...(options.queueBehavior ? { queueBehavior: options.queueBehavior } : {}),
+       })
+       if (promptResult.status === "failed") {
+diff --git a/src/shared/prompt-async-gate.ts b/src/shared/prompt-async-gate.ts
+index 02e324f3..25e35aa8 100644
+--- a/src/shared/prompt-async-gate.ts
++++ b/src/shared/prompt-async-gate.ts
+@@ -414,15 +414,19 @@ function partIsWaitingOnTool(part: unknown): boolean {
+   return state.status === "pending" || state.status === "running"
+ }
+ 
+-function latestAssistantTurnIsWaitingOnTools(messages: unknown[]): boolean {
++function latestAssistantTurnBlocksInternalPrompt(messages: unknown[]): boolean {
+   for (let index = messages.length - 1; index >= 0; index--) {
+     const message = messages[index]
+     const role = messageRole(message)
+     if (role === "assistant") {
++      const finish = messageFinish(message)
++      if (finish === undefined) {
++        return true
++      }
+       if (!isRecord(message) || !Array.isArray(message.parts)) {
+-        return messageFinish(message) === "tool-calls"
++        return finish === "tool-calls"
+       }
+-      return messageFinish(message) === "tool-calls" || message.parts.some(partIsWaitingOnTool)
++      return finish === "tool-calls" || message.parts.some(partIsWaitingOnTool)
+     }
+     if (role === "user") {
+       if (messageIsSyntheticOrInternalUser(message)) {
+@@ -434,7 +438,7 @@ function latestAssistantTurnIsWaitingOnTools(messages: unknown[]): boolean {
+   return false
+ }
+ 
+-async function sessionLatestAssistantIsWaitingOnTools<TInput>(args: {
++async function sessionLatestAssistantBlocksInternalPrompt<TInput>(args: {
+   client: { session?: { messages?: (input: { path: { id: string }; query: PromptMessagesQuery }) => Promise<unknown> } }
+   sessionID: string
+   input: TInput
+@@ -457,9 +461,9 @@ async function sessionLatestAssistantIsWaitingOnTools<TInput>(args: {
+       args.timeoutMs,
+       `[prompt-async-gate] ${args.sessionName} session.messages`,
+     )
+-    return latestAssistantTurnIsWaitingOnTools(getMessagesData(response))
++    return latestAssistantTurnBlocksInternalPrompt(getMessagesData(response))
+   } catch (error) {
+-    log("[prompt-async-gate] latest assistant tool-state check failed", {
++    log("[prompt-async-gate] latest assistant prompt-block check failed", {
+       sessionID: args.sessionID,
+       source: args.source,
+       error: String(error),
+@@ -548,7 +552,7 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+     if (
+       checkToolState
+       && typeof client.session?.messages === "function"
+-      && await sessionLatestAssistantIsWaitingOnTools({
++      && await sessionLatestAssistantBlocksInternalPrompt({
+         client,
+         sessionID,
+         input,
+@@ -557,7 +561,7 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+         timeoutMs: Math.min(dispatchTimeoutMs, getPromptGateMessagesFetchTimeoutMs()),
+       })
+     ) {
+-      log(`[prompt-async-gate] ${sessionName} skipped because latest assistant is waiting on tools`, {
++      log(`[prompt-async-gate] ${sessionName} skipped because latest assistant is still active`, {
+         sessionID,
+         source,
+       })
+@@ -737,7 +741,9 @@ export async function dispatchInternalPrompt<TInput = PromptAsyncInput>(
+     return { status: "unavailable" }
+   }
+ 
+-  if (args.queueBehavior === "defer") {
++  const queueBehavior = args.queueBehavior ?? (args.mode === "sync" ? "defer" : "enqueue")
++
++  if (queueBehavior === "defer") {
+     const activeReservation = getActiveReservation(sessionID)
+     if (activeReservation) {
+       return { status: "reserved", reservedBy: activeReservation.source }
+diff --git a/src/shared/prompt-async-route-audit.test.ts b/src/shared/prompt-async-route-audit.test.ts
+index 0c5aba76..30841eda 100644
+--- a/src/shared/prompt-async-route-audit.test.ts
++++ b/src/shared/prompt-async-route-audit.test.ts
+@@ -205,6 +205,74 @@ function detectRawPromptInSnippet(contents: string): boolean {
+   return detected
+ }
+ 
++function objectLiteralHasQueueBehavior(node: ts.ObjectLiteralExpression, sourceFile: ts.SourceFile): boolean {
++  return node.properties.some((property) => {
++    if (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property)) {
++      return getPropertyName(property.name) === "queueBehavior"
++    }
++    if (ts.isSpreadAssignment(property)) {
++      return property.expression.getText(sourceFile).includes("queueBehavior")
++    }
++    return false
++  })
++}
++
++function callExpressionName(node: ts.Expression): string | null {
++  const callee = unwrapExpression(node)
++  if (ts.isIdentifier(callee)) {
++    return callee.text
++  }
++  if (ts.isPropertyAccessExpression(callee) || ts.isPropertyAccessChain(callee)) {
++    return getPropertyName(callee.name)
++  }
++  return null
++}
++
++function findPromptGateCallsWithoutQueueBehavior(filePath: string, contents: string): number[] {
++  const sourceFile = ts.createSourceFile(filePath, contents, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
++  const offenders: number[] = []
++
++  const visit = (node: ts.Node): void => {
++    if (ts.isCallExpression(node)) {
++      if (callExpressionName(node.expression) === "dispatchInternalPrompt") {
++        const firstArgument = node.arguments[0]
++        if (
++          !firstArgument
++          || !ts.isObjectLiteralExpression(firstArgument)
++          || !objectLiteralHasQueueBehavior(firstArgument, sourceFile)
++        ) {
++          offenders.push(sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1)
++        }
++      }
++    }
++
++    ts.forEachChild(node, visit)
++  }
++
++  visit(sourceFile)
++  return offenders
++}
++
++function findPromptRetryCallsWithoutQueueBehavior(filePath: string, contents: string): number[] {
++  const sourceFile = ts.createSourceFile(filePath, contents, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
++  const offenders: number[] = []
++  const guardedNames = new Set(["promptWithModelSuggestionRetry", "promptSyncWithModelSuggestionRetry"])
++
++  const visit = (node: ts.Node): void => {
++    if (ts.isCallExpression(node) && guardedNames.has(callExpressionName(node.expression) ?? "")) {
++      const optionsArgument = node.arguments[2]
++      if (!optionsArgument || !ts.isObjectLiteralExpression(optionsArgument) || !objectLiteralHasQueueBehavior(optionsArgument, sourceFile)) {
++        offenders.push(sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1)
++      }
++    }
++
++    ts.forEachChild(node, visit)
++  }
++
++  visit(sourceFile)
++  return offenders
++}
++
+ describe("production prompt injection routes", () => {
+   test("#given a destructuring promptAsync reference #when audit scans snippet #then it is flagged", () => {
+     // given
+@@ -250,6 +318,20 @@ describe("production prompt injection routes", () => {
+     expect(detected).toBe(true)
+   })
+ 
++  test("#given indirect dispatchInternalPrompt options #when audit scans snippet #then it is flagged", () => {
++    // given
++    const snippet = `
++const options = { mode: "async", queueBehavior: "defer" }
++await dispatchInternalPrompt(options)
++`
++
++    // when
++    const offenders = findPromptGateCallsWithoutQueueBehavior("audit-snippet.ts", snippet)
++
++    // then
++    expect(offenders).toEqual([3])
++  })
++
+   test("#given production TypeScript sources #when prompt routes are audited #then only the shared gate may call raw OpenCode prompt APIs", async () => {
+     // given
+     const files = await listSourceFiles(SOURCE_ROOT)
+@@ -304,4 +386,40 @@ describe("production prompt injection routes", () => {
+     // then
+     expect(offenders).toEqual([])
+   })
++
++  test("#given production TypeScript sources #when prompt gate callers are audited #then every route declares queue behavior explicitly", async () => {
++    // given
++    const files = await listSourceFiles(SOURCE_ROOT)
++    const offenders: string[] = []
++
++    // when
++    for (const filePath of files) {
++      const contents = await readFile(filePath, "utf8")
++      const missingLines = findPromptGateCallsWithoutQueueBehavior(filePath, contents)
++      for (const line of missingLines) {
++        offenders.push(`${relativeSourcePath(filePath)}:${line}`)
++      }
++    }
++
++    // then
++    expect(offenders).toEqual([])
++  })
++
++  test("#given production TypeScript sources #when model-suggestion prompt wrappers are audited #then every retry caller declares queue behavior explicitly", async () => {
++    // given
++    const files = await listSourceFiles(SOURCE_ROOT)
++    const offenders: string[] = []
++
++    // when
++    for (const filePath of files) {
++      const contents = await readFile(filePath, "utf8")
++      const missingLines = findPromptRetryCallsWithoutQueueBehavior(filePath, contents)
++      for (const line of missingLines) {
++        offenders.push(`${relativeSourcePath(filePath)}:${line}`)
++      }
++    }
++
++    // then
++    expect(offenders).toEqual([])
++  })
+ })
+diff --git a/src/shared/session-route.test.ts b/src/shared/session-route.test.ts
+index c14d3c9c..e757f74e 100644
+--- a/src/shared/session-route.test.ts
++++ b/src/shared/session-route.test.ts
+@@ -1,9 +1,14 @@
+-import { describe, expect, mock, test } from "bun:test"
++import { afterEach, describe, expect, mock, test } from "bun:test"
+ 
+ import { unsafeTestValue } from "../../test-support/unsafe-test-value"
+-import { promptAsyncInDirectory } from "./session-route"
++import { releaseAllPromptAsyncReservationsForTesting } from "./prompt-async-gate"
++import { promptAsyncInDirectory, promptWithRetryInDirectory } from "./session-route"
+ 
+ describe("promptAsyncInDirectory", () => {
++  afterEach(() => {
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
+   test("#given no session id is present #when routing a promptAsync request #then the helper rejects instead of using an ungated raw prompt", async () => {
+     // given
+     const promptAsync = mock(async () => ({ data: "sent" }))
+@@ -27,7 +32,7 @@ describe("promptAsyncInDirectory", () => {
+     expect(promptAsync).toHaveBeenCalledTimes(0)
+   })
+ 
+-  test("#given a routed prompt just dispatched #when the same session is prompted again immediately #then the route coalesces the duplicate", async () => {
++  test("#given a routed prompt just dispatched #when the same session is prompted again immediately #then the route defers the duplicate", async () => {
+     // given
+     const promptAsync = mock(async () => ({ data: "sent" }))
+     const client = {
+@@ -46,7 +51,7 @@ describe("promptAsyncInDirectory", () => {
+       unsafeTestValue(args),
+       "/workspace/project",
+     )
+-    const second = await promptAsyncInDirectory(
++    const second = promptAsyncInDirectory(
+       unsafeTestValue(client),
+       unsafeTestValue(args),
+       "/workspace/project",
+@@ -54,7 +59,44 @@ describe("promptAsyncInDirectory", () => {
+ 
+     // then
+     expect(first).toEqual({ data: "sent" })
+-    expect(second).toBeUndefined()
++    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
++    expect(promptAsync).toHaveBeenCalledTimes(1)
++    expect(promptAsync.mock.calls[0]?.[0].query).toEqual({ directory: "/workspace/project" })
++  })
++})
++
++describe("promptWithRetryInDirectory", () => {
++  afterEach(() => {
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
++  test("#given a routed retry prompt just dispatched #when the same session is prompted again immediately #then the wrapper defers instead of enqueueing", async () => {
++    // given
++    const promptAsync = mock(async () => undefined)
++    const client = {
++      session: {
++        promptAsync,
++      },
++    }
++    const args = {
++      path: { id: "ses_retry_route_hold" },
++      body: { parts: [{ type: "text", text: "continue" }] },
++    }
++
++    // when
++    await promptWithRetryInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++    const second = promptWithRetryInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++
++    // then
++    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
+     expect(promptAsync).toHaveBeenCalledTimes(1)
+     expect(promptAsync.mock.calls[0]?.[0].query).toEqual({ directory: "/workspace/project" })
+   })
+diff --git a/src/shared/session-route.ts b/src/shared/session-route.ts
+index 643745e0..8547f94c 100644
+--- a/src/shared/session-route.ts
++++ b/src/shared/session-route.ts
+@@ -66,6 +66,7 @@ export function promptAsyncInDirectory(
+     input: routedArgs,
+     source: "session-route",
+     settleMs: 0,
++    queueBehavior: "defer",
+   }).then((result) => {
+     if (result.status === "failed") {
+       throw result.error
+@@ -82,7 +83,7 @@ export function promptWithRetryInDirectory(
+   args: PromptRetryArgs,
+   directory: string,
+ ): Promise<void> {
+-  return promptWithModelSuggestionRetry(client, routePromptRetry(args, directory))
++  return promptWithModelSuggestionRetry(client, routePromptRetry(args, directory), { queueBehavior: "defer" })
+ }
+ 
+ export function promptSyncWithRetryInDirectory(
+@@ -90,7 +91,7 @@ export function promptSyncWithRetryInDirectory(
+   args: PromptSyncRetryArgs,
+   directory: string,
+ ): Promise<void> {
+-  return promptSyncWithModelSuggestionRetry(client, routePromptSyncRetry(args, directory))
++  return promptSyncWithModelSuggestionRetry(client, routePromptSyncRetry(args, directory), { queueBehavior: "defer" })
+ }
+ 
+ export function messagesInDirectory(
+diff --git a/src/tools/call-omo-agent/sync-executor-leak.test.ts b/src/tools/call-omo-agent/sync-executor-leak.test.ts
+index eb236e97..5521a485 100644
+--- a/src/tools/call-omo-agent/sync-executor-leak.test.ts
++++ b/src/tools/call-omo-agent/sync-executor-leak.test.ts
+@@ -33,6 +33,7 @@ function createContext(promptAsync: ReturnType<typeof mock>) {
+   return {
+     client: {
+       session: {
++        prompt: promptAsync,
+         promptAsync,
+       },
+     },
+diff --git a/src/tools/call-omo-agent/sync-executor.test.ts b/src/tools/call-omo-agent/sync-executor.test.ts
+index bdbfd734..b696f90e 100644
+--- a/src/tools/call-omo-agent/sync-executor.test.ts
++++ b/src/tools/call-omo-agent/sync-executor.test.ts
+@@ -87,6 +87,7 @@ function createContext(
+   return {
+     client: {
+       session: {
++        prompt: promptAsync,
+         promptAsync,
+         ...(status ? { status } : {}),
+       },
+@@ -142,7 +143,7 @@ describe("executeSync", () => {
+     expect(promptInput?.body.agent).toBe("Sisyphus - Ultraworker")
+   })
+ 
+-  test("#given subagent_type is the lowercase config key 'hephaestus' #when executeSync runs #then promptAsync receives the registered display name 'Hephaestus - Deep Agent'", async () => {
++  test("#given subagent_type is the lowercase config key 'hephaestus' #when executeSync runs #then prompt receives the registered display name 'Hephaestus - Deep Agent'", async () => {
+     //#given
+     const executeSync = await importExecuteSync()
+     const deps = createDependencies()
+@@ -163,7 +164,7 @@ describe("executeSync", () => {
+     expect(promptInput?.body.agent).toBe("Hephaestus - Deep Agent")
+   })
+ 
+-  test("#given subagent_type is the lowercase config key 'sisyphus-junior' #when executeSync runs #then promptAsync receives the registered display name 'Sisyphus-Junior'", async () => {
++  test("#given subagent_type is the lowercase config key 'sisyphus-junior' #when executeSync runs #then prompt receives the registered display name 'Sisyphus-Junior'", async () => {
+     //#given
+     const executeSync = await importExecuteSync()
+     const deps = createDependencies()
+@@ -184,7 +185,7 @@ describe("executeSync", () => {
+     expect(promptInput?.body.agent).toBe("Sisyphus-Junior")
+   })
+ 
+-  test("#given subagent_type is already a display name like 'explore' (config key == display name) #when executeSync runs #then promptAsync receives 'explore' unchanged", async () => {
++  test("#given subagent_type is already a display name like 'explore' (config key == display name) #when executeSync runs #then prompt receives 'explore' unchanged", async () => {
+     //#given a same-keyed agent must not be double-translated
+     const executeSync = await importExecuteSync()
+     const deps = createDependencies()
+@@ -536,7 +537,7 @@ describe("executeSync", () => {
+ 
+     //#then
+     expect(first).toContain("agent response")
+-    expect(second).toContain("promptAsync skipped by gate: reserved")
++    expect(second).toContain("prompt skipped by gate: reserved")
+     expect(recorder.promptAsync).toHaveBeenCalledTimes(1)
+     expect(deps.waitForCompletion).toHaveBeenCalledTimes(1)
+     expect(deps.processMessages).toHaveBeenCalledTimes(1)
+@@ -576,6 +577,7 @@ describe("executeSync", () => {
+     const ctx = {
+       client: {
+         session: {
++          prompt: mock(async () => ({ data: {} })),
+           promptAsync: mock(async () => ({ data: {} })),
+         },
+       },
+diff --git a/src/tools/call-omo-agent/sync-executor.ts b/src/tools/call-omo-agent/sync-executor.ts
+index a7f6f119..97297777 100644
+--- a/src/tools/call-omo-agent/sync-executor.ts
++++ b/src/tools/call-omo-agent/sync-executor.ts
+@@ -16,12 +16,12 @@ import { processMessages } from "./message-processor"
+ import { createOrGetSession } from "./session-creator"
+ import type { CallOmoAgentArgs } from "./types"
+ 
+-type SessionWithPromptAsync = {
+-  promptAsync: (opts: { path: { id: string }; body: Record<string, unknown> }) => Promise<unknown>
++type SessionWithPrompt = {
++  prompt: (opts: { path: { id: string }; body: Record<string, unknown> }) => Promise<unknown>
+ }
+ 
+-function hasPromptAsync(session: PluginInput["client"]["session"]): session is PluginInput["client"]["session"] & SessionWithPromptAsync {
+-  return "promptAsync" in session && typeof session.promptAsync === "function"
++function hasPrompt(session: PluginInput["client"]["session"]): session is PluginInput["client"]["session"] & SessionWithPrompt {
++  return "prompt" in session && typeof session.prompt === "function"
+ }
+ 
+ type ExecuteSyncDeps = {
+@@ -130,12 +130,12 @@ export async function executeSync(
+     })
+ 
+     try {
+-      if (!hasPromptAsync(ctx.client.session)) {
+-        return `Error: Failed to send prompt: promptAsync is not available on this OpenCode client.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
++      if (!hasPrompt(ctx.client.session)) {
++        return `Error: Failed to send prompt: prompt is not available on this OpenCode client.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+       }
+ 
+       const promptResult = await dispatchInternalPrompt({
+-        mode: "async",
++        mode: "sync",
+         client: ctx.client,
+         sessionID,
+         source: "call-omo-agent:sync",
+@@ -157,7 +157,7 @@ export async function executeSync(
+         throw promptResult.error
+       }
+       if (!isInternalPromptDispatchAccepted(promptResult)) {
+-        throw new Error(`promptAsync skipped by gate: ${promptResult.status}`)
++        throw new Error(`prompt skipped by gate: ${promptResult.status}`)
+       }
+     } catch (error) {
+       const errorMessage = error instanceof Error ? error.message : String(error)
+diff --git a/src/tools/delegate-task/oracle-gap-closure.test.ts b/src/tools/delegate-task/oracle-gap-closure.test.ts
+index c6bbc01f..f70e8abc 100644
+--- a/src/tools/delegate-task/oracle-gap-closure.test.ts
++++ b/src/tools/delegate-task/oracle-gap-closure.test.ts
+@@ -69,6 +69,7 @@ describe("delegate-task Oracle gap closure", () => {
+       client: {
+         session: {
+           messages: async () => ({ data: [{ info: { agent: "explore", model: MODEL, variant: "max" } }] }),
++          prompt: async () => ({}),
+           promptAsync: async () => ({}),
+         },
+       },
+@@ -99,6 +100,7 @@ describe("delegate-task Oracle gap closure", () => {
+       client: {
+         session: {
+           messages: async () => ({ data: [{ info: { agent: "explore", model: MODEL } }] }),
++          prompt: async () => ({}),
+           promptAsync: async () => ({}),
+         },
+       },
+@@ -190,6 +192,10 @@ describe("delegate-task Oracle gap closure", () => {
+       client: {
+         session: {
+           messages: async () => ({ data: [{ info: { agent: "explore", model: MODEL } }] }),
++          prompt: async (input: { body?: { system?: string } }) => {
++            promptCalls.push(input)
++            return {}
++          },
+           promptAsync: async (input: { body?: { system?: string } }) => {
+             promptCalls.push(input)
+             return {}
+diff --git a/src/tools/delegate-task/sync-continuation.test.ts b/src/tools/delegate-task/sync-continuation.test.ts
+index 967b30fb..ada8c3e3 100644
+--- a/src/tools/delegate-task/sync-continuation.test.ts
++++ b/src/tools/delegate-task/sync-continuation.test.ts
+@@ -74,6 +74,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -136,6 +137,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -198,6 +200,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -256,6 +259,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -312,6 +316,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -363,6 +368,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+         messages: async () => {
+           throw new Error("messages unavailable")
+         },
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -429,6 +435,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -487,6 +494,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -550,6 +558,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -610,6 +619,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -664,6 +674,7 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async () => ({}),
+         promptAsync: async () => ({}),
+         status: async () => ({
+           data: { ses_test: { type: "idle" } },
+@@ -725,6 +736,10 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async (input: { path: { id: string }; body: Record<string, unknown> }) => {
++          promptAsyncCalls.push(input)
++          return {}
++        },
+         promptAsync: async (input: { path: { id: string }; body: Record<string, unknown> }) => {
+           promptAsyncCalls.push(input)
+           return {}
+@@ -796,6 +811,10 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async (input: { path: { id: string }; body: Record<string, unknown> }) => {
++          promptAsyncCalls.push(input)
++          return {}
++        },
+         promptAsync: async (input: { path: { id: string }; body: Record<string, unknown> }) => {
+           promptAsyncCalls.push(input)
+           return {}
+@@ -867,6 +886,10 @@ describe("executeSyncContinuation - toast cleanup error paths", () => {
+             },
+           ],
+         }),
++        prompt: async (input: { path: { id: string }; body: Record<string, unknown> }) => {
++          promptAsyncCalls.push(input)
++          return {}
++        },
+         promptAsync: async (input: { path: { id: string }; body: Record<string, unknown> }) => {
+           promptAsyncCalls.push(input)
+           return {}
+diff --git a/src/tools/delegate-task/sync-continuation.ts b/src/tools/delegate-task/sync-continuation.ts
+index ce6bf0e9..b5281c81 100644
+--- a/src/tools/delegate-task/sync-continuation.ts
++++ b/src/tools/delegate-task/sync-continuation.ts
+@@ -5,7 +5,7 @@ import { publishToolMetadata } from "../../features/tool-metadata-store"
+ import { getTaskToastManager } from "../../features/task-toast-manager"
+ import { getAgentToolRestrictions } from "../../shared/agent-tool-restrictions"
+ import { getMessageDir, normalizeSDKResponse } from "../../shared"
+-import { promptWithModelSuggestionRetry } from "../../shared/model-suggestion-retry"
++import { promptSyncWithModelSuggestionRetry } from "../../shared/model-suggestion-retry"
+ import { resolveMessageContext } from "../../features/hook-message-injector"
+ import { formatDuration } from "./time-formatter"
+ import { syncContinuationDeps, type SyncContinuationDeps } from "./sync-continuation-deps"
+@@ -160,7 +160,7 @@ export async function executeSyncContinuation(
+     }
+     setSessionTools(continuationID, tools)
+ 
+-    await promptWithModelSuggestionRetry(client, {
++    await promptSyncWithModelSuggestionRetry(client, {
+       path: { id: continuationID },
+       body: {
+         ...(resumeAgent !== undefined ? { agent: resumeAgent } : {}),
+diff --git a/src/tools/delegate-task/sync-prompt-route.test.ts b/src/tools/delegate-task/sync-prompt-route.test.ts
+index 2ada4277..02d79d95 100644
+--- a/src/tools/delegate-task/sync-prompt-route.test.ts
++++ b/src/tools/delegate-task/sync-prompt-route.test.ts
+@@ -5,19 +5,16 @@ import type { OpencodeClient } from "./types"
+ import { sendSyncPrompt } from "./sync-prompt-sender"
+ import {
+   promptSyncWithModelSuggestionRetry,
+-  promptWithModelSuggestionRetry,
+ } from "../../shared/model-suggestion-retry"
+ 
+-type PromptRetryClient = Parameters<typeof promptWithModelSuggestionRetry>[0]
+-type PromptRetryArgs = Parameters<typeof promptWithModelSuggestionRetry>[1]
+ type PromptSyncRetryClient = Parameters<typeof promptSyncWithModelSuggestionRetry>[0]
+ type PromptSyncRetryArgs = Parameters<typeof promptSyncWithModelSuggestionRetry>[1]
+ 
+ describe("sendSyncPrompt session routing", () => {
+-  test("#given a sync child session directory #when sending the prompt #then promptAsync uses that OpenCode directory route", async () => {
++  test("#given a sync child session directory #when sending the prompt #then prompt uses that OpenCode directory route", async () => {
+     // given
+-    const promptCalls: PromptRetryArgs[] = []
+-    const promptWithRetry = mock(async (_client: PromptRetryClient, input: PromptRetryArgs) => {
++    const promptCalls: PromptSyncRetryArgs[] = []
++    const promptSyncWithRetry = mock(async (_client: PromptSyncRetryClient, input: PromptSyncRetryArgs) => {
+       promptCalls.push(input)
+     })
+ 
+@@ -40,8 +37,7 @@ describe("sendSyncPrompt session routing", () => {
+         taskId: undefined,
+       },
+       {
+-        promptWithModelSuggestionRetry: promptWithRetry,
+-        promptSyncWithModelSuggestionRetry: mock(async () => {}),
++        promptSyncWithModelSuggestionRetry: promptSyncWithRetry,
+       },
+     )
+ 
+@@ -50,14 +46,12 @@ describe("sendSyncPrompt session routing", () => {
+     expect(promptCalls[0]?.query).toEqual({ directory: "/parent/project" })
+   })
+ 
+-  test("#given oracle falls back to promptSync #when async prompt returns unexpected EOF #then the sync retry keeps the same directory route", async () => {
++  test("#given oracle prompt returns unexpected EOF #when sending the prompt #then the sync route keeps the same directory route", async () => {
+     // given
+     const promptSyncCalls: PromptSyncRetryArgs[] = []
+-    const promptWithRetry = mock(async () => {
+-      throw new Error("JSON Parse error: Unexpected EOF")
+-    })
+     const promptSyncWithRetry = mock(async (_client: PromptSyncRetryClient, input: PromptSyncRetryArgs) => {
+       promptSyncCalls.push(input)
++      throw new Error("JSON Parse error: Unexpected EOF")
+     })
+ 
+     // when
+@@ -79,7 +73,6 @@ describe("sendSyncPrompt session routing", () => {
+         taskId: undefined,
+       },
+       {
+-        promptWithModelSuggestionRetry: promptWithRetry,
+         promptSyncWithModelSuggestionRetry: promptSyncWithRetry,
+       },
+     )
+diff --git a/src/tools/delegate-task/sync-prompt-sender.test.ts b/src/tools/delegate-task/sync-prompt-sender.test.ts
+index ae1ebfe2..150f48fe 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.test.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.test.ts
+@@ -28,6 +28,7 @@ bunDescribe("sendSyncPrompt", () => {
+ 
+     const mockClient = {
+       session: {
++        prompt: promptAsync,
+         promptAsync,
+       },
+     }
+@@ -67,6 +68,7 @@ bunDescribe("sendSyncPrompt", () => {
+ 
+     const mockClient = {
+       session: {
++        prompt: promptAsync,
+         promptAsync,
+       },
+     }
+@@ -107,6 +109,7 @@ bunDescribe("sendSyncPrompt", () => {
+ 
+     const mockClient = {
+       session: {
++        prompt: promptAsync,
+         promptAsync,
+       },
+     }
+@@ -147,6 +150,7 @@ bunDescribe("sendSyncPrompt", () => {
+ 
+     const mockClient = {
+       session: {
++        prompt: promptAsync,
+         promptAsync,
+       },
+     }
+@@ -187,6 +191,7 @@ bunDescribe("sendSyncPrompt", () => {
+ 
+     const mockClient = {
+       session: {
++        prompt: promptAsync,
+         promptAsync,
+       },
+     }
+@@ -229,7 +234,7 @@ bunDescribe("sendSyncPrompt", () => {
+     const { sendSyncPrompt } = require("./sync-prompt-sender")
+ 
+     let promptArgs: any
+-    const promptWithModelSuggestionRetry = bunMock(async (_client: any, input: any) => {
++    const promptSyncWithModelSuggestionRetry = bunMock(async (_client: any, input: any) => {
+       promptArgs = input
+     })
+ 
+@@ -259,16 +264,15 @@ bunDescribe("sendSyncPrompt", () => {
+ 
+     //#when
+     await sendSyncPrompt(
+-      { session: { promptAsync: bunMock(async () => ({ data: {} })) } },
++      { session: { prompt: bunMock(async () => ({ data: {} })) } },
+       input,
+       {
+-        promptWithModelSuggestionRetry,
+-        promptSyncWithModelSuggestionRetry: bunMock(async () => {}),
++        promptSyncWithModelSuggestionRetry,
+       },
+     )
+ 
+     //#then
+-    bunExpect(promptWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
++    bunExpect(promptSyncWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
+     bunExpect(promptArgs.body.model).toEqual({
+       providerID: "openai",
+       modelID: "gpt-5.4",
+@@ -295,7 +299,7 @@ bunDescribe("sendSyncPrompt", () => {
+     const { sendSyncPrompt } = require("./sync-prompt-sender")
+ 
+     let promptArgs: any
+-    const promptWithModelSuggestionRetry = bunMock(async (_client: any, input: any) => {
++    const promptSyncWithModelSuggestionRetry = bunMock(async (_client: any, input: any) => {
+       promptArgs = input
+     })
+ 
+@@ -321,26 +325,24 @@ bunDescribe("sendSyncPrompt", () => {
+ 
+     //#when
+     await sendSyncPrompt(
+-      { session: { promptAsync: bunMock(async () => ({ data: {} })) } },
++      { session: { prompt: bunMock(async () => ({ data: {} })) } },
+       input,
+       {
+-        promptWithModelSuggestionRetry,
+-        promptSyncWithModelSuggestionRetry: bunMock(async () => {}),
++        promptSyncWithModelSuggestionRetry,
+       },
+     )
+ 
+     //#then
+-    bunExpect(promptWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
++    bunExpect(promptSyncWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
+     bunExpect(promptArgs.body.temperature).toBe(0.25)
+   })
+-  bunTest("retries with promptSync for oracle when promptAsync fails with unexpected EOF", async () => {
++  bunTest("#given oracle promptSync returns unexpected EOF #when sending a sync prompt #then the prompt is treated as started without retrying promptAsync", async () => {
+     //#given
+     const { sendSyncPrompt } = require("./sync-prompt-sender")
+ 
+-    const promptWithModelSuggestionRetry = bunMock(async () => {
++    const promptSyncWithModelSuggestionRetry = bunMock(async () => {
+       throw new Error("JSON Parse error: Unexpected EOF")
+     })
+-    const promptSyncWithModelSuggestionRetry = bunMock(async () => {})
+ 
+     const input = {
+       sessionID: "test-session",
+@@ -362,25 +364,22 @@ bunDescribe("sendSyncPrompt", () => {
+       { session: { promptAsync: bunMock(async () => ({ data: {} })) } },
+       input,
+       {
+-        promptWithModelSuggestionRetry,
+         promptSyncWithModelSuggestionRetry,
+       },
+     )
+ 
+     //#then
+     bunExpect(result).toBeNull()
+-    bunExpect(promptWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
+     bunExpect(promptSyncWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
+   })
+ 
+-  bunTest("does not retry with promptSync for non-oracle on unexpected EOF", async () => {
++  bunTest("returns non-oracle unexpected EOF without retrying promptAsync", async () => {
+     //#given
+     const { sendSyncPrompt } = require("./sync-prompt-sender")
+ 
+-    const promptWithModelSuggestionRetry = bunMock(async () => {
++    const promptSyncWithModelSuggestionRetry = bunMock(async () => {
+       throw new Error("JSON Parse error: Unexpected EOF")
+     })
+-    const promptSyncWithModelSuggestionRetry = bunMock(async () => {})
+ 
+     const input = {
+       sessionID: "test-session",
+@@ -402,24 +401,19 @@ bunDescribe("sendSyncPrompt", () => {
+       { session: { promptAsync: bunMock(async () => ({ data: {} })) } },
+       input,
+       {
+-        promptWithModelSuggestionRetry,
+         promptSyncWithModelSuggestionRetry,
+       },
+     )
+ 
+     //#then
+     bunExpect(result).toContain("Unexpected EOF")
+-    bunExpect(promptWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
+-    bunExpect(promptSyncWithModelSuggestionRetry).toHaveBeenCalledTimes(0)
++    bunExpect(promptSyncWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
+   })
+ 
+-  bunTest("#given oracle promptSync fallback is blocked by the prompt gate #when async prompt reports EOF #then the original EOF error is preserved", async () => {
++  bunTest("#given oracle promptSync is blocked by the prompt gate #when sending a sync prompt #then the gate error is preserved", async () => {
+     //#given
+     const { sendSyncPrompt } = require("./sync-prompt-sender")
+ 
+-    const promptWithModelSuggestionRetry = bunMock(async () => {
+-      throw new Error("JSON Parse error: Unexpected EOF")
+-    })
+     const promptSyncWithModelSuggestionRetry = bunMock(async () => {
+       throw new Error("prompt skipped by gate: reserved")
+     })
+@@ -444,14 +438,12 @@ bunDescribe("sendSyncPrompt", () => {
+       { session: { promptAsync: bunMock(async () => ({ data: {} })) } },
+       input,
+       {
+-        promptWithModelSuggestionRetry,
+         promptSyncWithModelSuggestionRetry,
+       },
+     )
+ 
+     //#then
+-    bunExpect(result).toContain("JSON Parse error")
+-    bunExpect(result).not.toContain("prompt skipped by gate")
++    bunExpect(result).toContain("prompt skipped by gate")
+     bunExpect(promptSyncWithModelSuggestionRetry).toHaveBeenCalledTimes(1)
+   })
+ })
+diff --git a/src/tools/delegate-task/sync-prompt-sender.ts b/src/tools/delegate-task/sync-prompt-sender.ts
+index 833c0388..5a5ed28d 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.ts
+@@ -4,10 +4,9 @@ import { getAgentToolRestrictions } from "../../shared/agent-tool-restrictions"
+ import { createInternalAgentTextPart } from "../../shared/internal-initiator-marker"
+ import {
+   promptSyncWithModelSuggestionRetry,
+-  promptWithModelSuggestionRetry,
+ } from "../../shared/model-suggestion-retry"
+ import { applySessionPromptParams } from "../../shared/session-prompt-params-helpers"
+-import { routePromptRetry, routePromptSyncRetry } from "../../shared/session-route"
++import { routePromptSyncRetry } from "../../shared/session-route"
+ import { setSessionTools } from "../../shared/session-tools-store"
+ import { isPlanFamily } from "./constants"
+ import { formatDetailedError } from "./error-formatting"
+@@ -15,12 +14,10 @@ import { buildTaskPrompt } from "./prompt-builder"
+ import type { DelegatedModelConfig, DelegateTaskArgs, OpencodeClient } from "./types"
+ 
+ type SendSyncPromptDeps = {
+-  promptWithModelSuggestionRetry: typeof promptWithModelSuggestionRetry
+   promptSyncWithModelSuggestionRetry: typeof promptSyncWithModelSuggestionRetry
+ }
+ 
+ const sendSyncPromptDeps: SendSyncPromptDeps = {
+-  promptWithModelSuggestionRetry,
+   promptSyncWithModelSuggestionRetry,
+ }
+ 
+@@ -52,11 +49,6 @@ function isUnexpectedEofError(error: unknown): boolean {
+   return lowered.includes("unexpected eof") || lowered.includes("json parse error")
+ }
+ 
+-function isPromptGateReservedError(error: unknown): boolean {
+-  const message = error instanceof Error ? error.message : String(error)
+-  return message.includes("promptAsync skipped by gate: reserved") || message.includes("prompt skipped by gate: reserved")
+-}
+-
+ export function buildSyncPromptTools(agentToUse: string): Record<string, boolean> {
+   return {
+     task: isPlanFamily(agentToUse),
+@@ -109,20 +101,12 @@ export async function sendSyncPrompt(
+   }
+ 
+   try {
+-    const routedPromptArgs = routePromptRetry(promptArgs, input.directory)
+-    await deps.promptWithModelSuggestionRetry(client, routedPromptArgs, { queueBehavior: "defer" })
++    await deps.promptSyncWithModelSuggestionRetry(client, routePromptSyncRetry(promptArgs, input.directory), {
++      queueBehavior: "defer",
++    })
+   } catch (promptError) {
+     if (isOracleAgent(input.agentToUse) && isUnexpectedEofError(promptError)) {
+-      try {
+-        await deps.promptSyncWithModelSuggestionRetry(client, routePromptSyncRetry(promptArgs, input.directory), {
+-          queueBehavior: "defer",
+-        })
+-        return null
+-      } catch (oracleRetryError) {
+-        if (!isPromptGateReservedError(oracleRetryError)) {
+-          promptError = oracleRetryError
+-        }
+-      }
++      return null
+     }
+ 
+     if (input.toastManager && input.taskId !== undefined) {
+-- 
+2.39.2
+

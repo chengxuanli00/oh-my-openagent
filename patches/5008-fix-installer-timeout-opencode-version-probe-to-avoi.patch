@@ -1,0 +1,149 @@
+From 7464d7e00531fc2eaf548d74e1e15a28602b0e3f Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 10 May 2026 15:07:23 +0900
+Subject: [PATCH 5008/5749] fix(installer): timeout opencode --version probe to
+ avoid Desktop binary hang
+
+When the binary resolved as 'opencode' on PATH is the OpenCode Desktop GUI (not the CLI), it does not respond to --version with prompt exit. proc.exited then waits forever, freezing the installer at 'Checking OpenCode installation'.
+
+Fix: race proc.exited against OPENCODE_VERSION_CHECK_TIMEOUT_MS=1500. On timeout, proc.kill() and treat the binary as failed so the next candidate is tried. Success requires both timedExitCode === 0 and proc.exitCode === 0.
+
+Fixes #3766
+---
+ .../config-manager/opencode-binary.test.ts    | 50 ++++++++++++++++++-
+ src/cli/config-manager/opencode-binary.ts     | 35 +++++++++++--
+ 2 files changed, 80 insertions(+), 5 deletions(-)
+
+diff --git a/src/cli/config-manager/opencode-binary.test.ts b/src/cli/config-manager/opencode-binary.test.ts
+index b298c102..fb64de7e 100644
+--- a/src/cli/config-manager/opencode-binary.test.ts
++++ b/src/cli/config-manager/opencode-binary.test.ts
+@@ -9,17 +9,19 @@ type OpenCodeBinaryModule = typeof import("./opencode-binary")
+ 
+ type CreateProcOptions = {
+   exitCode?: number | null
++  exited?: Promise<number>
+   output?: { stdout?: string; stderr?: string }
++  kill?: (signal?: NodeJS.Signals) => void
+ }
+ 
+ function createProc(options: CreateProcOptions = {}): ReturnType<typeof spawnHelpers.spawnWithWindowsHide> {
+   const exitCode = options.exitCode ?? 0
+   return {
+-    exited: Promise.resolve(exitCode),
++    exited: options.exited ?? Promise.resolve(exitCode),
+     exitCode,
+     stdout: options.output?.stdout !== undefined ? new Blob([options.output.stdout]).stream() : undefined,
+     stderr: options.output?.stderr !== undefined ? new Blob([options.output.stderr]).stream() : undefined,
+-    kill: () => {},
++    kill: options.kill ?? (() => {}),
+   } satisfies ReturnType<typeof spawnHelpers.spawnWithWindowsHide>
+ }
+ 
+@@ -71,6 +73,50 @@ describe("getOpenCodeVersion (installer)", () => {
+     })
+   })
+ 
++  describe("#given timeout path #when getOpenCodeVersion #then sends SIGTERM and SIGKILL and returns null without hanging", () => {
++    it("bounds process lifetime on hung --version", async () => {
++      const killCalls: Array<NodeJS.Signals | undefined> = []
++      spawnSpy.mockReturnValue(
++        createProc({
++          exited: new Promise<number>(() => {}),
++          output: { stdout: "" },
++          kill: (signal?: NodeJS.Signals) => {
++            killCalls.push(signal)
++          },
++        }),
++      )
++
++      const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation((handler: TimerHandler) => {
++        if (typeof handler === "function") {
++          handler()
++        }
++        return 1 as unknown as ReturnType<typeof setTimeout>
++      })
++
++      const result = await getOpenCodeVersion()
++
++      expect(result).toBe(null)
++      expect(killCalls).toEqual(["SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL"])
++
++      setTimeoutSpy.mockRestore()
++    })
++  })
++
++  describe("#given quick successful exit #when getOpenCodeVersion #then clears the watchdog timer", () => {
++    it("avoids timer leak after success", async () => {
++      spawnSpy.mockReturnValue(createProc({ output: { stdout: "1.14.33\n" } }))
++
++      const clearTimeoutSpy = spyOn(globalThis, "clearTimeout")
++
++      const result = await getOpenCodeVersion()
++
++      expect(result).toBe("1.14.33")
++      expect(clearTimeoutSpy).toHaveBeenCalledTimes(1)
++
++      clearTimeoutSpy.mockRestore()
++    })
++  })
++
+   describe("#given no opencode binary on PATH #when getOpenCodeVersion #then returns null", () => {
+     it("all candidate spawns throw", async () => {
+       spawnSpy.mockImplementation(() => {
+diff --git a/src/cli/config-manager/opencode-binary.ts b/src/cli/config-manager/opencode-binary.ts
+index d5256a0b..4c64205c 100644
+--- a/src/cli/config-manager/opencode-binary.ts
++++ b/src/cli/config-manager/opencode-binary.ts
+@@ -4,6 +4,8 @@ import { spawnWithWindowsHide } from "../../shared/spawn-with-windows-hide"
+ import { initConfigContext } from "./config-context"
+ 
+ const OPENCODE_BINARIES = ["opencode", "opencode-desktop"] as const
++const OPENCODE_VERSION_CHECK_TIMEOUT_MS = 1500
++const OPENCODE_VERSION_KILL_GRACE_MS = 200
+ 
+ interface OpenCodeBinaryResult {
+   binary: OpenCodeBinaryType
+@@ -17,9 +19,36 @@ async function findOpenCodeBinaryWithVersion(): Promise<OpenCodeBinaryResult | n
+         stdout: "pipe",
+         stderr: "pipe",
+       })
+-      const output = await new Response(proc.stdout).text()
+-      await proc.exited
+-      if (proc.exitCode === 0) {
++
++      const outputPromise = new Response(proc.stdout).text()
++      let killTimer: ReturnType<typeof setTimeout> | null = null
++      const timedExitCode = await Promise.race([
++        proc.exited,
++        new Promise<number>((resolve) => {
++          killTimer = setTimeout(() => {
++            proc.kill("SIGTERM")
++            setTimeout(() => {
++              proc.kill("SIGKILL")
++            }, OPENCODE_VERSION_KILL_GRACE_MS)
++            resolve(1)
++          }, OPENCODE_VERSION_CHECK_TIMEOUT_MS)
++        }),
++      ])
++
++      if (killTimer) {
++        clearTimeout(killTimer)
++      }
++
++      const output = await Promise.race([
++        outputPromise,
++        new Promise<string>((resolve) => {
++          setTimeout(() => {
++            resolve("")
++          }, OPENCODE_VERSION_KILL_GRACE_MS)
++        }),
++      ])
++
++      if (timedExitCode === 0 && proc.exitCode === 0) {
+         const version = extractSemverFromOutput(output) ?? output.trim()
+         initConfigContext(binary, version)
+         return { binary, version }
+-- 
+2.39.2
+

@@ -1,0 +1,239 @@
+From 5e4d45a3cacfcec5295711d1de0418dc5a7c96d0 Mon Sep 17 00:00:00 2001
+From: ZeyuFu <fuzeyu09@gmail.com>
+Date: Sat, 16 May 2026 06:31:18 -0400
+Subject: [PATCH 5314/5749] fix(todo-continuation-enforcer): stop looping after
+ all todos complete (#4013)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two P0 fixes for the assistant loop that repeats its final summary 3-5 times
+after all todos are marked completed before stagnation detection finally halts it.
+
+P0.1 — session-level stop flag: when handleSessionIdle detects incompleteCount===0
+it now sets state.allTodosCompletedAt. Subsequent idle events for the same session
+bail out immediately at the top of the function before any HTTP fetch or injection
+logic runs, preventing the re-entry loop regardless of todo-fetch caching latency.
+The flag is cleared by resetContinuationProgress so sessions that receive new todos
+after completion resume enforcement normally.
+
+P0.2 — snapshot comparison scope: getTodoSnapshot now only serialises the
+{id → status} mapping (sorted by key). Content and priority changes are excluded
+from the comparison. Previously those fields were included, causing hasTodoSnapshotChanged
+to return true whenever the LLM re-wrote todo text with identical status — which
+reported progressSource="todo" and reset stagnationCount to 0, preventing
+MAX_STAGNATION_COUNT=3 from ever being reached.
+
+P1 fixes (CONTINUATION_PROMPT adversarial wording, 10 s completion grace period)
+are deferred to a follow-up PR as noted in the issue.
+---
+ .../idle-event.test.ts                        | 43 ++++++++++++++++++-
+ .../todo-continuation-enforcer/idle-event.ts  |  7 +++
+ .../session-state.test.ts                     | 27 ++++++++++++
+ .../session-state.ts                          | 27 ++++--------
+ src/hooks/todo-continuation-enforcer/types.ts |  1 +
+ 5 files changed, 85 insertions(+), 20 deletions(-)
+
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.test.ts b/src/hooks/todo-continuation-enforcer/idle-event.test.ts
+index ede5e005..989b0b37 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.test.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.test.ts
+@@ -9,12 +9,15 @@ import type { ContinuationProgressUpdate, SessionState } from "./types"
+ function createStateStore(): {
+   store: SessionStateStore
+   resetCalls: string[]
++  trackCalls: string[]
++  state: SessionState
+ } {
+   const state: SessionState = {
+     stagnationCount: 0,
+     consecutiveFailures: 0,
+   }
+   const resetCalls: string[] = []
++  const trackCalls: string[] = []
+   const progressUpdate: ContinuationProgressUpdate = {
+     previousStagnationCount: 0,
+     stagnationCount: 0,
+@@ -24,11 +27,16 @@ function createStateStore(): {
+ 
+   return {
+     resetCalls,
++    trackCalls,
++    state,
+     store: {
+       getState: () => state,
+       getExistingState: () => state,
+       startPruneInterval: () => {},
+-      trackContinuationProgress: () => progressUpdate,
++      trackContinuationProgress: (sessionID: string) => {
++        trackCalls.push(sessionID)
++        return progressUpdate
++      },
+       resetContinuationProgress: (sessionID: string) => {
+         resetCalls.push(sessionID)
+       },
+@@ -95,4 +103,37 @@ describe("handleSessionIdle", () => {
+     // then
+     expect(resetCalls).toEqual([sessionID])
+   })
++
++  it("does not re-enter the injection path on subsequent idle events once all todos are complete (#4013 P0.1)", async () => {
++    // given
++    const sessionID = "ses_stop_flag"
++    const { store, resetCalls, trackCalls, state } = createStateStore()
++    const completedTodos = [
++      { id: "todo-1", content: "Ship", status: "completed", priority: "high" },
++    ]
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++          todo: async () => ({ data: completedTodos }),
++        },
++      },
++      directory: "/tmp/test",
++    }
++
++    // when — first idle: detects incompleteCount === 0, sets the stop flag
++    await handleSessionIdle({ ctx: ctx as never, sessionID, sessionStateStore: store })
++
++    // sanity: stop flag was set and reset was called
++    expect(state.allTodosCompletedAt).toBeGreaterThan(0)
++    expect(resetCalls).toHaveLength(1)
++
++    // when — second idle: stop flag already set, must bail out immediately
++    await handleSessionIdle({ ctx: ctx as never, sessionID, sessionStateStore: store })
++
++    // then: trackContinuationProgress was never called (injection path never reached)
++    expect(trackCalls).toHaveLength(0)
++    // reset is still called only once (from the first idle)
++    expect(resetCalls).toHaveLength(1)
++  })
+ })
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 4e4b6365..bd430609 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -37,6 +37,12 @@ export async function handleSessionIdle(args: {
+ 
+   const state = sessionStateStore.getState(sessionID)
+   const observedCompactionEpoch = state.recentCompactionEpoch
++
++  if (state.allTodosCompletedAt) {
++    log(`[${HOOK_NAME}] Skipped: all todos were already completed`, { sessionID, allTodosCompletedAt: state.allTodosCompletedAt })
++    return
++  }
++
+   if (state.isRecovering) {
+     log(`[${HOOK_NAME}] Skipped: in recovery`, { sessionID })
+     return
+@@ -107,6 +113,7 @@ export async function handleSessionIdle(args: {
+ 
+   const incompleteCount = getIncompleteCount(todos)
+   if (incompleteCount === 0) {
++    state.allTodosCompletedAt = Date.now()
+     sessionStateStore.resetContinuationProgress(sessionID)
+     log(`[${HOOK_NAME}] All todos complete`, { sessionID, total: todos.length })
+     return
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.test.ts b/src/hooks/todo-continuation-enforcer/session-state.test.ts
+index faf075ea..189a4f1e 100644
+--- a/src/hooks/todo-continuation-enforcer/session-state.test.ts
++++ b/src/hooks/todo-continuation-enforcer/session-state.test.ts
+@@ -144,6 +144,33 @@ describe("createSessionStateStore", () => {
+     expect(stagnatedAgainUpdate.stagnationCount).toBe(1)
+   })
+ 
++  test("given only content or priority changes while id→status mapping stays the same, does not treat it as progress (#4013 P0.2)", () => {
++    // given
++    const sessionID = "ses-content-priority-no-progress"
++    const state = sessionStateStore.getState(sessionID)
++    state.lastInjectedAt = Date.now()
++    const initialTodos = [
++      { id: "1", content: "Task 1", status: "pending", priority: "high" },
++      { id: "2", content: "Task 2", status: "pending", priority: "medium" },
++    ]
++    // Same id→status mapping; only content and priority differ
++    const contentChangedTodos = [
++      { id: "1", content: "Task 1 (updated description)", status: "pending", priority: "low" },
++      { id: "2", content: "Task 2 (revised)", status: "pending", priority: "high" },
++    ]
++
++    sessionStateStore.trackContinuationProgress(sessionID, 2, initialTodos)
++    state.awaitingPostInjectionProgressCheck = true
++
++    // when
++    const progressUpdate = sessionStateStore.trackContinuationProgress(sessionID, 2, contentChangedTodos)
++
++    // then — content/priority drift must not reset the stagnation counter
++    expect(progressUpdate.hasProgressed).toBe(false)
++    expect(progressUpdate.progressSource).toBe("none")
++    expect(progressUpdate.stagnationCount).toBe(1)
++  })
++
+   test("given no todo changes after a successful continuation, keeps counting stagnation", () => {
+     // given
+     const sessionID = "ses-no-todo-change-stagnation"
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.ts b/src/hooks/todo-continuation-enforcer/session-state.ts
+index 615aade0..a8da2eaa 100644
+--- a/src/hooks/todo-continuation-enforcer/session-state.ts
++++ b/src/hooks/todo-continuation-enforcer/session-state.ts
+@@ -43,29 +43,17 @@ export interface SessionStateStore {
+ }
+ 
+ function getTodoSnapshot(todos: Todo[]): string {
+-  const normalizedTodos = todos
++  // Only compare {id → status} mappings. Content/priority changes do not represent
++  // meaningful progress and must not reset the stagnation counter (issue #4013 P0.2).
++  const entries = todos
+     .map((todo) => ({
+-      id: todo.id ?? null,
+-      content: todo.content,
+-      priority: todo.priority,
++      key: todo.id ?? `${todo.content}:${todo.priority}`,
+       status: todo.status,
+     }))
+-    .sort((left, right) => {
+-      const leftKey = left.id ?? `${left.content}:${left.priority}:${left.status}`
+-      const rightKey = right.id ?? `${right.content}:${right.priority}:${right.status}`
+-      if (leftKey !== rightKey) {
+-        return leftKey.localeCompare(rightKey)
+-      }
+-      if (left.content !== right.content) {
+-        return left.content.localeCompare(right.content)
+-      }
+-      if (left.priority !== right.priority) {
+-        return left.priority.localeCompare(right.priority)
+-      }
+-      return left.status.localeCompare(right.status)
+-    })
++    .sort((left, right) => left.key.localeCompare(right.key))
++    .map(({ key, status }) => `${key}=${status}`)
+ 
+-  return JSON.stringify(normalizedTodos)
++  return entries.join("|")
+ }
+ 
+ export function createSessionStateStore(): SessionStateStore {
+@@ -213,6 +201,7 @@ export function createSessionStateStore(): SessionStateStore {
+     state.lastIncompleteCount = undefined
+     state.stagnationCount = 0
+     state.awaitingPostInjectionProgressCheck = false
++    state.allTodosCompletedAt = undefined
+     trackedSession.lastCompletedCount = undefined
+     trackedSession.lastTodoSnapshot = undefined
+   }
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index 99fa7018..d90f3929 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -36,6 +36,7 @@ export interface SessionState {
+   inFlight?: boolean
+   stagnationCount: number
+   consecutiveFailures: number
++  allTodosCompletedAt?: number
+   recentCompactionAt?: number
+   recentCompactionEpoch?: number
+   acknowledgedCompactionEpoch?: number
+-- 
+2.39.2
+

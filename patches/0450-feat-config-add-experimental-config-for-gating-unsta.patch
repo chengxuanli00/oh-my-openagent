@@ -1,0 +1,858 @@
+From 8cf713e1493fa83f66ffacbba9d39e6c3f667d2c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 19 Dec 2025 02:45:59 +0900
+Subject: [PATCH 0450/5749] feat(config): add experimental config for gating
+ unstable features (#110)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* feat(anthropic-auto-compact): add aggressive truncation and empty message recovery
+
+Add truncateUntilTargetTokens method, empty content recovery mechanism, and
+emptyContentAttemptBySession tracking for robust message handling.
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+
+* feat(session-recovery): add auto-resume and recovery callbacks
+
+Implement ResumeConfig, resumeSession() method, and callback support for
+enhanced session recovery and resume functionality.
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+
+* feat(config): add experimental config schema for gating unstable features
+
+This adds a new 'experimental' config field to the OhMyOpenCode schema that enables fine-grained control over unstable/experimental features:
+
+- aggressive_truncation: Enables aggressive token truncation in anthropic-auto-compact hook for more aggressive token limit handling
+- empty_message_recovery: Enables empty message recovery mechanism in anthropic-auto-compact hook for fixing truncation-induced empty message errors
+- auto_resume: Enables automatic session resume after recovery in session-recovery hook for seamless recovery experience
+
+The experimental config is optional and all experimental features are disabled by default, ensuring backward compatibility while allowing early adopters to opt-in to cutting-edge features.
+
+🤖 Generated with assistance of [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/config/index.ts                          |   2 +
+ src/config/schema.ts                         |   8 +
+ src/hooks/anthropic-auto-compact/executor.ts | 220 ++++++++++++++++++-
+ src/hooks/anthropic-auto-compact/index.ts    |  21 +-
+ src/hooks/anthropic-auto-compact/parser.ts   |  16 ++
+ src/hooks/anthropic-auto-compact/storage.ts  |  86 +++++++-
+ src/hooks/anthropic-auto-compact/types.ts    |   7 +-
+ src/hooks/index.ts                           |   4 +-
+ src/hooks/session-recovery/index.ts          |  71 ++++--
+ src/hooks/session-recovery/types.ts          |  16 ++
+ src/index.ts                                 |   4 +-
+ 11 files changed, 422 insertions(+), 33 deletions(-)
+
+diff --git a/src/config/index.ts b/src/config/index.ts
+index 158fd8f5..29d32b64 100644
+--- a/src/config/index.ts
++++ b/src/config/index.ts
+@@ -6,6 +6,7 @@ export {
+   AgentNameSchema,
+   HookNameSchema,
+   OmoAgentConfigSchema,
++  ExperimentalConfigSchema,
+ } from "./schema"
+ 
+ export type {
+@@ -16,4 +17,5 @@ export type {
+   AgentName,
+   HookName,
+   OmoAgentConfig,
++  ExperimentalConfig,
+ } from "./schema"
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index c900a9b8..65864c8a 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -106,6 +106,12 @@ export const OmoAgentConfigSchema = z.object({
+   disabled: z.boolean().optional(),
+ })
+ 
++export const ExperimentalConfigSchema = z.object({
++  aggressive_truncation: z.boolean().optional(),
++  empty_message_recovery: z.boolean().optional(),
++  auto_resume: z.boolean().optional(),
++})
++
+ export const OhMyOpenCodeConfigSchema = z.object({
+   $schema: z.string().optional(),
+   disabled_mcps: z.array(McpNameSchema).optional(),
+@@ -115,6 +121,7 @@ export const OhMyOpenCodeConfigSchema = z.object({
+   claude_code: ClaudeCodeConfigSchema.optional(),
+   google_auth: z.boolean().optional(),
+   omo_agent: OmoAgentConfigSchema.optional(),
++  experimental: ExperimentalConfigSchema.optional(),
+ })
+ 
+ export type OhMyOpenCodeConfig = z.infer<typeof OhMyOpenCodeConfigSchema>
+@@ -123,5 +130,6 @@ export type AgentOverrides = z.infer<typeof AgentOverridesSchema>
+ export type AgentName = z.infer<typeof AgentNameSchema>
+ export type HookName = z.infer<typeof HookNameSchema>
+ export type OmoAgentConfig = z.infer<typeof OmoAgentConfigSchema>
++export type ExperimentalConfig = z.infer<typeof ExperimentalConfigSchema>
+ 
+ export { McpNameSchema, type McpName } from "../mcp/types"
+diff --git a/src/hooks/anthropic-auto-compact/executor.ts b/src/hooks/anthropic-auto-compact/executor.ts
+index 7897d27d..6607b953 100644
+--- a/src/hooks/anthropic-auto-compact/executor.ts
++++ b/src/hooks/anthropic-auto-compact/executor.ts
+@@ -1,6 +1,9 @@
+ import type { AutoCompactState, FallbackState, RetryState, TruncateState } from "./types"
++import type { ExperimentalConfig } from "../../config"
+ import { FALLBACK_CONFIG, RETRY_CONFIG, TRUNCATE_CONFIG } from "./types"
+-import { findLargestToolResult, truncateToolResult } from "./storage"
++import { findLargestToolResult, truncateToolResult, truncateUntilTargetTokens } from "./storage"
++import { findEmptyMessages, injectTextPart } from "../session-recovery/storage"
++import { log } from "../../shared/logger"
+ 
+ type Client = {
+   session: {
+@@ -151,24 +154,151 @@ function clearSessionState(autoCompactState: AutoCompactState, sessionID: string
+   autoCompactState.retryStateBySession.delete(sessionID)
+   autoCompactState.fallbackStateBySession.delete(sessionID)
+   autoCompactState.truncateStateBySession.delete(sessionID)
++  autoCompactState.emptyContentAttemptBySession.delete(sessionID)
+   autoCompactState.compactionInProgress.delete(sessionID)
+ }
+ 
++function getOrCreateEmptyContentAttempt(
++  autoCompactState: AutoCompactState,
++  sessionID: string
++): number {
++  return autoCompactState.emptyContentAttemptBySession.get(sessionID) ?? 0
++}
++
++async function fixEmptyMessages(
++  sessionID: string,
++  autoCompactState: AutoCompactState,
++  client: Client
++): Promise<boolean> {
++  const attempt = getOrCreateEmptyContentAttempt(autoCompactState, sessionID)
++  autoCompactState.emptyContentAttemptBySession.set(sessionID, attempt + 1)
++
++  const emptyMessageIds = findEmptyMessages(sessionID)
++  if (emptyMessageIds.length === 0) {
++    await client.tui
++      .showToast({
++        body: {
++          title: "Empty Content Error",
++          message: "No empty messages found in storage. Cannot auto-recover.",
++          variant: "error",
++          duration: 5000,
++        },
++      })
++      .catch(() => {})
++    return false
++  }
++
++  let fixed = false
++  for (const messageID of emptyMessageIds) {
++    const success = injectTextPart(sessionID, messageID, "[user interrupted]")
++    if (success) fixed = true
++  }
++
++  if (fixed) {
++    await client.tui
++      .showToast({
++        body: {
++          title: "Session Recovery",
++          message: `Fixed ${emptyMessageIds.length} empty messages. Retrying...`,
++          variant: "warning",
++          duration: 3000,
++        },
++      })
++      .catch(() => {})
++  }
++
++  return fixed
++}
++
+ export async function executeCompact(
+   sessionID: string,
+   msg: Record<string, unknown>,
+   autoCompactState: AutoCompactState,
+   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+   client: any,
+-  directory: string
++  directory: string,
++  experimental?: ExperimentalConfig
+ ): Promise<void> {
+   if (autoCompactState.compactionInProgress.has(sessionID)) {
+     return
+   }
+   autoCompactState.compactionInProgress.add(sessionID)
+ 
++  const errorData = autoCompactState.errorDataBySession.get(sessionID)
+   const truncateState = getOrCreateTruncateState(autoCompactState, sessionID)
+ 
++  if (
++    experimental?.aggressive_truncation &&
++    errorData?.currentTokens &&
++    errorData?.maxTokens &&
++    errorData.currentTokens > errorData.maxTokens &&
++    truncateState.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts
++  ) {
++    log("[auto-compact] aggressive truncation triggered (experimental)", {
++      currentTokens: errorData.currentTokens,
++      maxTokens: errorData.maxTokens,
++      targetRatio: TRUNCATE_CONFIG.targetTokenRatio,
++    })
++
++    const aggressiveResult = truncateUntilTargetTokens(
++      sessionID,
++      errorData.currentTokens,
++      errorData.maxTokens,
++      TRUNCATE_CONFIG.targetTokenRatio,
++      TRUNCATE_CONFIG.charsPerToken
++    )
++
++    if (aggressiveResult.truncatedCount > 0) {
++      truncateState.truncateAttempt += aggressiveResult.truncatedCount
++
++      const toolNames = aggressiveResult.truncatedTools.map((t) => t.toolName).join(", ")
++      const statusMsg = aggressiveResult.sufficient
++        ? `Truncated ${aggressiveResult.truncatedCount} outputs (${formatBytes(aggressiveResult.totalBytesRemoved)})`
++        : `Truncated ${aggressiveResult.truncatedCount} outputs (${formatBytes(aggressiveResult.totalBytesRemoved)}) but need ${formatBytes(aggressiveResult.targetBytesToRemove)}. Falling back to summarize/revert...`
++
++      await (client as Client).tui
++        .showToast({
++          body: {
++            title: aggressiveResult.sufficient ? "Aggressive Truncation" : "Partial Truncation",
++            message: `${statusMsg}: ${toolNames}`,
++            variant: "warning",
++            duration: 4000,
++          },
++        })
++        .catch(() => {})
++
++      log("[auto-compact] aggressive truncation completed", aggressiveResult)
++
++      if (aggressiveResult.sufficient) {
++        autoCompactState.compactionInProgress.delete(sessionID)
++
++        setTimeout(async () => {
++          try {
++            await (client as Client).session.prompt_async({
++              path: { sessionID },
++              body: { parts: [{ type: "text", text: "Continue" }] },
++              query: { directory },
++            })
++          } catch {}
++        }, 500)
++        return
++      }
++    } else {
++      await (client as Client).tui
++        .showToast({
++          body: {
++            title: "Truncation Skipped",
++            message: "No tool outputs found to truncate.",
++            variant: "warning",
++            duration: 3000,
++          },
++        })
++        .catch(() => {})
++    }
++  }
++
++  let skipSummarize = false
++
+   if (truncateState.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts) {
+     const largest = findLargestToolResult(sessionID)
+ 
+@@ -203,12 +333,68 @@ export async function executeCompact(
+         }, 500)
+         return
+       }
++    } else if (errorData?.currentTokens && errorData?.maxTokens && errorData.currentTokens > errorData.maxTokens) {
++      skipSummarize = true
++      await (client as Client).tui
++        .showToast({
++          body: {
++            title: "Summarize Skipped",
++            message: `Over token limit (${errorData.currentTokens}/${errorData.maxTokens}) with nothing to truncate. Going to revert...`,
++            variant: "warning",
++            duration: 3000,
++          },
++        })
++        .catch(() => {})
++    } else if (!errorData?.currentTokens) {
++      await (client as Client).tui
++        .showToast({
++          body: {
++            title: "Truncation Skipped",
++            message: "No large tool outputs found.",
++            variant: "warning",
++            duration: 3000,
++          },
++        })
++        .catch(() => {})
+     }
+   }
+ 
+   const retryState = getOrCreateRetryState(autoCompactState, sessionID)
+ 
+-  if (retryState.attempt < RETRY_CONFIG.maxAttempts) {
++  if (experimental?.empty_message_recovery && errorData?.errorType?.includes("non-empty content")) {
++    const attempt = getOrCreateEmptyContentAttempt(autoCompactState, sessionID)
++    if (attempt < 3) {
++      const fixed = await fixEmptyMessages(sessionID, autoCompactState, client as Client)
++      if (fixed) {
++        autoCompactState.compactionInProgress.delete(sessionID)
++        setTimeout(() => {
++          executeCompact(sessionID, msg, autoCompactState, client, directory, experimental)
++        }, 500)
++        return
++      }
++    } else {
++      await (client as Client).tui
++        .showToast({
++          body: {
++            title: "Recovery Failed",
++            message: "Max recovery attempts (3) reached for empty content error. Please start a new session.",
++            variant: "error",
++            duration: 10000,
++          },
++        })
++        .catch(() => {})
++      autoCompactState.compactionInProgress.delete(sessionID)
++      return
++    }
++  }
++
++  if (Date.now() - retryState.lastAttemptTime > 300000) {
++    retryState.attempt = 0
++    autoCompactState.fallbackStateBySession.delete(sessionID)
++    autoCompactState.truncateStateBySession.delete(sessionID)
++  }
++
++  if (!skipSummarize && retryState.attempt < RETRY_CONFIG.maxAttempts) {
+     retryState.attempt++
+     retryState.lastAttemptTime = Date.now()
+ 
+@@ -234,7 +420,7 @@ export async function executeCompact(
+           query: { directory },
+         })
+ 
+-        clearSessionState(autoCompactState, sessionID)
++        autoCompactState.compactionInProgress.delete(sessionID)
+ 
+         setTimeout(async () => {
+           try {
+@@ -253,10 +439,21 @@ export async function executeCompact(
+         const cappedDelay = Math.min(delay, RETRY_CONFIG.maxDelayMs)
+ 
+         setTimeout(() => {
+-          executeCompact(sessionID, msg, autoCompactState, client, directory)
++          executeCompact(sessionID, msg, autoCompactState, client, directory, experimental)
+         }, cappedDelay)
+         return
+       }
++    } else {
++      await (client as Client).tui
++        .showToast({
++          body: {
++            title: "Summarize Skipped",
++            message: "Missing providerID or modelID. Skipping to revert...",
++            variant: "warning",
++            duration: 3000,
++          },
++        })
++        .catch(() => {})
+     }
+   }
+ 
+@@ -301,10 +498,21 @@ export async function executeCompact(
+         autoCompactState.compactionInProgress.delete(sessionID)
+ 
+         setTimeout(() => {
+-          executeCompact(sessionID, msg, autoCompactState, client, directory)
++          executeCompact(sessionID, msg, autoCompactState, client, directory, experimental)
+         }, 1000)
+         return
+       } catch {}
++    } else {
++      await (client as Client).tui
++        .showToast({
++          body: {
++            title: "Revert Skipped",
++            message: "Could not find last message pair to revert.",
++            variant: "warning",
++            duration: 3000,
++          },
++        })
++        .catch(() => {})
+     }
+   }
+ 
+diff --git a/src/hooks/anthropic-auto-compact/index.ts b/src/hooks/anthropic-auto-compact/index.ts
+index 3e701009..e64ce85b 100644
+--- a/src/hooks/anthropic-auto-compact/index.ts
++++ b/src/hooks/anthropic-auto-compact/index.ts
+@@ -1,7 +1,13 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { AutoCompactState, ParsedTokenLimitError } from "./types"
++import type { ExperimentalConfig } from "../../config"
+ import { parseAnthropicTokenLimitError } from "./parser"
+ import { executeCompact, getLastAssistant } from "./executor"
++import { log } from "../../shared/logger"
++
++export interface AnthropicAutoCompactOptions {
++  experimental?: ExperimentalConfig
++}
+ 
+ function createAutoCompactState(): AutoCompactState {
+   return {
+@@ -10,12 +16,14 @@ function createAutoCompactState(): AutoCompactState {
+     retryStateBySession: new Map(),
+     fallbackStateBySession: new Map(),
+     truncateStateBySession: new Map(),
++    emptyContentAttemptBySession: new Map(),
+     compactionInProgress: new Set<string>(),
+   }
+ }
+ 
+-export function createAnthropicAutoCompactHook(ctx: PluginInput) {
++export function createAnthropicAutoCompactHook(ctx: PluginInput, options?: AnthropicAutoCompactOptions) {
+   const autoCompactState = createAutoCompactState()
++  const experimental = options?.experimental
+ 
+   const eventHandler = async ({ event }: { event: { type: string; properties?: unknown } }) => {
+     const props = event.properties as Record<string, unknown> | undefined
+@@ -28,6 +36,7 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+         autoCompactState.retryStateBySession.delete(sessionInfo.id)
+         autoCompactState.fallbackStateBySession.delete(sessionInfo.id)
+         autoCompactState.truncateStateBySession.delete(sessionInfo.id)
++        autoCompactState.emptyContentAttemptBySession.delete(sessionInfo.id)
+         autoCompactState.compactionInProgress.delete(sessionInfo.id)
+       }
+       return
+@@ -35,9 +44,11 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+ 
+     if (event.type === "session.error") {
+       const sessionID = props?.sessionID as string | undefined
++      log("[auto-compact] session.error received", { sessionID, error: props?.error })
+       if (!sessionID) return
+ 
+       const parsed = parseAnthropicTokenLimitError(props?.error)
++      log("[auto-compact] parsed result", { parsed, hasError: !!props?.error })
+       if (parsed) {
+         autoCompactState.pendingCompact.add(sessionID)
+         autoCompactState.errorDataBySession.set(sessionID, parsed)
+@@ -67,7 +78,8 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+             { providerID, modelID },
+             autoCompactState,
+             ctx.client,
+-            ctx.directory
++            ctx.directory,
++            experimental
+           )
+         }, 300)
+       }
+@@ -79,7 +91,9 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+       const sessionID = info?.sessionID as string | undefined
+ 
+       if (sessionID && info?.role === "assistant" && info.error) {
++        log("[auto-compact] message.updated with error", { sessionID, error: info.error })
+         const parsed = parseAnthropicTokenLimitError(info.error)
++        log("[auto-compact] message.updated parsed result", { parsed })
+         if (parsed) {
+           parsed.providerID = info.providerID as string | undefined
+           parsed.modelID = info.modelID as string | undefined
+@@ -123,7 +137,8 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+         { providerID, modelID },
+         autoCompactState,
+         ctx.client,
+-        ctx.directory
++        ctx.directory,
++        experimental
+       )
+     }
+   }
+diff --git a/src/hooks/anthropic-auto-compact/parser.ts b/src/hooks/anthropic-auto-compact/parser.ts
+index 68f18e60..66664802 100644
+--- a/src/hooks/anthropic-auto-compact/parser.ts
++++ b/src/hooks/anthropic-auto-compact/parser.ts
+@@ -25,6 +25,7 @@ const TOKEN_LIMIT_KEYWORDS = [
+   "token limit",
+   "context length",
+   "too many tokens",
++  "non-empty content",
+ ]
+ 
+ function extractTokensFromMessage(message: string): { current: number; max: number } | null {
+@@ -46,6 +47,13 @@ function isTokenLimitError(text: string): boolean {
+ 
+ export function parseAnthropicTokenLimitError(err: unknown): ParsedTokenLimitError | null {
+   if (typeof err === "string") {
++    if (err.toLowerCase().includes("non-empty content")) {
++      return {
++        currentTokens: 0,
++        maxTokens: 0,
++        errorType: "non-empty content",
++      }
++    }
+     if (isTokenLimitError(err)) {
+       const tokens = extractTokensFromMessage(err)
+       return {
+@@ -142,6 +150,14 @@ export function parseAnthropicTokenLimitError(err: unknown): ParsedTokenLimitErr
+     }
+   }
+ 
++  if (combinedText.toLowerCase().includes("non-empty content")) {
++    return {
++      currentTokens: 0,
++      maxTokens: 0,
++      errorType: "non-empty content",
++    }
++  }
++
+   if (isTokenLimitError(combinedText)) {
+     return {
+       currentTokens: 0,
+diff --git a/src/hooks/anthropic-auto-compact/storage.ts b/src/hooks/anthropic-auto-compact/storage.ts
+index 95e9facd..ddc0b80e 100644
+--- a/src/hooks/anthropic-auto-compact/storage.ts
++++ b/src/hooks/anthropic-auto-compact/storage.ts
+@@ -1,8 +1,19 @@
+ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
++import { homedir } from "node:os"
+ import { join } from "node:path"
+ import { xdgData } from "xdg-basedir"
+ 
+-const OPENCODE_STORAGE = join(xdgData ?? "", "opencode", "storage")
++let OPENCODE_STORAGE = join(xdgData ?? "", "opencode", "storage")
++
++// Fix for macOS where xdg-basedir points to ~/Library/Application Support
++// but OpenCode (cli) uses ~/.local/share
++if (process.platform === "darwin" && !existsSync(OPENCODE_STORAGE)) {
++  const localShare = join(homedir(), ".local", "share", "opencode", "storage")
++  if (existsSync(localShare)) {
++    OPENCODE_STORAGE = localShare
++  }
++}
++
+ const MESSAGE_STORAGE = join(OPENCODE_STORAGE, "message")
+ const PART_STORAGE = join(OPENCODE_STORAGE, "part")
+ 
+@@ -171,3 +182,76 @@ export function countTruncatedResults(sessionID: string): number {
+ 
+   return count
+ }
++
++export interface AggressiveTruncateResult {
++  success: boolean
++  sufficient: boolean
++  truncatedCount: number
++  totalBytesRemoved: number
++  targetBytesToRemove: number
++  truncatedTools: Array<{ toolName: string; originalSize: number }>
++}
++
++export function truncateUntilTargetTokens(
++  sessionID: string,
++  currentTokens: number,
++  maxTokens: number,
++  targetRatio: number = 0.8,
++  charsPerToken: number = 4
++): AggressiveTruncateResult {
++  const targetTokens = Math.floor(maxTokens * targetRatio)
++  const tokensToReduce = currentTokens - targetTokens
++  const charsToReduce = tokensToReduce * charsPerToken
++
++  if (tokensToReduce <= 0) {
++    return {
++      success: true,
++      sufficient: true,
++      truncatedCount: 0,
++      totalBytesRemoved: 0,
++      targetBytesToRemove: 0,
++      truncatedTools: [],
++    }
++  }
++
++  const results = findToolResultsBySize(sessionID)
++
++  if (results.length === 0) {
++    return {
++      success: false,
++      sufficient: false,
++      truncatedCount: 0,
++      totalBytesRemoved: 0,
++      targetBytesToRemove: charsToReduce,
++      truncatedTools: [],
++    }
++  }
++
++  let totalRemoved = 0
++  let truncatedCount = 0
++  const truncatedTools: Array<{ toolName: string; originalSize: number }> = []
++
++  for (const result of results) {
++    const truncateResult = truncateToolResult(result.partPath)
++    if (truncateResult.success) {
++      truncatedCount++
++      const removedSize = truncateResult.originalSize ?? result.outputSize
++      totalRemoved += removedSize
++      truncatedTools.push({
++        toolName: truncateResult.toolName ?? result.toolName,
++        originalSize: removedSize,
++      })
++    }
++  }
++
++  const sufficient = totalRemoved >= charsToReduce
++
++  return {
++    success: truncatedCount > 0,
++    sufficient,
++    truncatedCount,
++    totalBytesRemoved: totalRemoved,
++    targetBytesToRemove: charsToReduce,
++    truncatedTools,
++  }
++}
+diff --git a/src/hooks/anthropic-auto-compact/types.ts b/src/hooks/anthropic-auto-compact/types.ts
+index 7d58e1a7..6fdb9d19 100644
+--- a/src/hooks/anthropic-auto-compact/types.ts
++++ b/src/hooks/anthropic-auto-compact/types.ts
+@@ -28,6 +28,7 @@ export interface AutoCompactState {
+   retryStateBySession: Map<string, RetryState>
+   fallbackStateBySession: Map<string, FallbackState>
+   truncateStateBySession: Map<string, TruncateState>
++  emptyContentAttemptBySession: Map<string, number>
+   compactionInProgress: Set<string>
+ }
+ 
+@@ -44,6 +45,8 @@ export const FALLBACK_CONFIG = {
+ } as const
+ 
+ export const TRUNCATE_CONFIG = {
+-  maxTruncateAttempts: 10,
+-  minOutputSizeToTruncate: 1000,
++  maxTruncateAttempts: 20,
++  minOutputSizeToTruncate: 500,
++  targetTokenRatio: 0.5,
++  charsPerToken: 4,
+ } as const
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 7af81026..d882e20f 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -1,14 +1,14 @@
+ export { createTodoContinuationEnforcer, type TodoContinuationEnforcer } from "./todo-continuation-enforcer";
+ export { createContextWindowMonitorHook } from "./context-window-monitor";
+ export { createSessionNotification } from "./session-notification";
+-export { createSessionRecoveryHook, type SessionRecoveryHook } from "./session-recovery";
++export { createSessionRecoveryHook, type SessionRecoveryHook, type SessionRecoveryOptions } from "./session-recovery";
+ export { createCommentCheckerHooks } from "./comment-checker";
+ export { createGrepOutputTruncatorHook } from "./grep-output-truncator";
+ export { createToolOutputTruncatorHook } from "./tool-output-truncator";
+ export { createDirectoryAgentsInjectorHook } from "./directory-agents-injector";
+ export { createDirectoryReadmeInjectorHook } from "./directory-readme-injector";
+ export { createEmptyTaskResponseDetectorHook } from "./empty-task-response-detector";
+-export { createAnthropicAutoCompactHook } from "./anthropic-auto-compact";
++export { createAnthropicAutoCompactHook, type AnthropicAutoCompactOptions } from "./anthropic-auto-compact";
+ export { createThinkModeHook } from "./think-mode";
+ export { createClaudeCodeHooksHook } from "./claude-code-hooks";
+ export { createRulesInjectorHook } from "./rules-injector";
+diff --git a/src/hooks/session-recovery/index.ts b/src/hooks/session-recovery/index.ts
+index 60279077..89fb460f 100644
+--- a/src/hooks/session-recovery/index.ts
++++ b/src/hooks/session-recovery/index.ts
+@@ -1,5 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { createOpencodeClient } from "@opencode-ai/sdk"
++import type { ExperimentalConfig } from "../../config"
+ import {
+   findEmptyMessages,
+   findEmptyMessageByIndex,
+@@ -14,7 +15,11 @@ import {
+   replaceEmptyTextParts,
+   stripThinkingParts,
+ } from "./storage"
+-import type { MessageData } from "./types"
++import type { MessageData, ResumeConfig } from "./types"
++
++export interface SessionRecoveryOptions {
++  experimental?: ExperimentalConfig
++}
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+ 
+@@ -22,7 +27,6 @@ type RecoveryErrorType =
+   | "tool_result_missing"
+   | "thinking_block_order"
+   | "thinking_disabled_violation"
+-  | "empty_content_message"
+   | null
+ 
+ interface MessageInfo {
+@@ -49,6 +53,41 @@ interface MessagePart {
+   input?: Record<string, unknown>
+ }
+ 
++const RECOVERY_RESUME_TEXT = "[session recovered - continuing previous task]"
++
++function findLastUserMessage(messages: MessageData[]): MessageData | undefined {
++  for (let i = messages.length - 1; i >= 0; i--) {
++    if (messages[i].info?.role === "user") {
++      return messages[i]
++    }
++  }
++  return undefined
++}
++
++function extractResumeConfig(userMessage: MessageData | undefined, sessionID: string): ResumeConfig {
++  return {
++    sessionID,
++    agent: userMessage?.info?.agent,
++    model: userMessage?.info?.model,
++  }
++}
++
++async function resumeSession(client: Client, config: ResumeConfig): Promise<boolean> {
++  try {
++    await client.session.prompt({
++      path: { id: config.sessionID },
++      body: {
++        parts: [{ type: "text", text: RECOVERY_RESUME_TEXT }],
++        agent: config.agent,
++        model: config.model,
++      },
++    })
++    return true
++  } catch {
++    return false
++  }
++}
++
+ function getErrorMessage(error: unknown): string {
+   if (!error) return ""
+   if (typeof error === "string") return error.toLowerCase()
+@@ -104,15 +143,6 @@ function detectErrorType(error: unknown): RecoveryErrorType {
+     return "thinking_disabled_violation"
+   }
+ 
+-  if (
+-    message.includes("non-empty content") ||
+-    message.includes("must have non-empty content") ||
+-    (message.includes("content") && message.includes("is empty")) ||
+-    (message.includes("content field") && message.includes("empty"))
+-  ) {
+-    return "empty_content_message"
+-  }
+-
+   return null
+ }
+ 
+@@ -286,8 +316,9 @@ export interface SessionRecoveryHook {
+   setOnRecoveryCompleteCallback: (callback: (sessionID: string) => void) => void
+ }
+ 
+-export function createSessionRecoveryHook(ctx: PluginInput): SessionRecoveryHook {
++export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRecoveryOptions): SessionRecoveryHook {
+   const processingErrors = new Set<string>()
++  const experimental = options?.experimental
+   let onAbortCallback: ((sessionID: string) => void) | null = null
+   let onRecoveryCompleteCallback: ((sessionID: string) => void) | null = null
+ 
+@@ -338,13 +369,11 @@ export function createSessionRecoveryHook(ctx: PluginInput): SessionRecoveryHook
+         tool_result_missing: "Tool Crash Recovery",
+         thinking_block_order: "Thinking Block Recovery",
+         thinking_disabled_violation: "Thinking Strip Recovery",
+-        empty_content_message: "Empty Message Recovery",
+       }
+       const toastMessages: Record<RecoveryErrorType & string, string> = {
+         tool_result_missing: "Injecting cancelled tool results...",
+         thinking_block_order: "Fixing message structure...",
+         thinking_disabled_violation: "Stripping thinking blocks...",
+-        empty_content_message: "Fixing empty message...",
+       }
+ 
+       await ctx.client.tui
+@@ -364,13 +393,21 @@ export function createSessionRecoveryHook(ctx: PluginInput): SessionRecoveryHook
+         success = await recoverToolResultMissing(ctx.client, sessionID, failedMsg)
+       } else if (errorType === "thinking_block_order") {
+         success = await recoverThinkingBlockOrder(ctx.client, sessionID, failedMsg, ctx.directory, info.error)
++        if (success && experimental?.auto_resume) {
++          const lastUser = findLastUserMessage(msgs ?? [])
++          const resumeConfig = extractResumeConfig(lastUser, sessionID)
++          await resumeSession(ctx.client, resumeConfig)
++        }
+       } else if (errorType === "thinking_disabled_violation") {
+         success = await recoverThinkingDisabledViolation(ctx.client, sessionID, failedMsg)
+-      } else if (errorType === "empty_content_message") {
+-        success = await recoverEmptyContentMessage(ctx.client, sessionID, failedMsg, ctx.directory, info.error)
++        if (success && experimental?.auto_resume) {
++          const lastUser = findLastUserMessage(msgs ?? [])
++          const resumeConfig = extractResumeConfig(lastUser, sessionID)
++          await resumeSession(ctx.client, resumeConfig)
++        }
+       }
+ 
+-    return success
++      return success
+   } catch (err) {
+     console.error("[session-recovery] Recovery failed:", err)
+     return false
+diff --git a/src/hooks/session-recovery/types.ts b/src/hooks/session-recovery/types.ts
+index 09b6985d..23d19fd9 100644
+--- a/src/hooks/session-recovery/types.ts
++++ b/src/hooks/session-recovery/types.ts
+@@ -69,6 +69,13 @@ export interface MessageData {
+     sessionID?: string
+     parentID?: string
+     error?: unknown
++    agent?: string
++    model?: {
++      providerID: string
++      modelID: string
++    }
++    system?: string
++    tools?: Record<string, boolean>
+   }
+   parts?: Array<{
+     type: string
+@@ -80,3 +87,12 @@ export interface MessageData {
+     callID?: string
+   }>
+ }
++
++export interface ResumeConfig {
++  sessionID: string
++  agent?: string
++  model?: {
++    providerID: string
++    modelID: string
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 9b9e8685..e51eebbc 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -177,7 +177,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     ? createContextWindowMonitorHook(ctx)
+     : null;
+   const sessionRecovery = isHookEnabled("session-recovery")
+-    ? createSessionRecoveryHook(ctx)
++    ? createSessionRecoveryHook(ctx, { experimental: pluginConfig.experimental })
+     : null;
+   const sessionNotification = isHookEnabled("session-notification")
+     ? createSessionNotification(ctx)
+@@ -212,7 +212,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     disabledHooks: (pluginConfig.claude_code?.hooks ?? true) ? undefined : true,
+   });
+   const anthropicAutoCompact = isHookEnabled("anthropic-auto-compact")
+-    ? createAnthropicAutoCompactHook(ctx)
++    ? createAnthropicAutoCompactHook(ctx, { experimental: pluginConfig.experimental })
+     : null;
+   const rulesInjector = isHookEnabled("rules-injector")
+     ? createRulesInjectorHook(ctx)
+-- 
+2.39.2
+

@@ -1,0 +1,369 @@
+From 725ec9b91df9aa310172f6d3d3915d4f833c1722 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 5 Dec 2025 22:48:54 +0900
+Subject: [PATCH 0099/5749] feat(ast-grep): add safety limits to prevent token
+ overflow
+
+- Add timeout (5min), output limit (1MB), match limit (500)
+- Add SgResult type with truncation info
+- Update formatSearchResult/formatReplaceResult for truncation display
+- cli.ts: timeout + output truncation + graceful JSON recovery
+---
+ src/tools/ast-grep/cli.ts       | 148 ++++++++++++++++++++++----------
+ src/tools/ast-grep/constants.ts |   4 +
+ src/tools/ast-grep/tools.ts     |  10 +--
+ src/tools/ast-grep/types.ts     |   8 ++
+ src/tools/ast-grep/utils.ts     |  48 +++++++++--
+ 5 files changed, 161 insertions(+), 57 deletions(-)
+
+diff --git a/src/tools/ast-grep/cli.ts b/src/tools/ast-grep/cli.ts
+index 861d10c1..b93c317f 100644
+--- a/src/tools/ast-grep/cli.ts
++++ b/src/tools/ast-grep/cli.ts
+@@ -1,8 +1,15 @@
+ import { spawn } from "bun"
+ import { existsSync } from "fs"
+-import { getSgCliPath, setSgCliPath, findSgCliPathSync } from "./constants"
++import {
++  getSgCliPath,
++  setSgCliPath,
++  findSgCliPathSync,
++  DEFAULT_TIMEOUT_MS,
++  DEFAULT_MAX_OUTPUT_BYTES,
++  DEFAULT_MAX_MATCHES,
++} from "./constants"
+ import { ensureAstGrepBinary } from "./downloader"
+-import type { CliMatch, CliLanguage } from "./types"
++import type { CliMatch, CliLanguage, SgResult } from "./types"
+ 
+ export interface RunOptions {
+   pattern: string
+@@ -54,26 +61,7 @@ export function startBackgroundInit(): void {
+   }
+ }
+ 
+-interface SpawnResult {
+-  stdout: string
+-  stderr: string
+-  exitCode: number
+-}
+-
+-async function spawnSg(cliPath: string, args: string[]): Promise<SpawnResult> {
+-  const proc = spawn([cliPath, ...args], {
+-    stdout: "pipe",
+-    stderr: "pipe",
+-  })
+-
+-  const stdout = await new Response(proc.stdout).text()
+-  const stderr = await new Response(proc.stderr).text()
+-  const exitCode = await proc.exited
+-
+-  return { stdout, stderr, exitCode }
+-}
+-
+-export async function runSg(options: RunOptions): Promise<CliMatch[]> {
++export async function runSg(options: RunOptions): Promise<SgResult> {
+   const args = ["run", "-p", options.pattern, "--lang", options.lang, "--json=compact"]
+ 
+   if (options.rewrite) {
+@@ -105,55 +93,129 @@ export async function runSg(options: RunOptions): Promise<CliMatch[]> {
+     }
+   }
+ 
+-  let result: SpawnResult
++  const timeout = DEFAULT_TIMEOUT_MS
++
++  const proc = spawn([cliPath, ...args], {
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++
++  const timeoutPromise = new Promise<never>((_, reject) => {
++    const id = setTimeout(() => {
++      proc.kill()
++      reject(new Error(`Search timeout after ${timeout}ms`))
++    }, timeout)
++    proc.exited.then(() => clearTimeout(id))
++  })
++
++  let stdout: string
++  let stderr: string
++  let exitCode: number
++
+   try {
+-    result = await spawnSg(cliPath, args)
++    stdout = await Promise.race([new Response(proc.stdout).text(), timeoutPromise])
++    stderr = await new Response(proc.stderr).text()
++    exitCode = await proc.exited
+   } catch (e) {
+-    const error = e as NodeJS.ErrnoException
++    const error = e as Error
++    if (error.message?.includes("timeout")) {
++      return {
++        matches: [],
++        totalMatches: 0,
++        truncated: true,
++        truncatedReason: "timeout",
++        error: error.message,
++      }
++    }
++
++    const nodeError = e as NodeJS.ErrnoException
+     if (
+-      error.code === "ENOENT" ||
+-      error.message?.includes("ENOENT") ||
+-      error.message?.includes("not found")
++      nodeError.code === "ENOENT" ||
++      nodeError.message?.includes("ENOENT") ||
++      nodeError.message?.includes("not found")
+     ) {
+       const downloadedPath = await ensureAstGrepBinary()
+       if (downloadedPath) {
+         resolvedCliPath = downloadedPath
+         setSgCliPath(downloadedPath)
+-        result = await spawnSg(downloadedPath, args)
++        return runSg(options)
+       } else {
+-        throw new Error(
+-          `ast-grep CLI binary not found.\n\n` +
++        return {
++          matches: [],
++          totalMatches: 0,
++          truncated: false,
++          error:
++            `ast-grep CLI binary not found.\n\n` +
+             `Auto-download failed. Manual install options:\n` +
+             `  bun add -D @ast-grep/cli\n` +
+             `  cargo install ast-grep --locked\n` +
+-            `  brew install ast-grep`
+-        )
++            `  brew install ast-grep`,
++        }
+       }
+-    } else {
+-      throw new Error(`Failed to spawn ast-grep: ${error.message}`)
+     }
+-  }
+ 
+-  const { stdout, stderr, exitCode } = result
++    return {
++      matches: [],
++      totalMatches: 0,
++      truncated: false,
++      error: `Failed to spawn ast-grep: ${error.message}`,
++    }
++  }
+ 
+   if (exitCode !== 0 && stdout.trim() === "") {
+     if (stderr.includes("No files found")) {
+-      return []
++      return { matches: [], totalMatches: 0, truncated: false }
+     }
+     if (stderr.trim()) {
+-      throw new Error(stderr.trim())
++      return { matches: [], totalMatches: 0, truncated: false, error: stderr.trim() }
+     }
+-    return []
++    return { matches: [], totalMatches: 0, truncated: false }
+   }
+ 
+   if (!stdout.trim()) {
+-    return []
++    return { matches: [], totalMatches: 0, truncated: false }
+   }
+ 
++  const outputTruncated = stdout.length >= DEFAULT_MAX_OUTPUT_BYTES
++  const outputToProcess = outputTruncated ? stdout.substring(0, DEFAULT_MAX_OUTPUT_BYTES) : stdout
++
++  let matches: CliMatch[] = []
+   try {
+-    return JSON.parse(stdout) as CliMatch[]
++    matches = JSON.parse(outputToProcess) as CliMatch[]
+   } catch {
+-    return []
++    if (outputTruncated) {
++      try {
++        const lastValidIndex = outputToProcess.lastIndexOf("}")
++        if (lastValidIndex > 0) {
++          const bracketIndex = outputToProcess.lastIndexOf("},", lastValidIndex)
++          if (bracketIndex > 0) {
++            const truncatedJson = outputToProcess.substring(0, bracketIndex + 1) + "]"
++            matches = JSON.parse(truncatedJson) as CliMatch[]
++          }
++        }
++      } catch {
++        return {
++          matches: [],
++          totalMatches: 0,
++          truncated: true,
++          truncatedReason: "max_output_bytes",
++          error: "Output too large and could not be parsed",
++        }
++      }
++    } else {
++      return { matches: [], totalMatches: 0, truncated: false }
++    }
++  }
++
++  const totalMatches = matches.length
++  const matchesTruncated = totalMatches > DEFAULT_MAX_MATCHES
++  const finalMatches = matchesTruncated ? matches.slice(0, DEFAULT_MAX_MATCHES) : matches
++
++  return {
++    matches: finalMatches,
++    totalMatches,
++    truncated: outputTruncated || matchesTruncated,
++    truncatedReason: outputTruncated ? "max_output_bytes" : matchesTruncated ? "max_matches" : undefined,
+   }
+ }
+ 
+diff --git a/src/tools/ast-grep/constants.ts b/src/tools/ast-grep/constants.ts
+index 20a4caac..63fa2d62 100644
+--- a/src/tools/ast-grep/constants.ts
++++ b/src/tools/ast-grep/constants.ts
+@@ -135,6 +135,10 @@ export const CLI_LANGUAGES = [
+ export const NAPI_LANGUAGES = ["html", "javascript", "tsx", "css", "typescript"] as const
+ 
+ // Language to file extensions mapping
++export const DEFAULT_TIMEOUT_MS = 300_000
++export const DEFAULT_MAX_OUTPUT_BYTES = 1 * 1024 * 1024
++export const DEFAULT_MAX_MATCHES = 500
++
+ export const LANG_EXTENSIONS: Record<string, string[]> = {
+   bash: [".bash", ".sh", ".zsh", ".bats"],
+   c: [".c", ".h"],
+diff --git a/src/tools/ast-grep/tools.ts b/src/tools/ast-grep/tools.ts
+index b7c1b0f5..2940ee77 100644
+--- a/src/tools/ast-grep/tools.ts
++++ b/src/tools/ast-grep/tools.ts
+@@ -49,7 +49,7 @@ export const ast_grep_search = tool({
+   },
+   execute: async (args, context) => {
+     try {
+-      const matches = await runSg({
++      const result = await runSg({
+         pattern: args.pattern,
+         lang: args.lang as CliLanguage,
+         paths: args.paths,
+@@ -57,9 +57,9 @@ export const ast_grep_search = tool({
+         context: args.context,
+       })
+ 
+-      let output = formatSearchResult(matches)
++      let output = formatSearchResult(result)
+ 
+-      if (matches.length === 0) {
++      if (result.matches.length === 0 && !result.error) {
+         const hint = getEmptyResultHint(args.pattern, args.lang as CliLanguage)
+         if (hint) {
+           output += `\n\n${hint}`
+@@ -91,7 +91,7 @@ export const ast_grep_replace = tool({
+   },
+   execute: async (args, context) => {
+     try {
+-      const matches = await runSg({
++      const result = await runSg({
+         pattern: args.pattern,
+         rewrite: args.rewrite,
+         lang: args.lang as CliLanguage,
+@@ -99,7 +99,7 @@ export const ast_grep_replace = tool({
+         globs: args.globs,
+         updateAll: args.dryRun === false,
+       })
+-      const output = formatReplaceResult(matches, args.dryRun !== false)
++      const output = formatReplaceResult(result, args.dryRun !== false)
+       showOutputToUser(context, output)
+       return output
+     } catch (e) {
+diff --git a/src/tools/ast-grep/types.ts b/src/tools/ast-grep/types.ts
+index 6e10d5f0..f3d28cf5 100644
+--- a/src/tools/ast-grep/types.ts
++++ b/src/tools/ast-grep/types.ts
+@@ -51,3 +51,11 @@ export interface TransformResult {
+   transformed: string
+   editCount: number
+ }
++
++export interface SgResult {
++  matches: CliMatch[]
++  totalMatches: number
++  truncated: boolean
++  truncatedReason?: "max_matches" | "max_output_bytes" | "timeout"
++  error?: string
++}
+diff --git a/src/tools/ast-grep/utils.ts b/src/tools/ast-grep/utils.ts
+index d5a966af..1ddd5a17 100644
+--- a/src/tools/ast-grep/utils.ts
++++ b/src/tools/ast-grep/utils.ts
+@@ -1,13 +1,28 @@
+-import type { CliMatch, AnalyzeResult } from "./types"
++import type { CliMatch, AnalyzeResult, SgResult } from "./types"
+ 
+-export function formatSearchResult(matches: CliMatch[]): string {
+-  if (matches.length === 0) {
++export function formatSearchResult(result: SgResult): string {
++  if (result.error) {
++    return `Error: ${result.error}`
++  }
++
++  if (result.matches.length === 0) {
+     return "No matches found"
+   }
+ 
+-  const lines: string[] = [`Found ${matches.length} match(es):\n`]
++  const lines: string[] = []
++
++  if (result.truncated) {
++    const reason = result.truncatedReason === "max_matches"
++      ? `showing first ${result.matches.length} of ${result.totalMatches}`
++      : result.truncatedReason === "max_output_bytes"
++      ? "output exceeded 1MB limit"
++      : "search timed out"
++    lines.push(`⚠️ Results truncated (${reason})\n`)
++  }
++
++  lines.push(`Found ${result.matches.length} match(es)${result.truncated ? ` (truncated from ${result.totalMatches})` : ""}:\n`)
+ 
+-  for (const match of matches) {
++  for (const match of result.matches) {
+     const loc = `${match.file}:${match.range.start.line + 1}:${match.range.start.column + 1}`
+     lines.push(`${loc}`)
+     lines.push(`  ${match.lines.trim()}`)
+@@ -17,15 +32,30 @@ export function formatSearchResult(matches: CliMatch[]): string {
+   return lines.join("\n")
+ }
+ 
+-export function formatReplaceResult(matches: CliMatch[], isDryRun: boolean): string {
+-  if (matches.length === 0) {
++export function formatReplaceResult(result: SgResult, isDryRun: boolean): string {
++  if (result.error) {
++    return `Error: ${result.error}`
++  }
++
++  if (result.matches.length === 0) {
+     return "No matches found to replace"
+   }
+ 
+   const prefix = isDryRun ? "[DRY RUN] " : ""
+-  const lines: string[] = [`${prefix}${matches.length} replacement(s):\n`]
++  const lines: string[] = []
++
++  if (result.truncated) {
++    const reason = result.truncatedReason === "max_matches"
++      ? `showing first ${result.matches.length} of ${result.totalMatches}`
++      : result.truncatedReason === "max_output_bytes"
++      ? "output exceeded 1MB limit"
++      : "search timed out"
++    lines.push(`⚠️ Results truncated (${reason})\n`)
++  }
++
++  lines.push(`${prefix}${result.matches.length} replacement(s):\n`)
+ 
+-  for (const match of matches) {
++  for (const match of result.matches) {
+     const loc = `${match.file}:${match.range.start.line + 1}:${match.range.start.column + 1}`
+     lines.push(`${loc}`)
+     lines.push(`  ${match.text}`)
+-- 
+2.39.2
+

@@ -1,0 +1,181 @@
+From 3caae14192405722a9f7db28715b4fca24cec616 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 18 Mar 2026 12:49:27 +0900
+Subject: [PATCH 3361/5749] fix(ralph-loop): abort stale Oracle sessions before
+ ulw verification restart
+
+When Oracle verification fails in ulw-loop mode, the previous Oracle
+session was never aborted before restarting. Each retry created a new
+descendant session, causing unbounded session accumulation and 500
+errors from server overload.
+
+Now abort the old verification session before:
+- restarting the loop after failed verification
+- re-entering verification phase on subsequent DONE detection
+---
+ src/hooks/ralph-loop/completion-handler.ts    |  4 +
+ .../ralph-loop/ulw-loop-verification.test.ts  | 98 +++++++++++++++++++
+ .../verification-failure-handler.ts           |  4 +
+ 3 files changed, 106 insertions(+)
+
+diff --git a/src/hooks/ralph-loop/completion-handler.ts b/src/hooks/ralph-loop/completion-handler.ts
+index 71887d6e..740e5969 100644
+--- a/src/hooks/ralph-loop/completion-handler.ts
++++ b/src/hooks/ralph-loop/completion-handler.ts
+@@ -23,6 +23,10 @@ export async function handleDetectedCompletion(
+ 	const { sessionID, state, loopState, directory, apiTimeoutMs } = input
+ 
+ 	if (state.ultrawork && !state.verification_pending) {
++		if (state.verification_session_id) {
++			ctx.client.session.abort({ path: { id: state.verification_session_id } }).catch(() => {})
++		}
++
+ 		const verificationState = loopState.markVerificationPending(sessionID)
+ 		if (!verificationState) {
+ 			log(`[${HOOK_NAME}] Failed to transition ultrawork loop to verification`, {
+diff --git a/src/hooks/ralph-loop/ulw-loop-verification.test.ts b/src/hooks/ralph-loop/ulw-loop-verification.test.ts
+index 6e411a4d..abed0ad7 100644
+--- a/src/hooks/ralph-loop/ulw-loop-verification.test.ts
++++ b/src/hooks/ralph-loop/ulw-loop-verification.test.ts
+@@ -10,6 +10,7 @@ describe("ulw-loop verification", () => {
+ 	const testDir = join(tmpdir(), `ulw-loop-verification-${Date.now()}`)
+ 	let promptCalls: Array<{ sessionID: string; text: string }>
+ 	let toastCalls: Array<{ title: string; message: string; variant: string }>
++	let abortCalls: Array<{ id: string }>
+ 	let parentTranscriptPath: string
+ 	let oracleTranscriptPath: string
+ 
+@@ -25,6 +26,10 @@ describe("ulw-loop verification", () => {
+ 						return {}
+ 					},
+ 					messages: async () => ({ data: [] }),
++					abort: async (opts: { path: { id: string } }) => {
++						abortCalls.push({ id: opts.path.id })
++						return {}
++					},
+ 				},
+ 				tui: {
+ 					showToast: async (opts: { body: { title: string; message: string; variant: string } }) => {
+@@ -40,6 +45,7 @@ describe("ulw-loop verification", () => {
+ 	beforeEach(() => {
+ 		promptCalls = []
+ 		toastCalls = []
++		abortCalls = []
+ 		parentTranscriptPath = join(testDir, "transcript-parent.jsonl")
+ 		oracleTranscriptPath = join(testDir, "transcript-oracle.jsonl")
+ 
+@@ -385,4 +391,96 @@ describe("ulw-loop verification", () => {
+ 		expect(promptCalls).toHaveLength(2)
+ 		expect(promptCalls[1]?.text).toContain("Verification failed")
+ 	})
++
++	test("#given oracle verification fails #when loop restarts #then old oracle session is aborted", async () => {
++		const sessionMessages: Record<string, unknown[]> = {
++			"session-123": [{}, {}, {}],
++		}
++		const hook = createRalphLoopHook({
++			...createMockPluginInput(),
++			client: {
++				...createMockPluginInput().client,
++				session: {
++					...createMockPluginInput().client.session,
++					messages: async (opts: { path: { id: string } }) => ({
++						data: sessionMessages[opts.path.id] ?? [],
++					}),
++				},
++			},
++		} as Parameters<typeof createRalphLoopHook>[0], {
++			getTranscriptPath: (sessionID) => sessionID === "ses-oracle" ? oracleTranscriptPath : parentTranscriptPath,
++		})
++		hook.startLoop("session-123", "Build API", { ultrawork: true })
++		writeFileSync(
++			parentTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "done <promise>DONE</promise>" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++		writeState(testDir, {
++			...hook.getState()!,
++			verification_session_id: "ses-oracle",
++		})
++		writeFileSync(
++			oracleTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "verification failed: missing tests" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "ses-oracle" } } })
++
++		expect(abortCalls).toHaveLength(1)
++		expect(abortCalls[0].id).toBe("ses-oracle")
++	})
++
++	test("#given ulw loop re-enters verification #when DONE detected again after failed verification #then previous verification session is aborted", async () => {
++		const sessionMessages: Record<string, unknown[]> = {
++			"session-123": [{}, {}, {}],
++		}
++		const hook = createRalphLoopHook({
++			...createMockPluginInput(),
++			client: {
++				...createMockPluginInput().client,
++				session: {
++					...createMockPluginInput().client.session,
++					messages: async (opts: { path: { id: string } }) => ({
++						data: sessionMessages[opts.path.id] ?? [],
++					}),
++				},
++			},
++		} as Parameters<typeof createRalphLoopHook>[0], {
++			getTranscriptPath: (sessionID) => sessionID === "ses-oracle" ? oracleTranscriptPath : parentTranscriptPath,
++		})
++		hook.startLoop("session-123", "Build API", { ultrawork: true })
++		writeFileSync(
++			parentTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "done <promise>DONE</promise>" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++		writeState(testDir, {
++			...hook.getState()!,
++			verification_session_id: "ses-oracle",
++		})
++		writeFileSync(
++			oracleTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "failed" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "ses-oracle" } } })
++		abortCalls.length = 0
++
++		writeFileSync(
++			parentTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "fixed it <promise>DONE</promise>" } })}\n`,
++		)
++		writeState(testDir, {
++			...hook.getState()!,
++			verification_session_id: "ses-oracle-old",
++		})
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++
++		expect(abortCalls).toHaveLength(1)
++		expect(abortCalls[0].id).toBe("ses-oracle-old")
++	})
+ })
+diff --git a/src/hooks/ralph-loop/verification-failure-handler.ts b/src/hooks/ralph-loop/verification-failure-handler.ts
+index 5acd9084..f6ea8f52 100644
+--- a/src/hooks/ralph-loop/verification-failure-handler.ts
++++ b/src/hooks/ralph-loop/verification-failure-handler.ts
+@@ -68,6 +68,10 @@ export async function handleFailedVerification(
+ 		return false
+ 	}
+ 
++	if (state.verification_session_id) {
++		ctx.client.session.abort({ path: { id: state.verification_session_id } }).catch(() => {})
++	}
++
+ 	const resumedState = loopState.restartAfterFailedVerification(
+ 		parentSessionID,
+ 		messageCountAtStart,
+-- 
+2.39.2
+

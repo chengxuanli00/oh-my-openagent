@@ -1,0 +1,366 @@
+From 3199bd3d90b9cc57c3e39a50eb8a73691298956a Mon Sep 17 00:00:00 2001
+From: Ivan Smetanin <smetanin23@yandex.ru>
+Date: Mon, 11 May 2026 18:47:40 +0100
+Subject: [PATCH 5220/5749] fix(runtime-fallback): broaden watchdog progress
+ detection + harden test timing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Addresses two issues identified by cubic on PR #3952.
+
+1. Watchdog cancellation was too narrow — only `text`/`reasoning` parts
+   counted as progress, so a subagent that immediately ran tools
+   (Read/Bash/Edit) emitted `tool`/`tool_use`/`tool_result`/`tool-call`/
+   `step-start` parts that the watchdog ignored, risking a false fire
+   on actively-working subagents. Broaden to: any assistant part of any
+   known type counts as progress (the model has started responding,
+   whether or not visible text has arrived yet). `info.error` and
+   `info.finish` continue to cancel.
+
+2. Test timing margins were tight (15ms pre-cancel against a 40ms
+   timer), risking CI flakiness on loaded runners. Bumped to a 100ms
+   threshold with a 40ms pre-cancel window and a 250ms post-fire wait,
+   giving a 60ms margin before the timer fires and ~2.5x the threshold
+   after — robust against scheduler delay.
+
+Refactor for testability: extracted the OpenCode-event→watchdog-signal
+translation out of `hook.ts` into an exported `observeEventForWatchdog`
+helper on the watchdog module. This let me add direct unit tests for
+every part-type case (text, reasoning, tool, tool_use, tool_result,
+tool-call, step-start, file) plus the error/finish/empty-parts branches
+without spinning up the full hook. Net diff: hook.ts shrinks, watchdog
+module gains a small pure function with parametrised coverage.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../first-prompt-watchdog.test.ts             | 149 +++++++++++++++++-
+ .../runtime-fallback/first-prompt-watchdog.ts |  61 +++++++
+ src/hooks/runtime-fallback/hook.ts            |  53 +------
+ 3 files changed, 207 insertions(+), 56 deletions(-)
+
+diff --git a/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts b/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
+index a3fcb72d..cc187b7a 100644
+--- a/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
++++ b/src/hooks/runtime-fallback/first-prompt-watchdog.test.ts
+@@ -2,11 +2,18 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+ import type { HookDeps, RuntimeFallbackPluginInput } from "./types"
+ import type { AutoRetryHelpers } from "./auto-retry"
+ import { subagentSessions } from "../../features/claude-code-session-state"
+-import { createFirstPromptWatchdog } from "./first-prompt-watchdog"
++import { createFirstPromptWatchdog, observeEventForWatchdog, type FirstPromptWatchdog } from "./first-prompt-watchdog"
+ 
+-const WATCHDOG_MS = 40
+-const SAFE_WAIT_AFTER_FIRE_MS = 120
+-const SAFE_WAIT_BEFORE_FIRE_MS = 15
++// Real timers are unavoidable here (bun:test has no built-in fake-timer API),
++// so margins are sized generously to survive a loaded CI runner. Specifically:
++//   - SAFE_WAIT_BEFORE_FIRE_MS must be << WATCHDOG_MS so the cancel call lands
++//     before the timer fires even with significant scheduler delay
++//     (margin: WATCHDOG_MS - SAFE_WAIT_BEFORE_FIRE_MS >= 60ms here).
++//   - SAFE_WAIT_AFTER_FIRE_MS must be >> WATCHDOG_MS so we conclusively
++//     observe whether the timer fired (margin: ~2.5x WATCHDOG_MS).
++const WATCHDOG_MS = 100
++const SAFE_WAIT_BEFORE_FIRE_MS = 40
++const SAFE_WAIT_AFTER_FIRE_MS = 250
+ 
+ function wait(ms: number): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, ms))
+@@ -178,7 +185,7 @@ describe("first-prompt-watchdog", () => {
+     watchdog.dispose()
+   })
+ 
+-  it("#given a subagent silent past the threshold with no fallback configured #when the watchdog fires #then it logs but does not abort or dispatch (lets PR #3950 quota-abort path handle it later if an error event arrives)", async () => {
++  it("#given a subagent silent past the threshold with no fallback configured #when the watchdog fires #then it logs but does not abort or dispatch (lets the existing error-event paths handle it if one arrives later)", async () => {
+     // given
+     const sessionID = "session-no-fallback"
+     subagentSessions.add(sessionID)
+@@ -198,3 +205,135 @@ describe("first-prompt-watchdog", () => {
+     watchdog.dispose()
+   })
+ })
++
++interface RecordedWatchdogCalls {
++  user: Array<{ sessionID: string; model?: string; agent?: string }>
++  progress: string[]
++  terminal: string[]
++}
++
++function createRecordingWatchdog(calls: RecordedWatchdogCalls): FirstPromptWatchdog {
++  return {
++    onUserMessage(sessionID, model, agent) {
++      calls.user.push({ sessionID, model, agent })
++    },
++    onAssistantProgress(sessionID) {
++      calls.progress.push(sessionID)
++    },
++    onSessionTerminal(sessionID) {
++      calls.terminal.push(sessionID)
++    },
++    dispose() {},
++  }
++}
++
++describe("observeEventForWatchdog", () => {
++  const sessionID = "session-observed"
++
++  function freshCalls(): RecordedWatchdogCalls {
++    return { user: [], progress: [], terminal: [] }
++  }
++
++  it("#given a message.updated event with role=user #when observed #then onUserMessage is called with sessionID/model/agent", () => {
++    const calls = freshCalls()
++    observeEventForWatchdog(
++      {
++        type: "message.updated",
++        properties: { info: { sessionID, role: "user", model: "openai/gpt-5.4-mini", agent: "sisyphus-junior" } },
++      },
++      createRecordingWatchdog(calls),
++    )
++    expect(calls.user).toEqual([{ sessionID, model: "openai/gpt-5.4-mini", agent: "sisyphus-junior" }])
++    expect(calls.progress).toEqual([])
++    expect(calls.terminal).toEqual([])
++  })
++
++  it.each([
++    ["text", { type: "text", text: "hello" }],
++    ["reasoning", { type: "reasoning", text: "thinking..." }],
++    ["tool", { type: "tool" }],
++    ["tool_use", { type: "tool_use", id: "t1", name: "Read" }],
++    ["tool_result", { type: "tool_result", tool_use_id: "t1" }],
++    ["tool-call", { type: "tool-call" }],
++    ["step-start", { type: "step-start" }],
++    ["file", { type: "file" }],
++  ])("#given a message.updated assistant event whose only part is type=%s #when observed #then onAssistantProgress is called (model is *working*, not silent)", (_label, part) => {
++    const calls = freshCalls()
++    observeEventForWatchdog(
++      {
++        type: "message.updated",
++        properties: { info: { sessionID, role: "assistant" }, parts: [part] },
++      },
++      createRecordingWatchdog(calls),
++    )
++    expect(calls.progress).toEqual([sessionID])
++  })
++
++  it("#given a message.updated assistant event with parts: [] and no error/finish #when observed #then no progress is signalled (no activity yet)", () => {
++    const calls = freshCalls()
++    observeEventForWatchdog(
++      {
++        type: "message.updated",
++        properties: { info: { sessionID, role: "assistant" }, parts: [] },
++      },
++      createRecordingWatchdog(calls),
++    )
++    expect(calls.progress).toEqual([])
++  })
++
++  it("#given a message.updated assistant event with info.error set #when observed #then onAssistantProgress is called (the existing error-handling path takes over from here)", () => {
++    const calls = freshCalls()
++    observeEventForWatchdog(
++      {
++        type: "message.updated",
++        properties: { info: { sessionID, role: "assistant", error: { name: "RateLimitError", message: "429" } } },
++      },
++      createRecordingWatchdog(calls),
++    )
++    expect(calls.progress).toEqual([sessionID])
++  })
++
++  it("#given a message.updated assistant event with info.finish set #when observed #then onAssistantProgress is called", () => {
++    const calls = freshCalls()
++    observeEventForWatchdog(
++      {
++        type: "message.updated",
++        properties: { info: { sessionID, role: "assistant", finish: "stop" } },
++      },
++      createRecordingWatchdog(calls),
++    )
++    expect(calls.progress).toEqual([sessionID])
++  })
++
++  it.each([["session.idle"], ["session.stop"], ["session.deleted"], ["session.error"]])(
++    "#given a %s event #when observed #then onSessionTerminal is called",
++    (eventType) => {
++      const calls = freshCalls()
++      observeEventForWatchdog(
++        { type: eventType, properties: { sessionID } },
++        createRecordingWatchdog(calls),
++      )
++      expect(calls.terminal).toEqual([sessionID])
++    },
++  )
++
++  it("#given a session.deleted event whose sessionID is carried under properties.info.id #when observed #then onSessionTerminal is still called (matches event-handler shape)", () => {
++    const calls = freshCalls()
++    observeEventForWatchdog(
++      { type: "session.deleted", properties: { info: { id: sessionID } } },
++      createRecordingWatchdog(calls),
++    )
++    expect(calls.terminal).toEqual([sessionID])
++  })
++
++  it("#given an unrelated event type #when observed #then no watchdog method is called", () => {
++    const calls = freshCalls()
++    observeEventForWatchdog(
++      { type: "session.created", properties: { info: { id: sessionID } } },
++      createRecordingWatchdog(calls),
++    )
++    expect(calls.user).toEqual([])
++    expect(calls.progress).toEqual([])
++    expect(calls.terminal).toEqual([])
++  })
++})
+diff --git a/src/hooks/runtime-fallback/first-prompt-watchdog.ts b/src/hooks/runtime-fallback/first-prompt-watchdog.ts
+index e4fe61e9..fdcbda8b 100644
+--- a/src/hooks/runtime-fallback/first-prompt-watchdog.ts
++++ b/src/hooks/runtime-fallback/first-prompt-watchdog.ts
+@@ -20,6 +20,67 @@ export interface FirstPromptWatchdog {
+   dispose(): void
+ }
+ 
++const TERMINAL_EVENT_TYPES = new Set([
++  "session.idle",
++  "session.stop",
++  "session.deleted",
++  "session.error",
++])
++
++/**
++ * Translate an OpenCode session event into the appropriate watchdog signal.
++ *
++ * Progress semantics for cancelling the watchdog:
++ *   - assistant `info.error` set: the existing message-update-handler will
++ *     deal with the error path; the watchdog has done its job.
++ *   - assistant `info.finish` set: the response completed.
++ *   - any assistant part with a known type (`text`, `reasoning`, `tool`,
++ *     `tool_use`, `tool_result`, `tool-call`, `step-start`, `file`, ...):
++ *     the model has started responding. A subagent that immediately runs
++ *     tools is *working*, not silent — so any part presence cancels.
++ */
++export function observeEventForWatchdog(
++  event: { type: string; properties?: unknown },
++  watchdog: FirstPromptWatchdog,
++): void {
++  const props = event.properties as Record<string, unknown> | undefined
++  if (!props) return
++
++  if (event.type === "message.updated") {
++    const info = props.info as Record<string, unknown> | undefined
++    const sessionID = info?.sessionID as string | undefined
++    const role = info?.role as string | undefined
++    if (!sessionID || !role) return
++
++    if (role === "user") {
++      const model = info?.model as string | undefined
++      const agent = info?.agent as string | undefined
++      watchdog.onUserMessage(sessionID, model, agent)
++      return
++    }
++
++    if (role === "assistant") {
++      const hasError = info?.error !== undefined
++      const hasFinish = info?.finish !== undefined
++      const eventParts = props.parts as Array<{ type?: string }> | undefined
++      const infoParts = info?.parts as Array<{ type?: string }> | undefined
++      const parts = eventParts ?? infoParts ?? []
++      const hasAnyPart = parts.some((part) => typeof part?.type === "string")
++      if (hasError || hasFinish || hasAnyPart) {
++        watchdog.onAssistantProgress(sessionID)
++      }
++    }
++    return
++  }
++
++  if (TERMINAL_EVENT_TYPES.has(event.type)) {
++    const sessionID =
++      (props.sessionID as string | undefined) ??
++      ((props.info as Record<string, unknown> | undefined)?.id as string | undefined)
++    if (sessionID) watchdog.onSessionTerminal(sessionID)
++  }
++}
++
+ export function createFirstPromptWatchdog(
+   deps: HookDeps,
+   helpers: AutoRetryHelpers,
+diff --git a/src/hooks/runtime-fallback/hook.ts b/src/hooks/runtime-fallback/hook.ts
+index 1c12a863..4178a7dc 100644
+--- a/src/hooks/runtime-fallback/hook.ts
++++ b/src/hooks/runtime-fallback/hook.ts
+@@ -2,7 +2,7 @@ import { createAutoRetryHelpers } from "./auto-retry"
+ import { createChatMessageHandler } from "./chat-message-handler"
+ import { DEFAULT_CONFIG } from "./constants"
+ import { createEventHandler } from "./event-handler"
+-import { createFirstPromptWatchdog } from "./first-prompt-watchdog"
++import { createFirstPromptWatchdog, observeEventForWatchdog } from "./first-prompt-watchdog"
+ import { createMessageUpdateHandler } from "./message-update-handler"
+ import type { HookDeps, RuntimeFallbackHook, RuntimeFallbackInterval, RuntimeFallbackOptions, RuntimeFallbackPluginInput, RuntimeFallbackTimeout } from "./types"
+ 
+@@ -64,55 +64,6 @@ export function createRuntimeFallbackHook(
+   const chatMessageHandler = factories.createChatMessageHandler(deps)
+   const firstPromptWatchdog = factories.createFirstPromptWatchdog(deps, helpers)
+ 
+-  const TERMINAL_EVENT_TYPES = new Set([
+-    "session.idle",
+-    "session.stop",
+-    "session.deleted",
+-    "session.error",
+-  ])
+-
+-  const observeForWatchdog = (event: { type: string; properties?: unknown }): void => {
+-    const props = event.properties as Record<string, unknown> | undefined
+-    if (!props) return
+-
+-    if (event.type === "message.updated") {
+-      const info = props.info as Record<string, unknown> | undefined
+-      const sessionID = info?.sessionID as string | undefined
+-      const role = info?.role as string | undefined
+-      if (!sessionID || !role) return
+-
+-      if (role === "user") {
+-        const model = info?.model as string | undefined
+-        const agent = info?.agent as string | undefined
+-        firstPromptWatchdog.onUserMessage(sessionID, model, agent)
+-        return
+-      }
+-
+-      if (role === "assistant") {
+-        const hasError = info?.error !== undefined
+-        const hasFinish = info?.finish !== undefined
+-        const eventParts = props.parts as Array<{ type?: string; text?: string }> | undefined
+-        const infoParts = info?.parts as Array<{ type?: string; text?: string }> | undefined
+-        const parts = eventParts ?? infoParts ?? []
+-        const hasContent = parts.some((part) => {
+-          if (part.type !== "text" && part.type !== "reasoning") return false
+-          return (part.text ?? "").trim().length > 0
+-        })
+-        if (hasError || hasFinish || hasContent) {
+-          firstPromptWatchdog.onAssistantProgress(sessionID)
+-        }
+-      }
+-      return
+-    }
+-
+-    if (TERMINAL_EVENT_TYPES.has(event.type)) {
+-      const sessionID =
+-        (props.sessionID as string | undefined) ??
+-        ((props.info as Record<string, unknown> | undefined)?.id as string | undefined)
+-      if (sessionID) firstPromptWatchdog.onSessionTerminal(sessionID)
+-    }
+-  }
+-
+   let cleanupInterval: RuntimeFallbackInterval | null = null
+   let intervalStarted = false
+ 
+@@ -131,7 +82,7 @@ export function createRuntimeFallbackHook(
+     ensureInterval()
+ 
+     if (config.enabled) {
+-      observeForWatchdog(event)
++      observeEventForWatchdog(event, firstPromptWatchdog)
+     }
+ 
+     if (event.type === "message.updated") {
+-- 
+2.39.2
+

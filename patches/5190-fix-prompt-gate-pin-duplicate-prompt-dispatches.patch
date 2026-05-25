@@ -1,0 +1,1636 @@
+From c2aa180e7ee21fbfa6ee382f9064fa468e2e17ef Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 13:19:10 +0900
+Subject: [PATCH 5190/5749] fix(prompt-gate): pin duplicate prompt dispatches
+
+Keep prompt reservations briefly after successful dispatch so rapid idle/message/error transitions cannot inject the same follow-up twice.
+
+Route all production session prompt calls through the shared gate, restore skipped background resume state, release holds after abort/recovery paths, and preserve Ralph/ULW loop state when a dispatch is deferred.
+
+Add regression coverage for session routing, static prompt route auditing, team-mode live messaging, model suggestion retries, call-omo-agent reuse, background parent wakes, runtime fallback, compaction recovery, Atlas, and Ralph/ULW loops.
+---
+ src/cli/run/runner.ts                         |   1 -
+ src/features/background-agent/manager.test.ts | 230 ++++++++++++++++++
+ src/features/background-agent/manager.ts      | 217 ++++++++++++++++-
+ .../team-mode/tools/messaging.test.ts         |  65 +++++
+ src/hooks/atlas/index.test.ts                 |   2 +-
+ .../compaction-context-injector/recovery.ts   |   3 +-
+ .../continuation-prompt-injector.ts           |   4 +
+ src/hooks/ralph-loop/index.test.ts            |  25 ++
+ .../ralph-loop/iteration-continuation.ts      |   7 +
+ .../ralph-loop/ralph-loop-event-handler.ts    |  10 +
+ src/hooks/ralph-loop/ralph-loop-hook.ts       |   4 +
+ .../ralph-loop/ulw-loop-verification.test.ts  |  14 +-
+ .../verification-failure-handler.ts           |  45 ++--
+ src/hooks/runtime-fallback/auto-retry.ts      |   1 -
+ .../message-update-handler.ts                 |   6 +-
+ src/hooks/shared/prompt-async-gate.test.ts    |  36 +++
+ src/plugin/event.ts                           |   3 +-
+ src/shared/model-suggestion-retry.test.ts     |  50 ++++
+ src/shared/model-suggestion-retry.ts          |   3 -
+ src/shared/prompt-async-gate.ts               |  40 ++-
+ src/shared/prompt-async-route-audit.test.ts   |  78 ++++++
+ src/shared/session-route.test.ts              |  61 +++++
+ src/shared/session-route.ts                   |   3 +-
+ .../call-omo-agent/sync-executor.test.ts      |  29 +++
+ src/tools/call-omo-agent/sync-executor.ts     |   1 -
+ test-setup.ts                                 |   3 +
+ 26 files changed, 893 insertions(+), 48 deletions(-)
+ create mode 100644 src/shared/prompt-async-route-audit.test.ts
+ create mode 100644 src/shared/session-route.test.ts
+
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index d5971406..81763668 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -115,7 +115,6 @@ export async function run(options: RunOptions): Promise<number> {
+         sessionID,
+         source: "cli-run",
+         settleMs: 0,
+-        postDispatchHoldMs: 0,
+         input: {
+           path: { id: sessionID },
+           body: {
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 6c076d96..385f85da 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -12,6 +12,7 @@ import type { BackgroundTask, ResumeInput } from "./types"
+ import { MIN_IDLE_TIME_MS } from "./constants"
+ import { BackgroundManager } from "./manager"
+ import { ConcurrencyManager } from "./concurrency"
++import { promptAsyncAfterSessionIdle } from "../../shared/prompt-async-gate"
+ import { initTaskToastManager, _resetTaskToastManagerForTesting } from "../task-toast-manager/manager"
+ import { _resetForTesting as resetProcessCleanupState } from "./process-cleanup"
+ 
+@@ -27,6 +28,11 @@ mock.restore()
+ 
+ 
+ const TASK_TTL_MS = 30 * 60 * 1000
++type PendingParentWakeForTest = {
++  promptContext: Record<string, unknown>
++  notifications: string[]
++  shouldReply: boolean
++}
+ 
+ class MockBackgroundManager {
+   private tasks: Map<string, BackgroundTask> = new Map()
+@@ -235,6 +241,14 @@ function getPendingNotifications(manager: BackgroundManager): Map<string, string
+   return (cast<{ pendingNotifications: Map<string, string[]> }>(manager)).pendingNotifications
+ }
+ 
++function getPendingParentWakes(manager: BackgroundManager): Map<string, PendingParentWakeForTest> {
++  return (cast<{ pendingParentWakes: Map<string, PendingParentWakeForTest> }>(manager)).pendingParentWakes
++}
++
++function getDispatchedParentWakes(manager: BackgroundManager): Map<string, PendingParentWakeForTest> {
++  return (cast<{ dispatchedParentWakes: Map<string, PendingParentWakeForTest> }>(manager)).dispatchedParentWakes
++}
++
+ function getCompletionTimers(manager: BackgroundManager): Map<string, ReturnType<typeof setTimeout>> {
+   return (cast<{ completionTimers: Map<string, ReturnType<typeof setTimeout>> }>(manager)).completionTimers
+ }
+@@ -2208,6 +2222,123 @@ describe("BackgroundManager.resume concurrency key", () => {
+   })
+ })
+ 
++describe("BackgroundManager.resume promptAsync gate state", () => {
++  test("restores completed task state when resume prompt is skipped because the session is active", async () => {
++    //#given
++    let promptCallCount = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { "session-active-resume": { type: "busy" } } }),
++        promptAsync: async () => {
++          promptCallCount += 1
++          return {}
++        },
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ pluginContext: createPluginInput(client) })
++    const task: BackgroundTask = {
++      id: "task-active-resume-skip",
++      sessionId: "session-active-resume",
++      parentSessionId: "parent-session-original",
++      parentMessageId: "msg-original",
++      description: "completed task",
++      prompt: "original prompt",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(Date.now() - 1000),
++      completedAt: new Date(),
++      error: "previous terminal note",
++      concurrencyGroup: "explore",
++    }
++    const originalCompletedAt = task.completedAt
++    getTaskMap(manager).set(task.id, task)
++
++    //#when
++    await manager.resume({
++      sessionId: "session-active-resume",
++      prompt: "continue",
++      parentSessionId: "parent-session-new",
++      parentMessageId: "msg-new",
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(promptCallCount).toBe(0)
++    expect(task.status).toBe("completed")
++    expect(task.completedAt).toBe(originalCompletedAt)
++    expect(task.error).toBe("previous terminal note")
++    expect(task.parentSessionId).toBe("parent-session-original")
++    expect(task.parentMessageId).toBe("msg-original")
++    expect(task.concurrencyKey).toBeUndefined()
++    expect(getConcurrencyManager(manager).getCount("explore")).toBe(0)
++    expect(getPendingByParent(manager).get("parent-session-new")).toBeUndefined()
++
++    manager.shutdown()
++  })
++
++  test("restores completed task state when resume prompt is skipped by an existing reservation", async () => {
++    //#given
++    let promptCallCount = 0
++    const client = {
++      session: {
++        promptAsync: async () => {
++          promptCallCount += 1
++          return {}
++        },
++        abort: async () => ({}),
++      },
++    }
++    await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "session-reserved-resume",
++      source: "test-existing-reservation",
++      settleMs: 0,
++      postDispatchHoldMs: 1000,
++      input: {
++        path: { id: "session-reserved-resume" },
++        body: { parts: [] },
++      },
++    })
++
++    const manager = new BackgroundManager({ pluginContext: createPluginInput(client) })
++    const task: BackgroundTask = {
++      id: "task-reserved-resume-skip",
++      sessionId: "session-reserved-resume",
++      parentSessionId: "parent-session-original",
++      parentMessageId: "msg-original",
++      description: "completed task",
++      prompt: "original prompt",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(Date.now() - 1000),
++      completedAt: new Date(),
++      concurrencyGroup: "explore",
++    }
++    getTaskMap(manager).set(task.id, task)
++
++    //#when
++    await manager.resume({
++      sessionId: "session-reserved-resume",
++      prompt: "continue",
++      parentSessionId: "parent-session-new",
++      parentMessageId: "msg-new",
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(promptCallCount).toBe(1)
++    expect(task.status).toBe("completed")
++    expect(task.parentSessionId).toBe("parent-session-original")
++    expect(task.parentMessageId).toBe("msg-original")
++    expect(task.concurrencyKey).toBeUndefined()
++    expect(getConcurrencyManager(manager).getCount("explore")).toBe(0)
++    expect(getPendingByParent(manager).get("parent-session-new")).toBeUndefined()
++
++    manager.shutdown()
++  })
++})
++
+ describe("BackgroundManager.resume model persistence", () => {
+    let manager: BackgroundManager
+    let promptCalls: Array<{ path: { id: string }; body: Record<string, unknown> }>
+@@ -4938,6 +5069,105 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+     manager.shutdown()
+   })
+ 
++  test("terminates task when agent-not-found arrives as async session.error after promptAsync accept", async () => {
++    //#given
++    const manager = createBackgroundManager()
++    mockVerifySessionExists(manager, true)
++    const concurrencyManager = getConcurrencyManager(manager)
++    const concurrencyKey = "missing-agent"
++    await concurrencyManager.acquire(concurrencyKey)
++
++    const task = createMockTask({
++      id: "task-session-error-agent-not-found",
++      sessionId: "ses-agent-not-found",
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-agent-not-found",
++      description: "task with missing agent",
++      agent: "missing-agent",
++      status: "running",
++      concurrencyKey,
++    })
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++
++    //#when
++    manager.handleEvent({
++      type: "session.error",
++      properties: {
++        sessionID: task.sessionId,
++        error: {
++          name: "AgentNotFoundError",
++          message: "Agent not found: missing-agent",
++        },
++      },
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(task.status).toBe("interrupt")
++    expect(task.error).toBe("Agent \"missing-agent\" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.")
++    expect(task.completedAt).toBeInstanceOf(Date)
++    expect(task.concurrencyKey).toBeUndefined()
++    expect(concurrencyManager.getCount(concurrencyKey)).toBe(0)
++    expect(getPendingByParent(manager).get(task.parentSessionId)).toBeUndefined()
++    expect(getCompletionTimers(manager).has(task.id)).toBe(true)
++
++    manager.shutdown()
++  })
++
++  test("requeues dispatched parent wake when the wake prompt fails through session.error", async () => {
++    //#given
++    const promptCalls: Array<{ path: { id: string }; body: Record<string, unknown> }> = []
++    const client = {
++      session: {
++        status: async () => ({ data: { "parent-session-wake": { type: "idle" } } }),
++        promptAsync: async (args: { path: { id: string }; body: Record<string, unknown> }) => {
++          promptCalls.push(args)
++          return {}
++        },
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ pluginContext: createPluginInput(client) })
++    const managerInternals = cast<{
++      queuePendingParentWake: (
++        sessionID: string,
++        notification: string,
++        promptContext: Record<string, unknown>,
++        shouldReply: boolean,
++        delayMs?: number,
++      ) => void
++      flushPendingParentWake: (sessionID: string) => Promise<void>
++    }>(manager)
++    managerInternals.queuePendingParentWake(
++      "parent-session-wake",
++      "<system-reminder>done</system-reminder>",
++      { agent: "sisyphus" },
++      true,
++      0,
++    )
++
++    //#when
++    await managerInternals.flushPendingParentWake("parent-session-wake")
++    manager.handleEvent({
++      type: "session.error",
++      properties: {
++        sessionID: "parent-session-wake",
++        error: { name: "UnknownError", message: "wake prompt failed" },
++      },
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(promptCalls).toHaveLength(1)
++    expect(getDispatchedParentWakes(manager).has("parent-session-wake")).toBe(false)
++    expect(getPendingParentWakes(manager).get("parent-session-wake")?.notifications).toEqual([
++      "<system-reminder>done</system-reminder>",
++    ])
++
++    manager.shutdown()
++  })
++
+   test("terminates task on session.error when session is gone", async () => {
+     //#given
+     const manager = createBackgroundManager()
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index fb62dd93..579033be 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -66,7 +66,7 @@ import {
+   isSessionActive as isOpenCodeSessionActive,
+   settleAfterSessionIdle,
+ } from "../../hooks/shared/session-idle-settle"
+-import { promptAsyncAfterSessionIdle } from "../../hooks/shared/prompt-async-gate"
++import { promptAsyncAfterSessionIdle, type PromptAsyncGateResult } from "../../hooks/shared/prompt-async-gate"
+ import {
+   findNearestMessageExcludingCompaction,
+   resolvePromptContextFromSessionMessages,
+@@ -110,6 +110,21 @@ type PendingParentWake = {
+   shouldReply: boolean
+ }
+ 
++type ResumeTaskSnapshot = {
++  status: BackgroundTask["status"]
++  completedAt?: Date
++  error?: string
++  startedAt?: Date
++  progress?: BackgroundTask["progress"]
++  parentSessionId: string
++  parentMessageId: string
++  parentModel?: BackgroundTask["parentModel"]
++  parentAgent?: string
++  parentTools?: Record<string, boolean>
++  concurrencyKey?: string
++  concurrencyGroup?: string
++}
++
+ const PENDING_PARENT_WAKE_RETRY_MS = 1_000
+ const PENDING_PARENT_WAKE_DEBOUNCE_MS = 100
+ 
+@@ -196,6 +211,7 @@ export type OnSubagentSessionCreated = (event: SubagentSessionCreatedEvent) => P
+ 
+ const MAX_TASK_REMOVAL_RESCHEDULES = 6
+ const MAX_COMPLETED_TASK_ARCHIVE_SIZE = 100
++const PARENT_WAKE_FAILURE_REQUEUE_WINDOW_MS = 5_000
+ 
+ export interface BackgroundManagerConfig {
+   pluginContext: PluginInput
+@@ -236,6 +252,8 @@ export class BackgroundManager {
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
+   private pendingParentWakes: Map<string, PendingParentWake> = new Map()
+   private pendingParentWakeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
++  private dispatchedParentWakes: Map<string, PendingParentWake> = new Map()
++  private dispatchedParentWakeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private observedOutputSessions: Set<string> = new Set()
+   private observedIncompleteTodosBySession: Map<string, boolean> = new Map()
+   private rootDescendantCounts: Map<string, number>
+@@ -422,6 +440,60 @@ export class BackgroundManager {
+     this.tasksByParentSession.set(parentSessionID, taskIDs)
+   }
+ 
++  private captureResumeTaskSnapshot(task: BackgroundTask): ResumeTaskSnapshot {
++    return {
++      status: task.status,
++      completedAt: task.completedAt,
++      error: task.error,
++      startedAt: task.startedAt,
++      progress: task.progress,
++      parentSessionId: task.parentSessionId,
++      parentMessageId: task.parentMessageId,
++      parentModel: task.parentModel,
++      parentAgent: task.parentAgent,
++      parentTools: task.parentTools,
++      concurrencyKey: task.concurrencyKey,
++      concurrencyGroup: task.concurrencyGroup,
++    }
++  }
++
++  private restoreTaskAfterSkippedResume(
++    task: BackgroundTask,
++    snapshot: ResumeTaskSnapshot,
++    skippedStatus: Exclude<PromptAsyncGateResult["status"], "dispatched" | "failed">,
++  ): void {
++    log("[background-agent] Restoring task after skipped resume prompt:", {
++      taskId: task.id,
++      sessionID: task.sessionId,
++      skippedStatus,
++    })
++
++    this.cleanupPendingByParent(task)
++
++    if (task.concurrencyKey) {
++      this.concurrencyManager.release(task.concurrencyKey)
++    }
++
++    task.status = snapshot.status
++    task.completedAt = snapshot.completedAt
++    task.error = snapshot.error
++    task.startedAt = snapshot.startedAt
++    task.progress = snapshot.progress
++    task.parentMessageId = snapshot.parentMessageId
++    task.parentModel = snapshot.parentModel
++    task.parentAgent = snapshot.parentAgent
++    task.parentTools = snapshot.parentTools
++    task.concurrencyKey = snapshot.concurrencyKey
++    task.concurrencyGroup = snapshot.concurrencyGroup
++    this.updateTaskParent(task, snapshot.parentSessionId)
++
++    removeTaskToastTracking(task.id)
++    if (task.status !== "running" && task.status !== "pending") {
++      this.scheduleTaskRemoval(task.id)
++    }
++    this.updateBackgroundTaskMarker(task.parentSessionId)
++  }
++
+   private removeTaskFromParentIndex(taskID: string, parentSessionID: string | undefined): void {
+     if (!parentSessionID) {
+       return
+@@ -1083,6 +1155,7 @@ The fallback retry session is now created and can be inspected directly.
+       return existingTask
+     }
+ 
++    const resumeSnapshot = this.captureResumeTaskSnapshot(existingTask)
+     const completionTimer = this.completionTimers.get(existingTask.id)
+     if (completionTimer) {
+       clearTimeout(completionTimer)
+@@ -1166,7 +1239,6 @@ The fallback retry session is now created and can be inspected directly.
+       sessionID: existingTask.sessionId,
+       source: "background-agent-resume",
+       settleMs: 0,
+-      postDispatchHoldMs: 0,
+       input: {
+         path: { id: existingTask.sessionId },
+         body: {
+@@ -1199,6 +1271,7 @@ The fallback retry session is now created and can be inspected directly.
+           sessionID: existingTask.sessionId,
+           status: promptResult.status,
+         })
++        this.restoreTaskAfterSkippedResume(existingTask, resumeSnapshot, promptResult.status)
+       }
+     }).catch(async (error) => {
+       log("[background-agent] resume prompt error:", error)
+@@ -1276,6 +1349,60 @@ The fallback retry session is now created and can be inspected directly.
+     this.observedOutputSessions.add(sessionID)
+   }
+ 
++  private cloneParentWake(wake: PendingParentWake): PendingParentWake {
++    return {
++      promptContext: {
++        ...wake.promptContext,
++        ...(wake.promptContext.model ? { model: { ...wake.promptContext.model } } : {}),
++        ...(wake.promptContext.tools ? { tools: { ...wake.promptContext.tools } } : {}),
++      },
++      notifications: [...wake.notifications],
++      shouldReply: wake.shouldReply,
++    }
++  }
++
++  private clearDispatchedParentWake(sessionID: string): void {
++    const timer = this.dispatchedParentWakeTimers.get(sessionID)
++    if (timer) {
++      clearTimeout(timer)
++      this.dispatchedParentWakeTimers.delete(sessionID)
++    }
++    this.dispatchedParentWakes.delete(sessionID)
++  }
++
++  private trackDispatchedParentWake(sessionID: string, wake: PendingParentWake): void {
++    this.clearDispatchedParentWake(sessionID)
++    this.dispatchedParentWakes.set(sessionID, this.cloneParentWake(wake))
++    const timer = setTimeout(() => {
++      this.dispatchedParentWakeTimers.delete(sessionID)
++      this.dispatchedParentWakes.delete(sessionID)
++    }, PARENT_WAKE_FAILURE_REQUEUE_WINDOW_MS)
++    this.dispatchedParentWakeTimers.set(sessionID, timer)
++  }
++
++  private requeueDispatchedParentWake(sessionID: string, reason: string): boolean {
++    const wake = this.dispatchedParentWakes.get(sessionID)
++    if (!wake) {
++      return false
++    }
++
++    this.clearDispatchedParentWake(sessionID)
++    const pendingWake = this.pendingParentWakes.get(sessionID)
++    if (pendingWake) {
++      pendingWake.notifications.unshift(...wake.notifications)
++      pendingWake.shouldReply = pendingWake.shouldReply || wake.shouldReply
++      pendingWake.promptContext = wake.promptContext
++    } else {
++      this.pendingParentWakes.set(sessionID, this.cloneParentWake(wake))
++    }
++    this.schedulePendingParentWakeFlush(sessionID)
++    log("[background-agent] Requeued dispatched parent wake after prompt failure:", {
++      sessionID,
++      reason,
++    })
++    return true
++  }
++
+   private clearSessionOutputObserved(sessionID: string): void {
+     this.observedOutputSessions.delete(sessionID)
+   }
+@@ -1307,6 +1434,7 @@ The fallback retry session is now created and can be inspected directly.
+       const sessionID = resolveMessageEventSessionID(props)
+       const role = (info as Record<string, unknown>)["role"]
+       if (!sessionID) return
++      this.clearDispatchedParentWake(sessionID)
+ 
+       if (role === "tool") {
+         this.markSessionOutputObserved(sessionID)
+@@ -1339,6 +1467,7 @@ The fallback retry session is now created and can be inspected directly.
+       const partInfo = resolveMessagePartInfo(props)
+       const sessionID = resolveMessageEventSessionID(props)
+       if (!sessionID) return
++      this.clearDispatchedParentWake(sessionID)
+ 
+       const resolved = this.resolveTaskAttemptBySession(sessionID)
+       if (!resolved?.isCurrent) return
+@@ -1469,7 +1598,10 @@ The fallback retry session is now created and can be inspected directly.
+       if (!sessionID) return
+ 
+       const resolved = this.resolveTaskAttemptBySession(sessionID)
+-      if (!resolved?.isCurrent) return
++      if (!resolved?.isCurrent) {
++        this.requeueDispatchedParentWake(sessionID, "session.error")
++        return
++      }
+ 
+       const { task } = resolved
+       if (task.status !== "running") return
+@@ -1581,6 +1713,67 @@ The fallback retry session is now created and can be inspected directly.
+     }
+   }
+ 
++  private async interruptTaskFromAsyncPromptFailure(
++    task: BackgroundTask,
++    errorMessage: string,
++    reason: string,
++  ): Promise<void> {
++    if (task.currentAttemptID) {
++      finalizeAttempt(task, task.currentAttemptID, "interrupt", errorMessage)
++    } else {
++      task.status = "interrupt"
++      task.error = errorMessage
++      task.completedAt = new Date()
++    }
++
++    if (task.rootSessionId) {
++      this.unregisterRootDescendant(task.rootSessionId)
++    }
++    this.taskHistory.record(task.parentSessionId, {
++      id: task.id,
++      sessionID: task.sessionId,
++      agent: task.agent,
++      description: task.description,
++      status: "interrupt",
++      category: task.category,
++      startedAt: task.startedAt,
++      completedAt: task.completedAt,
++    })
++
++    if (task.concurrencyKey) {
++      this.concurrencyManager.release(task.concurrencyKey)
++      task.concurrencyKey = undefined
++    }
++
++    const completionTimer = this.completionTimers.get(task.id)
++    if (completionTimer) {
++      clearTimeout(completionTimer)
++      this.completionTimers.delete(task.id)
++    }
++
++    const idleTimer = this.idleDeferralTimers.get(task.id)
++    if (idleTimer) {
++      clearTimeout(idleTimer)
++      this.idleDeferralTimers.delete(task.id)
++    }
++
++    this.cleanupPendingByParent(task)
++    this.clearNotificationsForTask(task.id)
++    removeTaskToastTracking(task.id)
++    this.scheduleTaskRemoval(task.id)
++
++    if (task.sessionId) {
++      SessionCategoryRegistry.remove(task.sessionId)
++      await this.abortSessionWithLogging(task.sessionId, `${reason} cleanup`)
++    }
++
++    this.updateBackgroundTaskMarker(task.parentSessionId)
++    this.markForNotification(task)
++    this.enqueueNotificationForParent(task.parentSessionId, () => this.notifyParentSession(task)).catch(err => {
++      log("[background-agent] Failed to notify on async prompt failure:", { taskId: task.id, error: err })
++    })
++  }
++
+   private async handleSessionErrorEvent(args: {
+     task: BackgroundTask
+     errorInfo: { name?: string; message?: string }
+@@ -1596,13 +1789,16 @@ The fallback retry session is now created and can be inspected directly.
+       }
+     }
+ 
+-    // Agent-not-found errors are handled by the prompt catch block with agent fallback.
+-    // Do not also trigger model fallback retry — that would race with the agent retry.
+-    if (isAgentNotFoundError({ message: errorInfo.message } as Error)) {
+-      log("[background-agent] Skipping session.error fallback for agent-not-found (handled by prompt catch)", {
++    if (isAgentNotFoundError({ message: errorInfo.message ?? "" })) {
++      log("[background-agent] Handling async agent-not-found session.error:", {
+         taskId: task.id,
+         errorMessage: errorInfo.message?.slice(0, 100),
+       })
++      await this.interruptTaskFromAsyncPromptFailure(
++        task,
++        `Agent "${task.agent}" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.`,
++        "agent-not-found session.error",
++      )
+       return
+     }
+ 
+@@ -2383,6 +2579,7 @@ The task was re-queued on a fallback model after a retryable failure.
+         return
+       }
+       log("[background-agent] Sent deferred parent wake:", { sessionID })
++      this.trackDispatchedParentWake(sessionID, latestWake)
+     } catch (error) {
+       this.queuePendingNotification(sessionID, notificationContent)
+       log("[background-agent] Failed to send deferred parent wake:", { sessionID, error })
+@@ -2739,6 +2936,11 @@ The task was re-queued on a fallback model after a retryable failure.
+     }
+     this.pendingParentWakeTimers.clear()
+ 
++    for (const timer of this.dispatchedParentWakeTimers.values()) {
++      clearTimeout(timer)
++    }
++    this.dispatchedParentWakeTimers.clear()
++
+     for (const sessionID of trackedSessionIDs) {
+       subagentSessions.delete(sessionID)
+       SessionCategoryRegistry.remove(sessionID)
+@@ -2751,6 +2953,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     this.pendingNotifications.clear()
+     this.pendingByParent.clear()
+     this.pendingParentWakes.clear()
++    this.dispatchedParentWakes.clear()
+     this.notificationQueueByParent.clear()
+     this.rootDescendantCounts.clear()
+     this.queuesByKey.clear()
+diff --git a/src/features/team-mode/tools/messaging.test.ts b/src/features/team-mode/tools/messaging.test.ts
+index 2c069d5b..3b31e062 100644
+--- a/src/features/team-mode/tools/messaging.test.ts
++++ b/src/features/team-mode/tools/messaging.test.ts
+@@ -21,6 +21,7 @@ import { createRuntimeState, saveRuntimeState } from "../team-state-store/store"
+ import { clearTeamSessionRegistry, registerTeamSession } from "../team-session-registry"
+ import type { Message } from "../types"
+ import { MessageSchema } from "../types"
++import { createTeamIdleWakeHint } from "../../../hooks/team-session-events/team-idle-wake-hint"
+ import { createTeamSendMessageTool } from "./messaging"
+ 
+ type PromptAsyncCall = {
+@@ -310,6 +311,70 @@ describe("createTeamSendMessageTool", () => {
+     expect(unread[0]?.body).toBe("ping while busy")
+   })
+ 
++  test("#given rapid live deliveries to one recipient #when the first prompt just dispatched #then the next message stays unread instead of starting another reply", async () => {
++    // given
++    const fixture = await createTeamFixture()
++    const { client, calls } = createRecordingClient()
++    const liveTool = createTeamSendMessageTool(fixture.config, client)
++
++    // when
++    await liveTool.execute({
++      teamRunId: fixture.teamRunId,
++      to: "m2",
++      body: "first ping",
++    }, fixture.toolContext(fixture.memberOneSessionId))
++    await liveTool.execute({
++      teamRunId: fixture.teamRunId,
++      to: "m2",
++      body: "second ping",
++    }, fixture.toolContext(fixture.memberOneSessionId))
++
++    // then
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.parts[0]?.text).toContain("first ping")
++    const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
++    expect(unread).toHaveLength(1)
++    expect(unread[0]?.body).toBe("second ping")
++  })
++
++  test("#given live delivery left a rapid message unread #when recipient idle wake fires immediately #then the wake hint does not start a second reply", async () => {
++    // given
++    const fixture = await createTeamFixture()
++    const { client, calls } = createRecordingClient()
++    const liveTool = createTeamSendMessageTool(fixture.config, client)
++
++    await liveTool.execute({
++      teamRunId: fixture.teamRunId,
++      to: "m2",
++      body: "first ping",
++    }, fixture.toolContext(fixture.memberOneSessionId))
++    await liveTool.execute({
++      teamRunId: fixture.teamRunId,
++      to: "m2",
++      body: "second ping",
++    }, fixture.toolContext(fixture.memberOneSessionId))
++
++    const wakeHint = createTeamIdleWakeHint({
++      directory: resolveBaseDir(fixture.config),
++      client,
++    }, fixture.config, { idleSettleMs: 0 })
++
++    // when
++    await wakeHint({
++      event: {
++        type: "session.idle",
++        properties: { sessionID: fixture.memberTwoSessionId },
++      },
++    })
++
++    // then
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.parts[0]?.text).toContain("first ping")
++    const unread = await listUnreadMessages(fixture.teamRunId, "m2", fixture.config)
++    expect(unread).toHaveLength(1)
++    expect(unread[0]?.body).toBe("second ping")
++  })
++
+   test("live delivery pins the recipient's resolved subagent_type and model on promptAsync", async () => {
+     // given
+     const fixture = await createTeamFixture()
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index f3f9f560..576780b8 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -1702,7 +1702,7 @@ session_id: ses_untrusted_999
+ 
+         // then - stale idle is consumed, not converted into another scheduled continuation
+         expect(mockInput._promptMock).toHaveBeenCalledTimes(1)
+-        expect(scheduledDelays).toHaveLength(0)
++        expect(scheduledDelays.filter((delay) => delay >= 5_000)).toHaveLength(0)
+       } finally {
+         globalThis.setTimeout = originalSetTimeout
+       }
+diff --git a/src/hooks/compaction-context-injector/recovery.ts b/src/hooks/compaction-context-injector/recovery.ts
+index 7abc8e71..8b74294e 100644
+--- a/src/hooks/compaction-context-injector/recovery.ts
++++ b/src/hooks/compaction-context-injector/recovery.ts
+@@ -21,7 +21,7 @@ import {
+ import { AGENT_RECOVERY_PROMPT, NO_TEXT_TAIL_THRESHOLD, RECOVERY_COOLDOWN_MS, RECENT_COMPACTION_WINDOW_MS } from "./constants"
+ import type { CompactionContextClient } from "./types"
+ import type { TailMonitorState } from "./tail-monitor"
+-import { promptAsyncAfterSessionIdle } from "../shared/prompt-async-gate"
++import { promptAsyncAfterSessionIdle, releasePromptAsyncReservation } from "../shared/prompt-async-gate"
+ 
+ export function createRecoveryLogic(
+   ctx: CompactionContextClient | undefined,
+@@ -117,6 +117,7 @@ export function createRecoveryLogic(
+           hasTools: !!tools,
+           recoveredPromptConfig,
+         })
++        releasePromptAsyncReservation(sessionID, "compaction-context-injector:incomplete-recovery")
+         return false
+       }
+ 
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.ts b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+index 8c75dc99..62dc150e 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-injector.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+@@ -22,6 +22,7 @@ type MessageInfo = {
+ 
+ export type ContinuationPromptResult =
+ 	| { status: "dispatched" }
++	| { status: "deferred"; reason: "active" | "reserved" }
+ 	| { status: "rejected"; error: Error }
+ 
+ function extractPromptAsyncError(response: unknown): unknown | undefined {
+@@ -141,6 +142,9 @@ export async function injectContinuationPrompt(
+ 		if (promptResult.status === "failed") {
+ 			throw promptResult.error
+ 		}
++		if (promptResult.status === "active" || promptResult.status === "reserved") {
++			return { status: "deferred", reason: promptResult.status }
++		}
+ 		if (promptResult.status !== "dispatched") {
+ 			return {
+ 				status: "rejected",
+diff --git a/src/hooks/ralph-loop/index.test.ts b/src/hooks/ralph-loop/index.test.ts
+index b083502a..98856f0d 100644
+--- a/src/hooks/ralph-loop/index.test.ts
++++ b/src/hooks/ralph-loop/index.test.ts
+@@ -871,6 +871,24 @@ describe("ralph-loop", () => {
+       expect(state?.iteration).toBe(2)
+     })
+ 
++    test("#given duplicate real idle fires before assistant activity #then loop state is preserved without another prompt", async () => {
++      // given - active loop
++      const hook = createRalphLoopHook(createMockPluginInput(), { idleSettleMs: 0 })
++      hook.startLoop("session-123", "Build feature", { maxIterations: 5 })
++
++      // when - duplicate idle events arrive without any intervening activity
++      await hook.event({
++        event: { type: "session.idle", properties: { sessionID: "session-123" } },
++      })
++      await hook.event({
++        event: { type: "session.idle", properties: { sessionID: "session-123" } },
++      })
++
++      // then - the second dispatch is deferred, not treated as loop failure
++      expect(hook.getState()?.iteration).toBe(2)
++      expect(promptCalls.length).toBe(1)
++    })
++
+     test("should handle multiple iterations correctly", async () => {
+       // given - active loop
+       const hook = createRalphLoopHook(createMockPluginInput())
+@@ -880,6 +898,9 @@ describe("ralph-loop", () => {
+       await hook.event({
+         event: { type: "session.idle", properties: { sessionID: "session-123" } },
+       })
++      await hook.event({
++        event: { type: "message.part.updated", properties: { sessionID: "session-123" } },
++      })
+       await hook.event({
+         event: { type: "session.idle", properties: { sessionID: "session-123" } },
+       })
+@@ -1127,6 +1148,9 @@ describe("ralph-loop", () => {
+       await hook.event({
+         event: { type: "session.idle", properties: { sessionID: "session-A" } },
+       })
++      await hook.event({
++        event: { type: "message.part.updated", properties: { sessionID: "session-A" } },
++      })
+       await hook.event({
+         event: { type: "session.idle", properties: { sessionID: "session-A" } },
+       })
+@@ -1328,6 +1352,7 @@ Original task: Build something`
+       // when - delayed start snapshot resolves after the loop has already advanced
+       resolveInitialMessages?.({ data: mockSessionMessages })
+       await new Promise((resolve) => setTimeout(resolve, 0))
++      await hook.event({ event: { type: "message.part.updated", properties: { sessionID: "session-123" } } })
+       await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
+ 
+       // then - the late snapshot must not hide the DONE message from verification gating
+diff --git a/src/hooks/ralph-loop/iteration-continuation.ts b/src/hooks/ralph-loop/iteration-continuation.ts
+index aeca27a1..6067f6a7 100644
+--- a/src/hooks/ralph-loop/iteration-continuation.ts
++++ b/src/hooks/ralph-loop/iteration-continuation.ts
+@@ -18,6 +18,7 @@ type ContinuationOptions = {
+ 
+ export type ContinuationResult =
+   | { status: "dispatched"; sessionID: string }
++  | { status: "dispatch_deferred"; reason: "active" | "reserved" }
+   | { status: "session_creation_rejected" }
+   | { status: "dispatch_rejected"; error: unknown }
+ 
+@@ -48,6 +49,9 @@ export async function continueIteration(
+         apiTimeoutMs: options.apiTimeoutMs,
+         idleSettleMs: options.idleSettleMs,
+       })
++      if (promptResult.status === "deferred") {
++        return { status: "dispatch_deferred", reason: promptResult.reason }
++      }
+       if (promptResult.status === "rejected") {
+         return { status: "dispatch_rejected", error: promptResult.error }
+       }
+@@ -77,6 +81,9 @@ export async function continueIteration(
+       apiTimeoutMs: options.apiTimeoutMs,
+       idleSettleMs: options.idleSettleMs,
+     })
++    if (promptResult.status === "deferred") {
++      return { status: "dispatch_deferred", reason: promptResult.reason }
++    }
+     if (promptResult.status === "rejected") {
+       return { status: "dispatch_rejected", error: promptResult.error }
+     }
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index 02c4c3d8..5f12ec40 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -2,6 +2,7 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { log } from "../../shared/logger"
+ import { resolveMessageEventSessionID, resolveSessionEventID } from "../../shared/event-session-id"
+ import { isSessionActive } from "../shared/session-idle-settle"
++import { releasePromptAsyncReservation } from "../shared/prompt-async-gate"
+ import type { IterationCommitExpectation, RalphLoopOptions, RalphLoopState } from "./types"
+ import { HOOK_NAME } from "./constants"
+ import { handleDetectedCompletion } from "./completion-handler"
+@@ -196,6 +197,7 @@ export function createRalphLoopEventHandler(
+ 		const props = event.properties as Record<string, unknown> | undefined
+ 		const runtimeRetryActivitySessionID = getRuntimeRetryActivitySessionID(event.type, props)
+ 		if (runtimeRetryActivitySessionID) {
++			releasePromptAsyncReservation(runtimeRetryActivitySessionID, "ralph-loop:activity")
+ 			runtimeErrorRetriedSessions.delete(runtimeRetryActivitySessionID)
+ 			recentHandledSyntheticIdleAt.delete(runtimeRetryActivitySessionID)
+ 		}
+@@ -396,6 +398,10 @@ export function createRalphLoopEventHandler(
+ 					}
+ 					return
+ 				}
++				if (result.status === "dispatch_deferred") {
++					log(`[${HOOK_NAME}] Dispatch deferred`, { sessionID, reason: result.reason })
++					return
++				}
+ 
+ 				log(`[${HOOK_NAME}] Dispatch failed`, { sessionID, status: result.status })
+ 				options.loopState.clear()
+@@ -563,6 +569,10 @@ export function createRalphLoopEventHandler(
+ 					}
+ 					return
+ 				}
++				if (result.status === "dispatch_deferred") {
++					log(`[${HOOK_NAME}] Dispatch deferred after runtime error`, { sessionID, reason: result.reason })
++					return
++				}
+ 
+ 				log(`[${HOOK_NAME}] Dispatch failed after runtime error`, { sessionID, status: result.status })
+ 				options.loopState.clear()
+diff --git a/src/hooks/ralph-loop/ralph-loop-hook.ts b/src/hooks/ralph-loop/ralph-loop-hook.ts
+index 9cadd343..70923be5 100644
+--- a/src/hooks/ralph-loop/ralph-loop-hook.ts
++++ b/src/hooks/ralph-loop/ralph-loop-hook.ts
+@@ -1,6 +1,7 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { RalphLoopOptions, RalphLoopState } from "./types"
+ import { getTranscriptPath as getDefaultTranscriptPath } from "../claude-code-hooks/transcript"
++import { releasePromptAsyncReservation } from "../shared/prompt-async-gate"
+ import { createLoopStateController } from "./loop-state-controller"
+ import { createRalphLoopEventHandler } from "./ralph-loop-event-handler"
+ 
+@@ -69,6 +70,9 @@ export function createRalphLoopHook(
+ 		event,
+ 		startLoop: (sessionID, prompt, loopOptions): boolean => {
+ 			const startSuccess = loopState.startLoop(sessionID, prompt, loopOptions)
++			if (startSuccess) {
++				releasePromptAsyncReservation(sessionID, "ralph-loop:start-loop")
++			}
+ 			if (!startSuccess || typeof loopOptions?.messageCountAtStart === "number") {
+ 				return startSuccess
+ 			}
+diff --git a/src/hooks/ralph-loop/ulw-loop-verification.test.ts b/src/hooks/ralph-loop/ulw-loop-verification.test.ts
+index 2c7499b9..cf72554a 100644
+--- a/src/hooks/ralph-loop/ulw-loop-verification.test.ts
++++ b/src/hooks/ralph-loop/ulw-loop-verification.test.ts
+@@ -176,10 +176,11 @@ describe("ulw-loop verification", () => {
+ 			`${JSON.stringify({ type: "assistant", timestamp: new Date().toISOString(), content: "done <promise>DONE</promise>" })}\n`,
+ 		)
+ 
+-		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
+-		const stateAfterDone = hook.getState()
++			await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++			const stateAfterDone = hook.getState()
+ 
+-		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++			await hook.event({ event: { type: "message.part.updated", properties: { sessionID: "session-123" } } })
++			await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
+ 
+ 		expect(stateAfterDone?.verification_pending).toBe(true)
+ 		expect(hook.getState()?.iteration).toBe(2)
+@@ -208,10 +209,11 @@ describe("ulw-loop verification", () => {
+ 		writeFileSync(
+ 			oracleTranscriptPath,
+ 			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "still checking" } })}\n`,
+-		)
+-		const stateBeforeWait = hook.getState()
++			)
++			const stateBeforeWait = hook.getState()
+ 
+-		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++			await hook.event({ event: { type: "message.part.updated", properties: { sessionID: "session-123" } } })
++			await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
+ 
+ 		expect(stateBeforeWait?.verification_session_id).toBe("ses-oracle")
+ 		expect(hook.getState()?.iteration).toBe(2)
+diff --git a/src/hooks/ralph-loop/verification-failure-handler.ts b/src/hooks/ralph-loop/verification-failure-handler.ts
+index 760ea950..52874ae9 100644
+--- a/src/hooks/ralph-loop/verification-failure-handler.ts
++++ b/src/hooks/ralph-loop/verification-failure-handler.ts
+@@ -1,5 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { log } from "../../shared/logger"
++import { releasePromptAsyncReservation } from "../shared/prompt-async-gate"
+ import { buildVerificationFailurePrompt } from "./continuation-prompt-builder"
+ import { HOOK_NAME } from "./constants"
+ import { injectContinuationPrompt } from "./continuation-prompt-injector"
+@@ -80,30 +81,29 @@ export async function handleFailedVerification(
+ 		return false
+ 	}
+ 
+-	if (state.verification_session_id) {
+-		ctx.client.session.abort({ path: { id: state.verification_session_id } }).catch(() => {})
++	const previewState: RalphLoopState = {
++		...state,
++		verification_pending: undefined,
++		verification_session_id: undefined,
++		message_count_at_start: messageCountAtStart,
++		iteration: state.iteration + 1,
+ 	}
+ 
+-	const clearedState = loopState.clearVerificationState(
+-		parentSessionID,
+-		messageCountAtStart,
+-	)
+-	if (!clearedState) {
+-		log(`[${HOOK_NAME}] Failed to restart loop after verification failure`, {
+-			parentSessionID,
+-		})
+-		return false
+-	}
+-
+-	const previewState: RalphLoopState = { ...clearedState, iteration: clearedState.iteration + 1 }
+-
+ 	try {
++		releasePromptAsyncReservation(parentSessionID, "ralph-loop:verification-failed")
+ 		const promptResult = await injectContinuationPrompt(ctx, {
+ 			sessionID: parentSessionID,
+ 			prompt: buildVerificationFailurePrompt(previewState),
+ 			directory,
+ 			apiTimeoutMs,
+ 		})
++		if (promptResult.status === "deferred") {
++			log(`[${HOOK_NAME}] Deferred verification failure prompt`, {
++				parentSessionID,
++				reason: promptResult.reason,
++			})
++			return false
++		}
+ 		if (promptResult.status === "rejected") {
+ 			log(`[${HOOK_NAME}] Failed to inject verification failure prompt`, {
+ 				parentSessionID,
+@@ -133,6 +133,21 @@ export async function handleFailedVerification(
+ 		return false
+ 	}
+ 
++	if (state.verification_session_id) {
++		ctx.client.session.abort({ path: { id: state.verification_session_id } }).catch(() => {})
++	}
++
++	const clearedState = loopState.clearVerificationState(
++		parentSessionID,
++		messageCountAtStart,
++	)
++	if (!clearedState) {
++		log(`[${HOOK_NAME}] Failed to restart loop after verification failure`, {
++			parentSessionID,
++		})
++		return false
++	}
++
+ 	const committed = loopState.incrementIteration()
+ 	if (!committed) {
+ 		log(`[${HOOK_NAME}] Failed to commit iteration after verification restart`, { parentSessionID })
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index 7e8a7fd6..aa875b4e 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -147,7 +147,6 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+           sessionID,
+           source: `runtime-fallback:${source}`,
+           settleMs: 0,
+-          postDispatchHoldMs: 0,
+           input: {
+             path: { id: sessionID },
+             body: {
+diff --git a/src/hooks/runtime-fallback/message-update-handler.ts b/src/hooks/runtime-fallback/message-update-handler.ts
+index b054ca5d..348cf2de 100644
+--- a/src/hooks/runtime-fallback/message-update-handler.ts
++++ b/src/hooks/runtime-fallback/message-update-handler.ts
+@@ -66,14 +66,14 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
+     }
+ 
+     if (sessionID && role === "assistant" && error) {
+-      sessionAwaitingFallbackResult.delete(sessionID)
++      const wasAwaitingFallbackResult = sessionAwaitingFallbackResult.delete(sessionID)
+       if (sessionRetryInFlight.has(sessionID) && !retrySignal) {
+         log(`[${HOOK_NAME}] message.updated fallback skipped (retry in flight)`, { sessionID })
+         return
+       }
+ 
+-      if (retrySignal && sessionRetryInFlight.has(sessionID) && timeoutEnabled) {
+-        log(`[${HOOK_NAME}] Overriding in-flight retry due to provider auto-retry signal`, {
++      if (retrySignal && timeoutEnabled && (sessionRetryInFlight.has(sessionID) || wasAwaitingFallbackResult)) {
++        log(`[${HOOK_NAME}] Overriding active retry due to provider auto-retry signal`, {
+           sessionID,
+           model,
+         })
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+index cd943d3b..a4f5e3e9 100644
+--- a/src/hooks/shared/prompt-async-gate.test.ts
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -118,6 +118,42 @@ describe("promptAsyncAfterSessionIdle", () => {
+     expect(promptCalls).toBe(0)
+   })
+ 
++  test("#given dispatch hold has expired #when the same session prompts again #then the next promptAsync is accepted", async () => {
++    // given
++    let promptCalls = 0
++    const client = {
++      session: {
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++
++    // when
++    const first = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_expired_hold",
++      input: { path: { id: "ses_expired_hold" }, body: { parts: [] } },
++      source: "test:expired:first",
++      settleMs: 0,
++      postDispatchHoldMs: 1,
++    })
++    await new Promise((resolve) => setTimeout(resolve, 5))
++    const second = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_expired_hold",
++      input: { path: { id: "ses_expired_hold" }, body: { parts: [] } },
++      source: "test:expired:second",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(first.status).toBe("dispatched")
++    expect(second.status).toBe("dispatched")
++    expect(promptCalls).toBe(2)
++  })
++
+   test("#given two internal prompt calls race for one idle session #when they dispatch concurrently #then only one prompt is accepted", async () => {
+     // given
+     let promptCalls = 0
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 840bbe99..c071caf9 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -42,7 +42,7 @@ import { createTeamIdleWakeHint } from "../hooks/team-session-events/team-idle-w
+ import { createTeamLeadOrphanHandler } from "../hooks/team-session-events/team-lead-orphan-handler";
+ import { createTeamMemberErrorHandler } from "../hooks/team-session-events/team-member-error-handler";
+ import { createTeamMemberStatusHandler } from "../hooks/team-session-events/team-member-status-handler";
+-import { promptAfterSessionIdle, promptAsyncAfterSessionIdle } from "../hooks/shared/prompt-async-gate";
++import { promptAfterSessionIdle, promptAsyncAfterSessionIdle, releasePromptAsyncReservation } from "../hooks/shared/prompt-async-gate";
+ 
+ import type { CreatedHooks } from "../create-hooks";
+ import type { Managers } from "../create-managers";
+@@ -469,6 +469,7 @@ export function createEventHandler(args: {
+       await pluginContext.client.session.abort({ path: { id: sessionID } }).catch((error) => {
+         log("[event] model-fallback abort failed", { sessionID, source, error });
+       });
++      releasePromptAsyncReservation(sessionID, `model-fallback-abort:${source}`);
+ 
+       const launchAgent = fallbackContext?.agentName
+         ? resolveRegisteredAgentName(fallbackContext.agentName)
+diff --git a/src/shared/model-suggestion-retry.test.ts b/src/shared/model-suggestion-retry.test.ts
+index fb2e3248..019f87e8 100644
+--- a/src/shared/model-suggestion-retry.test.ts
++++ b/src/shared/model-suggestion-retry.test.ts
+@@ -266,6 +266,31 @@ describe("promptWithModelSuggestionRetry", () => {
+     expect(results[1]?.status).toBe("rejected")
+   })
+ 
++  it("#given promptAsync retry just dispatched #when the same session is prompted again immediately #then the second caller is rejected by the gate", async () => {
++    // given
++    const promptMock = mock(async () => undefined)
++    const client = {
++      session: {
++        promptAsync: promptMock,
++      },
++    }
++    const args = {
++      path: { id: "session-post-dispatch-hold" },
++      body: {
++        parts: [{ type: "text", text: "hello" }],
++        model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
++      },
++    }
++
++    // when
++    await promptWithModelSuggestionRetry(unsafeTestValue(client), args)
++    const second = promptWithModelSuggestionRetry(unsafeTestValue(client), args)
++
++    // then
++    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
++    expect(promptMock).toHaveBeenCalledTimes(1)
++  })
++
+   it("should throw error from promptAsync directly on model-not-found error", async () => {
+     // given a client that fails with model-not-found error
+     const promptMock = mock().mockRejectedValueOnce({
+@@ -436,6 +461,31 @@ describe("promptSyncWithModelSuggestionRetry", () => {
+     expect(promptAsyncMock).toHaveBeenCalledTimes(0)
+   })
+ 
++  it("#given sync prompt retry just dispatched #when the same session is prompted again immediately #then the second caller is rejected by the gate", async () => {
++    // given
++    const promptMock = mock(async () => undefined)
++    const client = {
++      session: {
++        prompt: promptMock,
++      },
++    }
++    const args = {
++      path: { id: "session-sync-post-dispatch-hold" },
++      body: {
++        parts: [{ type: "text", text: "hello" }],
++        model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
++      },
++    }
++
++    // when
++    await promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
++    const second = promptSyncWithModelSuggestionRetry(unsafeTestValue(client), args)
++
++    // then
++    await expect(second).rejects.toThrow("prompt skipped by gate: reserved")
++    expect(promptMock).toHaveBeenCalledTimes(1)
++  })
++
+   it("should abort and throw timeout error when sync prompt hangs", async () => {
+     // given a client where sync prompt never resolves unless aborted
+     let receivedSignal: AbortSignal | undefined
+diff --git a/src/shared/model-suggestion-retry.ts b/src/shared/model-suggestion-retry.ts
+index 184467e4..ab0ab536 100644
+--- a/src/shared/model-suggestion-retry.ts
++++ b/src/shared/model-suggestion-retry.ts
+@@ -105,7 +105,6 @@ export async function promptWithModelSuggestionRetry(
+       } as Parameters<typeof client.session.promptAsync>[0],
+       source: "model-suggestion-retry",
+       settleMs: 0,
+-      postDispatchHoldMs: 0,
+     })
+     if (promptResult.status === "failed") {
+       throw promptResult.error
+@@ -145,7 +144,6 @@ export async function promptSyncWithModelSuggestionRetry(
+         } as Parameters<typeof client.session.prompt>[0],
+         source: "model-suggestion-retry:sync",
+         settleMs: 0,
+-        postDispatchHoldMs: 0,
+         checkStatus: false,
+       })
+       if (promptResult.status === "failed") {
+@@ -198,7 +196,6 @@ export async function promptSyncWithModelSuggestionRetry(
+         } as Parameters<typeof client.session.prompt>[0],
+         source: "model-suggestion-retry:sync-retry",
+         settleMs: 0,
+-        postDispatchHoldMs: 0,
+         checkStatus: false,
+       })
+       if (promptResult.status === "failed") {
+diff --git a/src/shared/prompt-async-gate.ts b/src/shared/prompt-async-gate.ts
+index 7f2f5755..ca1bac8a 100644
+--- a/src/shared/prompt-async-gate.ts
++++ b/src/shared/prompt-async-gate.ts
+@@ -33,6 +33,7 @@ type PromptAsyncReservation = {
+   source: string
+   reservedAt: number
+   token: symbol
++  expiresAt?: number
+ }
+ 
+ export type PromptAsyncGateResult =
+@@ -44,6 +45,23 @@ export type PromptAsyncGateResult =
+ 
+ const promptAsyncReservations = new Map<string, PromptAsyncReservation>()
+ 
++function pruneExpiredReservations(now = Date.now()): void {
++  for (const [sessionID, reservation] of promptAsyncReservations) {
++    if (typeof reservation.expiresAt === "number" && reservation.expiresAt <= now) {
++      promptAsyncReservations.delete(sessionID)
++      log("[prompt-async-gate] expired reservation released", {
++        sessionID,
++        source: reservation.source,
++      })
++    }
++  }
++}
++
++function getActiveReservation(sessionID: string): PromptAsyncReservation | undefined {
++  pruneExpiredReservations()
++  return promptAsyncReservations.get(sessionID)
++}
++
+ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+   client: PromptAsyncClient<TInput>
+   sessionID: string
+@@ -67,7 +85,7 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+     return { status: "unavailable" }
+   }
+ 
+-  const existing = promptAsyncReservations.get(sessionID)
++  const existing = getActiveReservation(sessionID)
+   if (existing) {
+     log("[prompt-async-gate] promptAsync skipped because session is reserved", {
+       sessionID,
+@@ -84,6 +102,7 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+     token: Symbol(source),
+   }
+   promptAsyncReservations.set(sessionID, reservation)
++  let holdReservationAfterDispatch = false
+ 
+   try {
+     const canReadStatus = args.checkStatus !== false && typeof client.session?.status === "function"
+@@ -99,7 +118,7 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+     log("[prompt-async-gate] promptAsync dispatching", { sessionID, source })
+     const response = await client.session.promptAsync(input)
+     if (postDispatchHoldMs > 0) {
+-      await settleAfterSessionIdle(postDispatchHoldMs)
++      holdReservationAfterDispatch = true
+     }
+     log("[prompt-async-gate] promptAsync dispatched", { sessionID, source })
+     return { status: "dispatched", response }
+@@ -109,7 +128,11 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+   } finally {
+     const current = promptAsyncReservations.get(sessionID)
+     if (current?.token === reservation.token) {
+-      promptAsyncReservations.delete(sessionID)
++      if (holdReservationAfterDispatch && postDispatchHoldMs > 0) {
++        reservation.expiresAt = Date.now() + postDispatchHoldMs
++      } else {
++        promptAsyncReservations.delete(sessionID)
++      }
+     }
+   }
+ }
+@@ -137,7 +160,7 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+     return { status: "unavailable" }
+   }
+ 
+-  const existing = promptAsyncReservations.get(sessionID)
++  const existing = getActiveReservation(sessionID)
+   if (existing) {
+     log("[prompt-async-gate] prompt skipped because session is reserved", {
+       sessionID,
+@@ -154,6 +177,7 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+     token: Symbol(source),
+   }
+   promptAsyncReservations.set(sessionID, reservation)
++  let holdReservationAfterDispatch = false
+ 
+   try {
+     const canReadStatus = args.checkStatus !== false && typeof client.session?.status === "function"
+@@ -169,7 +193,7 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+     log("[prompt-async-gate] prompt dispatching", { sessionID, source })
+     const response = await client.session.prompt(input)
+     if (postDispatchHoldMs > 0) {
+-      await settleAfterSessionIdle(postDispatchHoldMs)
++      holdReservationAfterDispatch = true
+     }
+     log("[prompt-async-gate] prompt dispatched", { sessionID, source })
+     return { status: "dispatched", response }
+@@ -179,7 +203,11 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+   } finally {
+     const current = promptAsyncReservations.get(sessionID)
+     if (current?.token === reservation.token) {
+-      promptAsyncReservations.delete(sessionID)
++      if (holdReservationAfterDispatch && postDispatchHoldMs > 0) {
++        reservation.expiresAt = Date.now() + postDispatchHoldMs
++      } else {
++        promptAsyncReservations.delete(sessionID)
++      }
+     }
+   }
+ }
+diff --git a/src/shared/prompt-async-route-audit.test.ts b/src/shared/prompt-async-route-audit.test.ts
+new file mode 100644
+index 00000000..0335b7c4
+--- /dev/null
++++ b/src/shared/prompt-async-route-audit.test.ts
+@@ -0,0 +1,78 @@
++import { describe, expect, test } from "bun:test"
++import { readdir, readFile } from "node:fs/promises"
++import path from "node:path"
++
++const SOURCE_ROOT = path.resolve(import.meta.dir, "..")
++const PROMPT_GATE_FILE = path.join(SOURCE_ROOT, "shared", "prompt-async-gate.ts")
++
++async function listSourceFiles(directory: string): Promise<string[]> {
++  const entries = await readdir(directory, { withFileTypes: true })
++  const nestedFiles = await Promise.all(entries.map(async (entry) => {
++    const entryPath = path.join(directory, entry.name)
++    if (entry.isDirectory()) {
++      return listSourceFiles(entryPath)
++    }
++    if (
++      entry.isFile()
++      && entry.name.endsWith(".ts")
++      && !entry.name.endsWith(".test.ts")
++      && !entry.name.endsWith(".d.ts")
++    ) {
++      return [entryPath]
++    }
++    return []
++  }))
++
++  return nestedFiles.flat()
++}
++
++function relativeSourcePath(filePath: string): string {
++  return path.relative(SOURCE_ROOT, filePath)
++}
++
++function uncommentedLines(contents: string): string[] {
++  return contents
++    .split("\n")
++    .map((line) => line.trimStart())
++    .filter((line) => !line.startsWith("//") && !line.startsWith("*"))
++}
++
++describe("production prompt injection routes", () => {
++  test("#given production TypeScript sources #when prompt routes are audited #then only the shared gate may call raw OpenCode prompt APIs", async () => {
++    // given
++    const files = await listSourceFiles(SOURCE_ROOT)
++    const offenders: string[] = []
++
++    // when
++    for (const filePath of files) {
++      if (filePath === PROMPT_GATE_FILE) {
++        continue
++      }
++
++      const contents = uncommentedLines(await readFile(filePath, "utf8")).join("\n")
++      if (/\bsession\.promptAsync\s*\(/.test(contents) || /\bsession\.prompt\s*\(/.test(contents)) {
++        offenders.push(relativeSourcePath(filePath))
++      }
++    }
++
++    // then
++    expect(offenders).toEqual([])
++  })
++
++  test("#given production TypeScript sources #when prompt gate callers are audited #then callers cannot disable the post-dispatch reservation hold", async () => {
++    // given
++    const files = await listSourceFiles(SOURCE_ROOT)
++    const offenders: string[] = []
++
++    // when
++    for (const filePath of files) {
++      const contents = uncommentedLines(await readFile(filePath, "utf8")).join("\n")
++      if (/postDispatchHoldMs\s*:\s*0\b/.test(contents)) {
++        offenders.push(relativeSourcePath(filePath))
++      }
++    }
++
++    // then
++    expect(offenders).toEqual([])
++  })
++})
+diff --git a/src/shared/session-route.test.ts b/src/shared/session-route.test.ts
+new file mode 100644
+index 00000000..e4e0eae1
+--- /dev/null
++++ b/src/shared/session-route.test.ts
+@@ -0,0 +1,61 @@
++import { describe, expect, mock, test } from "bun:test"
++
++import { unsafeTestValue } from "../../test-support/unsafe-test-value"
++import { promptAsyncInDirectory } from "./session-route"
++
++describe("promptAsyncInDirectory", () => {
++  test("#given no session id is present #when routing a promptAsync request #then the helper rejects instead of using an ungated raw prompt", async () => {
++    // given
++    const promptAsync = mock(async () => ({ data: "sent" }))
++    const client = {
++      session: {
++        promptAsync,
++      },
++    }
++    const args = {
++      body: { parts: [{ type: "text", text: "continue" }] },
++    }
++
++    // when, then
++    await expect(
++      promptAsyncInDirectory(
++        unsafeTestValue(client),
++        unsafeTestValue(args),
++        "/workspace/project",
++      ),
++    ).rejects.toThrow("session id is required for routed promptAsync")
++    expect(promptAsync).toHaveBeenCalledTimes(0)
++  })
++
++  test("#given a routed prompt just dispatched #when the same session is prompted again immediately #then the route keeps the session reserved", async () => {
++    // given
++    const promptAsync = mock(async () => ({ data: "sent" }))
++    const client = {
++      session: {
++        promptAsync,
++      },
++    }
++    const args = {
++      path: { id: "ses_route_hold" },
++      body: { parts: [{ type: "text", text: "continue" }] },
++    }
++
++    // when
++    const first = await promptAsyncInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++    const second = promptAsyncInDirectory(
++      unsafeTestValue(client),
++      unsafeTestValue(args),
++      "/workspace/project",
++    )
++
++    // then
++    expect(first).toEqual({ data: "sent" })
++    await expect(second).rejects.toThrow("promptAsync skipped by gate: reserved")
++    expect(promptAsync).toHaveBeenCalledTimes(1)
++    expect(promptAsync.mock.calls[0]?.[0].query).toEqual({ directory: "/workspace/project" })
++  })
++})
+diff --git a/src/shared/session-route.ts b/src/shared/session-route.ts
+index e6e5428d..3a39277d 100644
+--- a/src/shared/session-route.ts
++++ b/src/shared/session-route.ts
+@@ -56,7 +56,7 @@ export function promptAsyncInDirectory(
+   const routedArgs = routeSessionPrompt(args, directory)
+   const sessionID = routedArgs.path?.id
+   if (!sessionID) {
+-    return client.session.promptAsync(routedArgs)
++    return Promise.reject(new Error("session id is required for routed promptAsync"))
+   }
+ 
+   return promptAsyncAfterSessionIdle({
+@@ -65,7 +65,6 @@ export function promptAsyncInDirectory(
+     input: routedArgs,
+     source: "session-route",
+     settleMs: 0,
+-    postDispatchHoldMs: 0,
+   }).then((result) => {
+     if (result.status === "failed") {
+       throw result.error
+diff --git a/src/tools/call-omo-agent/sync-executor.test.ts b/src/tools/call-omo-agent/sync-executor.test.ts
+index c0bb0a8d..fdd6cff0 100644
+--- a/src/tools/call-omo-agent/sync-executor.test.ts
++++ b/src/tools/call-omo-agent/sync-executor.test.ts
+@@ -389,6 +389,35 @@ describe("executeSync", () => {
+     expect(deps.processMessages).not.toHaveBeenCalled()
+   })
+ 
++  test("#given a reused sync session was just prompted #when executeSync is called again immediately #then the second prompt is rejected by the shared gate", async () => {
++    //#given
++    const executeSync = await importExecuteSync()
++    const deps = createDependencies({
++      createOrGetSession: mock(async () => ({ sessionID: "ses-reused-hold", isNew: false })),
++    })
++    const toolContext = createToolContext()
++    const recorder = createPromptAsyncRecorder()
++    const args = {
++      subagent_type: "explore",
++      description: "reused hold",
++      prompt: "find something",
++      run_in_background: false,
++      session_id: "ses-reused-hold",
++    }
++    const context = createContext(recorder.promptAsync) as never
++
++    //#when
++    const first = await executeSync(args, toolContext, context, deps)
++    const second = await executeSync(args, toolContext, context, deps)
++
++    //#then
++    expect(first).toContain("agent response")
++    expect(second).toContain("promptAsync skipped by gate: reserved")
++    expect(recorder.promptAsync).toHaveBeenCalledTimes(1)
++    expect(deps.waitForCompletion).toHaveBeenCalledTimes(1)
++    expect(deps.processMessages).toHaveBeenCalledTimes(1)
++  })
++
+   test("commits reserved descendant quota after creating a new sync session", async () => {
+     //#given
+     const { executeSync } = require("./sync-executor")
+diff --git a/src/tools/call-omo-agent/sync-executor.ts b/src/tools/call-omo-agent/sync-executor.ts
+index 85c0c621..640bdb15 100644
+--- a/src/tools/call-omo-agent/sync-executor.ts
++++ b/src/tools/call-omo-agent/sync-executor.ts
+@@ -116,7 +116,6 @@ export async function executeSync(
+         sessionID,
+         source: "call-omo-agent:sync",
+         settleMs: 0,
+-        postDispatchHoldMs: 0,
+         input: {
+           path: { id: sessionID },
+           body: {
+diff --git a/test-setup.ts b/test-setup.ts
+index ccdfb080..c8e8f8d4 100644
+--- a/test-setup.ts
++++ b/test-setup.ts
+@@ -6,6 +6,7 @@ import { _resetTaskToastManagerForTesting as resetTaskToastManager } from "./src
+ import { _resetForTesting as resetModelFallbackState } from "./src/hooks/model-fallback/hook"
+ import { _resetMemCacheForTesting as resetConnectedProvidersCache } from "./src/shared/connected-providers-cache"
+ import { getOmoOpenCodeCacheDir } from "./src/shared/data-path"
++import { releaseAllPromptAsyncReservationsForTesting } from "./src/shared/prompt-async-gate"
+ import { installModuleMockLifecycle } from "./src/testing/module-mock-lifecycle"
+ 
+ const { restoreModuleMocks } = installModuleMockLifecycle(mock)
+@@ -25,6 +26,7 @@ beforeEach(() => {
+   resetTaskToastManager()
+   resetModelFallbackState()
+   resetConnectedProvidersCache()
++  releaseAllPromptAsyncReservationsForTesting()
+ })
+ 
+ afterEach(() => {
+@@ -53,6 +55,7 @@ afterEach(() => {
+   cleanupOmoCacheDir(getOmoOpenCodeCacheDir())
+   resetTaskToastManager()
+   resetConnectedProvidersCache()
++  releaseAllPromptAsyncReservationsForTesting()
+   mock.restore()
+   restoreModuleMocks()
+ })
+-- 
+2.39.2
+

@@ -1,0 +1,1605 @@
+From 161d6e4159eac7c263c73e7e42e95453b170a2e2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 8 Feb 2026 16:22:01 +0900
+Subject: [PATCH 1911/5749] refactor(context-window-recovery): split executor
+ and storage into focused modules
+
+Extract recovery strategies and storage management:
+- recovery-strategy.ts, aggressive-truncation-strategy.ts
+- summarize-retry-strategy.ts, target-token-truncation.ts
+- empty-content-recovery.ts, message-builder.ts
+- tool-result-storage.ts, storage-paths.ts, state.ts
+- client.ts, tool-part-types.ts
+---
+ .../aggressive-truncation-strategy.ts         |  81 ++++
+ .../client.ts                                 |  33 ++
+ .../empty-content-recovery.ts                 |  85 ++++
+ .../executor.ts                               | 458 ++----------------
+ .../index.ts                                  |   3 +
+ .../message-builder.ts                        |  73 +++
+ .../message-storage-directory.ts              |  36 ++
+ .../recovery-strategy.ts                      |   2 +
+ .../state.ts                                  |  53 ++
+ .../storage-paths.ts                          |  10 +
+ .../storage.ts                                | 257 +---------
+ .../summarize-retry-strategy.ts               | 120 +++++
+ .../target-token-truncation.ts                |  85 ++++
+ .../tool-part-types.ts                        |  38 ++
+ .../tool-result-storage.ts                    | 107 ++++
+ 15 files changed, 762 insertions(+), 679 deletions(-)
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/client.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/empty-content-recovery.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/message-builder.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/message-storage-directory.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/recovery-strategy.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/state.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/storage-paths.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/summarize-retry-strategy.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/target-token-truncation.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/tool-part-types.ts
+ create mode 100644 src/hooks/anthropic-context-window-limit-recovery/tool-result-storage.ts
+
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+new file mode 100644
+index 00000000..709cb0db
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.ts
+@@ -0,0 +1,81 @@
++import type { AutoCompactState } from "./types"
++import { TRUNCATE_CONFIG } from "./types"
++import { truncateUntilTargetTokens } from "./storage"
++import type { Client } from "./client"
++import { clearSessionState } from "./state"
++import { formatBytes } from "./message-builder"
++import { log } from "../../shared/logger"
++
++export async function runAggressiveTruncationStrategy(params: {
++  sessionID: string
++  autoCompactState: AutoCompactState
++  client: Client
++  directory: string
++  truncateAttempt: number
++  currentTokens: number
++  maxTokens: number
++}): Promise<{ handled: boolean; nextTruncateAttempt: number }> {
++  if (params.truncateAttempt >= TRUNCATE_CONFIG.maxTruncateAttempts) {
++    return { handled: false, nextTruncateAttempt: params.truncateAttempt }
++  }
++
++  log("[auto-compact] PHASE 2: aggressive truncation triggered", {
++    currentTokens: params.currentTokens,
++    maxTokens: params.maxTokens,
++    targetRatio: TRUNCATE_CONFIG.targetTokenRatio,
++  })
++
++  const aggressiveResult = truncateUntilTargetTokens(
++    params.sessionID,
++    params.currentTokens,
++    params.maxTokens,
++    TRUNCATE_CONFIG.targetTokenRatio,
++    TRUNCATE_CONFIG.charsPerToken,
++  )
++
++  if (aggressiveResult.truncatedCount <= 0) {
++    return { handled: false, nextTruncateAttempt: params.truncateAttempt }
++  }
++
++  const nextTruncateAttempt = params.truncateAttempt + aggressiveResult.truncatedCount
++  const toolNames = aggressiveResult.truncatedTools.map((t) => t.toolName).join(", ")
++  const statusMsg = aggressiveResult.sufficient
++    ? `Truncated ${aggressiveResult.truncatedCount} outputs (${formatBytes(aggressiveResult.totalBytesRemoved)})`
++    : `Truncated ${aggressiveResult.truncatedCount} outputs (${formatBytes(aggressiveResult.totalBytesRemoved)}) - continuing to summarize...`
++
++  await params.client.tui
++    .showToast({
++      body: {
++        title: aggressiveResult.sufficient ? "Truncation Complete" : "Partial Truncation",
++        message: `${statusMsg}: ${toolNames}`,
++        variant: aggressiveResult.sufficient ? "success" : "warning",
++        duration: 4000,
++      },
++    })
++    .catch(() => {})
++
++  log("[auto-compact] aggressive truncation completed", aggressiveResult)
++
++  if (aggressiveResult.sufficient) {
++    clearSessionState(params.autoCompactState, params.sessionID)
++    setTimeout(async () => {
++      try {
++        await params.client.session.prompt_async({
++          path: { id: params.sessionID },
++          body: { auto: true } as never,
++          query: { directory: params.directory },
++        })
++      } catch {}
++    }, 500)
++
++    return { handled: true, nextTruncateAttempt }
++  }
++
++  log("[auto-compact] truncation insufficient, falling through to summarize", {
++    sessionID: params.sessionID,
++    truncatedCount: aggressiveResult.truncatedCount,
++    sufficient: aggressiveResult.sufficient,
++  })
++
++  return { handled: false, nextTruncateAttempt }
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/client.ts b/src/hooks/anthropic-context-window-limit-recovery/client.ts
+new file mode 100644
+index 00000000..13bef9ae
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/client.ts
+@@ -0,0 +1,33 @@
++export type Client = {
++  session: {
++    messages: (opts: {
++      path: { id: string }
++      query?: { directory?: string }
++    }) => Promise<unknown>
++    summarize: (opts: {
++      path: { id: string }
++      body: { providerID: string; modelID: string }
++      query: { directory: string }
++    }) => Promise<unknown>
++    revert: (opts: {
++      path: { id: string }
++      body: { messageID: string; partID?: string }
++      query: { directory: string }
++    }) => Promise<unknown>
++    prompt_async: (opts: {
++      path: { id: string }
++      body: { parts: Array<{ type: string; text: string }> }
++      query: { directory: string }
++    }) => Promise<unknown>
++  }
++  tui: {
++    showToast: (opts: {
++      body: {
++        title: string
++        message: string
++        variant: string
++        duration: number
++      }
++    }) => Promise<unknown>
++  }
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/empty-content-recovery.ts b/src/hooks/anthropic-context-window-limit-recovery/empty-content-recovery.ts
+new file mode 100644
+index 00000000..140d98aa
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/empty-content-recovery.ts
+@@ -0,0 +1,85 @@
++import {
++  findEmptyMessages,
++  findEmptyMessageByIndex,
++  injectTextPart,
++  replaceEmptyTextParts,
++} from "../session-recovery/storage"
++import type { AutoCompactState } from "./types"
++import type { Client } from "./client"
++import { PLACEHOLDER_TEXT } from "./message-builder"
++import { incrementEmptyContentAttempt } from "./state"
++
++export async function fixEmptyMessages(params: {
++  sessionID: string
++  autoCompactState: AutoCompactState
++  client: Client
++  messageIndex?: number
++}): Promise<boolean> {
++  incrementEmptyContentAttempt(params.autoCompactState, params.sessionID)
++
++  let fixed = false
++  const fixedMessageIds: string[] = []
++
++  if (params.messageIndex !== undefined) {
++    const targetMessageId = findEmptyMessageByIndex(params.sessionID, params.messageIndex)
++    if (targetMessageId) {
++      const replaced = replaceEmptyTextParts(targetMessageId, PLACEHOLDER_TEXT)
++      if (replaced) {
++        fixed = true
++        fixedMessageIds.push(targetMessageId)
++      } else {
++        const injected = injectTextPart(params.sessionID, targetMessageId, PLACEHOLDER_TEXT)
++        if (injected) {
++          fixed = true
++          fixedMessageIds.push(targetMessageId)
++        }
++      }
++    }
++  }
++
++  if (!fixed) {
++    const emptyMessageIds = findEmptyMessages(params.sessionID)
++    if (emptyMessageIds.length === 0) {
++      await params.client.tui
++        .showToast({
++          body: {
++            title: "Empty Content Error",
++            message: "No empty messages found in storage. Cannot auto-recover.",
++            variant: "error",
++            duration: 5000,
++          },
++        })
++        .catch(() => {})
++      return false
++    }
++
++    for (const messageID of emptyMessageIds) {
++      const replaced = replaceEmptyTextParts(messageID, PLACEHOLDER_TEXT)
++      if (replaced) {
++        fixed = true
++        fixedMessageIds.push(messageID)
++      } else {
++        const injected = injectTextPart(params.sessionID, messageID, PLACEHOLDER_TEXT)
++        if (injected) {
++          fixed = true
++          fixedMessageIds.push(messageID)
++        }
++      }
++    }
++  }
++
++  if (fixed) {
++    await params.client.tui
++      .showToast({
++        body: {
++          title: "Session Recovery",
++          message: `Fixed ${fixedMessageIds.length} empty message(s). Retrying...`,
++          variant: "warning",
++          duration: 3000,
++        },
++      })
++      .catch(() => {})
++  }
++
++  return fixed
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/executor.ts b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+index 1e9f0ea5..16876cb5 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/executor.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+@@ -1,259 +1,15 @@
+-import type {
+-  AutoCompactState,
+-  RetryState,
+-  TruncateState,
+-} from "./types";
++import type { AutoCompactState } from "./types";
+ import type { ExperimentalConfig } from "../../config";
+-import { RETRY_CONFIG, TRUNCATE_CONFIG } from "./types";
++import { TRUNCATE_CONFIG } from "./types";
+ 
++import type { Client } from "./client";
++import { getOrCreateTruncateState } from "./state";
+ import {
+-  findLargestToolResult,
+-  truncateToolResult,
+-  truncateUntilTargetTokens,
+-} from "./storage";
+-import {
+-  findEmptyMessages,
+-  findEmptyMessageByIndex,
+-  injectTextPart,
+-  replaceEmptyTextParts,
+-} from "../session-recovery/storage";
+-import { log } from "../../shared/logger";
+-
+-const PLACEHOLDER_TEXT = "[user interrupted]";
+-
+-type Client = {
+-  session: {
+-    messages: (opts: {
+-      path: { id: string };
+-      query?: { directory?: string };
+-    }) => Promise<unknown>;
+-    summarize: (opts: {
+-      path: { id: string };
+-      body: { providerID: string; modelID: string };
+-      query: { directory: string };
+-    }) => Promise<unknown>;
+-    revert: (opts: {
+-      path: { id: string };
+-      body: { messageID: string; partID?: string };
+-      query: { directory: string };
+-    }) => Promise<unknown>;
+-    prompt_async: (opts: {
+-      path: { id: string };
+-      body: { parts: Array<{ type: string; text: string }> };
+-      query: { directory: string };
+-    }) => Promise<unknown>;
+-  };
+-  tui: {
+-    showToast: (opts: {
+-      body: {
+-        title: string;
+-        message: string;
+-        variant: string;
+-        duration: number;
+-      };
+-    }) => Promise<unknown>;
+-  };
+-};
+-
+-function getOrCreateRetryState(
+-  autoCompactState: AutoCompactState,
+-  sessionID: string,
+-): RetryState {
+-  let state = autoCompactState.retryStateBySession.get(sessionID);
+-  if (!state) {
+-    state = { attempt: 0, lastAttemptTime: 0 };
+-    autoCompactState.retryStateBySession.set(sessionID, state);
+-  }
+-  return state;
+-}
+-
+-
+-
+-function getOrCreateTruncateState(
+-  autoCompactState: AutoCompactState,
+-  sessionID: string,
+-): TruncateState {
+-  let state = autoCompactState.truncateStateBySession.get(sessionID);
+-  if (!state) {
+-    state = { truncateAttempt: 0 };
+-    autoCompactState.truncateStateBySession.set(sessionID, state);
+-  }
+-  return state;
+-}
+-
+-
+-
+-function sanitizeEmptyMessagesBeforeSummarize(sessionID: string): number {
+-  const emptyMessageIds = findEmptyMessages(sessionID);
+-  if (emptyMessageIds.length === 0) {
+-    return 0;
+-  }
+-
+-  let fixedCount = 0;
+-  for (const messageID of emptyMessageIds) {
+-    const replaced = replaceEmptyTextParts(messageID, PLACEHOLDER_TEXT);
+-    if (replaced) {
+-      fixedCount++;
+-    } else {
+-      const injected = injectTextPart(sessionID, messageID, PLACEHOLDER_TEXT);
+-      if (injected) {
+-        fixedCount++;
+-      }
+-    }
+-  }
+-
+-  if (fixedCount > 0) {
+-    log("[auto-compact] pre-summarize sanitization fixed empty messages", {
+-      sessionID,
+-      fixedCount,
+-      totalEmpty: emptyMessageIds.length,
+-    });
+-  }
+-
+-  return fixedCount;
+-}
+-
+-function formatBytes(bytes: number): string {
+-  if (bytes < 1024) return `${bytes}B`;
+-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+-}
+-
+-export async function getLastAssistant(
+-  sessionID: string,
+-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+-  client: any,
+-  directory: string,
+-): Promise<Record<string, unknown> | null> {
+-  try {
+-    const resp = await (client as Client).session.messages({
+-      path: { id: sessionID },
+-      query: { directory },
+-    });
+-
+-    const data = (resp as { data?: unknown[] }).data;
+-    if (!Array.isArray(data)) return null;
+-
+-    const reversed = [...data].reverse();
+-    const last = reversed.find((m) => {
+-      const msg = m as Record<string, unknown>;
+-      const info = msg.info as Record<string, unknown> | undefined;
+-      return info?.role === "assistant";
+-    });
+-    if (!last) return null;
+-    return (last as { info?: Record<string, unknown> }).info ?? null;
+-  } catch {
+-    return null;
+-  }
+-}
+-
+-
+-
+-function clearSessionState(
+-  autoCompactState: AutoCompactState,
+-  sessionID: string,
+-): void {
+-  autoCompactState.pendingCompact.delete(sessionID);
+-  autoCompactState.errorDataBySession.delete(sessionID);
+-  autoCompactState.retryStateBySession.delete(sessionID);
+-  autoCompactState.truncateStateBySession.delete(sessionID);
+-  autoCompactState.emptyContentAttemptBySession.delete(sessionID);
+-  autoCompactState.compactionInProgress.delete(sessionID);
+-}
+-
+-function getOrCreateEmptyContentAttempt(
+-  autoCompactState: AutoCompactState,
+-  sessionID: string,
+-): number {
+-  return autoCompactState.emptyContentAttemptBySession.get(sessionID) ?? 0;
+-}
+-
+-async function fixEmptyMessages(
+-  sessionID: string,
+-  autoCompactState: AutoCompactState,
+-  client: Client,
+-  messageIndex?: number,
+-): Promise<boolean> {
+-  const attempt = getOrCreateEmptyContentAttempt(autoCompactState, sessionID);
+-  autoCompactState.emptyContentAttemptBySession.set(sessionID, attempt + 1);
+-
+-  let fixed = false;
+-  const fixedMessageIds: string[] = [];
+-
+-  if (messageIndex !== undefined) {
+-    const targetMessageId = findEmptyMessageByIndex(sessionID, messageIndex);
+-    if (targetMessageId) {
+-      const replaced = replaceEmptyTextParts(
+-        targetMessageId,
+-        "[user interrupted]",
+-      );
+-      if (replaced) {
+-        fixed = true;
+-        fixedMessageIds.push(targetMessageId);
+-      } else {
+-        const injected = injectTextPart(
+-          sessionID,
+-          targetMessageId,
+-          "[user interrupted]",
+-        );
+-        if (injected) {
+-          fixed = true;
+-          fixedMessageIds.push(targetMessageId);
+-        }
+-      }
+-    }
+-  }
+-
+-  if (!fixed) {
+-    const emptyMessageIds = findEmptyMessages(sessionID);
+-    if (emptyMessageIds.length === 0) {
+-      await client.tui
+-        .showToast({
+-          body: {
+-            title: "Empty Content Error",
+-            message: "No empty messages found in storage. Cannot auto-recover.",
+-            variant: "error",
+-            duration: 5000,
+-          },
+-        })
+-        .catch(() => {});
+-      return false;
+-    }
+-
+-    for (const messageID of emptyMessageIds) {
+-      const replaced = replaceEmptyTextParts(messageID, "[user interrupted]");
+-      if (replaced) {
+-        fixed = true;
+-        fixedMessageIds.push(messageID);
+-      } else {
+-        const injected = injectTextPart(
+-          sessionID,
+-          messageID,
+-          "[user interrupted]",
+-        );
+-        if (injected) {
+-          fixed = true;
+-          fixedMessageIds.push(messageID);
+-        }
+-      }
+-    }
+-  }
+-
+-  if (fixed) {
+-    await client.tui
+-      .showToast({
+-        body: {
+-          title: "Session Recovery",
+-          message: `Fixed ${fixedMessageIds.length} empty message(s). Retrying...`,
+-          variant: "warning",
+-          duration: 3000,
+-        },
+-      })
+-      .catch(() => {});
+-  }
++  runAggressiveTruncationStrategy,
++  runSummarizeRetryStrategy,
++} from "./recovery-strategy";
+ 
+-  return fixed;
+-}
++export { getLastAssistant } from "./message-builder";
+ 
+ export async function executeCompact(
+   sessionID: string,
+@@ -264,6 +20,8 @@ export async function executeCompact(
+   directory: string,
+   experimental?: ExperimentalConfig,
+ ): Promise<void> {
++  void experimental
++
+   if (autoCompactState.compactionInProgress.has(sessionID)) {
+     await (client as Client).tui
+       .showToast({
+@@ -294,191 +52,29 @@ export async function executeCompact(
+       isOverLimit &&
+       truncateState.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts
+     ) {
+-      log("[auto-compact] PHASE 2: aggressive truncation triggered", {
++      const result = await runAggressiveTruncationStrategy({
++        sessionID,
++        autoCompactState,
++        client: client as Client,
++        directory,
++        truncateAttempt: truncateState.truncateAttempt,
+         currentTokens: errorData.currentTokens,
+         maxTokens: errorData.maxTokens,
+-        targetRatio: TRUNCATE_CONFIG.targetTokenRatio,
+       });
+ 
+-      const aggressiveResult = truncateUntilTargetTokens(
+-        sessionID,
+-        errorData.currentTokens,
+-        errorData.maxTokens,
+-        TRUNCATE_CONFIG.targetTokenRatio,
+-        TRUNCATE_CONFIG.charsPerToken,
+-      );
+-
+-      if (aggressiveResult.truncatedCount > 0) {
+-        truncateState.truncateAttempt += aggressiveResult.truncatedCount;
+-
+-        const toolNames = aggressiveResult.truncatedTools
+-          .map((t) => t.toolName)
+-          .join(", ");
+-        const statusMsg = aggressiveResult.sufficient
+-          ? `Truncated ${aggressiveResult.truncatedCount} outputs (${formatBytes(aggressiveResult.totalBytesRemoved)})`
+-          : `Truncated ${aggressiveResult.truncatedCount} outputs (${formatBytes(aggressiveResult.totalBytesRemoved)}) - continuing to summarize...`;
+-
+-        await (client as Client).tui
+-          .showToast({
+-            body: {
+-              title: aggressiveResult.sufficient
+-                ? "Truncation Complete"
+-                : "Partial Truncation",
+-              message: `${statusMsg}: ${toolNames}`,
+-              variant: aggressiveResult.sufficient ? "success" : "warning",
+-              duration: 4000,
+-            },
+-          })
+-          .catch(() => {});
+-
+-        log("[auto-compact] aggressive truncation completed", aggressiveResult);
+-
+-        // Only return early if truncation was sufficient to get under token limit
+-        // Otherwise fall through to PHASE 3 (Summarize)
+-        if (aggressiveResult.sufficient) {
+-          clearSessionState(autoCompactState, sessionID);
+-          setTimeout(async () => {
+-            try {
+-              await (client as Client).session.prompt_async({
+-                path: { id: sessionID },
+-                body: { auto: true } as never,
+-                query: { directory },
+-              });
+-            } catch {}
+-          }, 500);
+-          return;
+-        }
+-        // Truncation was insufficient - fall through to Summarize
+-        log("[auto-compact] truncation insufficient, falling through to summarize", {
+-          sessionID,
+-          truncatedCount: aggressiveResult.truncatedCount,
+-          sufficient: aggressiveResult.sufficient,
+-        });
+-      }
+-    }
+-
+-    // PHASE 3: Summarize - fallback when truncation insufficient or no tool outputs
+-    const retryState = getOrCreateRetryState(autoCompactState, sessionID);
+-
+-    if (errorData?.errorType?.includes("non-empty content")) {
+-      const attempt = getOrCreateEmptyContentAttempt(
+-        autoCompactState,
+-        sessionID,
+-      );
+-      if (attempt < 3) {
+-        const fixed = await fixEmptyMessages(
+-          sessionID,
+-          autoCompactState,
+-          client as Client,
+-          errorData.messageIndex,
+-        );
+-        if (fixed) {
+-          setTimeout(() => {
+-            executeCompact(
+-              sessionID,
+-              msg,
+-              autoCompactState,
+-              client,
+-              directory,
+-              experimental,
+-            );
+-          }, 500);
+-          return;
+-        }
+-      } else {
+-        await (client as Client).tui
+-          .showToast({
+-            body: {
+-              title: "Recovery Failed",
+-              message:
+-                "Max recovery attempts (3) reached for empty content error. Please start a new session.",
+-              variant: "error",
+-              duration: 10000,
+-            },
+-          })
+-          .catch(() => {});
+-        return;
+-      }
++      truncateState.truncateAttempt = result.nextTruncateAttempt;
++      if (result.handled) return;
+     }
+ 
+-    if (Date.now() - retryState.lastAttemptTime > 300000) {
+-      retryState.attempt = 0;
+-      autoCompactState.truncateStateBySession.delete(sessionID);
+-    }
+-
+-    if (retryState.attempt < RETRY_CONFIG.maxAttempts) {
+-      retryState.attempt++;
+-      retryState.lastAttemptTime = Date.now();
+-
+-      const providerID = msg.providerID as string | undefined;
+-      const modelID = msg.modelID as string | undefined;
+-
+-      if (providerID && modelID) {
+-        try {
+-          sanitizeEmptyMessagesBeforeSummarize(sessionID);
+-
+-          await (client as Client).tui
+-            .showToast({
+-              body: {
+-                title: "Auto Compact",
+-                message: `Summarizing session (attempt ${retryState.attempt}/${RETRY_CONFIG.maxAttempts})...`,
+-                variant: "warning",
+-                duration: 3000,
+-              },
+-            })
+-            .catch(() => {});
+-
+-          const summarizeBody = { providerID, modelID, auto: true }
+-          await (client as Client).session.summarize({
+-            path: { id: sessionID },
+-            body: summarizeBody as never,
+-            query: { directory },
+-          });
+-          return;
+-        } catch {
+-          const delay =
+-            RETRY_CONFIG.initialDelayMs *
+-            Math.pow(RETRY_CONFIG.backoffFactor, retryState.attempt - 1);
+-          const cappedDelay = Math.min(delay, RETRY_CONFIG.maxDelayMs);
+-
+-          setTimeout(() => {
+-            executeCompact(
+-              sessionID,
+-              msg,
+-              autoCompactState,
+-              client,
+-              directory,
+-              experimental,
+-            );
+-          }, cappedDelay);
+-          return;
+-        }
+-      } else {
+-        await (client as Client).tui
+-          .showToast({
+-            body: {
+-              title: "Summarize Skipped",
+-              message: "Missing providerID or modelID.",
+-              variant: "warning",
+-              duration: 3000,
+-            },
+-          })
+-          .catch(() => {});
+-      }
+-    }
+-
+-    clearSessionState(autoCompactState, sessionID);
+-
+-    await (client as Client).tui
+-      .showToast({
+-        body: {
+-          title: "Auto Compact Failed",
+-          message: "All recovery attempts failed. Please start a new session.",
+-          variant: "error",
+-          duration: 5000,
+-        },
+-      })
+-      .catch(() => {});
++    await runSummarizeRetryStrategy({
++      sessionID,
++      msg,
++      autoCompactState,
++      client: client as Client,
++      directory,
++      errorType: errorData?.errorType,
++      messageIndex: errorData?.messageIndex,
++    })
+   } finally {
+     autoCompactState.compactionInProgress.delete(sessionID);
+   }
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/index.ts b/src/hooks/anthropic-context-window-limit-recovery/index.ts
+index 205170a9..2cbe1f93 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/index.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/index.ts
+@@ -3,3 +3,6 @@ export type { AnthropicContextWindowLimitRecoveryOptions } from "./recovery-hook
+ export type { AutoCompactState, ParsedTokenLimitError, TruncateState } from "./types"
+ export { parseAnthropicTokenLimitError } from "./parser"
+ export { executeCompact, getLastAssistant } from "./executor"
++export * from "./state"
++export * from "./message-builder"
++export * from "./recovery-strategy"
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/message-builder.ts b/src/hooks/anthropic-context-window-limit-recovery/message-builder.ts
+new file mode 100644
+index 00000000..cb600ca2
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/message-builder.ts
+@@ -0,0 +1,73 @@
++import { log } from "../../shared/logger"
++import {
++  findEmptyMessages,
++  injectTextPart,
++  replaceEmptyTextParts,
++} from "../session-recovery/storage"
++import type { Client } from "./client"
++
++export const PLACEHOLDER_TEXT = "[user interrupted]"
++
++export function sanitizeEmptyMessagesBeforeSummarize(sessionID: string): number {
++  const emptyMessageIds = findEmptyMessages(sessionID)
++  if (emptyMessageIds.length === 0) {
++    return 0
++  }
++
++  let fixedCount = 0
++  for (const messageID of emptyMessageIds) {
++    const replaced = replaceEmptyTextParts(messageID, PLACEHOLDER_TEXT)
++    if (replaced) {
++      fixedCount++
++    } else {
++      const injected = injectTextPart(sessionID, messageID, PLACEHOLDER_TEXT)
++      if (injected) {
++        fixedCount++
++      }
++    }
++  }
++
++  if (fixedCount > 0) {
++    log("[auto-compact] pre-summarize sanitization fixed empty messages", {
++      sessionID,
++      fixedCount,
++      totalEmpty: emptyMessageIds.length,
++    })
++  }
++
++  return fixedCount
++}
++
++export function formatBytes(bytes: number): string {
++  if (bytes < 1024) return `${bytes}B`
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
++  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
++}
++
++export async function getLastAssistant(
++  sessionID: string,
++  // eslint-disable-next-line @typescript-eslint/no-explicit-any
++  client: any,
++  directory: string,
++): Promise<Record<string, unknown> | null> {
++  try {
++    const resp = await (client as Client).session.messages({
++      path: { id: sessionID },
++      query: { directory },
++    })
++
++    const data = (resp as { data?: unknown[] }).data
++    if (!Array.isArray(data)) return null
++
++    const reversed = [...data].reverse()
++    const last = reversed.find((m) => {
++      const msg = m as Record<string, unknown>
++      const info = msg.info as Record<string, unknown> | undefined
++      return info?.role === "assistant"
++    })
++    if (!last) return null
++    return (last as { info?: Record<string, unknown> }).info ?? null
++  } catch {
++    return null
++  }
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/message-storage-directory.ts b/src/hooks/anthropic-context-window-limit-recovery/message-storage-directory.ts
+new file mode 100644
+index 00000000..249e4644
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/message-storage-directory.ts
+@@ -0,0 +1,36 @@
++import { existsSync, readdirSync } from "node:fs"
++import { join } from "node:path"
++
++import { MESSAGE_STORAGE_DIR } from "./storage-paths"
++
++export function getMessageDir(sessionID: string): string {
++	if (!existsSync(MESSAGE_STORAGE_DIR)) return ""
++
++	const directPath = join(MESSAGE_STORAGE_DIR, sessionID)
++	if (existsSync(directPath)) {
++		return directPath
++	}
++
++	for (const directory of readdirSync(MESSAGE_STORAGE_DIR)) {
++		const sessionPath = join(MESSAGE_STORAGE_DIR, directory, sessionID)
++		if (existsSync(sessionPath)) {
++			return sessionPath
++		}
++	}
++
++	return ""
++}
++
++export function getMessageIds(sessionID: string): string[] {
++	const messageDir = getMessageDir(sessionID)
++	if (!messageDir || !existsSync(messageDir)) return []
++
++	const messageIds: string[] = []
++	for (const file of readdirSync(messageDir)) {
++		if (!file.endsWith(".json")) continue
++		const messageId = file.replace(".json", "")
++		messageIds.push(messageId)
++	}
++
++	return messageIds
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/recovery-strategy.ts b/src/hooks/anthropic-context-window-limit-recovery/recovery-strategy.ts
+new file mode 100644
+index 00000000..d1bf1f8a
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/recovery-strategy.ts
+@@ -0,0 +1,2 @@
++export { runAggressiveTruncationStrategy } from "./aggressive-truncation-strategy"
++export { runSummarizeRetryStrategy } from "./summarize-retry-strategy"
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/state.ts b/src/hooks/anthropic-context-window-limit-recovery/state.ts
+new file mode 100644
+index 00000000..1ee1001f
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/state.ts
+@@ -0,0 +1,53 @@
++import type { AutoCompactState, RetryState, TruncateState } from "./types"
++
++export function getOrCreateRetryState(
++  autoCompactState: AutoCompactState,
++  sessionID: string,
++): RetryState {
++  let state = autoCompactState.retryStateBySession.get(sessionID)
++  if (!state) {
++    state = { attempt: 0, lastAttemptTime: 0 }
++    autoCompactState.retryStateBySession.set(sessionID, state)
++  }
++  return state
++}
++
++export function getOrCreateTruncateState(
++  autoCompactState: AutoCompactState,
++  sessionID: string,
++): TruncateState {
++  let state = autoCompactState.truncateStateBySession.get(sessionID)
++  if (!state) {
++    state = { truncateAttempt: 0 }
++    autoCompactState.truncateStateBySession.set(sessionID, state)
++  }
++  return state
++}
++
++export function clearSessionState(
++  autoCompactState: AutoCompactState,
++  sessionID: string,
++): void {
++  autoCompactState.pendingCompact.delete(sessionID)
++  autoCompactState.errorDataBySession.delete(sessionID)
++  autoCompactState.retryStateBySession.delete(sessionID)
++  autoCompactState.truncateStateBySession.delete(sessionID)
++  autoCompactState.emptyContentAttemptBySession.delete(sessionID)
++  autoCompactState.compactionInProgress.delete(sessionID)
++}
++
++export function getEmptyContentAttempt(
++  autoCompactState: AutoCompactState,
++  sessionID: string,
++): number {
++  return autoCompactState.emptyContentAttemptBySession.get(sessionID) ?? 0
++}
++
++export function incrementEmptyContentAttempt(
++  autoCompactState: AutoCompactState,
++  sessionID: string,
++): number {
++  const attempt = getEmptyContentAttempt(autoCompactState, sessionID)
++  autoCompactState.emptyContentAttemptBySession.set(sessionID, attempt + 1)
++  return attempt
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/storage-paths.ts b/src/hooks/anthropic-context-window-limit-recovery/storage-paths.ts
+new file mode 100644
+index 00000000..95825a0a
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/storage-paths.ts
+@@ -0,0 +1,10 @@
++import { join } from "node:path"
++import { getOpenCodeStorageDir } from "../../shared/data-path"
++
++const OPENCODE_STORAGE_DIR = getOpenCodeStorageDir()
++
++export const MESSAGE_STORAGE_DIR = join(OPENCODE_STORAGE_DIR, "message")
++export const PART_STORAGE_DIR = join(OPENCODE_STORAGE_DIR, "part")
++
++export const TRUNCATION_MESSAGE =
++	"[TOOL RESULT TRUNCATED - Context limit exceeded. Original output was too large and has been truncated to recover the session. Please re-run this tool if you need the full output.]"
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/storage.ts b/src/hooks/anthropic-context-window-limit-recovery/storage.ts
+index e1a771ac..3cd302c8 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/storage.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/storage.ts
+@@ -1,250 +1,11 @@
+-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+-import { join } from "node:path"
+-import { getOpenCodeStorageDir } from "../../shared/data-path"
++export type { AggressiveTruncateResult, ToolResultInfo } from "./tool-part-types"
+ 
+-const OPENCODE_STORAGE = getOpenCodeStorageDir()
+-const MESSAGE_STORAGE = join(OPENCODE_STORAGE, "message")
+-const PART_STORAGE = join(OPENCODE_STORAGE, "part")
++export {
++	countTruncatedResults,
++	findLargestToolResult,
++	findToolResultsBySize,
++	getTotalToolOutputSize,
++	truncateToolResult,
++} from "./tool-result-storage"
+ 
+-const TRUNCATION_MESSAGE =
+-  "[TOOL RESULT TRUNCATED - Context limit exceeded. Original output was too large and has been truncated to recover the session. Please re-run this tool if you need the full output.]"
+-
+-interface StoredToolPart {
+-  id: string
+-  sessionID: string
+-  messageID: string
+-  type: "tool"
+-  callID: string
+-  tool: string
+-  state: {
+-    status: "pending" | "running" | "completed" | "error"
+-    input: Record<string, unknown>
+-    output?: string
+-    error?: string
+-    time?: {
+-      start: number
+-      end?: number
+-      compacted?: number
+-    }
+-  }
+-  truncated?: boolean
+-  originalSize?: number
+-}
+-
+-export interface ToolResultInfo {
+-  partPath: string
+-  partId: string
+-  messageID: string
+-  toolName: string
+-  outputSize: number
+-}
+-
+-function getMessageDir(sessionID: string): string {
+-  if (!existsSync(MESSAGE_STORAGE)) return ""
+-
+-  const directPath = join(MESSAGE_STORAGE, sessionID)
+-  if (existsSync(directPath)) {
+-    return directPath
+-  }
+-
+-  for (const dir of readdirSync(MESSAGE_STORAGE)) {
+-    const sessionPath = join(MESSAGE_STORAGE, dir, sessionID)
+-    if (existsSync(sessionPath)) {
+-      return sessionPath
+-    }
+-  }
+-
+-  return ""
+-}
+-
+-function getMessageIds(sessionID: string): string[] {
+-  const messageDir = getMessageDir(sessionID)
+-  if (!messageDir || !existsSync(messageDir)) return []
+-
+-  const messageIds: string[] = []
+-  for (const file of readdirSync(messageDir)) {
+-    if (!file.endsWith(".json")) continue
+-    const messageId = file.replace(".json", "")
+-    messageIds.push(messageId)
+-  }
+-
+-  return messageIds
+-}
+-
+-export function findToolResultsBySize(sessionID: string): ToolResultInfo[] {
+-  const messageIds = getMessageIds(sessionID)
+-  const results: ToolResultInfo[] = []
+-
+-  for (const messageID of messageIds) {
+-    const partDir = join(PART_STORAGE, messageID)
+-    if (!existsSync(partDir)) continue
+-
+-    for (const file of readdirSync(partDir)) {
+-      if (!file.endsWith(".json")) continue
+-      try {
+-        const partPath = join(partDir, file)
+-        const content = readFileSync(partPath, "utf-8")
+-        const part = JSON.parse(content) as StoredToolPart
+-
+-        if (part.type === "tool" && part.state?.output && !part.truncated) {
+-          results.push({
+-            partPath,
+-            partId: part.id,
+-            messageID,
+-            toolName: part.tool,
+-            outputSize: part.state.output.length,
+-          })
+-        }
+-      } catch {
+-        continue
+-      }
+-    }
+-  }
+-
+-  return results.sort((a, b) => b.outputSize - a.outputSize)
+-}
+-
+-export function findLargestToolResult(sessionID: string): ToolResultInfo | null {
+-  const results = findToolResultsBySize(sessionID)
+-  return results.length > 0 ? results[0] : null
+-}
+-
+-export function truncateToolResult(partPath: string): {
+-  success: boolean
+-  toolName?: string
+-  originalSize?: number
+-} {
+-  try {
+-    const content = readFileSync(partPath, "utf-8")
+-    const part = JSON.parse(content) as StoredToolPart
+-
+-    if (!part.state?.output) {
+-      return { success: false }
+-    }
+-
+-    const originalSize = part.state.output.length
+-    const toolName = part.tool
+-
+-    part.truncated = true
+-    part.originalSize = originalSize
+-    part.state.output = TRUNCATION_MESSAGE
+-
+-    if (!part.state.time) {
+-      part.state.time = { start: Date.now() }
+-    }
+-    part.state.time.compacted = Date.now()
+-
+-    writeFileSync(partPath, JSON.stringify(part, null, 2))
+-
+-    return { success: true, toolName, originalSize }
+-  } catch {
+-    return { success: false }
+-  }
+-}
+-
+-export function getTotalToolOutputSize(sessionID: string): number {
+-  const results = findToolResultsBySize(sessionID)
+-  return results.reduce((sum, r) => sum + r.outputSize, 0)
+-}
+-
+-export function countTruncatedResults(sessionID: string): number {
+-  const messageIds = getMessageIds(sessionID)
+-  let count = 0
+-
+-  for (const messageID of messageIds) {
+-    const partDir = join(PART_STORAGE, messageID)
+-    if (!existsSync(partDir)) continue
+-
+-    for (const file of readdirSync(partDir)) {
+-      if (!file.endsWith(".json")) continue
+-      try {
+-        const content = readFileSync(join(partDir, file), "utf-8")
+-        const part = JSON.parse(content)
+-        if (part.truncated === true) {
+-          count++
+-        }
+-      } catch {
+-        continue
+-      }
+-    }
+-  }
+-
+-  return count
+-}
+-
+-export interface AggressiveTruncateResult {
+-  success: boolean
+-  sufficient: boolean
+-  truncatedCount: number
+-  totalBytesRemoved: number
+-  targetBytesToRemove: number
+-  truncatedTools: Array<{ toolName: string; originalSize: number }>
+-}
+-
+-export function truncateUntilTargetTokens(
+-  sessionID: string,
+-  currentTokens: number,
+-  maxTokens: number,
+-  targetRatio: number = 0.8,
+-  charsPerToken: number = 4
+-): AggressiveTruncateResult {
+-  const targetTokens = Math.floor(maxTokens * targetRatio)
+-  const tokensToReduce = currentTokens - targetTokens
+-  const charsToReduce = tokensToReduce * charsPerToken
+-
+-  if (tokensToReduce <= 0) {
+-    return {
+-      success: true,
+-      sufficient: true,
+-      truncatedCount: 0,
+-      totalBytesRemoved: 0,
+-      targetBytesToRemove: 0,
+-      truncatedTools: [],
+-    }
+-  }
+-
+-  const results = findToolResultsBySize(sessionID)
+-
+-  if (results.length === 0) {
+-    return {
+-      success: false,
+-      sufficient: false,
+-      truncatedCount: 0,
+-      totalBytesRemoved: 0,
+-      targetBytesToRemove: charsToReduce,
+-      truncatedTools: [],
+-    }
+-  }
+-
+-  let totalRemoved = 0
+-  let truncatedCount = 0
+-  const truncatedTools: Array<{ toolName: string; originalSize: number }> = []
+-
+-  for (const result of results) {
+-    const truncateResult = truncateToolResult(result.partPath)
+-    if (truncateResult.success) {
+-      truncatedCount++
+-      const removedSize = truncateResult.originalSize ?? result.outputSize
+-      totalRemoved += removedSize
+-      truncatedTools.push({
+-        toolName: truncateResult.toolName ?? result.toolName,
+-        originalSize: removedSize,
+-      })
+-      
+-      if (totalRemoved >= charsToReduce) {
+-        break
+-      }
+-    }
+-  }
+-
+-  const sufficient = totalRemoved >= charsToReduce
+-
+-  return {
+-    success: truncatedCount > 0,
+-    sufficient,
+-    truncatedCount,
+-    totalBytesRemoved: totalRemoved,
+-    targetBytesToRemove: charsToReduce,
+-    truncatedTools,
+-  }
+-}
++export { truncateUntilTargetTokens } from "./target-token-truncation"
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/summarize-retry-strategy.ts b/src/hooks/anthropic-context-window-limit-recovery/summarize-retry-strategy.ts
+new file mode 100644
+index 00000000..41db33d0
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/summarize-retry-strategy.ts
+@@ -0,0 +1,120 @@
++import type { AutoCompactState } from "./types"
++import { RETRY_CONFIG } from "./types"
++import type { Client } from "./client"
++import { clearSessionState, getEmptyContentAttempt, getOrCreateRetryState } from "./state"
++import { sanitizeEmptyMessagesBeforeSummarize } from "./message-builder"
++import { fixEmptyMessages } from "./empty-content-recovery"
++
++export async function runSummarizeRetryStrategy(params: {
++  sessionID: string
++  msg: Record<string, unknown>
++  autoCompactState: AutoCompactState
++  client: Client
++  directory: string
++  errorType?: string
++  messageIndex?: number
++}): Promise<void> {
++  const retryState = getOrCreateRetryState(params.autoCompactState, params.sessionID)
++
++  if (params.errorType?.includes("non-empty content")) {
++    const attempt = getEmptyContentAttempt(params.autoCompactState, params.sessionID)
++    if (attempt < 3) {
++      const fixed = await fixEmptyMessages({
++        sessionID: params.sessionID,
++        autoCompactState: params.autoCompactState,
++        client: params.client,
++        messageIndex: params.messageIndex,
++      })
++      if (fixed) {
++        setTimeout(() => {
++          void runSummarizeRetryStrategy(params)
++        }, 500)
++        return
++      }
++    } else {
++      await params.client.tui
++        .showToast({
++          body: {
++            title: "Recovery Failed",
++            message:
++              "Max recovery attempts (3) reached for empty content error. Please start a new session.",
++            variant: "error",
++            duration: 10000,
++          },
++        })
++        .catch(() => {})
++      return
++    }
++  }
++
++  if (Date.now() - retryState.lastAttemptTime > 300000) {
++    retryState.attempt = 0
++    params.autoCompactState.truncateStateBySession.delete(params.sessionID)
++  }
++
++  if (retryState.attempt < RETRY_CONFIG.maxAttempts) {
++    retryState.attempt++
++    retryState.lastAttemptTime = Date.now()
++
++    const providerID = params.msg.providerID as string | undefined
++    const modelID = params.msg.modelID as string | undefined
++
++    if (providerID && modelID) {
++      try {
++        sanitizeEmptyMessagesBeforeSummarize(params.sessionID)
++
++        await params.client.tui
++          .showToast({
++            body: {
++              title: "Auto Compact",
++              message: `Summarizing session (attempt ${retryState.attempt}/${RETRY_CONFIG.maxAttempts})...`,
++              variant: "warning",
++              duration: 3000,
++            },
++          })
++          .catch(() => {})
++
++        const summarizeBody = { providerID, modelID, auto: true }
++        await params.client.session.summarize({
++          path: { id: params.sessionID },
++          body: summarizeBody as never,
++          query: { directory: params.directory },
++        })
++        return
++      } catch {
++        const delay =
++          RETRY_CONFIG.initialDelayMs *
++          Math.pow(RETRY_CONFIG.backoffFactor, retryState.attempt - 1)
++        const cappedDelay = Math.min(delay, RETRY_CONFIG.maxDelayMs)
++
++        setTimeout(() => {
++          void runSummarizeRetryStrategy(params)
++        }, cappedDelay)
++        return
++      }
++    } else {
++      await params.client.tui
++        .showToast({
++          body: {
++            title: "Summarize Skipped",
++            message: "Missing providerID or modelID.",
++            variant: "warning",
++            duration: 3000,
++          },
++        })
++        .catch(() => {})
++    }
++  }
++
++  clearSessionState(params.autoCompactState, params.sessionID)
++  await params.client.tui
++    .showToast({
++      body: {
++        title: "Auto Compact Failed",
++        message: "All recovery attempts failed. Please start a new session.",
++        variant: "error",
++        duration: 5000,
++      },
++    })
++    .catch(() => {})
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/target-token-truncation.ts b/src/hooks/anthropic-context-window-limit-recovery/target-token-truncation.ts
+new file mode 100644
+index 00000000..6e5ea6c2
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/target-token-truncation.ts
+@@ -0,0 +1,85 @@
++import type { AggressiveTruncateResult } from "./tool-part-types"
++import { findToolResultsBySize, truncateToolResult } from "./tool-result-storage"
++
++function calculateTargetBytesToRemove(
++	currentTokens: number,
++	maxTokens: number,
++	targetRatio: number,
++	charsPerToken: number
++): { tokensToReduce: number; targetBytesToRemove: number } {
++	const targetTokens = Math.floor(maxTokens * targetRatio)
++	const tokensToReduce = currentTokens - targetTokens
++	const targetBytesToRemove = tokensToReduce * charsPerToken
++	return { tokensToReduce, targetBytesToRemove }
++}
++
++export function truncateUntilTargetTokens(
++	sessionID: string,
++	currentTokens: number,
++	maxTokens: number,
++	targetRatio: number = 0.8,
++	charsPerToken: number = 4
++): AggressiveTruncateResult {
++	const { tokensToReduce, targetBytesToRemove } = calculateTargetBytesToRemove(
++		currentTokens,
++		maxTokens,
++		targetRatio,
++		charsPerToken
++	)
++
++	if (tokensToReduce <= 0) {
++		return {
++			success: true,
++			sufficient: true,
++			truncatedCount: 0,
++			totalBytesRemoved: 0,
++			targetBytesToRemove: 0,
++			truncatedTools: [],
++		}
++	}
++
++	const results = findToolResultsBySize(sessionID)
++
++	if (results.length === 0) {
++		return {
++			success: false,
++			sufficient: false,
++			truncatedCount: 0,
++			totalBytesRemoved: 0,
++			targetBytesToRemove,
++			truncatedTools: [],
++		}
++	}
++
++	let totalRemoved = 0
++	let truncatedCount = 0
++	const truncatedTools: Array<{ toolName: string; originalSize: number }> = []
++
++	for (const result of results) {
++		const truncateResult = truncateToolResult(result.partPath)
++		if (truncateResult.success) {
++			truncatedCount++
++			const removedSize = truncateResult.originalSize ?? result.outputSize
++			totalRemoved += removedSize
++			truncatedTools.push({
++				toolName: truncateResult.toolName ?? result.toolName,
++				originalSize: removedSize,
++			})
++
++			if (totalRemoved >= targetBytesToRemove) {
++				break
++			}
++		}
++	}
++
++	const sufficient = totalRemoved >= targetBytesToRemove
++
++	return {
++		success: truncatedCount > 0,
++		sufficient,
++		truncatedCount,
++		totalBytesRemoved: totalRemoved,
++		targetBytesToRemove,
++		truncatedTools,
++	}
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/tool-part-types.ts b/src/hooks/anthropic-context-window-limit-recovery/tool-part-types.ts
+new file mode 100644
+index 00000000..748b7978
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/tool-part-types.ts
+@@ -0,0 +1,38 @@
++export interface StoredToolPart {
++	id: string
++	sessionID: string
++	messageID: string
++	type: "tool"
++	callID: string
++	tool: string
++	state: {
++		status: "pending" | "running" | "completed" | "error"
++		input: Record<string, unknown>
++		output?: string
++		error?: string
++		time?: {
++			start: number
++			end?: number
++			compacted?: number
++		}
++	}
++	truncated?: boolean
++	originalSize?: number
++}
++
++export interface ToolResultInfo {
++	partPath: string
++	partId: string
++	messageID: string
++	toolName: string
++	outputSize: number
++}
++
++export interface AggressiveTruncateResult {
++	success: boolean
++	sufficient: boolean
++	truncatedCount: number
++	totalBytesRemoved: number
++	targetBytesToRemove: number
++	truncatedTools: Array<{ toolName: string; originalSize: number }>
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/tool-result-storage.ts b/src/hooks/anthropic-context-window-limit-recovery/tool-result-storage.ts
+new file mode 100644
+index 00000000..70d9ffa5
+--- /dev/null
++++ b/src/hooks/anthropic-context-window-limit-recovery/tool-result-storage.ts
+@@ -0,0 +1,107 @@
++import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
++import { join } from "node:path"
++
++import { getMessageIds } from "./message-storage-directory"
++import { PART_STORAGE_DIR, TRUNCATION_MESSAGE } from "./storage-paths"
++import type { StoredToolPart, ToolResultInfo } from "./tool-part-types"
++
++export function findToolResultsBySize(sessionID: string): ToolResultInfo[] {
++	const messageIds = getMessageIds(sessionID)
++	const results: ToolResultInfo[] = []
++
++	for (const messageID of messageIds) {
++		const partDir = join(PART_STORAGE_DIR, messageID)
++		if (!existsSync(partDir)) continue
++
++		for (const file of readdirSync(partDir)) {
++			if (!file.endsWith(".json")) continue
++			try {
++				const partPath = join(partDir, file)
++				const content = readFileSync(partPath, "utf-8")
++				const part = JSON.parse(content) as StoredToolPart
++
++				if (part.type === "tool" && part.state?.output && !part.truncated) {
++					results.push({
++						partPath,
++						partId: part.id,
++						messageID,
++						toolName: part.tool,
++						outputSize: part.state.output.length,
++					})
++				}
++			} catch {
++				continue
++			}
++		}
++	}
++
++	return results.sort((a, b) => b.outputSize - a.outputSize)
++}
++
++export function findLargestToolResult(sessionID: string): ToolResultInfo | null {
++	const results = findToolResultsBySize(sessionID)
++	return results.length > 0 ? results[0] : null
++}
++
++export function truncateToolResult(partPath: string): {
++	success: boolean
++	toolName?: string
++	originalSize?: number
++} {
++	try {
++		const content = readFileSync(partPath, "utf-8")
++		const part = JSON.parse(content) as StoredToolPart
++
++		if (!part.state?.output) {
++			return { success: false }
++		}
++
++		const originalSize = part.state.output.length
++		const toolName = part.tool
++
++		part.truncated = true
++		part.originalSize = originalSize
++		part.state.output = TRUNCATION_MESSAGE
++
++		if (!part.state.time) {
++			part.state.time = { start: Date.now() }
++		}
++		part.state.time.compacted = Date.now()
++
++		writeFileSync(partPath, JSON.stringify(part, null, 2))
++
++		return { success: true, toolName, originalSize }
++	} catch {
++		return { success: false }
++	}
++}
++
++export function getTotalToolOutputSize(sessionID: string): number {
++	const results = findToolResultsBySize(sessionID)
++	return results.reduce((sum, result) => sum + result.outputSize, 0)
++}
++
++export function countTruncatedResults(sessionID: string): number {
++	const messageIds = getMessageIds(sessionID)
++	let count = 0
++
++	for (const messageID of messageIds) {
++		const partDir = join(PART_STORAGE_DIR, messageID)
++		if (!existsSync(partDir)) continue
++
++		for (const file of readdirSync(partDir)) {
++			if (!file.endsWith(".json")) continue
++			try {
++				const content = readFileSync(join(partDir, file), "utf-8")
++				const part = JSON.parse(content)
++				if (part.truncated === true) {
++					count++
++				}
++			} catch {
++				continue
++			}
++		}
++	}
++
++	return count
++}
+-- 
+2.39.2
+

@@ -1,0 +1,451 @@
+From cc1d9cf030ff90c345b8e972e73e992005598171 Mon Sep 17 00:00:00 2001
+From: Matan Kushner <hello@matchai.dev>
+Date: Mon, 4 May 2026 19:25:07 +0900
+Subject: [PATCH 4877/5749] feat(config): walk up directory tree to merge
+ ancestor plugin configs
+
+Closes #417.
+
+The user config (`~/.config/opencode/oh-my-openagent.json[c]`) is no
+longer the only level above the project. `loadPluginConfig` now walks
+from the working directory up to `$HOME` (inclusive), collecting every
+`.opencode/oh-my-openagent.json[c]` it finds along the way. Configs
+closer to the working directory override configs farther up, allowing
+per-tree setups like:
+
+    ~/work/.opencode/oh-my-openagent.json     # work credentials
+    ~/dev/.opencode/oh-my-openagent.json      # personal credentials
+    ~/.config/opencode/oh-my-openagent.json   # global fallback
+
+This subsumes the previous single project-config load: the project's
+own config is just the closest hit of the walk. `agent_definitions`
+relative paths resolve against each ancestor's own `.opencode/` base,
+`git_master` overrides accumulate across the walk (closer wins), and
+legacy basenames are migrated wherever they appear.
+
+`mcp_env_allowlist` is intentionally NOT extensible from walked
+ancestors. It remains user-only as a security boundary so a malicious
+or untrusted parent directory cannot extend the env var allowlist used
+during ${VAR} expansion in `.mcp.json` files. The existing test that
+pins this behaviour is extended to cover the multi-ancestor case.
+
+`os.homedir()` caches in Bun, so the stop directory is resolved by
+reading `process.env.HOME` directly. Production behaviour is unchanged
+because the OS sets HOME at startup; tests can now redirect the walk
+boundary by setting HOME to a temp directory before each call.
+---
+ src/plugin-config.test.ts | 198 +++++++++++++++++++++++++++++++++++++-
+ src/plugin-config.ts      | 142 +++++++++++++++++----------
+ 2 files changed, 286 insertions(+), 54 deletions(-)
+
+diff --git a/src/plugin-config.test.ts b/src/plugin-config.test.ts
+index c8bac63b..fbe4d859 100644
+--- a/src/plugin-config.test.ts
++++ b/src/plugin-config.test.ts
+@@ -560,7 +560,6 @@ describe("loadPluginConfig", () => {
+       git_env_prefix: "GIT_MASTER=1",
+     })
+   })
+-
+   describe("team_mode.tmux_visualization", () => {
+     it("#given canonical user config enables team_mode and legacy config also exists #when loadPluginConfig runs #then tmux_visualization remains false", async () => {
+       // given
+@@ -639,4 +638,201 @@ describe("loadPluginConfig", () => {
+       expect(config.team_mode).toBeUndefined()
+     })
+   })
++
++  it("should merge configs from ancestor directories with closer winning", async () => {
++    // given
++    const rootDir = mkdtempSync(join(tmpdir(), "omo-plugin-config-walk-"))
++    const userConfigDir = join(rootDir, "user-config")
++    const homeDir = join(rootDir, "home")
++    const workDir = join(homeDir, "work")
++    const projectDir = join(workDir, "project")
++
++    tempDirs.push(rootDir)
++    mkdirSync(userConfigDir, { recursive: true })
++    mkdirSync(join(homeDir, ".opencode"), { recursive: true })
++    mkdirSync(join(workDir, ".opencode"), { recursive: true })
++    mkdirSync(join(projectDir, ".opencode"), { recursive: true })
++
++    writeFileSync(
++      join(userConfigDir, "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { oracle: { model: "user/model" } } })
++    )
++    writeFileSync(
++      join(homeDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { oracle: { model: "home/model" } } })
++    )
++    writeFileSync(
++      join(workDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { oracle: { model: "work/model" } } })
++    )
++    writeFileSync(
++      join(projectDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { oracle: { model: "project/model" } } })
++    )
++
++    process.env.OPENCODE_CONFIG_DIR = userConfigDir
++    process.env.HOME = homeDir
++
++    // when
++    const { loadPluginConfig } = await importFreshPluginConfigModule()
++    const config = loadPluginConfig(projectDir, {})
++
++    // then
++    expect(config.agents?.oracle?.model).toBe("project/model")
++  })
++
++  it("should layer ancestor configs so each contributes fields not overridden by closer ones", async () => {
++    // given
++    const rootDir = mkdtempSync(join(tmpdir(), "omo-plugin-config-walk-layer-"))
++    const userConfigDir = join(rootDir, "user-config")
++    const homeDir = join(rootDir, "home")
++    const workDir = join(homeDir, "work")
++    const projectDir = join(workDir, "project")
++
++    tempDirs.push(rootDir)
++    mkdirSync(userConfigDir, { recursive: true })
++    mkdirSync(join(homeDir, ".opencode"), { recursive: true })
++    mkdirSync(join(workDir, ".opencode"), { recursive: true })
++    mkdirSync(join(projectDir, ".opencode"), { recursive: true })
++
++    writeFileSync(join(userConfigDir, "oh-my-openagent.jsonc"), "{}")
++    writeFileSync(
++      join(homeDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { oracle: { model: "home/oracle" } } })
++    )
++    writeFileSync(
++      join(workDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { hephaestus: { model: "work/hephaestus" } } })
++    )
++    writeFileSync(
++      join(projectDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { sisyphus: { model: "project/sisyphus" } } })
++    )
++
++    process.env.OPENCODE_CONFIG_DIR = userConfigDir
++    process.env.HOME = homeDir
++
++    // when
++    const { loadPluginConfig } = await importFreshPluginConfigModule()
++    const config = loadPluginConfig(projectDir, {})
++
++    // then - each level contributes a non-conflicting field
++    expect(config.agents?.oracle?.model).toBe("home/oracle")
++    expect(config.agents?.hephaestus?.model).toBe("work/hephaestus")
++    expect(config.agents?.sisyphus?.model).toBe("project/sisyphus")
++  })
++
++  it("should preserve mcp_env_allowlist as user-only when ancestors set their own allowlists", async () => {
++    // given
++    const rootDir = mkdtempSync(join(tmpdir(), "omo-plugin-config-walk-allowlist-"))
++    const userConfigDir = join(rootDir, "user-config")
++    const homeDir = join(rootDir, "home")
++    const workDir = join(homeDir, "work")
++    const projectDir = join(workDir, "project")
++
++    tempDirs.push(rootDir)
++    mkdirSync(userConfigDir, { recursive: true })
++    mkdirSync(join(homeDir, ".opencode"), { recursive: true })
++    mkdirSync(join(workDir, ".opencode"), { recursive: true })
++    mkdirSync(join(projectDir, ".opencode"), { recursive: true })
++
++    writeFileSync(
++      join(userConfigDir, "oh-my-openagent.jsonc"),
++      JSON.stringify({ mcp_env_allowlist: ["USER_ONLY_TOKEN"] })
++    )
++    writeFileSync(
++      join(homeDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ mcp_env_allowlist: ["HOME_TOKEN"] })
++    )
++    writeFileSync(
++      join(workDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ mcp_env_allowlist: ["WORK_TOKEN"] })
++    )
++    writeFileSync(
++      join(projectDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ mcp_env_allowlist: ["PROJECT_TOKEN"] })
++    )
++
++    process.env.OPENCODE_CONFIG_DIR = userConfigDir
++    process.env.HOME = homeDir
++
++    // when
++    const { loadPluginConfig } = await importFreshPluginConfigModule()
++    const config = loadPluginConfig(projectDir, {})
++
++    // then - only the canonical user config can extend the allowlist
++    expect(config.mcp_env_allowlist).toEqual(["USER_ONLY_TOKEN"])
++  })
++
++  it("should stop walking at $HOME and ignore configs above it", async () => {
++    // given
++    const rootDir = mkdtempSync(join(tmpdir(), "omo-plugin-config-walk-stop-"))
++    const userConfigDir = join(rootDir, "user-config")
++    const aboveHomeDir = join(rootDir, "above-home")
++    const homeDir = join(aboveHomeDir, "home")
++    const projectDir = join(homeDir, "project")
++
++    tempDirs.push(rootDir)
++    mkdirSync(userConfigDir, { recursive: true })
++    mkdirSync(join(aboveHomeDir, ".opencode"), { recursive: true })
++    mkdirSync(join(homeDir, ".opencode"), { recursive: true })
++    mkdirSync(join(projectDir, ".opencode"), { recursive: true })
++
++    writeFileSync(join(userConfigDir, "oh-my-openagent.jsonc"), "{}")
++    writeFileSync(
++      join(aboveHomeDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { oracle: { model: "above-home/leak" } } })
++    )
++    writeFileSync(
++      join(homeDir, ".opencode", "oh-my-openagent.jsonc"),
++      JSON.stringify({ agents: { hephaestus: { model: "home/wins" } } })
++    )
++    writeFileSync(join(projectDir, ".opencode", "oh-my-openagent.jsonc"), "{}")
++
++    process.env.OPENCODE_CONFIG_DIR = userConfigDir
++    process.env.HOME = homeDir
++
++    // when
++    const { loadPluginConfig } = await importFreshPluginConfigModule()
++    const config = loadPluginConfig(projectDir, {})
++
++    // then - $HOME's config applies, but the directory above it does NOT
++    expect(config.agents?.hephaestus?.model).toBe("home/wins")
++    expect(config.agents?.oracle).toBeUndefined()
++  })
++
++  it("should migrate legacy basenames found in ancestor directories", async () => {
++    // given
++    const rootDir = mkdtempSync(join(tmpdir(), "omo-plugin-config-walk-legacy-"))
++    const userConfigDir = join(rootDir, "user-config")
++    const homeDir = join(rootDir, "home")
++    const workDir = join(homeDir, "work")
++    const projectDir = join(workDir, "project")
++    const ancestorLegacyPath = join(workDir, ".opencode", "oh-my-opencode.jsonc")
++    const ancestorCanonicalPath = join(workDir, ".opencode", "oh-my-openagent.jsonc")
++
++    tempDirs.push(rootDir)
++    mkdirSync(userConfigDir, { recursive: true })
++    mkdirSync(join(homeDir, ".opencode"), { recursive: true })
++    mkdirSync(join(workDir, ".opencode"), { recursive: true })
++    mkdirSync(join(projectDir, ".opencode"), { recursive: true })
++
++    writeFileSync(join(userConfigDir, "oh-my-openagent.jsonc"), "{}")
++    writeFileSync(
++      ancestorLegacyPath,
++      JSON.stringify({ agents: { oracle: { model: "ancestor-legacy/model" } } })
++    )
++
++    process.env.OPENCODE_CONFIG_DIR = userConfigDir
++    process.env.HOME = homeDir
++
++    // when
++    const { loadPluginConfig } = await importFreshPluginConfigModule()
++    const config = loadPluginConfig(projectDir, {})
++
++    // then
++    expect(existsSync(ancestorLegacyPath)).toBe(false)
++    expect(existsSync(ancestorCanonicalPath)).toBe(true)
++    expect(config.agents?.oracle?.model).toBe("ancestor-legacy/model")
++  })
+ })
+diff --git a/src/plugin-config.ts b/src/plugin-config.ts
+index 008c7cd0..f745f918 100644
+--- a/src/plugin-config.ts
++++ b/src/plugin-config.ts
+@@ -1,4 +1,5 @@
+ import * as fs from "fs";
++import { homedir } from "node:os";
+ import * as path from "path";
+ import { OhMyOpenCodeConfigSchema, type OhMyOpenCodeConfig } from "./config";
+ import {
+@@ -8,12 +9,41 @@ import {
+   addConfigLoadError,
+   parseJsonc,
+   detectPluginConfigFile,
++  findProjectOpencodePluginConfigFiles,
+   migrateConfigFile,
+   resolveAgentDefinitionPaths,
+ } from "./shared";
+ import { migrateLegacyConfigFile } from "./shared/migrate-legacy-config-file";
+ import { CONFIG_BASENAME, LEGACY_CONFIG_BASENAME } from "./shared/plugin-identity";
+ 
++function resolveHomeDirectory(): string {
++  // Read env vars directly to bypass os.homedir() caching. Bun caches the
++  // first os.homedir() result, which means tests that set process.env.HOME
++  // after import never see the new value. Production behaviour is preserved
++  // because HOME (or USERPROFILE on Windows) is set by the OS at startup.
++  return process.env.HOME ?? process.env.USERPROFILE ?? homedir()
++}
++
++function migrateLegacyAndResolveCanonicalPath(detectedPath: string): string {
++  if (!path.basename(detectedPath).startsWith(LEGACY_CONFIG_BASENAME)) {
++    return detectedPath
++  }
++
++  const migrated = migrateLegacyConfigFile(detectedPath)
++  const canonicalPath = path.join(
++    path.dirname(detectedPath),
++    `${CONFIG_BASENAME}${path.extname(detectedPath)}`,
++  )
++
++  // Only switch to canonical path if migration succeeded OR canonical file already exists
++  if (migrated || fs.existsSync(canonicalPath)) {
++    return canonicalPath
++  }
++
++  // Otherwise keep loading from the legacy path that was detected
++  return detectedPath
++}
++
+ function loadExplicitGitMasterOverrides(configPath: string): Record<string, unknown> | undefined {
+   try {
+     if (!fs.existsSync(configPath)) {
+@@ -214,47 +244,35 @@ export function loadPluginConfig(
+   }
+ 
+   // Auto-copy legacy config file to canonical name if needed
+-  if (userDetected.format !== "none" && path.basename(userDetected.path).startsWith(LEGACY_CONFIG_BASENAME)) {
+-    const migrated = migrateLegacyConfigFile(userDetected.path);
+-    const canonicalPath = path.join(
+-      path.dirname(userDetected.path),
+-      `${CONFIG_BASENAME}${path.extname(userDetected.path)}`
+-    );
+-    // Only switch to canonical path if migration succeeded OR canonical file already exists
+-    if (migrated || fs.existsSync(canonicalPath)) {
+-      userConfigPath = canonicalPath;
+-    }
+-    // Otherwise keep loading from the legacy path that was detected
+-  }
+-
+-  // Project-level config path - prefer .jsonc over .json
+-  const projectBasePath = path.join(directory, ".opencode");
+-  const projectDetected = detectPluginConfigFile(projectBasePath);
+-  let projectConfigPath =
+-    projectDetected.format !== "none"
+-      ? projectDetected.path
+-      : path.join(projectBasePath, `${CONFIG_BASENAME}.json`);
+-
+-  if (projectDetected.legacyPath) {
+-    log("Canonical plugin config detected alongside legacy config. Remove the legacy file to avoid confusion.", {
+-      canonicalPath: projectDetected.path,
+-      legacyPath: projectDetected.legacyPath,
+-    });
++  if (userDetected.format !== "none") {
++    userConfigPath = migrateLegacyAndResolveCanonicalPath(userConfigPath)
+   }
+ 
+-  // Auto-copy legacy project config file to canonical name if needed
+-  if (projectDetected.format !== "none" && path.basename(projectDetected.path).startsWith(LEGACY_CONFIG_BASENAME)) {
+-    const projectMigrated = migrateLegacyConfigFile(projectDetected.path);
+-    const canonicalProjectPath = path.join(
+-      path.dirname(projectDetected.path),
+-      `${CONFIG_BASENAME}${path.extname(projectDetected.path)}`
+-    );
+-    // Only switch to canonical path if migration succeeded OR canonical file already exists
+-    if (projectMigrated || fs.existsSync(canonicalProjectPath)) {
+-      projectConfigPath = canonicalProjectPath;
++  // Walk up from directory to $HOME for ancestor configs (closest first)
++  // This subsumes the previous single project-config load: the closest hit is
++  // the project's own .opencode/oh-my-openagent.json[c], and walking continues
++  // up so configs in ~/work/ (etc.) apply to all subprojects.
++  const ancestorConfigPaths = findProjectOpencodePluginConfigFiles(
++    directory,
++    resolveHomeDirectory(),
++  )
++  log("Walked ancestor plugin configs", {
++    paths: ancestorConfigPaths,
++    count: ancestorConfigPaths.length,
++  })
++
++  // Migrate any legacy basenames among ancestors and warn on dual-config presence
++  const canonicalAncestorPaths = ancestorConfigPaths.map((ancestorPath) => {
++    const opencodeDir = path.dirname(ancestorPath)
++    const ancestorDetected = detectPluginConfigFile(opencodeDir)
++    if (ancestorDetected.legacyPath) {
++      log("Canonical plugin config detected alongside legacy config. Remove the legacy file to avoid confusion.", {
++        canonicalPath: ancestorDetected.path,
++        legacyPath: ancestorDetected.legacyPath,
++      })
+     }
+-    // Otherwise keep loading from the legacy path that was detected
+-  }
++    return migrateLegacyAndResolveCanonicalPath(ancestorPath)
++  })
+ 
+   // Load user config first (base). Parse empty config through Zod to apply field defaults.
+   const userConfig = loadConfigFromPath(userConfigPath, ctx)
+@@ -271,34 +289,52 @@ export function loadPluginConfig(
+   let config: OhMyOpenCodeConfig =
+     userConfig ?? OhMyOpenCodeConfigSchema.parse({});
+ 
+-  // Override with project config
++  // Merge ancestor configs from farthest to nearest, so closer overrides farther.
++  // Walker returns nearest-first; reverse for merge order.
+   const defaultGitMaster = OhMyOpenCodeConfigSchema.parse({}).git_master
+-  const projectConfig = loadConfigFromPath(projectConfigPath, ctx);
+-  const projectGitMasterOverrides = loadExplicitGitMasterOverrides(projectConfigPath)
+-
+-  if (projectConfig?.agent_definitions) {
+-    projectConfig.agent_definitions = resolveAgentDefinitionPaths(
+-      projectConfig.agent_definitions,
+-      projectBasePath,
+-      directory
+-    )
+-  }
++  const ancestorGitMasterOverrides: Array<Record<string, unknown>> = []
++
++  for (const ancestorPath of canonicalAncestorPaths.slice().reverse()) {
++    const ancestorConfig = loadConfigFromPath(ancestorPath, ctx)
++    const ancestorOverrides = loadExplicitGitMasterOverrides(ancestorPath)
++
++    if (ancestorConfig?.agent_definitions) {
++      // Resolve relative paths against this ancestor's own .opencode/ base.
++      const ancestorBasePath = path.dirname(ancestorPath)
++      const ancestorDir = path.dirname(ancestorBasePath)
++      ancestorConfig.agent_definitions = resolveAgentDefinitionPaths(
++        ancestorConfig.agent_definitions,
++        ancestorBasePath,
++        ancestorDir,
++      )
++    }
+ 
+-  if (projectConfig) {
+-    config = mergeConfigs(config, projectConfig);
++    if (ancestorConfig) {
++      config = mergeConfigs(config, ancestorConfig)
++    }
++
++    if (ancestorOverrides) {
++      ancestorGitMasterOverrides.push(ancestorOverrides)
++    }
+   }
+ 
+-  if (userGitMasterOverrides || projectGitMasterOverrides) {
++  if (userGitMasterOverrides || ancestorGitMasterOverrides.length > 0) {
+     config = {
+       ...config,
+       git_master: {
+         ...defaultGitMaster,
+         ...(userGitMasterOverrides ?? {}),
+-        ...(projectGitMasterOverrides ?? {}),
++        // Ancestors are pushed far-to-near; Object.assign with an empty seed
++        // applies each in order so the nearest (last) wins.
++        ...Object.assign({}, ...ancestorGitMasterOverrides),
+       },
+     }
+   }
+ 
++  // Security: mcp_env_allowlist remains user-only across the entire walk.
++  // This prevents clone-and-load attacks where a malicious project (or any
++  // walked ancestor) could extend the env var allowlist used during ${VAR}
++  // expansion in .mcp.json files. See commit 316d2504 for context.
+   config = {
+     ...config,
+     mcp_env_allowlist: userConfig?.mcp_env_allowlist ?? [],
+-- 
+2.39.2
+

@@ -1,0 +1,438 @@
+From 078e49629e74105323b6ad3dae27fe481ce8b792 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Choi=20Kijin=20/=20=EC=B5=9C=20=EA=B8=B0=EC=A7=84=20/=20?=
+ =?UTF-8?q?=E3=83=81=E3=83=A7=E3=82=A4=20=E3=82=AD=E3=82=B8=E3=83=B3?=
+ <kichoi@lycorp.co.jp>
+Date: Tue, 28 Apr 2026 19:09:01 +0900
+Subject: [PATCH 4618/5749] fix(delegate-task): replay sync retry session
+ registration
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/tools/delegate-task/sync-task.test.ts | 167 +++++++++++++++++++---
+ src/tools/delegate-task/sync-task.ts      | 142 +++++++++---------
+ 2 files changed, 220 insertions(+), 89 deletions(-)
+
+diff --git a/src/tools/delegate-task/sync-task.test.ts b/src/tools/delegate-task/sync-task.test.ts
+index 80c0572e..e032f11a 100644
+--- a/src/tools/delegate-task/sync-task.test.ts
++++ b/src/tools/delegate-task/sync-task.test.ts
+@@ -15,7 +15,6 @@ describe("executeSyncTask - cleanup on error paths", () => {
+   let resetToastManager: (() => void) | null = null
+ 
+   beforeEach(() => {
+-    //#given - configure fast timing for all tests
+     const { __setTimingConfig } = require("./timing")
+     __setTimingConfig({
+       POLL_INTERVAL_MS: 10,
+@@ -24,7 +23,6 @@ describe("executeSyncTask - cleanup on error paths", () => {
+       MAX_POLL_TIME_MS: 100,
+     })
+ 
+-    //#given - reset call tracking
+     removeTaskCalls = []
+     addTaskCalls = []
+     deleteCalls = []
+@@ -32,7 +30,6 @@ describe("executeSyncTask - cleanup on error paths", () => {
+ 
+     clearRequireCache("./sync-task")
+ 
+-    //#given - initialize real task toast manager (avoid global module mocks)
+     const { initTaskToastManager, _resetTaskToastManagerForTesting } = require("../../features/task-toast-manager/manager")
+     _resetTaskToastManagerForTesting()
+     resetToastManager = _resetTaskToastManagerForTesting
+@@ -48,7 +45,6 @@ describe("executeSyncTask - cleanup on error paths", () => {
+       removeTaskCalls.push(id)
+     })
+ 
+-    //#given - mock subagentSessions
+     const { subagentSessions } = require("../../features/claude-code-session-state")
+     spyOn(subagentSessions, "add").mockImplementation((id: string) => {
+       addCalls.push(id)
+@@ -60,7 +56,6 @@ describe("executeSyncTask - cleanup on error paths", () => {
+   })
+ 
+   afterEach(() => {
+-    //#given - reset timing after each test
+     const { __resetTimingConfig } = require("./timing")
+     __resetTimingConfig()
+ 
+@@ -516,11 +511,158 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     })
+   })
+ 
+-  test("depth regression: blocks spawn when reserveSubagentSpawn throws depth limit error", async () => {
+-    // This is a smoke test guarding against regressions where the depth limit
+-    // would be silently bypassed (e.g. via a fallback path that hardcodes
+-    // childDepth: 1).
++  test("replays sync session side effects for retry-created sessions", async () => {
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ignored" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++    const createdSessions: string[] = []
++    const onSyncSessionCreated = mock(async (_event: unknown) => {})
++
++    const deps = {
++      createSyncSession: async () => {
++        const sessionID = createdSessions.length === 0 ? "ses_first" : "ses_second"
++        createdSessions.push(sessionID)
++        return { ok: true as const, sessionID }
++      },
++      sendSyncPrompt: async () => null,
++      pollSyncSession: async (_ctx: unknown, _client: unknown, input: { sessionID: string }) => {
++        return input.sessionID === "ses_first"
++          ? "Forbidden: Selected provider is forbidden"
++          : null
++      },
++      fetchSyncResult: async (_client: unknown, sessionID: string) => ({ ok: true as const, textContent: `Result from ${sessionID}` }),
++    }
++
++    const metadataCalls: any[] = []
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: (input: any) => { metadataCalls.push(input) },
++    }
+ 
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated,
++      modelFallbackControllerAccessor: {
++        setSessionFallbackChain: () => {},
++        clearSessionFallbackChain: () => {},
++      },
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "quick",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    const initialModel = {
++      providerID: "genai-proxy-openai",
++      modelID: "gpt-5.4-mini",
++      variant: undefined,
++    }
++    const fallbackChain = [
++      { providers: ["genai-proxy-openai"], model: "gpt-5.4-mini" },
++      { providers: ["genai-proxy-aws"], model: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
++    ]
++
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "sisyphus-junior", initialModel, undefined, undefined, fallbackChain, deps)
++
++    expect(result).toContain("Result from ses_second")
++    expect(onSyncSessionCreated.mock.calls.map((call: any[]) => call[0])).toEqual([
++      { sessionID: "ses_first", parentID: "parent-session", title: "test task" },
++      { sessionID: "ses_second", parentID: "parent-session", title: "test task" },
++    ])
++    expect(addTaskCalls.map((task) => task.sessionID)).toEqual(["ses_first", "ses_second"])
++    expect(addTaskCalls.map((task) => task.id)).toEqual(["sync_ses_firs", "sync_ses_firs"])
++  })
++
++  test("publishes latest retry session metadata when final retry still fails", async () => {
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ignored" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++    const createdSessions: string[] = []
++
++    const deps = {
++      createSyncSession: async () => {
++        const sessionID = createdSessions.length === 0 ? "ses_first" : "ses_second"
++        createdSessions.push(sessionID)
++        return { ok: true as const, sessionID }
++      },
++      sendSyncPrompt: async () => null,
++      pollSyncSession: async (_ctx: unknown, _client: unknown, input: { sessionID: string }) => {
++        return input.sessionID === "ses_first"
++          ? "Forbidden: Selected provider is forbidden"
++          : "Final retry failed"
++      },
++      fetchSyncResult: async () => ({ ok: true as const, textContent: "unused" }),
++    }
++
++    const metadataCalls: any[] = []
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: (input: any) => { metadataCalls.push(input) },
++    }
++
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++      modelFallbackControllerAccessor: {
++        setSessionFallbackChain: () => {},
++        clearSessionFallbackChain: () => {},
++      },
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "quick",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    const initialModel = {
++      providerID: "genai-proxy-openai",
++      modelID: "gpt-5.4-mini",
++      variant: undefined,
++    }
++    const fallbackChain = [
++      { providers: ["genai-proxy-openai"], model: "gpt-5.4-mini" },
++      { providers: ["genai-proxy-aws"], model: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
++    ]
++
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "sisyphus-junior", initialModel, undefined, undefined, fallbackChain, deps)
++
++    expect(result).toBe("Final retry failed")
++    const finalMetadata = metadataCalls.at(-1)
++    expect(finalMetadata.metadata.sessionId).toBe("ses_second")
++    expect(finalMetadata.metadata.taskId).toBe("ses_second")
++    expect(finalMetadata.metadata.model).toEqual({
++      providerID: "genai-proxy-aws",
++      modelID: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
++      variant: undefined,
++    })
++  })
++
++  test("depth regression: blocks spawn when reserveSubagentSpawn throws depth limit error", async () => {
+     const mockClient = {
+       session: {
+         create: async () => ({ data: { id: "ses_test_12345678" } }),
+@@ -574,17 +716,10 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     expect(result).toContain("child depth 4")
+     expect(result).toContain("maxDepth=3")
+     expect(reserveSubagentSpawn).toHaveBeenCalledWith("parent-session")
+-    // critical: createSyncSession must NOT have been called -- if it was,
+-    // the depth guard was bypassed.
+     expect(addCalls.length).toBe(0)
+   })
+ 
+   test("depth regression: does not silently fall back to childDepth: 1 when manager methods are present", async () => {
+-    // Guards against the dangerous fallback path in sync-task.ts that
+-    // hardcodes childDepth: 1 if reserveSubagentSpawn / assertCanSpawn are
+-    // not functions. With a real manager present, the fallback must NOT be
+-    // taken.
+-
+     const mockClient = {
+       session: {
+         create: async () => ({ data: { id: "ses_test_12345678" } }),
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index 758d516f..5601247b 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -40,12 +40,7 @@ export async function executeSyncTask(
+       spawnReservation = await manager.reserveSubagentSpawn(parentContext.sessionID)
+     }
+ 
+-    // Depth guard. We must NOT silently fall back to childDepth: 1
+-    // when the manager is unavailable or lacks the spawn methods, because that
+-    // would let subagents recurse without bound. The only safe fallback is
+-    // when the manager genuinely cannot enforce limits (legacy SDK), in which
+-    // case we still record childDepth: 1 but log a warning so regressions are
+-    // visible.
++    // Only default to childDepth: 1 for legacy managers that cannot enforce spawn depth.
+     let spawnContext: { rootSessionID: string; parentDepth: number; childDepth: number }
+     if (spawnReservation?.spawnContext) {
+       spawnContext = spawnReservation.spawnContext
+@@ -79,29 +74,61 @@ export async function executeSyncTask(
+     const sessionID = createSessionResult.sessionID
+     spawnReservation?.commit()
+     syncSessionID = sessionID
+-    subagentSessions.add(sessionID)
+-    syncSubagentSessions.add(sessionID)
+-    setSessionAgent(sessionID, agentToUse)
+-    executorCtx.modelFallbackControllerAccessor?.setSessionFallbackChain(sessionID, fallbackChain)
+ 
+-    if (args.category) {
+-      SessionCategoryRegistry.register(sessionID, args.category)
+-    }
++    const registerSyncSession = async (newSessionID: string): Promise<void> => {
++      syncSessionID = newSessionID
++      subagentSessions.add(newSessionID)
++      syncSubagentSessions.add(newSessionID)
++      setSessionAgent(newSessionID, agentToUse)
++      executorCtx.modelFallbackControllerAccessor?.setSessionFallbackChain(newSessionID, fallbackChain)
+ 
+-    if (onSyncSessionCreated) {
+-      log("[task] Invoking onSyncSessionCreated callback", { sessionID, parentID: parentContext.sessionID })
+-      try {
+-        await onSyncSessionCreated({
+-          sessionID,
+-          parentID: parentContext.sessionID,
+-          title: args.description,
+-        })
+-      } catch (error) {
+-        log("[task] onSyncSessionCreated callback failed", { error: String(error) })
++      if (args.category) {
++        SessionCategoryRegistry.register(newSessionID, args.category)
++      }
++
++      if (onSyncSessionCreated) {
++        log("[task] Invoking onSyncSessionCreated callback", { sessionID: newSessionID, parentID: parentContext.sessionID })
++        try {
++          await onSyncSessionCreated({
++            sessionID: newSessionID,
++            parentID: parentContext.sessionID,
++            title: args.description,
++          })
++        } catch (error) {
++          log("[task] onSyncSessionCreated callback failed", { error: String(error) })
++        }
++        await new Promise(r => setTimeout(r, 200))
+       }
+-      await new Promise(r => setTimeout(r, 200))
+     }
+ 
++    const publishSyncMetadata = async (
++      currentSessionID: string,
++      currentModel: DelegatedModelConfig | undefined,
++      currentTaskId: string,
++      spawnDepth: number,
++    ): Promise<void> => {
++      await publishToolMetadata(ctx, {
++        title: args.description,
++        metadata: {
++          prompt: args.prompt,
++          agent: agentToUse,
++          category: args.category,
++          ...(args.requested_subagent_type !== undefined ? { requested_subagent_type: args.requested_subagent_type } : {}),
++          load_skills: args.load_skills,
++          description: args.description,
++          run_in_background: args.run_in_background,
++          taskId: currentSessionID,
++          sessionId: currentSessionID,
++          sync: true,
++          spawnDepth,
++          command: args.command,
++          model: resolveMetadataModel(currentModel, parentContext.model),
++        },
++      })
++    }
++
++    await registerSyncSession(sessionID)
++
+     taskId = `sync_${sessionID.slice(0, 8)}`
+     const startTime = new Date()
+ 
+@@ -117,26 +144,7 @@ export async function executeSyncTask(
+         modelInfo,
+       })
+     }
+-
+-    const syncTaskMeta = {
+-      title: args.description,
+-      metadata: {
+-        prompt: args.prompt,
+-        agent: agentToUse,
+-        category: args.category,
+-        ...(args.requested_subagent_type !== undefined ? { requested_subagent_type: args.requested_subagent_type } : {}),
+-        load_skills: args.load_skills,
+-        description: args.description,
+-        run_in_background: args.run_in_background,
+-        taskId: sessionID,
+-        sessionId: sessionID,
+-        sync: true,
+-        spawnDepth: spawnContext.childDepth,
+-        command: args.command,
+-        model: resolveMetadataModel(categoryModel, parentContext.model),
+-      },
+-    }
+-    await publishToolMetadata(ctx, syncTaskMeta)
++    await publishSyncMetadata(sessionID, categoryModel, taskId, spawnContext.childDepth)
+ 
+     const syncPromptInput = {
+       sessionID,
+@@ -225,17 +233,23 @@ export async function executeSyncTask(
+           }
+ 
+           activeSessionID = retrySessionResult.sessionID
+-          syncSessionID = retrySessionResult.sessionID
+-          subagentSessions.add(activeSessionID)
+-          syncSubagentSessions.add(activeSessionID)
+-          setSessionAgent(activeSessionID, agentToUse)
+-          executorCtx.modelFallbackControllerAccessor?.setSessionFallbackChain(activeSessionID, fallbackChain)
+-
+-          if (args.category) {
+-            SessionCategoryRegistry.register(activeSessionID, args.category)
+-          }
+-
+           effectiveCategoryModel = nextFallbackModel
++          await registerSyncSession(activeSessionID)
++          if (toastManager && taskId) {
++            toastManager.addTask({
++              id: taskId,
++              sessionID: activeSessionID,
++              description: args.description,
++              agent: agentToUse,
++              isBackground: false,
++              category: args.category,
++              skills: args.load_skills,
++              modelInfo,
++            })
++          }
++          if (taskId) {
++            await publishSyncMetadata(activeSessionID, effectiveCategoryModel, taskId, spawnContext.childDepth)
++          }
+           continue
+         }
+ 
+@@ -246,7 +260,6 @@ export async function executeSyncTask(
+ 
+       const duration = formatDuration(startTime)
+ 
+-      // 检测模型路由是否与父 session 不同，给用户可见的提示
+       const actualModelStr = effectiveCategoryModel
+         ? `${effectiveCategoryModel.providerID}/${effectiveCategoryModel.modelID}`
+         : undefined
+@@ -260,24 +273,7 @@ export async function executeSyncTask(
+         modelRoutingNote = `\nModel: ${actualModelStr}${args.category ? ` (category: ${args.category})` : ""}`
+       }
+ 
+-      await publishToolMetadata(ctx, {
+-        title: args.description,
+-        metadata: {
+-          prompt: args.prompt,
+-          agent: agentToUse,
+-          category: args.category,
+-          ...(args.requested_subagent_type !== undefined ? { requested_subagent_type: args.requested_subagent_type } : {}),
+-          load_skills: args.load_skills,
+-          description: args.description,
+-          run_in_background: args.run_in_background,
+-          taskId: activeSessionID,
+-          sessionId: activeSessionID,
+-          sync: true,
+-          spawnDepth: spawnContext.childDepth,
+-          command: args.command,
+-          model: resolveMetadataModel(effectiveCategoryModel, parentContext.model),
+-        },
+-      })
++      await publishSyncMetadata(activeSessionID, effectiveCategoryModel, taskId!, spawnContext.childDepth)
+ 
+       return `Task completed in ${duration}.
+ 
+-- 
+2.39.2
+

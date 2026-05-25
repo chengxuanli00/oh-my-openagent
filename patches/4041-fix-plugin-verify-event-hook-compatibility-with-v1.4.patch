@@ -1,0 +1,821 @@
+From 78e6d780eb53f3512fbfffa223e64c639d79ccc1 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 8 Apr 2026 13:08:03 +0900
+Subject: [PATCH 4041/5749] fix(plugin): verify event hook compatibility with
+ v1.4.0
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../compaction-aware-message-resolver.test.ts | 52 ++++++++++++++-
+ .../compaction-aware-message-resolver.ts      | 23 +++++--
+ .../hook-message-injector/injector.test.ts    | 59 +++++++++++++++++
+ .../hook-message-injector/injector.ts         | 38 ++++++++++-
+ .../atlas/session-last-agent.json.test.ts     | 33 ++++++++++
+ .../atlas/session-last-agent.sqlite.test.ts   | 24 +++++++
+ src/hooks/atlas/session-last-agent.ts         | 31 ++++++---
+ .../todo-continuation-enforcer/idle-event.ts  |  7 ++
+ .../pending-question-detection.ts             |  2 +-
+ .../resolve-message-info.ts                   | 15 ++++-
+ .../todo-continuation-enforcer.test.ts        | 65 +++++++++++++++++--
+ src/hooks/todo-continuation-enforcer/types.ts |  2 +
+ src/plugin/chat-params.ts                     |  2 +-
+ src/shared/compaction-marker.ts               | 57 ++++++++++++++++
+ src/shared/index.ts                           |  1 +
+ 15 files changed, 383 insertions(+), 28 deletions(-)
+ create mode 100644 src/shared/compaction-marker.ts
+
+diff --git a/src/features/background-agent/compaction-aware-message-resolver.test.ts b/src/features/background-agent/compaction-aware-message-resolver.test.ts
+index 5b9bed5a..d4fe5104 100644
+--- a/src/features/background-agent/compaction-aware-message-resolver.test.ts
++++ b/src/features/background-agent/compaction-aware-message-resolver.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+-import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
++import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
+ import { join } from "node:path"
+ import { tmpdir } from "node:os"
+ import {
+@@ -11,6 +11,7 @@ import {
+   clearCompactionAgentConfigCheckpoint,
+   setCompactionAgentConfigCheckpoint,
+ } from "../../shared/compaction-agent-config-checkpoint"
++import { PART_STORAGE } from "../../shared"
+ 
+ describe("isCompactionAgent", () => {
+   describe("#given agent name variations", () => {
+@@ -73,6 +74,7 @@ describe("findNearestMessageExcludingCompaction", () => {
+ 
+   afterEach(() => {
+     rmSync(tempDir, { force: true, recursive: true })
++    rmSync(join(PART_STORAGE, "msg_test_background_compaction_marker"), { force: true, recursive: true })
+     clearCompactionAgentConfigCheckpoint("ses_checkpoint")
+   })
+ 
+@@ -116,6 +118,30 @@ describe("findNearestMessageExcludingCompaction", () => {
+       expect(result?.agent).toBe("sisyphus")
+     })
+ 
++    test("skips JSON messages whose part storage contains a compaction marker", () => {
++      // given
++      const compactionMessageID = "msg_test_background_compaction_marker"
++      const partDir = join(PART_STORAGE, compactionMessageID)
++      writeFileSync(join(tempDir, "002.json"), JSON.stringify({
++        id: compactionMessageID,
++        agent: "atlas",
++        model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
++      }))
++      writeFileSync(join(tempDir, "001.json"), JSON.stringify({
++        id: "msg_001",
++        agent: "sisyphus",
++        model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
++      }))
++      mkdirSync(partDir, { recursive: true })
++      writeFileSync(join(partDir, "prt_0001.json"), JSON.stringify({ type: "compaction" }))
++
++      // when
++      const result = findNearestMessageExcludingCompaction(tempDir)
++
++      // then
++      expect(result?.agent).toBe("sisyphus")
++    })
++
+     test("falls back to partial agent/model match", () => {
+       // given
+       const messageWithAgentOnly = {
+@@ -256,4 +282,28 @@ describe("resolvePromptContextFromSessionMessages", () => {
+       tools: { bash: true },
+     })
+   })
++
++  test("skips SDK messages that only exist to mark compaction", () => {
++    // given
++    const messages = [
++      {
++        id: "msg_compaction",
++        info: { agent: "atlas", model: { providerID: "openai", modelID: "gpt-5" } },
++        parts: [{ type: "compaction" }],
++      },
++      { info: { agent: "sisyphus" } },
++      { info: { model: { providerID: "anthropic", modelID: "claude-opus-4-1" } } },
++      { info: { tools: { bash: true } } },
++    ]
++
++    // when
++    const result = resolvePromptContextFromSessionMessages(messages)
++
++    // then
++    expect(result).toEqual({
++      agent: "sisyphus",
++      model: { providerID: "anthropic", modelID: "claude-opus-4-1" },
++      tools: { bash: true },
++    })
++  })
+ })
+diff --git a/src/features/background-agent/compaction-aware-message-resolver.ts b/src/features/background-agent/compaction-aware-message-resolver.ts
+index 60b3949b..573002b4 100644
+--- a/src/features/background-agent/compaction-aware-message-resolver.ts
++++ b/src/features/background-agent/compaction-aware-message-resolver.ts
+@@ -2,8 +2,16 @@ import { readdirSync, readFileSync } from "node:fs"
+ import { join } from "node:path"
+ import type { StoredMessage } from "../hook-message-injector"
+ import { getCompactionAgentConfigCheckpoint } from "../../shared/compaction-agent-config-checkpoint"
++import {
++  hasCompactionPartInStorage,
++  isCompactionAgent,
++  isCompactionMessage,
++} from "../../shared/compaction-marker"
++
++export { isCompactionAgent } from "../../shared/compaction-marker"
+ 
+ type SessionMessage = {
++  id?: string
+   info?: {
+     agent?: string
+     model?: {
+@@ -15,10 +23,7 @@ type SessionMessage = {
+     modelID?: string
+     tools?: StoredMessage["tools"]
+   }
+-}
+-
+-export function isCompactionAgent(agent: string | undefined): boolean {
+-  return agent?.trim().toLowerCase() === "compaction"
++  parts?: Array<{ type?: string }>
+ }
+ 
+ function hasFullAgentAndModel(message: StoredMessage): boolean {
+@@ -35,6 +40,10 @@ function hasPartialAgentOrModel(message: StoredMessage): boolean {
+ }
+ 
+ function convertSessionMessageToStoredMessage(message: SessionMessage): StoredMessage | null {
++  if (isCompactionMessage(message)) {
++    return null
++  }
++
+   const info = message.info
+   if (!info) {
+     return null
+@@ -138,7 +147,11 @@ export function findNearestMessageExcludingCompaction(
+     for (const file of files) {
+       try {
+         const content = readFileSync(join(messageDir, file), "utf-8")
+-        messages.push(JSON.parse(content) as StoredMessage)
++        const parsed = JSON.parse(content) as StoredMessage & { id?: string }
++        if (hasCompactionPartInStorage(parsed.id) || isCompactionAgent(parsed.agent)) {
++          continue
++        }
++        messages.push(parsed)
+       } catch {
+         continue
+       }
+diff --git a/src/features/hook-message-injector/injector.test.ts b/src/features/hook-message-injector/injector.test.ts
+index 663b5e06..3db36764 100644
+--- a/src/features/hook-message-injector/injector.test.ts
++++ b/src/features/hook-message-injector/injector.test.ts
+@@ -11,6 +11,7 @@ import {
+   generatePartId,
+   injectHookMessage,
+ } from "./injector"
++import { PART_STORAGE } from "../../shared"
+ import { isSqliteBackend, resetSqliteBackendCache } from "../../shared/opencode-storage-detection"
+ 
+ //#region Mocks
+@@ -53,6 +54,7 @@ function createMockClient(messages: Array<{
+     tools?: Record<string, boolean>
+     time?: { created?: number }
+   }
++  parts?: Array<{ type?: string }>
+ }>): {
+   session: {
+     messages: (opts: { path: { id: string } }) => Promise<{ data: typeof messages }>
+@@ -176,6 +178,24 @@ describe("findNearestMessageWithFieldsFromSDK", () => {
+ 
+     expect(result?.agent).toBe("newest-by-time")
+   })
++
++  it("skips compaction marker user messages when resolving nearest message", async () => {
++    const mockClient = createMockClient([
++      {
++        id: "msg_compaction",
++        info: { agent: "atlas", model: { providerID: "openai", modelID: "gpt-5" }, time: { created: 200 } },
++        parts: [{ type: "compaction" }],
++      },
++      {
++        id: "msg_real",
++        info: { agent: "sisyphus", model: { providerID: "anthropic", modelID: "claude-opus-4" }, time: { created: 100 } },
++      },
++    ])
++
++    const result = await findNearestMessageWithFieldsFromSDK(mockClient as any, "ses_123")
++
++    expect(result?.agent).toBe("sisyphus")
++  })
+ })
+ 
+ describe("findNearestMessageWithFields JSON backend ordering", () => {
+@@ -197,6 +217,34 @@ describe("findNearestMessageWithFields JSON backend ordering", () => {
+ 
+     expect(result?.agent).toBe("newest-by-time")
+   })
++
++  it("skips JSON messages whose parts contain a compaction marker", () => {
++    mockIsSqliteBackend.mockReturnValue(false)
++    const messageDir = createMessageDir()
++    const compactionMessageID = "msg_test_injector_compaction_marker"
++    const partDir = join(PART_STORAGE, compactionMessageID)
++    tempDirs.push(partDir)
++
++    writeFileSync(join(messageDir, "msg_0001.json"), JSON.stringify({
++      id: compactionMessageID,
++      agent: "atlas",
++      model: { providerID: "openai", modelID: "gpt-5" },
++      time: { created: 200 },
++    }))
++    mkdirSync(partDir, { recursive: true })
++    writeFileSync(join(partDir, "prt_0001.json"), JSON.stringify({ type: "compaction" }))
++
++    writeFileSync(join(messageDir, "msg_0002.json"), JSON.stringify({
++      id: "msg_0002",
++      agent: "sisyphus",
++      model: { providerID: "anthropic", modelID: "claude-opus-4" },
++      time: { created: 100 },
++    }))
++
++    const result = findNearestMessageWithFields(messageDir)
++
++    expect(result?.agent).toBe("sisyphus")
++  })
+ })
+ 
+ describe("findFirstMessageWithAgentFromSDK", () => {
+@@ -222,6 +270,17 @@ describe("findFirstMessageWithAgentFromSDK", () => {
+     expect(result).toBe("earliest-agent")
+   })
+ 
++  it("skips compaction marker user messages when resolving first agent", async () => {
++    const mockClient = createMockClient([
++      { id: "msg_compaction", info: { agent: "atlas", time: { created: 10 } }, parts: [{ type: "compaction" }] },
++      { id: "msg_real", info: { agent: "sisyphus", time: { created: 20 } } },
++    ])
++
++    const result = await findFirstMessageWithAgentFromSDK(mockClient as any, "ses_123")
++
++    expect(result).toBe("sisyphus")
++  })
++
+   it("skips messages without agent field", async () => {
+     const mockClient = createMockClient([
+       { info: {} },
+diff --git a/src/features/hook-message-injector/injector.ts b/src/features/hook-message-injector/injector.ts
+index a0568371..84ecddf0 100644
+--- a/src/features/hook-message-injector/injector.ts
++++ b/src/features/hook-message-injector/injector.ts
+@@ -7,6 +7,7 @@ import type { MessageMeta, OriginalMessageContext, TextPart, ToolPermission } fr
+ import { log } from "../../shared/logger"
+ import { isSqliteBackend } from "../../shared/opencode-storage-detection"
+ import { createInternalAgentTextPart, normalizeSDKResponse } from "../../shared"
++import { hasCompactionPartInStorage, isCompactionMessage } from "../../shared/compaction-marker"
+ 
+ export interface StoredMessage {
+   agent?: string
+@@ -32,6 +33,7 @@ interface SDKMessage {
+       created?: number
+     }
+   }
++  parts?: Array<{ type?: string }>
+ }
+ 
+ const processPrefix = randomBytes(4).toString("hex")
+@@ -39,6 +41,10 @@ let messageCounter = 0
+ let partCounter = 0
+ 
+ function convertSDKMessageToStoredMessage(msg: SDKMessage): StoredMessage | null {
++  if (isCompactionMessage(msg)) {
++    return null
++  }
++
+   const info = msg.info
+   if (!info) return null
+ 
+@@ -164,22 +170,38 @@ export function findNearestMessageWithFields(messageDir: string): StoredMessage
+           return {
+             fileName,
+             msg,
++            hasCompactionMarker: hasCompactionPartInStorage(
++              typeof (msg as { id?: unknown }).id === "string" ? (msg as { id?: string }).id : undefined,
++            ),
+             createdAt: typeof msg.time?.created === "number" ? msg.time.created : Number.NEGATIVE_INFINITY,
+           }
+         } catch {
+           return null
+         }
+       })
+-      .filter((entry): entry is { fileName: string; msg: StoredMessage & { time?: { created?: number } }; createdAt: number } => entry !== null)
++      .filter((entry): entry is {
++        fileName: string
++        msg: StoredMessage & { time?: { created?: number } }
++        hasCompactionMarker: boolean
++        createdAt: number
++      } => entry !== null)
+       .sort((left, right) => right.createdAt - left.createdAt || right.fileName.localeCompare(left.fileName))
+ 
+     for (const entry of messages) {
++      if (entry.hasCompactionMarker || isCompactionMessage({ agent: entry.msg.agent })) {
++        continue
++      }
++
+       if (entry.msg.agent && entry.msg.model?.providerID && entry.msg.model?.modelID) {
+         return entry.msg
+       }
+     }
+ 
+     for (const entry of messages) {
++      if (entry.hasCompactionMarker || isCompactionMessage({ agent: entry.msg.agent })) {
++        continue
++      }
++
+       if (entry.msg.agent || (entry.msg.model?.providerID && entry.msg.model?.modelID)) {
+         return entry.msg
+       }
+@@ -216,16 +238,28 @@ export function findFirstMessageWithAgent(messageDir: string): string | null {
+           return {
+             fileName,
+             msg,
++            hasCompactionMarker: hasCompactionPartInStorage(
++              typeof (msg as { id?: unknown }).id === "string" ? (msg as { id?: string }).id : undefined,
++            ),
+             createdAt: typeof msg.time?.created === "number" ? msg.time.created : Number.POSITIVE_INFINITY,
+           }
+         } catch {
+           return null
+         }
+       })
+-      .filter((entry): entry is { fileName: string; msg: StoredMessage & { time?: { created?: number } }; createdAt: number } => entry !== null)
++      .filter((entry): entry is {
++        fileName: string
++        msg: StoredMessage & { time?: { created?: number } }
++        hasCompactionMarker: boolean
++        createdAt: number
++      } => entry !== null)
+       .sort((left, right) => left.createdAt - right.createdAt || left.fileName.localeCompare(right.fileName))
+ 
+     for (const entry of messages) {
++      if (entry.hasCompactionMarker || isCompactionMessage({ agent: entry.msg.agent })) {
++        continue
++      }
++
+       if (entry.msg.agent) {
+         return entry.msg.agent
+       }
+diff --git a/src/hooks/atlas/session-last-agent.json.test.ts b/src/hooks/atlas/session-last-agent.json.test.ts
+index 196078a5..fec27133 100644
+--- a/src/hooks/atlas/session-last-agent.json.test.ts
++++ b/src/hooks/atlas/session-last-agent.json.test.ts
+@@ -3,6 +3,7 @@ const { afterEach, describe, expect, mock, test, afterAll } = require("bun:test"
+ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+ import { join } from "node:path"
+ import { tmpdir } from "node:os"
++import { PART_STORAGE } from "../../shared"
+ 
+ const testDirs: string[] = []
+ const TEST_STORAGE_ROOT = join(tmpdir(), `atlas-session-last-agent-${Date.now()}`)
+@@ -64,4 +65,36 @@ describe("getLastAgentFromSession JSON backend", () => {
+     // then
+     expect(result).toBe("atlas")
+   })
++
++  test("skips JSON messages whose part storage contains a compaction marker", async () => {
++    // given
++    const sessionID = "ses_json_compaction_marker"
++    const messageDir = createTempMessageDir(sessionID)
++    const compactionMessageID = "msg_test_atlas_compaction_marker"
++    const partDir = join(PART_STORAGE, compactionMessageID)
++    testDirs.push(partDir)
++    writeFileSync(join(messageDir, "msg_0001.json"), JSON.stringify({
++      id: compactionMessageID,
++      agent: "atlas",
++      time: { created: 200 },
++    }), "utf-8")
++    mkdirSync(partDir, { recursive: true })
++    writeFileSync(join(partDir, "prt_0001.json"), JSON.stringify({
++      type: "compaction",
++    }), "utf-8")
++
++    writeFileSync(join(messageDir, "msg_0002.json"), JSON.stringify({
++      id: "msg_0002",
++      agent: "sisyphus-junior",
++      time: { created: 100 },
++    }), "utf-8")
++
++    const { getLastAgentFromSession } = await import("./session-last-agent")
++
++    // when
++    const result = await getLastAgentFromSession(sessionID)
++
++    // then
++    expect(result).toBe("sisyphus-junior")
++  })
+ })
+diff --git a/src/hooks/atlas/session-last-agent.sqlite.test.ts b/src/hooks/atlas/session-last-agent.sqlite.test.ts
+index a5ce6dbc..5ae77029 100644
+--- a/src/hooks/atlas/session-last-agent.sqlite.test.ts
++++ b/src/hooks/atlas/session-last-agent.sqlite.test.ts
+@@ -52,6 +52,30 @@ describe("getLastAgentFromSession SQLite backend ordering", () => {
+     expect(result).toBe("sisyphus-junior")
+   })
+ 
++  test("skips compaction marker user messages that retain the original agent", async () => {
++    // given
++    const client = {
++      session: {
++        messages: async () => ({
++          data: [
++            { id: "msg_real", info: { agent: "sisyphus", time: { created: 100 } } },
++            {
++              id: "msg_compaction",
++              info: { agent: "atlas", time: { created: 200 } },
++              parts: [{ type: "compaction" }],
++            },
++          ],
++        }),
++      },
++    }
++
++    // when
++    const result = await getLastAgentFromSession("ses_sqlite_compaction_marker", client as never)
++
++    // then
++    expect(result).toBe("sisyphus")
++  })
++
+   test("returns null instead of throwing when SQLite message lookup fails", async () => {
+     // given
+     const client = {
+diff --git a/src/hooks/atlas/session-last-agent.ts b/src/hooks/atlas/session-last-agent.ts
+index 43933b33..4f12fb02 100644
+--- a/src/hooks/atlas/session-last-agent.ts
++++ b/src/hooks/atlas/session-last-agent.ts
+@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from "node:fs"
+ import { join } from "node:path"
+ 
+ import { getMessageDir, isSqliteBackend, normalizeSDKResponse } from "../../shared"
++import { hasCompactionPartInStorage, isCompactionMessage } from "../../shared/compaction-marker"
+ 
+ type SessionMessagesClient = {
+   session: {
+@@ -9,10 +10,6 @@ type SessionMessagesClient = {
+   }
+ }
+ 
+-function isCompactionAgent(agent: unknown): boolean {
+-  return typeof agent === "string" && agent.toLowerCase() === "compaction"
+-}
+-
+ function getLastAgentFromMessageDir(messageDir: string): string | null {
+   try {
+     const messages = readdirSync(messageDir)
+@@ -20,9 +17,10 @@ function getLastAgentFromMessageDir(messageDir: string): string | null {
+       .map((fileName) => {
+         try {
+           const content = readFileSync(join(messageDir, fileName), "utf-8")
+-          const parsed = JSON.parse(content) as { agent?: unknown; time?: { created?: unknown } }
++          const parsed = JSON.parse(content) as { id?: string; agent?: unknown; time?: { created?: unknown } }
+           return {
+             fileName,
++            id: parsed.id,
+             agent: parsed.agent,
+             createdAt: typeof parsed.time?.created === "number" ? parsed.time.created : Number.NEGATIVE_INFINITY,
+           }
+@@ -30,11 +28,16 @@ function getLastAgentFromMessageDir(messageDir: string): string | null {
+           return null
+         }
+       })
+-      .filter((message): message is { fileName: string; agent: unknown; createdAt: number } => message !== null)
+-      .sort((left, right) => right.createdAt - left.createdAt || right.fileName.localeCompare(left.fileName))
++      .filter((message): message is { fileName: string; id: string | undefined; agent: unknown; createdAt: number } => message !== null)
++      .sort((left, right) => (right?.createdAt ?? 0) - (left?.createdAt ?? 0) || (right?.fileName ?? "").localeCompare(left?.fileName ?? ""))
+ 
+     for (const message of messages) {
+-      if (typeof message.agent === "string" && !isCompactionAgent(message.agent)) {
++      if (!message) continue
++      if (isCompactionMessage({ agent: message.agent }) || hasCompactionPartInStorage(message?.id)) {
++        continue
++      }
++
++      if (typeof message.agent === "string") {
+         return message.agent.toLowerCase()
+       }
+     }
+@@ -52,7 +55,11 @@ export async function getLastAgentFromSession(
+   if (isSqliteBackend() && client) {
+     try {
+       const response = await client.session.messages({ path: { id: sessionID } })
+-      const messages = normalizeSDKResponse(response, [] as Array<{ id?: string; info?: { agent?: string; time?: { created?: number } } }>, {
++      const messages = normalizeSDKResponse(response, [] as Array<{
++        id?: string
++        info?: { agent?: string; time?: { created?: number } }
++        parts?: Array<{ type?: string }>
++      }>, {
+         preferResponseOnMissingData: true,
+       }).sort((left, right) => {
+         const leftTime = (left as { info?: { time?: { created?: number } } }).info?.time?.created ?? Number.NEGATIVE_INFINITY
+@@ -67,8 +74,12 @@ export async function getLastAgentFromSession(
+       })
+ 
+       for (const message of messages) {
++        if (isCompactionMessage(message)) {
++          continue
++        }
++
+         const agent = message.info?.agent
+-        if (typeof agent === "string" && !isCompactionAgent(agent)) {
++        if (typeof agent === "string") {
+           return agent.toLowerCase()
+         }
+       }
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 87c67410..162b60f6 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -150,14 +150,21 @@ export async function handleSessionIdle(args: {
+ 
+   let resolvedInfo: ResolvedMessageInfo | undefined
+   let encounteredCompaction = false
++  let latestMessageWasCompaction = false
+   try {
+     const messageInfoResult = await resolveLatestMessageInfo(ctx, sessionID, prefetchedMessages)
+     resolvedInfo = messageInfoResult.resolvedInfo
+     encounteredCompaction = messageInfoResult.encounteredCompaction
++    latestMessageWasCompaction = messageInfoResult.latestMessageWasCompaction
+   } catch (error) {
+     log(`[${HOOK_NAME}] Failed to fetch messages for agent check`, { sessionID, error: String(error) })
+   }
+ 
++  if (latestMessageWasCompaction) {
++    log(`[${HOOK_NAME}] Skipped: latest message is a compaction marker`, { sessionID })
++    return
++  }
++
+   const sessionAgent = getSessionAgent(sessionID)
+   if (!resolvedInfo?.agent && sessionAgent) {
+     resolvedInfo = { ...resolvedInfo, agent: sessionAgent }
+diff --git a/src/hooks/todo-continuation-enforcer/pending-question-detection.ts b/src/hooks/todo-continuation-enforcer/pending-question-detection.ts
+index fd97b6c3..7777da03 100644
+--- a/src/hooks/todo-continuation-enforcer/pending-question-detection.ts
++++ b/src/hooks/todo-continuation-enforcer/pending-question-detection.ts
+@@ -2,7 +2,7 @@ import { log } from "../../shared/logger"
+ import { HOOK_NAME } from "./constants"
+ 
+ interface MessagePart {
+-  type: string
++  type?: string
+   name?: string
+   toolName?: string
+ }
+diff --git a/src/hooks/todo-continuation-enforcer/resolve-message-info.ts b/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
+index bffd8cfd..42431aa0 100644
+--- a/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
++++ b/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
+@@ -1,6 +1,7 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ 
+ import { normalizeSDKResponse } from "../../shared"
++import { isCompactionMessage } from "../../shared/compaction-marker"
+ 
+ import type { MessageInfo, MessageWithInfo, ResolveLatestMessageInfoResult } from "./types"
+ 
+@@ -16,10 +17,17 @@ export async function resolveLatestMessageInfo(
+     [] as MessageWithInfo[],
+   )
+   let encounteredCompaction = false
++  let latestMessageWasCompaction = false
+ 
+   for (let i = messages.length - 1; i >= 0; i--) {
+-    const info = messages[i].info
+-    if (info?.agent === "compaction") {
++    const message = messages[i]
++    const info = message.info
++    const isCompaction = isCompactionMessage(message)
++    if (i === messages.length - 1) {
++      latestMessageWasCompaction = isCompaction
++    }
++
++    if (isCompaction) {
+       encounteredCompaction = true
+       continue
+     }
+@@ -31,9 +39,10 @@ export async function resolveLatestMessageInfo(
+           tools: info.tools,
+         },
+         encounteredCompaction,
++        latestMessageWasCompaction,
+       }
+     }
+   }
+ 
+-  return { resolvedInfo: undefined, encounteredCompaction }
++  return { resolvedInfo: undefined, encounteredCompaction, latestMessageWasCompaction }
+ }
+diff --git a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+index ecd95c88..9c5a35f5 100644
+--- a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
++++ b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+@@ -1594,8 +1594,8 @@ describe("todo-continuation-enforcer", () => {
+   // when resolving agent info, preventing infinite continuation loops
+   // ============================================================
+ 
+-  test("should skip compaction agent messages when resolving agent info", async () => {
+-    // given - session where last message is from compaction agent but previous was Sisyphus
++  test("should skip injection while the latest message is from the compaction agent", async () => {
++    // given - session where the latest activity is still the compaction assistant turn
+     const sessionID = "main-compaction-filter"
+     setMainSession(sessionID)
+ 
+@@ -1644,9 +1644,8 @@ describe("todo-continuation-enforcer", () => {
+      await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
+      await fakeTimers.advanceBy(2500)
+ 
+-     // then - continuation uses Sisyphus (skipped compaction agent)
+-     expect(promptCalls.length).toBe(1)
+-    expect(promptCalls[0].agent).toBe("sisyphus")
++     // then - no continuation while compaction is still the latest event
++    expect(promptCalls).toHaveLength(0)
+   })
+ 
+   test("should skip injection when only compaction agent messages exist", async () => {
+@@ -1702,6 +1701,62 @@ describe("todo-continuation-enforcer", () => {
+     expect(promptCalls).toHaveLength(0)
+   })
+ 
++  test("should skip compaction marker user messages when resolving agent info", async () => {
++    // given - latest user message is the OpenCode compaction marker, not a real turn
++    const sessionID = "main-compaction-marker-filter"
++    setMainSession(sessionID)
++
++    const mockMessagesWithCompactionMarker = [
++      { info: { id: "msg-1", role: "assistant", agent: "sisyphus", modelID: "claude-sonnet-4-6", providerID: "anthropic" } },
++      {
++        info: { id: "msg-2", role: "user", agent: "atlas", model: { providerID: "openai", modelID: "gpt-5.4" } },
++        parts: [{ type: "compaction" }],
++      },
++    ]
++
++    const mockInput = {
++      client: {
++        session: {
++          todo: async () => ({
++            data: [{ id: "1", content: "Task 1", status: "pending", priority: "high" }],
++          }),
++          messages: async () => ({ data: mockMessagesWithCompactionMarker }),
++          prompt: async (opts: any) => {
++            promptCalls.push({
++              sessionID: opts.path.id,
++              agent: opts.body.agent,
++              model: opts.body.model,
++              text: opts.body.parts[0].text,
++            })
++            return {}
++          },
++          promptAsync: async (opts: any) => {
++            promptCalls.push({
++              sessionID: opts.path.id,
++              agent: opts.body.agent,
++              model: opts.body.model,
++              text: opts.body.parts[0].text,
++            })
++            return {}
++          },
++        },
++        tui: { showToast: async () => ({}) },
++      },
++      directory: "/tmp/test",
++    } as any
++
++    const hook = createTodoContinuationEnforcer(mockInput, {
++      backgroundManager: createMockBackgroundManager(false),
++    })
++
++    // when - session goes idle
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(3000)
++
++    // then - no continuation while the compaction marker is the latest event
++    expect(promptCalls).toHaveLength(0)
++  })
++
+   test("should skip injection when prometheus agent is after compaction", async () => {
+     // given - prometheus session that was compacted
+     const sessionID = "main-prometheus-compacted"
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index d28874ed..3d0e6177 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -54,6 +54,7 @@ export interface MessageInfo {
+ 
+ export interface MessageWithInfo {
+   info?: MessageInfo
++  parts?: Array<{ type?: string }>
+ }
+ 
+ export interface ResolvedMessageInfo {
+@@ -65,6 +66,7 @@ export interface ResolvedMessageInfo {
+ export interface ResolveLatestMessageInfoResult {
+   resolvedInfo?: ResolvedMessageInfo
+   encounteredCompaction: boolean
++  latestMessageWasCompaction: boolean
+ }
+ 
+ export interface ContinuationProgressOptions {
+diff --git a/src/plugin/chat-params.ts b/src/plugin/chat-params.ts
+index 3bc992da..b28f6a42 100644
+--- a/src/plugin/chat-params.ts
++++ b/src/plugin/chat-params.ts
+@@ -101,7 +101,7 @@ export function createChatParamsHandler(args: {
+         output.topP = storedPromptParams.topP
+       }
+       if (storedPromptParams.maxOutputTokens !== undefined) {
+-        output.maxOutputTokens = storedPromptParams.maxOutputTokens
++        (output as Record<string, unknown>).maxOutputTokens = storedPromptParams.maxOutputTokens
+       }
+       if (storedPromptParams.options) {
+         output.options = {
+diff --git a/src/shared/compaction-marker.ts b/src/shared/compaction-marker.ts
+new file mode 100644
+index 00000000..6af43e77
+--- /dev/null
++++ b/src/shared/compaction-marker.ts
+@@ -0,0 +1,57 @@
++import { existsSync, readdirSync, readFileSync } from "node:fs"
++import { join } from "node:path"
++import { PART_STORAGE } from "./opencode-storage-paths"
++
++type CompactionPartLike = {
++  type?: unknown
++}
++
++type CompactionMessageLike = {
++  agent?: unknown
++  info?: {
++    agent?: unknown
++  }
++  parts?: unknown
++}
++
++function isCompactionPart(part: unknown): boolean {
++  return typeof part === "object" && part !== null && (part as CompactionPartLike).type === "compaction"
++}
++
++export function isCompactionAgent(agent: unknown): boolean {
++  return typeof agent === "string" && agent.trim().toLowerCase() === "compaction"
++}
++
++export function hasCompactionPart(parts: unknown): boolean {
++  return Array.isArray(parts) && parts.some((part) => isCompactionPart(part))
++}
++
++export function isCompactionMessage(message: CompactionMessageLike): boolean {
++  return isCompactionAgent(message.info?.agent ?? message.agent) || hasCompactionPart(message.parts)
++}
++
++export function hasCompactionPartInStorage(messageID: string | undefined): boolean {
++  if (!messageID) {
++    return false
++  }
++
++  const partDir = join(PART_STORAGE, messageID)
++  if (!existsSync(partDir)) {
++    return false
++  }
++
++  try {
++    return readdirSync(partDir)
++      .filter((fileName) => fileName.endsWith(".json"))
++      .some((fileName) => {
++        try {
++          const content = readFileSync(join(partDir, fileName), "utf-8")
++          return isCompactionPart(JSON.parse(content))
++        } catch {
++          return false
++        }
++      })
++  } catch {
++    return false
++  }
++}
+diff --git a/src/shared/index.ts b/src/shared/index.ts
+index fff73f3f..485926bf 100644
+--- a/src/shared/index.ts
++++ b/src/shared/index.ts
+@@ -68,6 +68,7 @@ export * from "./project-discovery-dirs"
+ export * from "./normalize-sdk-response"
+ export * from "./session-directory-resolver"
+ export * from "./prompt-tools"
++export * from "./compaction-marker"
+ export * from "./internal-initiator-marker"
+ export * from "./plugin-command-discovery"
+ export { SessionCategoryRegistry } from "./session-category-registry"
+-- 
+2.39.2
+

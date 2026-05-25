@@ -1,0 +1,198 @@
+From 3ba61790ab7b1785fcf2c36b4db52de7741d26e1 Mon Sep 17 00:00:00 2001
+From: Sisyphus <sisyphus@mengmota.com>
+Date: Fri, 2 Jan 2026 16:37:04 +0900
+Subject: [PATCH 0760/5749] fix(ralph-loop): detect completion promise from
+ session messages API (#413)
+
+* fix(ralph-loop): detect completion promise from session messages API
+
+The completion promise (e.g., <promise>DONE</promise>) was not being detected
+because assistant text messages were never recorded to the transcript file.
+Only user messages, tool uses, and tool results were recorded.
+
+This fix adds a new detection method that fetches session messages via the
+OpenCode API and checks assistant text messages for the completion promise.
+The transcript file check is kept as a fallback.
+
+Fixes #412
+
+* refactor(ralph-loop): address review feedback
+
+- Simplify response parsing to use response.data consistently (greptile)
+- Add session ID tracking to messages mock for better test coverage (cubic)
+- Add assertion to verify correct session ID is passed to API
+
+---------
+
+Co-authored-by: sisyphus-dev-ai <sisyphus-dev-ai@users.noreply.github.com>
+---
+ src/hooks/ralph-loop/index.test.ts | 39 ++++++++++++++++++++-
+ src/hooks/ralph-loop/index.ts      | 56 ++++++++++++++++++++++++++++--
+ 2 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/src/hooks/ralph-loop/index.test.ts b/src/hooks/ralph-loop/index.test.ts
+index 885ecc24..cf48ec9f 100644
+--- a/src/hooks/ralph-loop/index.test.ts
++++ b/src/hooks/ralph-loop/index.test.ts
+@@ -10,6 +10,8 @@ describe("ralph-loop", () => {
+   const TEST_DIR = join(tmpdir(), "ralph-loop-test-" + Date.now())
+   let promptCalls: Array<{ sessionID: string; text: string }>
+   let toastCalls: Array<{ title: string; message: string; variant: string }>
++  let messagesCalls: Array<{ sessionID: string }>
++  let mockSessionMessages: Array<{ info?: { role?: string }; parts?: Array<{ type: string; text?: string }> }>
+ 
+   function createMockPluginInput() {
+     return {
+@@ -22,6 +24,10 @@ describe("ralph-loop", () => {
+             })
+             return {}
+           },
++          messages: async (opts: { path: { id: string } }) => {
++            messagesCalls.push({ sessionID: opts.path.id })
++            return { data: mockSessionMessages }
++          },
+         },
+         tui: {
+           showToast: async (opts: { body: { title: string; message: string; variant: string } }) => {
+@@ -35,12 +41,14 @@ describe("ralph-loop", () => {
+         },
+       },
+       directory: TEST_DIR,
+-    } as Parameters<typeof createRalphLoopHook>[0]
++    } as unknown as Parameters<typeof createRalphLoopHook>[0]
+   }
+ 
+   beforeEach(() => {
+     promptCalls = []
+     toastCalls = []
++    messagesCalls = []
++    mockSessionMessages = []
+ 
+     if (!existsSync(TEST_DIR)) {
+       mkdirSync(TEST_DIR, { recursive: true })
+@@ -351,6 +359,35 @@ describe("ralph-loop", () => {
+       expect(hook.getState()).toBeNull()
+     })
+ 
++    test("should detect completion promise via session messages API", async () => {
++      // #given - active loop with assistant message containing completion promise
++      mockSessionMessages = [
++        { info: { role: "user" }, parts: [{ type: "text", text: "Build something" }] },
++        { info: { role: "assistant" }, parts: [{ type: "text", text: "I have completed the task. <promise>API_DONE</promise>" }] },
++      ]
++      const hook = createRalphLoopHook(createMockPluginInput(), {
++        getTranscriptPath: () => join(TEST_DIR, "nonexistent.jsonl"),
++      })
++      hook.startLoop("session-123", "Build something", { completionPromise: "API_DONE" })
++
++      // #when - session goes idle
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "session-123" },
++        },
++      })
++
++      // #then - loop completed via API detection, no continuation
++      expect(promptCalls.length).toBe(0)
++      expect(toastCalls.some((t) => t.title === "Ralph Loop Complete!")).toBe(true)
++      expect(hook.getState()).toBeNull()
++
++      // #then - messages API was called with correct session ID
++      expect(messagesCalls.length).toBe(1)
++      expect(messagesCalls[0].sessionID).toBe("session-123")
++    })
++
+     test("should handle multiple iterations correctly", async () => {
+       // #given - active loop
+       const hook = createRalphLoopHook(createMockPluginInput())
+diff --git a/src/hooks/ralph-loop/index.ts b/src/hooks/ralph-loop/index.ts
+index 80da2d00..dc1a5007 100644
+--- a/src/hooks/ralph-loop/index.ts
++++ b/src/hooks/ralph-loop/index.ts
+@@ -18,6 +18,17 @@ interface SessionState {
+   isRecovering?: boolean
+ }
+ 
++interface OpenCodeSessionMessage {
++  info?: {
++    role?: string
++  }
++  parts?: Array<{
++    type: string
++    text?: string
++    [key: string]: unknown
++  }>
++}
++
+ const CONTINUATION_PROMPT = `[RALPH LOOP - ITERATION {{ITERATION}}/{{MAX}}]
+ 
+ Your previous attempt did not output the completion promise. Continue working on the task.
+@@ -81,6 +92,41 @@ export function createRalphLoopHook(
+     return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+   }
+ 
++  async function detectCompletionInSessionMessages(
++    sessionID: string,
++    promise: string
++  ): Promise<boolean> {
++    try {
++      const response = await ctx.client.session.messages({
++        path: { id: sessionID },
++        query: { directory: ctx.directory },
++      })
++
++      const messages = (response as { data?: unknown[] }).data ?? []
++
++      if (!Array.isArray(messages)) return false
++
++      const pattern = new RegExp(`<promise>\\s*${escapeRegex(promise)}\\s*</promise>`, "is")
++
++      for (const msg of messages as OpenCodeSessionMessage[]) {
++        if (msg.info?.role !== "assistant") continue
++
++        for (const part of msg.parts || []) {
++          if (part.type === "text" && part.text) {
++            if (pattern.test(part.text)) {
++              return true
++            }
++          }
++        }
++      }
++
++      return false
++    } catch (err) {
++      log(`[${HOOK_NAME}] Failed to fetch session messages`, { sessionID, error: String(err) })
++      return false
++    }
++  }
++
+   const startLoop = (
+     sessionID: string,
+     prompt: string,
+@@ -151,14 +197,20 @@ export function createRalphLoopHook(
+         return
+       }
+ 
+-      // Generate transcript path from sessionID - OpenCode doesn't pass it in event properties
++      const completionDetectedViaApi = await detectCompletionInSessionMessages(
++        sessionID,
++        state.completion_promise
++      )
++
+       const transcriptPath = getTranscriptPath(sessionID)
++      const completionDetectedViaTranscript = detectCompletionPromise(transcriptPath, state.completion_promise)
+ 
+-      if (detectCompletionPromise(transcriptPath, state.completion_promise)) {
++      if (completionDetectedViaApi || completionDetectedViaTranscript) {
+         log(`[${HOOK_NAME}] Completion detected!`, {
+           sessionID,
+           iteration: state.iteration,
+           promise: state.completion_promise,
++          detectedVia: completionDetectedViaApi ? "session_messages_api" : "transcript_file",
+         })
+         clearState(ctx.directory, stateDir)
+ 
+-- 
+2.39.2
+

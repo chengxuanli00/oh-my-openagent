@@ -1,0 +1,635 @@
+From 16315099898a5efc7f44eecb6841832f170c04d7 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 3 Apr 2026 18:40:02 +0900
+Subject: [PATCH 3769/5749] fix: reset hook state on abort so session recovers
+ after user cancel
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a user cancels a generation (ESC x2), all three idle hooks could
+enter a permanently broken state:
+
+1. **todo-continuation-enforcer**: consecutiveFailures accumulated from
+   abort-caused promptAsync failures, eventually hitting MAX_CONSECUTIVE_FAILURES
+   and permanently stopping continuation injection.
+
+2. **unstable-agent-babysitter**: no abort awareness at all — would keep
+   firing reminders after user cancelled the session.
+
+3. **runtime-fallback**: retry dedupe keys and pending fallback state
+   persisted across cancellation, blocking legitimate error recovery.
+
+Fix:
+- Add shared `isAbortError()` utility for consistent abort detection
+- Reset consecutiveFailures and clear stale state on AbortError in all hooks
+- Track `lastCancelledAt` in todo-continuation-enforcer for abort window
+- Add abort-awareness to unstable-agent-babysitter (skip if recently cancelled)
+- Clear runtime-fallback retry state on abort errors
+
+Tests: 61 pass, 0 fail across all 3 affected hook test suites.
+
+Closes #2984
+---
+ .../runtime-fallback/event-handler.test.ts    |  58 ++++++++++
+ src/hooks/runtime-fallback/event-handler.ts   |  50 +++++++--
+ .../continuation-injection.ts                 |  10 ++
+ .../todo-continuation-enforcer/handler.ts     |   6 +
+ .../todo-continuation-enforcer/idle-event.ts  |   5 +
+ .../non-idle-events.ts                        |  20 +++-
+ .../todo-continuation-enforcer.test.ts        | 103 +++++++++++++++++-
+ src/hooks/todo-continuation-enforcer/types.ts |   1 +
+ .../unstable-agent-babysitter/index.test.ts   |  33 ++++++
+ .../unstable-agent-babysitter-hook.ts         |  56 +++++++++-
+ src/shared/is-abort-error.ts                  |  20 ++++
+ 11 files changed, 344 insertions(+), 18 deletions(-)
+ create mode 100644 src/shared/is-abort-error.ts
+
+diff --git a/src/hooks/runtime-fallback/event-handler.test.ts b/src/hooks/runtime-fallback/event-handler.test.ts
+index 3bad84be..a2a323ee 100644
+--- a/src/hooks/runtime-fallback/event-handler.test.ts
++++ b/src/hooks/runtime-fallback/event-handler.test.ts
+@@ -104,4 +104,62 @@ describe("createEventHandler", () => {
+     expect(abortCalls).toEqual([])
+     expect(state.pendingFallbackModel).toBe(undefined)
+   })
++
++  it("#given a cancelled session #when session.error receives an abort error #then fallback retry state is reset", async () => {
++    const sessionID = "session-cancelled"
++    const deps = createDeps()
++    const abortCalls: string[] = []
++    const clearCalls: string[] = []
++    const state = createFallbackState("google/gemini-2.5-pro")
++    state.currentModel = "openai/gpt-5.4"
++    state.fallbackIndex = 1
++    state.attemptCount = 2
++    state.pendingFallbackModel = "openai/gpt-5.4"
++    state.failedModels.set("google/gemini-2.5-pro", Date.now())
++    deps.sessionStates.set(sessionID, state)
++    deps.sessionRetryInFlight.add(sessionID)
++    deps.sessionAwaitingFallbackResult.add(sessionID)
++    deps.sessionStatusRetryKeys.set(sessionID, "retry:2")
++    const handler = createEventHandler(deps, createHelpers(deps, abortCalls, clearCalls))
++
++    await handler({ event: { type: "session.error", properties: { sessionID, error: { name: "AbortError" } } } })
++
++    const resetState = deps.sessionStates.get(sessionID)
++    expect(resetState?.originalModel).toBe("google/gemini-2.5-pro")
++    expect(resetState?.currentModel).toBe("google/gemini-2.5-pro")
++    expect(resetState?.fallbackIndex).toBe(-1)
++    expect(resetState?.attemptCount).toBe(0)
++    expect(resetState?.pendingFallbackModel).toBe(undefined)
++    expect(resetState?.failedModels.size).toBe(0)
++    expect(deps.sessionRetryInFlight.has(sessionID)).toBe(false)
++    expect(deps.sessionAwaitingFallbackResult.has(sessionID)).toBe(false)
++    expect(deps.sessionStatusRetryKeys.has(sessionID)).toBe(false)
++    expect(clearCalls).toEqual([sessionID])
++    expect(abortCalls).toEqual([])
++  })
++
++  it("#given a cancelled session #when session.idle fires #then fallback retry state stays cleared", async () => {
++    const sessionID = "session-cancelled-idle"
++    const deps = createDeps()
++    const abortCalls: string[] = []
++    const clearCalls: string[] = []
++    const state = createFallbackState("google/gemini-2.5-pro")
++    state.currentModel = "openai/gpt-5.4"
++    state.fallbackIndex = 1
++    state.attemptCount = 2
++    state.pendingFallbackModel = "openai/gpt-5.4"
++    deps.sessionStates.set(sessionID, state)
++    const handler = createEventHandler(deps, createHelpers(deps, abortCalls, clearCalls))
++
++    await handler({ event: { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } } })
++    clearCalls.length = 0
++
++    await handler({ event: { type: "session.idle", properties: { sessionID } } })
++
++    const resetState = deps.sessionStates.get(sessionID)
++    expect(resetState?.currentModel).toBe("google/gemini-2.5-pro")
++    expect(resetState?.attemptCount).toBe(0)
++    expect(clearCalls).toEqual([sessionID])
++    expect(abortCalls).toEqual([])
++  })
+ })
+diff --git a/src/hooks/runtime-fallback/event-handler.ts b/src/hooks/runtime-fallback/event-handler.ts
+index 09175dda..8b8931c6 100644
+--- a/src/hooks/runtime-fallback/event-handler.ts
++++ b/src/hooks/runtime-fallback/event-handler.ts
+@@ -6,6 +6,7 @@ import { extractStatusCode, extractErrorName, classifyErrorType, isRetryableErro
+ import { createFallbackState } from "./fallback-state"
+ import { getFallbackModelsForSession } from "./fallback-models"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
++import { isAbortError } from "../../shared/is-abort-error"
+ import { resolveFallbackBootstrapModel } from "./fallback-bootstrap-model"
+ import { dispatchFallbackRetry } from "./fallback-retry-dispatcher"
+ import { createSessionStatusHandler } from "./session-status-handler"
+@@ -13,6 +14,19 @@ import { createSessionStatusHandler } from "./session-status-handler"
+ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+   const { config, pluginConfig, sessionStates, sessionLastAccess, sessionRetryInFlight, sessionAwaitingFallbackResult, sessionFallbackTimeouts, sessionStatusRetryKeys } = deps
+   const sessionStatusHandler = createSessionStatusHandler(deps, helpers, sessionStatusRetryKeys)
++  const cancelledSessions = new Set<string>()
++
++  const resetRetryState = (sessionID: string) => {
++    const state = sessionStates.get(sessionID)
++    if (state) {
++      sessionStates.set(sessionID, createFallbackState(state.originalModel))
++    }
++
++    sessionRetryInFlight.delete(sessionID)
++    sessionAwaitingFallbackResult.delete(sessionID)
++    sessionStatusRetryKeys.delete(sessionID)
++    helpers.clearSessionFallbackTimeout(sessionID)
++  }
+ 
+   const handleSessionCreated = (props: Record<string, unknown> | undefined) => {
+     const sessionInfo = props?.info as { id?: string; model?: string } | undefined
+@@ -32,6 +46,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+ 
+     if (sessionID) {
+       log(`[${HOOK_NAME}] Cleaning up session state`, { sessionID })
++      cancelledSessions.delete(sessionID)
+       sessionStates.delete(sessionID)
+       sessionLastAccess.delete(sessionID)
+       sessionRetryInFlight.delete(sessionID)
+@@ -46,28 +61,35 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+     const sessionID = props?.sessionID as string | undefined
+     if (!sessionID) return
+ 
+-    helpers.clearSessionFallbackTimeout(sessionID)
+-
+     if (sessionRetryInFlight.has(sessionID) || sessionAwaitingFallbackResult.has(sessionID)) {
+       await helpers.abortSessionRequest(sessionID, "session.stop")
+     }
+ 
+-    sessionRetryInFlight.delete(sessionID)
+-    sessionAwaitingFallbackResult.delete(sessionID)
+-    sessionStatusRetryKeys.delete(sessionID)
+-
+-    const state = sessionStates.get(sessionID)
+-    if (state?.pendingFallbackModel) {
+-      state.pendingFallbackModel = undefined
+-    }
++    cancelledSessions.add(sessionID)
++    resetRetryState(sessionID)
+ 
+     log(`[${HOOK_NAME}] Cleared fallback retry state on session.stop`, { sessionID })
+   }
+ 
++  const handleMessageUpdated = (props: Record<string, unknown> | undefined) => {
++    const info = props?.info as Record<string, unknown> | undefined
++    const sessionID = info?.sessionID as string | undefined
++    const role = info?.role as string | undefined
++    if (!sessionID || role !== "user") return
++
++    cancelledSessions.delete(sessionID)
++  }
++
+   const handleSessionIdle = (props: Record<string, unknown> | undefined) => {
+     const sessionID = props?.sessionID as string | undefined
+     if (!sessionID) return
+ 
++    if (cancelledSessions.has(sessionID)) {
++      resetRetryState(sessionID)
++      log(`[${HOOK_NAME}] Cleared fallback retry state for cancelled session on idle`, { sessionID })
++      return
++    }
++
+     if (sessionAwaitingFallbackResult.has(sessionID)) {
+       log(`[${HOOK_NAME}] session.idle while awaiting fallback result; keeping timeout armed`, { sessionID })
+       return
+@@ -100,6 +122,13 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+ 
+     const resolvedAgent = await helpers.resolveAgentForSessionFromContext(sessionID, agent)
+ 
++    if (isAbortError(error)) {
++      cancelledSessions.add(sessionID)
++      resetRetryState(sessionID)
++      log(`[${HOOK_NAME}] session.error matched cancellation; cleared retry state`, { sessionID, resolvedAgent })
++      return
++    }
++
+     if (sessionRetryInFlight.has(sessionID)) {
+       log(`[${HOOK_NAME}] session.error skipped — retry in flight`, {
+         sessionID,
+@@ -176,6 +205,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+     if (event.type === "session.created") { handleSessionCreated(props); return }
+     if (event.type === "session.deleted") { handleSessionDeleted(props); return }
+     if (event.type === "session.stop") { await handleSessionStop(props); return }
++    if (event.type === "message.updated") { handleMessageUpdated(props); return }
+     if (event.type === "session.idle") { handleSessionIdle(props); return }
+     if (event.type === "session.status") { await sessionStatusHandler(props); return }
+     if (event.type === "session.error") { await handleSessionError(props); return }
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index f5b2b84e..5b2c43c9 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -61,6 +61,11 @@ export async function injectContinuation(args: {
+     return
+   }
+ 
++  if (state?.wasCancelled) {
++    log(`[${HOOK_NAME}] Skipped injection: session was cancelled`, { sessionID })
++    return
++  }
++
+   if (isContinuationStopped?.(sessionID)) {
+     log(`[${HOOK_NAME}] Skipped injection: continuation stopped for session`, { sessionID })
+     return
+@@ -145,6 +150,11 @@ Remaining tasks:
+ ${todoList}`
+ 
+   const injectionState = sessionStateStore.getExistingState(sessionID)
++  if (injectionState?.wasCancelled) {
++    log(`[${HOOK_NAME}] Skipped injection: session was cancelled before prompt`, { sessionID })
++    return
++  }
++
+   if (injectionState) {
+     injectionState.inFlight = true
+   }
+diff --git a/src/hooks/todo-continuation-enforcer/handler.ts b/src/hooks/todo-continuation-enforcer/handler.ts
+index 2ee354d4..e9416750 100644
+--- a/src/hooks/todo-continuation-enforcer/handler.ts
++++ b/src/hooks/todo-continuation-enforcer/handler.ts
+@@ -37,7 +37,13 @@ export function createTodoContinuationHandler(args: {
+       const error = props?.error as { name?: string } | undefined
+       if (error?.name === "MessageAbortedError" || error?.name === "AbortError") {
+         const state = sessionStateStore.getState(sessionID)
++        state.wasCancelled = true
+         state.abortDetectedAt = Date.now()
++        state.lastIncompleteCount = undefined
++        state.lastInjectedAt = undefined
++        state.awaitingPostInjectionProgressCheck = false
++        state.stagnationCount = 0
++        state.consecutiveFailures = 0
+         log(`[${HOOK_NAME}] Abort detected via session.error`, { sessionID, errorName: error.name })
+       }
+ 
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index ed030154..90968715 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -42,6 +42,11 @@ export async function handleSessionIdle(args: {
+     return
+   }
+ 
++  if (state.wasCancelled) {
++    log(`[${HOOK_NAME}] Skipped: session was cancelled`, { sessionID })
++    return
++  }
++
+   if (state.abortDetectedAt) {
+     const timeSinceAbort = Date.now() - state.abortDetectedAt
+     if (timeSinceAbort < ABORT_WINDOW_MS) {
+diff --git a/src/hooks/todo-continuation-enforcer/non-idle-events.ts b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+index dc467704..f93f1231 100644
+--- a/src/hooks/todo-continuation-enforcer/non-idle-events.ts
++++ b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+@@ -25,14 +25,20 @@ export function handleNonIdleEvent(args: {
+           return
+         }
+       }
+-      if (state) state.abortDetectedAt = undefined
++      if (state) {
++        state.abortDetectedAt = undefined
++        state.wasCancelled = false
++      }
+       sessionStateStore.cancelCountdown(sessionID)
+       return
+     }
+ 
+     if (role === "assistant") {
+       const state = sessionStateStore.getExistingState(sessionID)
+-      if (state) state.abortDetectedAt = undefined
++      if (state) {
++        state.abortDetectedAt = undefined
++        state.wasCancelled = false
++      }
+       sessionStateStore.cancelCountdown(sessionID)
+       return
+     }
+@@ -47,7 +53,10 @@ export function handleNonIdleEvent(args: {
+ 
+     if (sessionID && role === "assistant") {
+       const state = sessionStateStore.getExistingState(sessionID)
+-      if (state) state.abortDetectedAt = undefined
++      if (state) {
++        state.abortDetectedAt = undefined
++        state.wasCancelled = false
++      }
+       sessionStateStore.cancelCountdown(sessionID)
+     }
+     return
+@@ -57,7 +66,10 @@ export function handleNonIdleEvent(args: {
+     const sessionID = properties?.sessionID as string | undefined
+     if (sessionID) {
+       const state = sessionStateStore.getExistingState(sessionID)
+-      if (state) state.abortDetectedAt = undefined
++      if (state) {
++        state.abortDetectedAt = undefined
++        state.wasCancelled = false
++      }
+       sessionStateStore.cancelCountdown(sessionID)
+     }
+     return
+diff --git a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+index 508cef6a..aa5543db 100644
+--- a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
++++ b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+@@ -1179,7 +1179,7 @@ describe("todo-continuation-enforcer", () => {
+     expect(promptCalls).toHaveLength(0)
+   })
+ 
+-  test("should inject when abort flag is stale (>3s old)", async () => {
++  test("should keep skipping after cancel even when the abort window is stale", async () => {
+     fakeTimers.restore()
+     // given - session with incomplete todos and old abort timestamp
+     const sessionID = "main-stale-abort"
+@@ -1208,8 +1208,7 @@ describe("todo-continuation-enforcer", () => {
+ 
+     await wait(3000)
+ 
+-    // then - continuation injected (abort flag is stale)
+-    expect(promptCalls.length).toBeGreaterThan(0)
++    expect(promptCalls).toHaveLength(0)
+   }, { timeout: 15000 })
+ 
+   test("should clear abort flag on user message activity", async () => {
+@@ -1252,6 +1251,44 @@ describe("todo-continuation-enforcer", () => {
+     expect(promptCalls.length).toBeGreaterThan(0)
+   }, { timeout: 15000 })
+ 
++  test("should reset failure state and keep skipping after a cancelled run", async () => {
++    fakeTimers.restore()
++    const sessionID = "main-reset-after-cancel"
++    setMainSession(sessionID)
++    mockMessages = [
++      { info: { id: "msg-1", role: "user" } },
++      { info: { id: "msg-2", role: "assistant" } },
++    ]
++
++    const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
++
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++
++    await wait(2500)
++    expect(promptCalls.length).toBeGreaterThan(0)
++
++    promptCalls.length = 0
++
++    await hook.handler({
++      event: {
++        type: "session.error",
++        properties: { sessionID, error: { name: "MessageAbortedError" } },
++      },
++    })
++
++    await wait(3100)
++
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++
++    await wait(2500)
++
++    expect(promptCalls).toHaveLength(0)
++  }, { timeout: 15000 })
++
+   test("should clear abort flag on assistant message activity", async () => {
+     fakeTimers.restore()
+     // given - session with abort detected
+@@ -1775,4 +1812,64 @@ describe("todo-continuation-enforcer", () => {
+     expect(promptCalls).toHaveLength(0)
+   })
+ 
++  test("should reset consecutiveFailures after user-initiated abort and resume after fresh activity [regression #2984]", async () => {
++    fakeTimers.restore()
++    const sessionID = "main-abort-recovery"
++    setMainSession(sessionID)
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.todo = async () => ({
++      data: [
++        { id: "1", content: "Write tests", status: "pending", priority: "high" },
++      ],
++    })
++
++    let shouldFail = true
++    let promptCallCount = 0
++    mockInput.client.session.promptAsync = async (_opts: PromptRequestOptions) => {
++      promptCallCount++
++      if (shouldFail) {
++        throw new Error("promptAsync failed (3ms) unknown error")
++      }
++      promptCalls.push({
++        sessionID: _opts.path.id,
++        agent: _opts.body.agent,
++        model: _opts.body.model,
++        text: _opts.body.parts[0].text,
++      })
++    }
++
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await wait(2500)
++    expect(promptCallCount).toBe(1)
++
++    await hook.handler({
++      event: {
++        type: "session.error",
++        properties: { sessionID, error: { name: "MessageAbortedError" } },
++      },
++    })
++
++    shouldFail = false
++    await wait(9000)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await wait(2500)
++    expect(promptCallCount).toBe(1)
++
++    await hook.handler({
++      event: {
++        type: "message.updated",
++        properties: { info: { sessionID, role: "user" } },
++      },
++    })
++
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await wait(2500)
++
++    expect(promptCallCount).toBe(2)
++    expect(promptCalls).toHaveLength(1)
++  }, { timeout: 20000 })
++
++
+ })
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index d44bd579..055677b6 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -26,6 +26,7 @@ export interface SessionState {
+   countdownTimer?: ReturnType<typeof setTimeout>
+   countdownInterval?: ReturnType<typeof setInterval>
+   isRecovering?: boolean
++  wasCancelled?: boolean
+   countdownStartedAt?: number
+   abortDetectedAt?: number
+   lastIncompleteCount?: number
+diff --git a/src/hooks/unstable-agent-babysitter/index.test.ts b/src/hooks/unstable-agent-babysitter/index.test.ts
+index 8dd6fa03..38cd2a87 100644
+--- a/src/hooks/unstable-agent-babysitter/index.test.ts
++++ b/src/hooks/unstable-agent-babysitter/index.test.ts
+@@ -181,4 +181,37 @@ describe("unstable-agent-babysitter hook", () => {
+     expect(promptCalls.length).toBe(1)
+     Date.now = originalNow
+   })
++
++  test("skips follow-up reminder after the main session is cancelled", async () => {
++    setMainSession("main-1")
++    const promptCalls: Array<{ input: unknown }> = []
++    const ctx = createMockPluginInput({
++      messagesBySession: {
++        "main-1": [
++          { info: { agent: "sisyphus", model: { providerID: "openai", modelID: "gpt-4" } } },
++        ],
++        "bg-1": [
++          { info: { role: "assistant" }, parts: [{ type: "thinking", thinking: "deep thought" }] },
++        ],
++      },
++      promptCalls,
++    })
++    const backgroundManager = createBackgroundManager([createTask()])
++    const hook = createUnstableAgentBabysitterHook(ctx, {
++      backgroundManager,
++      config: { timeout_ms: 120000 },
++    })
++    const firstNow = Date.now()
++    const originalNow = Date.now
++    let currentNow = firstNow
++    Date.now = () => currentNow
++
++    await hook.event({ event: { type: "session.idle", properties: { sessionID: "main-1" } } })
++    await hook.event({ event: { type: "session.error", properties: { sessionID: "main-1", error: { name: "AbortError" } } } })
++    currentNow += 5 * 60 * 1000 + 1
++    await hook.event({ event: { type: "session.idle", properties: { sessionID: "main-1" } } })
++
++    expect(promptCalls.length).toBe(1)
++    Date.now = originalNow
++  })
+ })
+diff --git a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+index 9bfdbb01..01823639 100644
+--- a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
++++ b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+@@ -2,6 +2,7 @@ import type { BackgroundManager } from "../../features/background-agent"
+ import { getMainSessionID, getSessionAgent } from "../../features/claude-code-session-state"
+ import { log } from "../../shared/logger"
+ import { createInternalAgentTextPart, resolveInheritedPromptTools } from "../../shared"
++import { isAbortError } from "../../shared/is-abort-error"
+ import {
+   buildReminder,
+   extractMessages,
+@@ -117,17 +118,70 @@ async function getThinkingSummary(ctx: BabysitterContext, sessionID: string): Pr
+ 
+ export function createUnstableAgentBabysitterHook(ctx: BabysitterContext, options: BabysitterOptions) {
+   const reminderCooldowns = new Map<string, number>()
++  const cancelledSessions = new Set<string>()
+ 
+   const eventHandler = async ({ event }: { event: { type: string; properties?: unknown } }) => {
++    const props = event.properties as Record<string, unknown> | undefined
++
++    if (event.type === "session.error") {
++      const sessionID = props?.sessionID as string | undefined
++      if (!sessionID || !isAbortError(props?.error)) return
++
++      cancelledSessions.add(sessionID)
++      reminderCooldowns.clear()
++      log(`[${HOOK_NAME}] Marked session cancelled`, { sessionID })
++      return
++    }
++
++    if (event.type === "session.stop") {
++      const sessionID = props?.sessionID as string | undefined
++      if (!sessionID) return
++
++      cancelledSessions.add(sessionID)
++      reminderCooldowns.clear()
++      log(`[${HOOK_NAME}] Marked session cancelled via session.stop`, { sessionID })
++      return
++    }
++
++    if (event.type === "message.updated") {
++      const info = props?.info as Record<string, unknown> | undefined
++      const sessionID = info?.sessionID as string | undefined
++      const role = info?.role as string | undefined
++      if (!sessionID || (role !== "user" && role !== "assistant")) return
++
++      cancelledSessions.delete(sessionID)
++      return
++    }
++
++    if (event.type === "tool.execute.before" || event.type === "tool.execute.after") {
++      const sessionID = props?.sessionID as string | undefined
++      if (!sessionID) return
++
++      cancelledSessions.delete(sessionID)
++      return
++    }
++
++    if (event.type === "session.deleted") {
++      const sessionInfo = props?.info as { id?: string } | undefined
++      if (!sessionInfo?.id) return
++
++      cancelledSessions.delete(sessionInfo.id)
++      return
++    }
++
+     if (event.type !== "session.idle") return
+ 
+-    const props = event.properties as Record<string, unknown> | undefined
+     const sessionID = props?.sessionID as string | undefined
+     if (!sessionID) return
+ 
+     const mainSessionID = getMainSessionID()
+     if (!mainSessionID || sessionID !== mainSessionID) return
+ 
++    if (cancelledSessions.has(mainSessionID)) {
++      log(`[${HOOK_NAME}] Skipped reminder: session was cancelled`, { sessionID: mainSessionID })
++      return
++    }
++
+     const tasks = options.backgroundManager.getTasksByParentSession(mainSessionID)
+     if (tasks.length === 0) return
+ 
+diff --git a/src/shared/is-abort-error.ts b/src/shared/is-abort-error.ts
+new file mode 100644
+index 00000000..3a8c92c1
+--- /dev/null
++++ b/src/shared/is-abort-error.ts
+@@ -0,0 +1,20 @@
++export function isAbortError(error: unknown): boolean {
++  if (!error) return false
++
++  if (typeof error === "object") {
++    const errObj = error as Record<string, unknown>
++    const name = errObj.name as string | undefined
++    const message = (errObj.message as string | undefined)?.toLowerCase() ?? ""
++
++    if (name === "MessageAbortedError" || name === "AbortError") return true
++    if (name === "DOMException" && message.includes("abort")) return true
++    if (message.includes("aborted") || message.includes("cancelled") || message.includes("interrupted")) return true
++  }
++
++  if (typeof error === "string") {
++    const lower = error.toLowerCase()
++    return lower.includes("abort") || lower.includes("cancel") || lower.includes("interrupt")
++  }
++
++  return false
++}
+-- 
+2.39.2
+

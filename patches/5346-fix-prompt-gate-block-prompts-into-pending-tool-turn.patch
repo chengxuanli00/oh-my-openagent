@@ -1,0 +1,741 @@
+From a7b7ace7ed2a228a952f0f3daa43d570167415b8 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 15:42:58 +0900
+Subject: [PATCH 5346/5749] fix(prompt-gate): block prompts into pending tool
+ turns
+
+---
+ .debugging                                    |  46 +++++
+ src/hooks/session-recovery/hook.test.ts       |  26 ++-
+ src/hooks/session-recovery/hook.ts            |  18 +-
+ .../interrupted-idle-message-fetch-timeout.ts |  38 +++++
+ .../recover-tool-result-missing.ts            |   1 +
+ src/hooks/shared/prompt-async-gate.test.ts    | 104 ++++++++++++
+ src/plugin/event.test.ts                      |  40 +++++
+ src/plugin/event.ts                           |  47 ++++--
+ src/shared/prompt-async-gate.ts               | 157 +++++++++++++++++-
+ 9 files changed, 454 insertions(+), 23 deletions(-)
+ create mode 100644 src/hooks/session-recovery/interrupted-idle-message-fetch-timeout.ts
+
+diff --git a/.debugging b/.debugging
+index 01268e15..e1e12fee 100644
+--- a/.debugging
++++ b/.debugging
+@@ -325,6 +325,52 @@ Expected: only interrupted `running` / `pending` call IDs are recovered, complet
+   - `bun run typecheck`: pass.
+   - `bun run build`: pass.
+ 
++## Review-work Follow-up
++
++- Review-work code-quality/context-mining agents found three valid P1 gaps:
++  - Synthetic `session.status { type: "idle" }` normalized idles skipped the interrupted-tool recovery preflight.
++  - `finish: "tool-calls"` was incorrectly treated as a finished assistant message by idle recovery.
++  - Idle recovery added a top-level `session.messages` call without a timeout.
++- Context mining also flagged a broader route: `promptAsyncAfterSessionIdle` could still dispatch into an idle session whose latest assistant turn had `pending` / `running` tool state, e.g. team live delivery outside an idle event.
++- Red tests added:
++  - `plugin/event.test.ts`: synthetic `session.status` idle recovers and skips later idle hooks.
++  - `session-recovery/hook.test.ts`: `finish: "tool-calls"` plus pending/running tools is recovered.
++  - `session-recovery/hook.test.ts`: hanging `session.messages` during idle recovery times out and returns `false`.
++  - `prompt-async-gate.test.ts`: generic internal `promptAsync` skips when the latest assistant is waiting on tools.
++  - `prompt-async-gate.test.ts`: tool-state check can be disabled for deliberate tool-result recovery.
++  - `prompt-async-gate.test.ts`: generic latest-message fetch timeout does not create a new hang.
++- Fixes:
++  - `src/plugin/event.ts` now applies the same interrupted-tool recovery gate before both real and synthetic idle fanout.
++  - `src/hooks/session-recovery/hook.ts` treats `finish: "tool-calls"` as waiting, not finished.
++  - `src/hooks/session-recovery/interrupted-idle-message-fetch-timeout.ts` bounds idle recovery message fetches at 5s.
++  - `src/shared/prompt-async-gate.ts` skips generic internal prompts when latest assistant is still waiting on tools, with a timeout-bound `session.messages` check.
++  - `recoverToolResultMissing` passes `checkToolState: false`, because recovery intentionally sends `tool_result` parts into a waiting tool turn.
++- Post-fix validation:
++  - `bun test src/hooks/shared/prompt-async-gate.test.ts src/hooks/session-recovery/recover-tool-result-missing.test.ts src/hooks/session-recovery/hook.test.ts src/features/background-agent/task-completion-cleanup.test.ts src/plugin/event.test.ts --bail`: 72 pass, 0 fail.
++  - `bun --install=fallback /Users/yeongyu/.config/opencode/skills/typescript-programmer/scripts/check-no-excuse-rules.ts src/shared/prompt-async-gate.ts src/hooks/shared/prompt-async-gate.test.ts src/hooks/session-recovery/hook.ts src/hooks/session-recovery/hook.test.ts src/hooks/session-recovery/recover-tool-result-missing.ts src/hooks/session-recovery/recover-tool-result-missing.test.ts src/hooks/session-recovery/interrupted-idle-message-fetch-timeout.ts src/plugin/event.ts src/plugin/event.test.ts`: pass.
++  - `bun run typecheck`: pass.
++  - `bun run build`: pass.
++- Full-suite follow-up caught a prompt-gate ordering regression in the no-space validation worktree:
++  - Failing tests: `BackgroundManager tmux callback ordering > starts promptAsync before a blocking tmux callback resolves` and `background-agent spawner tmux callback ordering > fires promptAsync before tmux callback resolves`.
++  - Cause: even with no `session.messages` API present, the async helper was still awaited, yielding before prompt dispatch.
++  - Fix: guard the latest-assistant tool-state check before awaiting it; when `client.session.messages` is unavailable, the old synchronous dispatch ordering is preserved.
++  - Targeted ordering validation:
++    - `bun test src/features/background-agent/manager.test.ts --test-name-pattern "starts promptAsync before"`: pass.
++    - `bun test src/features/background-agent/spawner.test.ts --test-name-pattern "fires promptAsync before"`: pass.
++    - `bun test src/hooks/shared/prompt-async-gate.test.ts --test-name-pattern "waiting on tools|tool-state check|latest-message fetch"`: pass.
++  - Final focused validation:
++    - `bun test src/hooks/shared/prompt-async-gate.test.ts src/hooks/session-recovery/recover-tool-result-missing.test.ts src/hooks/session-recovery/hook.test.ts src/features/background-agent/task-completion-cleanup.test.ts src/plugin/event.test.ts src/features/background-agent/manager.test.ts src/features/background-agent/spawner.test.ts --bail`
++    - Result: 259 pass, 0 fail.
++  - Final no-excuse/type/build validation:
++    - `bun --install=fallback /Users/yeongyu/.config/opencode/skills/typescript-programmer/scripts/check-no-excuse-rules.ts <9 changed TS paths>`: pass.
++    - `bun run typecheck`: pass.
++    - `bun run build`: pass.
++  - Final no-space validation worktree:
++    - Base: `origin/dev` at `4d417a33b6951d3194802dcf102e6094af79e799`.
++    - Worktree: `/tmp/omo-ci-validation.OhVAMY`.
++    - Command: `bun test`.
++    - Result: 7034 pass, 1 skip, 0 fail across 725 files.
++
+ ## Final Status Before PR
+ 
+ - Product behavior change: only malformed idle events with unfinished latest assistant messages and `pending` / `running` tool parts get synthetic interrupted tool results.
+diff --git a/src/hooks/session-recovery/hook.test.ts b/src/hooks/session-recovery/hook.test.ts
+index f1a2c8a5..71c66e68 100644
+--- a/src/hooks/session-recovery/hook.test.ts
++++ b/src/hooks/session-recovery/hook.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, describe, expect, test } from "bun:test"
+ import { createSessionRecoveryHook } from "./hook"
++import { _setInterruptedIdleMessagesFetchTimeoutMsForTesting } from "./interrupted-idle-message-fetch-timeout"
+ import { releaseAllPromptAsyncReservationsForTesting } from "../../shared/prompt-async-gate"
+ 
+ type RecoverableInfo = Parameters<ReturnType<typeof createSessionRecoveryHook>["handleSessionRecovery"]>[0]
+@@ -19,6 +20,7 @@ type PromptAsyncCall = {
+ 
+ afterEach(() => {
+   releaseAllPromptAsyncReservationsForTesting()
++  _setInterruptedIdleMessagesFetchTimeoutMsForTesting(undefined)
+ })
+ 
+ function createPrefillErrorInfo(): RecoverableInfo {
+@@ -127,7 +129,8 @@ describe("session-recovery hook interrupted idle recovery", () => {
+                   id: "msg_assistant_unfinished",
+                   role: "assistant",
+                   sessionID: "ses_idle_interrupted",
+-                  time: { created: 1778995446058 },
++                  finish: "tool-calls",
++                  time: { created: 1778995446058, completed: 1778995447058 },
+                 },
+                 parts: [
+                   {
+@@ -186,4 +189,25 @@ describe("session-recovery hook interrupted idle recovery", () => {
+     expect(promptAsyncCalls[0]?.body.model).toEqual({ providerID: "anthropic", modelID: "claude-opus-4-7" })
+     expect(promptAsyncCalls[0]?.body.variant).toBe("max")
+   })
++
++  test("#given session.messages hangs during idle recovery #when timeout elapses #then idle recovery returns false", async () => {
++    // given
++    _setInterruptedIdleMessagesFetchTimeoutMsForTesting(5)
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => new Promise(() => {}),
++          promptAsync: async () => ({}),
++        },
++      },
++      directory: "/tmp/session-recovery-timeout-test",
++    }
++    const hook = createSessionRecoveryHook(ctx as never)
++
++    // when
++    const result = await hook.handleInterruptedToolResultsOnIdle("ses_messages_hangs")
++
++    // then
++    expect(result).toBe(false)
++  })
+ })
+diff --git a/src/hooks/session-recovery/hook.ts b/src/hooks/session-recovery/hook.ts
+index ca8f3f1d..89f2b430 100644
+--- a/src/hooks/session-recovery/hook.ts
++++ b/src/hooks/session-recovery/hook.ts
+@@ -5,6 +5,10 @@ import { detectErrorType } from "./detect-error-type"
+ import type { RecoveryErrorType } from "./detect-error-type"
+ import type { MessageData } from "./types"
+ import { normalizeSDKResponse } from "../../shared"
++import {
++  getInterruptedIdleMessagesFetchTimeoutMs,
++  withInterruptedIdleMessagesFetchTimeout,
++} from "./interrupted-idle-message-fetch-timeout"
+ import { recoverToolResultMissing } from "./recover-tool-result-missing"
+ import { recoverUnavailableTool } from "./recover-unavailable-tool"
+ import { recoverThinkingBlockOrder } from "./recover-thinking-block-order"
+@@ -56,6 +60,9 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
+     }
+ 
+     const finish = message.info?.finish
++    if (finish === "tool-calls") {
++      return false
++    }
+     if ((typeof finish === "string" && finish.length > 0) || finish === true) {
+       return true
+     }
+@@ -99,10 +106,13 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
+     let recoveryStarted = false
+     let assistantMessageIDForRecovery: string | undefined
+     try {
+-      const messagesResp = await ctx.client.session.messages({
+-        path: { id: sessionID },
+-        query: { directory: ctx.directory },
+-      })
++      const messagesResp = await withInterruptedIdleMessagesFetchTimeout(
++        ctx.client.session.messages({
++          path: { id: sessionID },
++          query: { directory: ctx.directory },
++        }),
++        getInterruptedIdleMessagesFetchTimeoutMs(),
++      )
+       const messages = normalizeSDKResponse(messagesResp, [] as MessageData[])
+       const latestAssistant = findLatestAssistantMessage(messages)
+       if (!latestAssistant?.info?.id) {
+diff --git a/src/hooks/session-recovery/interrupted-idle-message-fetch-timeout.ts b/src/hooks/session-recovery/interrupted-idle-message-fetch-timeout.ts
+new file mode 100644
+index 00000000..c8af5327
+--- /dev/null
++++ b/src/hooks/session-recovery/interrupted-idle-message-fetch-timeout.ts
+@@ -0,0 +1,38 @@
++export const DEFAULT_INTERRUPTED_IDLE_MESSAGES_FETCH_TIMEOUT_MS = 5_000
++
++let interruptedIdleMessagesFetchTimeoutMsForTesting: number | undefined
++
++export function _setInterruptedIdleMessagesFetchTimeoutMsForTesting(value: number | undefined): void {
++  interruptedIdleMessagesFetchTimeoutMsForTesting = value
++}
++
++export function getInterruptedIdleMessagesFetchTimeoutMs(): number {
++  return interruptedIdleMessagesFetchTimeoutMsForTesting ?? DEFAULT_INTERRUPTED_IDLE_MESSAGES_FETCH_TIMEOUT_MS
++}
++
++export class InterruptedIdleMessagesFetchTimeoutError extends Error {
++  constructor(timeoutMs: number) {
++    super(`[session-recovery] session.messages timed out after ${timeoutMs}ms while checking interrupted idle tools`)
++    this.name = "InterruptedIdleMessagesFetchTimeoutError"
++  }
++}
++
++export function withInterruptedIdleMessagesFetchTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
++  if (timeoutMs <= 0) {
++    return operation
++  }
++
++  let timeoutID: ReturnType<typeof globalThis.setTimeout> | undefined
++  const timeoutPromise = new Promise<never>((_, reject) => {
++    timeoutID = globalThis.setTimeout(
++      () => reject(new InterruptedIdleMessagesFetchTimeoutError(timeoutMs)),
++      timeoutMs,
++    )
++  })
++
++  return Promise.race([operation, timeoutPromise]).finally(() => {
++    if (timeoutID !== undefined) {
++      globalThis.clearTimeout(timeoutID)
++    }
++  })
++}
+diff --git a/src/hooks/session-recovery/recover-tool-result-missing.ts b/src/hooks/session-recovery/recover-tool-result-missing.ts
+index f7ae2af0..ec504067 100644
+--- a/src/hooks/session-recovery/recover-tool-result-missing.ts
++++ b/src/hooks/session-recovery/recover-tool-result-missing.ts
+@@ -174,6 +174,7 @@ export async function recoverToolResultMissing(
+       sessionID,
+       source: options?.source ?? "session-recovery-tool-result-missing",
+       input: promptInput,
++      checkToolState: false,
+     })
+ 
+     return promptResult.status === "dispatched"
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+index 7f6dc604..cc64d2db 100644
+--- a/src/hooks/shared/prompt-async-gate.test.ts
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -1,6 +1,7 @@
+ import { afterEach, describe, expect, test } from "bun:test"
+ 
+ import {
++  _setPromptGateMessagesFetchTimeoutMsForTesting,
+   promptAfterSessionIdle,
+   promptAsyncAfterSessionIdle,
+   releaseAllPromptAsyncReservationsForTesting,
+@@ -148,6 +149,109 @@ describe("promptAsyncAfterSessionIdle", () => {
+     expect(promptCalls).toBe(0)
+   })
+ 
++  test("#given latest assistant turn is waiting on tools #when an internal promptAsync is requested #then no prompt is sent", async () => {
++    // given
++    let promptCalls = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_waiting_tools: { type: "idle" } } }),
++        messages: async () => ({
++          data: [
++            {
++              info: { id: "msg_user", role: "user" },
++              parts: [{ type: "text", text: "run work" }],
++            },
++            {
++              info: { id: "msg_assistant", role: "assistant", finish: "tool-calls" },
++              parts: [{ type: "tool_use", id: "toolu_pending", state: { status: "pending" } }],
++            },
++          ],
++        }),
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++
++    // when
++    const result = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_waiting_tools",
++      input: { path: { id: "ses_waiting_tools" }, body: { parts: [] } },
++      source: "test:waiting-tools",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(result.status).toBe("active")
++    expect(promptCalls).toBe(0)
++  })
++
++  test("#given latest assistant turn is waiting on tools #when tool-state check is disabled #then promptAsync is sent", async () => {
++    // given
++    let promptCalls = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_recovery_tools: { type: "idle" } } }),
++        messages: async () => ({
++          data: [{
++            info: { id: "msg_assistant", role: "assistant", finish: "tool-calls" },
++            parts: [{ type: "tool_use", id: "toolu_pending", state: { status: "pending" } }],
++          }],
++        }),
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++
++    // when
++    const result = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_recovery_tools",
++      input: { path: { id: "ses_recovery_tools" }, body: { parts: [] } },
++      source: "test:recovery-tools",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++      checkToolState: false,
++    })
++
++    // then
++    expect(result.status).toBe("dispatched")
++    expect(promptCalls).toBe(1)
++  })
++
++  test("#given latest-message fetch hangs #when an internal promptAsync is requested #then the tool-state check times out and dispatch continues", async () => {
++    // given
++    _setPromptGateMessagesFetchTimeoutMsForTesting(5)
++    let promptCalls = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_messages_hang: { type: "idle" } } }),
++        messages: async () => new Promise(() => {}),
++        promptAsync: async () => {
++          promptCalls += 1
++        },
++      },
++    }
++
++    // when
++    const result = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_messages_hang",
++      input: { path: { id: "ses_messages_hang" }, body: { parts: [] } },
++      source: "test:messages-hang",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++      dispatchTimeoutMs: 50,
++    })
++
++    // then
++    expect(result.status).toBe("dispatched")
++    expect(promptCalls).toBe(1)
++  })
++
+   test("#given dispatch hold has expired #when the same session prompts again #then the next promptAsync is accepted", async () => {
+     // given
+     let promptCalls = 0
+diff --git a/src/plugin/event.test.ts b/src/plugin/event.test.ts
+index d063a69c..d5fd0c64 100644
+--- a/src/plugin/event.test.ts
++++ b/src/plugin/event.test.ts
+@@ -408,6 +408,46 @@ describe("createEventHandler - idle deduplication", () => {
+ 		expect(callOrder).toEqual(["sessionRecovery"])
+ 	})
+ 
++	it("#given idle recovery handles an interrupted tool turn #when session.status normalizes to idle #then synthetic idle hooks are skipped", async () => {
++		const callOrder: string[] = []
++		const eventHandler = createEventHandler({
++			ctx: asEventHandlerContext({ directory: "/tmp" }),
++			pluginConfig: asPluginConfig({}),
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: createEventHandlerManagers(),
++			hooks: createEventHandlerHooks({
++				sessionRecovery: {
++					handleInterruptedToolResultsOnIdle: async () => {
++						callOrder.push("sessionRecovery")
++						return true
++					},
++				},
++				todoContinuationEnforcer: {
++					handler: async (input: EventInput) => {
++						if (input.event.type === "session.idle") {
++							callOrder.push("todoContinuationEnforcer")
++						}
++					},
++				},
++			}),
++		})
++
++		await eventHandler(asEventHandlerInput({
++			event: {
++				type: "session.status",
++				properties: {
++					sessionID: "ses_interrupted_status_idle",
++					status: { type: "idle" },
++				},
++			},
++		}))
++
++		expect(callOrder).toEqual(["sessionRecovery"])
++	})
++
+ 	it("keeps other session dedup state untouched when bypassing synthetic-idle for current session", async () => {
+ 		//#given
+ 		const originalDateNow = Date.now
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index a2d0dd0a..6720b1bd 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -377,6 +377,19 @@ export function createEventHandler(args: {
+     return true;
+   };
+ 
++  const recoverInterruptedToolResultsOnIdleEvent = async (input: EventInput): Promise<boolean> => {
++    if (input.event.type !== "session.idle") {
++      return false;
++    }
++
++    const sessionID = getEventSessionID(input);
++    if (!sessionID || !hooks.sessionRecovery?.handleInterruptedToolResultsOnIdle) {
++      return false;
++    }
++
++    return hooks.sessionRecovery.handleInterruptedToolResultsOnIdle(sessionID);
++  };
++
+   const getFallbackContinuationKeys = (fallbackContext?: FallbackContinuationContext): FallbackContinuationDedupeKeys => {
+     const agentKey = fallbackContext?.agentName
+       ? getAgentConfigKey(fallbackContext.agentName).trim().toLowerCase()
+@@ -572,12 +585,9 @@ export function createEventHandler(args: {
+     }
+ 
+     if (input.event.type === "session.idle") {
+-      const sessionID = getEventSessionID(input);
+-      if (sessionID && hooks.sessionRecovery?.handleInterruptedToolResultsOnIdle) {
+-        const recovered = await hooks.sessionRecovery.handleInterruptedToolResultsOnIdle(sessionID);
+-        if (recovered) {
+-          return;
+-        }
++      const recovered = await recoverInterruptedToolResultsOnIdleEvent(input);
++      if (recovered) {
++        return;
+       }
+     }
+ 
+@@ -596,17 +606,20 @@ export function createEventHandler(args: {
+       if (!shouldDispatchIdleEvent(sessionID, now)) {
+         return;
+       }
+-      await dispatchToHooks(syntheticIdle as EventInput);
+-      if (pluginConfig.openclaw) {
+-        await dispatchOpenClawEvent({
+-          config: pluginConfig.openclaw,
+-          rawEvent: "session.idle",
+-          context: {
+-            sessionId: sessionID,
+-            projectPath: pluginContext.directory,
+-            tmuxPaneId: managers.tmuxSessionManager.getTrackedPaneId?.(sessionID) ?? process.env.TMUX_PANE,
+-          },
+-        });
++      const recovered = await recoverInterruptedToolResultsOnIdleEvent(syntheticIdle as EventInput);
++      if (!recovered) {
++        await dispatchToHooks(syntheticIdle as EventInput);
++        if (pluginConfig.openclaw) {
++          await dispatchOpenClawEvent({
++            config: pluginConfig.openclaw,
++            rawEvent: "session.idle",
++            context: {
++              sessionId: sessionID,
++              projectPath: pluginContext.directory,
++              tmuxPaneId: managers.tmuxSessionManager.getTrackedPaneId?.(sessionID) ?? process.env.TMUX_PANE,
++            },
++          });
++        }
+       }
+     }
+ 
+diff --git a/src/shared/prompt-async-gate.ts b/src/shared/prompt-async-gate.ts
+index ff53a16c..30850a54 100644
+--- a/src/shared/prompt-async-gate.ts
++++ b/src/shared/prompt-async-gate.ts
+@@ -7,6 +7,7 @@ import {
+ 
+ export const DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS = 250
+ export const DEFAULT_PROMPT_DISPATCH_TIMEOUT_MS = 30_000
++export const DEFAULT_PROMPT_GATE_MESSAGES_FETCH_TIMEOUT_MS = 5_000
+ 
+ type PromptAsyncInput = {
+   path?: { id?: string }
+@@ -16,9 +17,15 @@ type PromptAsyncInput = {
+   [key: string]: unknown
+ }
+ 
++type PromptMessagesQuery = {
++  directory: string
++  limit?: number
++}
++
+ type PromptAsyncClient<TInput> = {
+   session?: {
+     status?: () => Promise<unknown>
++    messages?: (input: { path: { id: string }; query: PromptMessagesQuery }) => Promise<unknown>
+     promptAsync?: (input: TInput) => Promise<unknown>
+   }
+ }
+@@ -26,6 +33,7 @@ type PromptAsyncClient<TInput> = {
+ type PromptClient<TInput> = {
+   session?: {
+     status?: () => Promise<unknown>
++    messages?: (input: { path: { id: string }; query: PromptMessagesQuery }) => Promise<unknown>
+     prompt?: (input: TInput) => Promise<unknown>
+   }
+ }
+@@ -40,6 +48,8 @@ type PromptAsyncReservation = {
+ declare function setTimeout(callback: () => void, delay?: number): ReturnType<typeof globalThis.setTimeout>
+ declare function clearTimeout(timeout: ReturnType<typeof globalThis.setTimeout>): void
+ 
++let promptGateMessagesFetchTimeoutMsForTesting: number | undefined
++
+ export type PromptAsyncGateResult =
+   | { status: "dispatched"; response: unknown }
+   | { status: "active" }
+@@ -54,6 +64,14 @@ type PromptAsyncReservationReleaseOptions = {
+ 
+ const promptAsyncReservations = new Map<string, PromptAsyncReservation>()
+ 
++export function _setPromptGateMessagesFetchTimeoutMsForTesting(value: number | undefined): void {
++  promptGateMessagesFetchTimeoutMsForTesting = value
++}
++
++function getPromptGateMessagesFetchTimeoutMs(): number {
++  return promptGateMessagesFetchTimeoutMsForTesting ?? DEFAULT_PROMPT_GATE_MESSAGES_FETCH_TIMEOUT_MS
++}
++
+ function pruneExpiredReservations(now = Date.now()): void {
+   for (const [sessionID, reservation] of promptAsyncReservations) {
+     if (typeof reservation.expiresAt === "number" && reservation.expiresAt <= now) {
+@@ -119,9 +137,120 @@ async function withDispatchTimeout<T>(
+   }
+ }
+ 
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null
++}
++
++function getPromptQuery(input: unknown): PromptMessagesQuery {
++  if (!isRecord(input)) {
++    return { directory: "" }
++  }
++  const query = input.query
++  if (!isRecord(query)) {
++    return { directory: "" }
++  }
++
++  const promptQuery: PromptMessagesQuery = { directory: "" }
++  if (typeof query.directory === "string") {
++    promptQuery.directory = query.directory
++  }
++  if (typeof query.limit === "number") {
++    promptQuery.limit = query.limit
++  }
++  return promptQuery
++}
++
++function getMessagesData(response: unknown): unknown[] {
++  if (isRecord(response) && Array.isArray(response.data)) {
++    return response.data
++  }
++  return Array.isArray(response) ? response : []
++}
++
++function messageRole(message: unknown): string | undefined {
++  if (!isRecord(message)) {
++    return undefined
++  }
++  const info = message.info
++  if (isRecord(info) && typeof info.role === "string") {
++    return info.role
++  }
++  return typeof message.role === "string" ? message.role : undefined
++}
++
++function partIsWaitingOnTool(part: unknown): boolean {
++  if (!isRecord(part)) {
++    return false
++  }
++  if (part.type !== "tool" && part.type !== "tool_use") {
++    return false
++  }
++
++  const state = part.state
++  if (!isRecord(state)) {
++    return false
++  }
++  return state.status === "pending" || state.status === "running"
++}
++
++function latestAssistantTurnIsWaitingOnTools(messages: unknown[]): boolean {
++  for (let index = messages.length - 1; index >= 0; index--) {
++    const message = messages[index]
++    const role = messageRole(message)
++    if (role === "assistant") {
++      if (!isRecord(message) || !Array.isArray(message.parts)) {
++        return false
++      }
++      return message.parts.some(partIsWaitingOnTool)
++    }
++    if (role === "user") {
++      return false
++    }
++  }
++  return false
++}
++
++async function sessionLatestAssistantIsWaitingOnTools<TInput>(args: {
++  client: { session?: { messages?: (input: { path: { id: string }; query: PromptMessagesQuery }) => Promise<unknown> } }
++  sessionID: string
++  input: TInput
++  sessionName: "promptAsync" | "prompt"
++  source: string
++  timeoutMs: number
++}): Promise<boolean> {
++  const messages = args.client.session?.messages
++  if (typeof messages !== "function") {
++    return false
++  }
++
++  try {
++    const response = await withDispatchTimeout(
++      messages({
++        path: { id: args.sessionID },
++        query: getPromptQuery(args.input),
++      }),
++      args.timeoutMs,
++      `[prompt-async-gate] ${args.sessionName} session.messages`,
++    )
++    return latestAssistantTurnIsWaitingOnTools(getMessagesData(response))
++  } catch (error) {
++    log("[prompt-async-gate] latest assistant tool-state check failed", {
++      sessionID: args.sessionID,
++      source: args.source,
++      error: String(error),
++    })
++    return false
++  }
++}
++
+ async function dispatchAfterSessionIdle<TInput>(args: {
+   sessionName: "promptAsync" | "prompt"
+-  client: { session?: { status?: () => Promise<unknown> } }
++  client: {
++    session?: {
++      status?: () => Promise<unknown>
++      messages?: (input: { path: { id: string }; query: PromptMessagesQuery }) => Promise<unknown>
++    }
++  }
+   sessionID: string
+   input: TInput
+   source: string
+@@ -129,6 +258,7 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+   postDispatchHoldMs: number
+   dispatchTimeoutMs: number
+   checkStatus: boolean
++  checkToolState: boolean
+   dispatch: (input: TInput) => Promise<unknown>
+ }): Promise<PromptAsyncGateResult> {
+   const {
+@@ -141,6 +271,7 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+     postDispatchHoldMs,
+     dispatchTimeoutMs,
+     checkStatus,
++    checkToolState,
+     dispatch,
+   } = args
+ 
+@@ -186,6 +317,25 @@ async function dispatchAfterSessionIdle<TInput>(args: {
+       return { status: "active" }
+     }
+ 
++    if (
++      checkToolState
++      && typeof client.session?.messages === "function"
++      && await sessionLatestAssistantIsWaitingOnTools({
++        client,
++        sessionID,
++        input,
++        sessionName,
++        source,
++        timeoutMs: Math.min(dispatchTimeoutMs, getPromptGateMessagesFetchTimeoutMs()),
++      })
++    ) {
++      log(`[prompt-async-gate] ${sessionName} skipped because latest assistant is waiting on tools`, {
++        sessionID,
++        source,
++      })
++      return { status: "active" }
++    }
++
+     log(`[prompt-async-gate] ${sessionName} dispatching`, { sessionID, source })
+     dispatchAttempted = true
+     const response = await withDispatchTimeout(
+@@ -219,6 +369,7 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+   postDispatchHoldMs?: number
+   dispatchTimeoutMs?: number
+   checkStatus?: boolean
++  checkToolState?: boolean
+ }): Promise<PromptAsyncGateResult> {
+   const {
+     client,
+@@ -247,6 +398,7 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+     postDispatchHoldMs,
+     dispatchTimeoutMs,
+     checkStatus: args.checkStatus !== false,
++    checkToolState: args.checkToolState !== false,
+     dispatch: (dispatchInput) => dispatchPromptAsync(dispatchInput),
+   })
+ }
+@@ -260,6 +412,7 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+   postDispatchHoldMs?: number
+   dispatchTimeoutMs?: number
+   checkStatus?: boolean
++  checkToolState?: boolean
+ }): Promise<PromptAsyncGateResult> {
+   const {
+     client,
+@@ -288,12 +441,14 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+     postDispatchHoldMs,
+     dispatchTimeoutMs,
+     checkStatus: args.checkStatus !== false,
++    checkToolState: args.checkToolState !== false,
+     dispatch: (dispatchInput) => dispatchPrompt(dispatchInput),
+   })
+ }
+ 
+ export function releaseAllPromptAsyncReservationsForTesting(): void {
+   promptAsyncReservations.clear()
++  promptGateMessagesFetchTimeoutMsForTesting = undefined
+ }
+ 
+ export function releasePromptAsyncReservation(
+-- 
+2.39.2
+

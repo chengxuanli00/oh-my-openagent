@@ -1,0 +1,453 @@
+From f8defe2588ba31fb28385d15b286213ba3966ee5 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 5 May 2026 22:59:43 +0900
+Subject: [PATCH 4699/5749] fix(node-runtime-compat): harden Bun spawn shim
+
+---
+ package.json                               |   3 +-
+ script/patch-node-require-shim.ts          |  27 +++
+ src/electron-compat.test.ts                |  23 ---
+ src/shared/bun-spawn-shim.test.ts          |  64 +++++++
+ src/shared/bun-spawn-shim.ts               | 186 ++++++++++++++++-----
+ src/shared/dist-bundle-bun-globals.test.ts |  65 +++++++
+ 6 files changed, 300 insertions(+), 68 deletions(-)
+ create mode 100644 script/patch-node-require-shim.ts
+ delete mode 100644 src/electron-compat.test.ts
+ create mode 100644 src/shared/bun-spawn-shim.test.ts
+ create mode 100644 src/shared/dist-bundle-bun-globals.test.ts
+
+diff --git a/package.json b/package.json
+index ffd57237..3f715667 100644
+--- a/package.json
++++ b/package.json
+@@ -22,7 +22,8 @@
+     "./schema.json": "./dist/oh-my-opencode.schema.json"
+   },
+   "scripts": {
+-    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @ast-grep/napi --external zod && tsc --emitDeclarationOnly && bun build src/cli/index.ts --outdir dist/cli --target bun --format esm --external @ast-grep/napi && bun run build:schema",
++    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @ast-grep/napi --external zod && bun run build:node-require-shim && tsc --emitDeclarationOnly && bun build src/cli/index.ts --outdir dist/cli --target bun --format esm --external @ast-grep/napi && bun run build:schema",
++    "build:node-require-shim": "bun run script/patch-node-require-shim.ts",
+     "build:all": "bun run build && bun run build:binaries",
+     "build:binaries": "bun run script/build-binaries.ts",
+     "build:schema": "bun run script/build-schema.ts",
+diff --git a/script/patch-node-require-shim.ts b/script/patch-node-require-shim.ts
+new file mode 100644
+index 00000000..a2e39f0a
+--- /dev/null
++++ b/script/patch-node-require-shim.ts
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bun
++
++import { readFileSync, writeFileSync } from "node:fs"
++import { dirname, join } from "node:path"
++import { fileURLToPath } from "node:url"
++
++const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
++const DIST_PATH = join(SCRIPT_DIR, "..", "dist", "index.js")
++const IMPORT_LINE = 'import { createRequire as __omoCreateRequire } from "node:module";'
++const BUN_REQUIRE_LINE = "var __require = import.meta.require;"
++const NODE_SAFE_REQUIRE_LINE = 'var __require = typeof import.meta.require === "function" ? import.meta.require : __omoCreateRequire(import.meta.url);'
++
++const original = readFileSync(DIST_PATH, "utf-8")
++
++if (original.includes(NODE_SAFE_REQUIRE_LINE)) {
++  console.log("Node/Electron require shim already present in dist/index.js, skipping.")
++  process.exit(0)
++}
++
++if (!original.includes(BUN_REQUIRE_LINE)) {
++  throw new Error(`Expected Bun require helper not found in ${DIST_PATH}`)
++}
++
++const patched = original.replace(BUN_REQUIRE_LINE, `${IMPORT_LINE}\n${NODE_SAFE_REQUIRE_LINE}`)
++
++writeFileSync(DIST_PATH, patched, "utf-8")
++console.log("Patched Node/Electron require shim in dist/index.js")
+diff --git a/src/electron-compat.test.ts b/src/electron-compat.test.ts
+deleted file mode 100644
+index 1f91f453..00000000
+--- a/src/electron-compat.test.ts
++++ /dev/null
+@@ -1,23 +0,0 @@
+-import { describe, test, expect } from "bun:test"
+-
+-describe("electron-compat: dist/index.js globalThis.Bun safety", () => {
+-  test("#given dist/index.js #then no top-level globalThis.Bun destructures exist", async () => {
+-    // This guards the fix for https://github.com/code-yeongyu/oh-my-openagent/issues/3797.
+-    // Previously 'bun build --target bun' emitted 25 top-level
+-    //   var { spawn } = globalThis.Bun;
+-    // statements that crashed on Node/Electron where globalThis.Bun is undefined.
+-    // The fix replaces all 'from "bun"' spawn imports with a node:child_process
+-    // shim so the bundler no longer emits these destructures.
+-    const dist = await Bun.file("dist/index.js").text()
+-    const destructures = (dist.match(/\} = globalThis\.Bun;/g) ?? []).length
+-    expect(destructures).toBe(0)
+-  })
+-
+-  test("#given Bun runtime #when shim module is loaded #then globalThis.Bun remains real Bun", () => {
+-    // On real Bun runtime, globalThis.Bun must not be overwritten by any shim
+-    expect(globalThis.Bun).toBeDefined()
+-    expect(typeof globalThis.Bun.spawn).toBe("function")
+-    // The shim version string is only set when globalThis.Bun was absent
+-    expect(globalThis.Bun.version).not.toBe("0.0.0-node-shim")
+-  })
+-})
+diff --git a/src/shared/bun-spawn-shim.test.ts b/src/shared/bun-spawn-shim.test.ts
+new file mode 100644
+index 00000000..06905bd7
+--- /dev/null
++++ b/src/shared/bun-spawn-shim.test.ts
+@@ -0,0 +1,64 @@
++import { describe, expect, test } from "bun:test"
++
++import { spawn, spawnSync } from "./bun-spawn-shim"
++
++describe("bun-spawn-shim", () => {
++  test("#given array command #when spawn exits successfully #then exited resolves to zero", async () => {
++    const proc = spawn(["bun", "--version"], { stdout: "pipe", stderr: "pipe" })
++
++    const exitCode = await proc.exited
++
++    expect(exitCode).toBe(0)
++    expect(proc.exitCode).toBe(0)
++  })
++
++  test("#given piped stdout #when spawn writes output #then stdout is readable", async () => {
++    const proc = spawn(["bun", "--print", "'shim-ok'"], { stdout: "pipe", stderr: "pipe" })
++
++    const [exitCode, stdout] = await Promise.all([
++      proc.exited,
++      new Response(proc.stdout).text(),
++    ])
++
++    expect(exitCode).toBe(0)
++    expect(stdout.trim()).toBe("shim-ok")
++  })
++
++  test("#given detached object command #when spawn starts #then process exposes daemon controls", async () => {
++    const proc = spawn({
++      cmd: ["bun", "--print", "'detached-ok'"],
++      stdout: "pipe",
++      stderr: "pipe",
++      detached: true,
++    })
++
++    proc.unref()
++    const exitCode = await proc.exited
++
++    expect(exitCode).toBe(0)
++    expect(typeof proc.ref).toBe("function")
++    expect(typeof proc.unref).toBe("function")
++    expect(proc.pid).toBeGreaterThan(0)
++  })
++
++  test("#given stdio tuple #when spawn runs #then ignored streams are still safe to read", async () => {
++    const proc = spawn({
++      cmd: ["bun", "--print", "'ignored'"],
++      stdio: ["ignore", "ignore", "ignore"],
++    })
++
++    const exitCode = await proc.exited
++    const stdout = await new Response(proc.stdout).text()
++
++    expect(exitCode).toBe(0)
++    expect(stdout).toBe("")
++  })
++
++  test("#given spawnSync command #when it writes output #then stdout and exit code match", () => {
++    const result = spawnSync(["bun", "--print", "'sync-ok'"], { stdout: "pipe", stderr: "pipe" })
++
++    expect(result.exitCode).toBe(0)
++    expect(result.success).toBe(true)
++    expect(Buffer.from(result.stdout).toString().trim()).toBe("sync-ok")
++  })
++})
+diff --git a/src/shared/bun-spawn-shim.ts b/src/shared/bun-spawn-shim.ts
+index bab4ac94..158894f2 100644
+--- a/src/shared/bun-spawn-shim.ts
++++ b/src/shared/bun-spawn-shim.ts
+@@ -1,68 +1,166 @@
+-/**
+- * Node/Electron-compatible spawn shim.
+- *
+- * Replaces direct `import { spawn } from "bun"` throughout the codebase so
+- * that `bun build --target bun` no longer emits top-level
+- *   var { spawn } = globalThis.Bun;
+- * destructures that crash on Node/Electron (where globalThis.Bun is undefined).
+- *
+- * On real Bun runtime:  delegates straight to Bun.spawn / Bun.spawnSync.
+- * On Node/Electron:     backed by node:child_process (via static ESM imports
+- *                       which are safe in both runtimes).
+- */
+-
+-/* eslint-disable @typescript-eslint/no-explicit-any */
+-
+ import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from "node:child_process"
+-import { Readable } from "node:stream"
++import { Readable, Writable } from "node:stream"
++
++type AnyRecord = Record<string, unknown>
++type StdioMode = "pipe" | "inherit" | "ignore"
++type StdioTuple = [StdioMode, StdioMode, StdioMode]
++
++export interface SpawnOptions {
++  cmd?: string[]
++  cwd?: string
++  env?: NodeJS.ProcessEnv
++  stdin?: StdioMode
++  stdout?: StdioMode
++  stderr?: StdioMode
++  stdio?: StdioTuple
++  detached?: boolean
++}
++
++export interface SpawnedProcess {
++  readonly exitCode: number | null
++  readonly exited: Promise<number>
++  readonly stdout: ReadableStream<Uint8Array>
++  readonly stderr: ReadableStream<Uint8Array>
++  readonly stdin: NodeJS.WritableStream
++  readonly pid: number | undefined
++  kill(signal?: NodeJS.Signals): void
++  ref(): void
++  unref(): void
++}
++
++export interface SpawnSyncResult {
++  readonly exitCode: number
++  readonly stdout: Buffer
++  readonly stderr: Buffer
++  readonly success: boolean
++  readonly pid: number
++}
+ 
+-const IS_BUN = typeof globalThis.Bun !== "undefined"
++type BunSpawnRuntime = {
++  spawn(command: string[], options?: SpawnOptions): SpawnedProcess
++  spawn(options: SpawnOptions & { cmd: string[] }): SpawnedProcess
++  spawnSync(command: string[], options?: SpawnOptions): SpawnSyncResult
++  spawnSync(options: SpawnOptions & { cmd: string[] }): SpawnSyncResult
++}
++
++const runtime = globalThis as typeof globalThis & { Bun?: BunSpawnRuntime }
++const IS_BUN = typeof runtime.Bun !== "undefined"
++
++function emptyReadableStream(): ReadableStream<Uint8Array> {
++  return new ReadableStream<Uint8Array>({
++    start(controller) {
++      controller.close()
++    },
++  })
++}
++
++function toReadableStream(stream: NodeJS.ReadableStream | null): ReadableStream<Uint8Array> {
++  if (!stream) return emptyReadableStream()
++
++  return Readable.toWeb(stream as Readable) as ReadableStream<Uint8Array>
++}
+ 
+-function _resolveCmd(cmdOrOpts: any, optsArg?: any): { cmd: string[]; opts: any } {
++function emptyWritableStream(): Writable {
++  return new Writable({
++    write(_chunk, _encoding, callback) {
++      callback()
++    },
++  })
++}
++
++function resolveCommand(cmdOrOpts: unknown, optsArg?: unknown): { cmd: string[]; opts: SpawnOptions } {
+   const isObj = !Array.isArray(cmdOrOpts)
++  const opts = isObj ? (cmdOrOpts as SpawnOptions) : ((optsArg ?? {}) as SpawnOptions)
++
+   return {
+-    cmd: isObj ? (cmdOrOpts as any).cmd : (cmdOrOpts as string[]),
+-    opts: isObj ? cmdOrOpts : (optsArg ?? {}),
++    cmd: isObj ? ((cmdOrOpts as AnyRecord).cmd as string[]) : (cmdOrOpts as string[]),
++    opts,
+   }
+ }
+ 
+-function _wrapNodeProc(proc: ReturnType<typeof nodeSpawn>): any {
+-  let code: number | null = null
++function resolveStdio(options: SpawnOptions): StdioTuple {
++  if (options.stdio) return options.stdio
++
++  return [options.stdin ?? "pipe", options.stdout ?? "pipe", options.stderr ?? "pipe"]
++}
++
++function wrapNodeProcess(proc: ReturnType<typeof nodeSpawn>): SpawnedProcess {
++  let exitCode: number | null = null
+   const exited = new Promise<number>((resolve) => {
+-    proc.on("exit", (c) => { code = c ?? 1; resolve(code) })
+-    proc.on("error", () => { if (code === null) { code = 1; resolve(1) } })
++    proc.on("exit", (code) => {
++      exitCode = code ?? 1
++      resolve(exitCode)
++    })
++    proc.on("error", () => {
++      if (exitCode === null) {
++        exitCode = 1
++        resolve(1)
++      }
++    })
+   })
++
+   return {
+-    get exitCode() { return code },
++    get exitCode() {
++      return exitCode
++    },
+     exited,
+-    stdout: proc.stdout ? Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array> : undefined,
+-    stderr: proc.stderr ? Readable.toWeb(proc.stderr) as ReadableStream<Uint8Array> : undefined,
+-    stdin: proc.stdin,
+-    kill(s?: NodeJS.Signals) { try { proc.kill(s) } catch {} },
++    stdout: toReadableStream(proc.stdout),
++    stderr: toReadableStream(proc.stderr),
++    stdin: proc.stdin ?? emptyWritableStream(),
++    kill(signal?: NodeJS.Signals) {
++      if (proc.killed || exitCode !== null) return
++
++      try {
++        proc.kill(signal)
++      } catch (error) {
++        if (!String(error).includes("kill")) throw error
++      }
++    },
+     pid: proc.pid,
++    ref() {
++      proc.ref()
++    },
++    unref() {
++      proc.unref()
++    },
+   }
+ }
+ 
+-export function spawn(cmdOrOpts: any, opts?: any): any {
+-  if (IS_BUN) return (globalThis.Bun as any).spawn(cmdOrOpts, opts)
+-  const { cmd, opts: o } = _resolveCmd(cmdOrOpts, opts)
++export function spawn(command: string[], options?: SpawnOptions): SpawnedProcess
++export function spawn(options: SpawnOptions & { cmd: string[] }): SpawnedProcess
++export function spawn(cmdOrOpts: unknown, opts?: unknown): SpawnedProcess {
++  if (IS_BUN) return runtime.Bun!.spawn(cmdOrOpts as string[] & SpawnOptions & { cmd: string[] }, opts as SpawnOptions)
++
++  const { cmd, opts: options } = resolveCommand(cmdOrOpts, opts)
+   const [bin, ...args] = cmd
+   const proc = nodeSpawn(bin, args, {
+-    cwd: o.cwd as string | undefined,
+-    env: o.env as NodeJS.ProcessEnv | undefined,
+-    stdio: [(o.stdin ?? "pipe") as any, (o.stdout ?? "pipe") as any, (o.stderr ?? "pipe") as any],
++    cwd: options.cwd,
++    env: options.env,
++    stdio: resolveStdio(options),
++    detached: options.detached,
+   })
+-  return _wrapNodeProc(proc)
++
++  return wrapNodeProcess(proc)
+ }
+ 
+-export function spawnSync(cmdOrOpts: any, _opts?: any): any {
+-  if (IS_BUN) return (globalThis.Bun as any).spawnSync(cmdOrOpts)
+-  const { cmd, opts: o } = _resolveCmd(cmdOrOpts)
++export function spawnSync(command: string[], options?: SpawnOptions): SpawnSyncResult
++export function spawnSync(options: SpawnOptions & { cmd: string[] }): SpawnSyncResult
++export function spawnSync(cmdOrOpts: unknown, opts?: unknown): SpawnSyncResult {
++  if (IS_BUN) return runtime.Bun!.spawnSync(cmdOrOpts as string[] & SpawnOptions & { cmd: string[] }, opts as SpawnOptions)
++
++  const { cmd, opts: options } = resolveCommand(cmdOrOpts, opts)
+   const [bin, ...args] = cmd
+-  const r = nodeSpawnSync(bin, args, {
+-    cwd: o.cwd as string | undefined,
+-    env: o.env as NodeJS.ProcessEnv | undefined,
+-    stdio: ["pipe", "pipe", "pipe"],
++  const result = nodeSpawnSync(bin, args, {
++    cwd: options.cwd,
++    env: options.env,
++    stdio: resolveStdio(options),
+   })
+-  return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr, success: (r.status ?? 1) === 0, pid: -1 }
++
++  return {
++    exitCode: result.status ?? 1,
++    stdout: result.stdout,
++    stderr: result.stderr,
++    success: (result.status ?? 1) === 0,
++    pid: -1,
++  }
+ }
+diff --git a/src/shared/dist-bundle-bun-globals.test.ts b/src/shared/dist-bundle-bun-globals.test.ts
+new file mode 100644
+index 00000000..4d8b7a1d
+--- /dev/null
++++ b/src/shared/dist-bundle-bun-globals.test.ts
+@@ -0,0 +1,65 @@
++import { existsSync } from "node:fs"
++import { describe, expect, test } from "bun:test"
++
++const DIST_INDEX = "dist/index.js"
++const GLOBAL_BUN_DESTRUCTURE = /^\s*(?:var|let|const)\s*\{[^}]*\}\s*=\s*globalThis\.Bun/gm
++const TOP_LEVEL_REQUIRE_CALL = "__require("
++
++describe("dist bundle Bun globals", () => {
++  test.skipIf(!existsSync(DIST_INDEX))("#given dist bundle #when scanned #then no globalThis.Bun destructures remain", async () => {
++    const dist = await Bun.file(DIST_INDEX).text()
++
++    const matches = dist.match(GLOBAL_BUN_DESTRUCTURE) ?? []
++
++    expect(matches).toEqual([])
++  })
++
++  test.skipIf(!existsSync(DIST_INDEX))("#given dist bundle #when scanned #then no top-level __require call remains", async () => {
++    const dist = await Bun.file(DIST_INDEX).text()
++    const offending: string[] = []
++    let depth = 0
++
++    for (const [index, line] of dist.split("\n").entries()) {
++      if (depth === 0 && line.includes(TOP_LEVEL_REQUIRE_CALL)) {
++        offending.push(`${index + 1}: ${line.trim()}`)
++      }
++
++      for (const char of line) {
++        if (char === "{") {
++          depth += 1
++        } else if (char === "}") {
++          depth -= 1
++          if (depth < 0) depth = 0
++        }
++      }
++    }
++
++    expect(offending).toEqual([])
++  })
++
++  test.skipIf(!existsSync(DIST_INDEX))("#given dist bundle #when imported under node --input-type=module #then it loads without error", async () => {
++    const node = Bun.which("node")
++    if (!node) return
++
++    const proc = Bun.spawn({
++      cmd: [node, "--input-type=module", "-e", "await import('./dist/index.js'); console.log('node-esm-load-ok')"],
++      cwd: process.cwd(),
++      stdout: "pipe",
++      stderr: "pipe",
++    })
++
++    const stdout = await new Response(proc.stdout).text()
++    const stderr = await new Response(proc.stderr).text()
++    const exitCode = await proc.exited
++
++    expect({
++      exitCode,
++      stdout: stdout.trim(),
++      stderr: stderr.trim(),
++    }).toEqual({
++      exitCode: 0,
++      stdout: "node-esm-load-ok",
++      stderr: "",
++    })
++  })
++})
+-- 
+2.39.2
+

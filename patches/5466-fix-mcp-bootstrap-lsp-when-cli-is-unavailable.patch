@@ -1,0 +1,350 @@
+From 6fe2f72c76e808d3ddb2c0f13973af02e47c39d8 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 18 May 2026 20:18:51 +0900
+Subject: [PATCH 5466/5749] fix(mcp): bootstrap lsp when cli is unavailable
+
+Keep the built-in lsp MCP registered even when the submodule CLI artifact is missing.
+
+The fallback command initializes the lsp-tools-mcp submodule, prefers the source CLI without dirtying the checkout with dist output, and keeps npm build as a last resort when Bun cannot run the source entrypoint.
+
+Plan: plans/fix-lsp-mcp-missing-cli.md
+---
+ src/cli/doctor/checks/tools-lsp.test.ts    | 43 +++++++++------
+ src/cli/doctor/checks/tools-lsp.ts         | 18 ++++---
+ src/mcp/lsp.test.ts                        | 11 ++--
+ src/mcp/lsp.ts                             | 62 +++++++++++++++++++---
+ src/mcp/zauc-mocks-mcp-index/index.test.ts | 14 +++++
+ 5 files changed, 113 insertions(+), 35 deletions(-)
+
+diff --git a/src/cli/doctor/checks/tools-lsp.test.ts b/src/cli/doctor/checks/tools-lsp.test.ts
+index 104e83b3..f426166d 100644
+--- a/src/cli/doctor/checks/tools-lsp.test.ts
++++ b/src/cli/doctor/checks/tools-lsp.test.ts
+@@ -1,13 +1,11 @@
+ /// <reference types="bun-types" />
+ 
+-import { afterEach, describe, expect, it, mock } from "bun:test"
++import { afterEach, describe, expect, it } from "bun:test"
+ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ import { clearPluginConfigFileDetectionCache } from "../../../shared/jsonc-parser"
+ 
+-const originalCwd = process.cwd()
+-const originalOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR
+ const temporaryDirectories: string[] = []
+ 
+ function createTemporaryDirectory(prefix: string): string {
+@@ -16,16 +14,14 @@ function createTemporaryDirectory(prefix: string): string {
+   return directory
+ }
+ 
++function createLspDistCli(workspaceDirectory: string): void {
++  const lspDistDirectory = join(workspaceDirectory, "packages", "lsp-tools-mcp", "dist")
++  mkdirSync(lspDistDirectory, { recursive: true })
++  writeFileSync(join(lspDistDirectory, "cli.js"), "#!/usr/bin/env node\n", "utf-8")
++}
++
+ afterEach(() => {
+-  mock.restore()
+   clearPluginConfigFileDetectionCache()
+-  process.chdir(originalCwd)
+-
+-  if (originalOpenCodeConfigDir === undefined) {
+-    delete process.env.OPENCODE_CONFIG_DIR
+-  } else {
+-    process.env.OPENCODE_CONFIG_DIR = originalOpenCodeConfigDir
+-  }
+ 
+   for (const directory of temporaryDirectories.splice(0)) {
+     rmSync(directory, { recursive: true, force: true })
+@@ -39,36 +35,49 @@ describe("getInstalledLspServers", () => {
+     const workspaceDirectory = createTemporaryDirectory("omo-tools-lsp-workspace-")
+     const projectConfigDirectory = join(workspaceDirectory, ".opencode")
+     mkdirSync(projectConfigDirectory, { recursive: true })
++    createLspDistCli(workspaceDirectory)
+     writeFileSync(
+       join(projectConfigDirectory, "oh-my-openagent.json"),
+       JSON.stringify({ disabled_mcps: ["lsp"] }),
+       "utf-8",
+     )
+-    process.env.OPENCODE_CONFIG_DIR = userConfigDirectory
+-    process.chdir(workspaceDirectory)
+     clearPluginConfigFileDetectionCache()
+ 
+     const { getInstalledLspServers } = await import(`./tools-lsp?t=${Date.now()}-disabled`)
+ 
+     // when
+-    const servers = getInstalledLspServers()
++    const servers = getInstalledLspServers({ configDirectory: userConfigDirectory, cwd: workspaceDirectory })
+ 
+     // then
+     expect(servers).toEqual([])
+   })
+ 
++  it("returns bundled lsp server info when lsp MCP uses bootstrap fallback", async () => {
++    // given
++    const userConfigDirectory = createTemporaryDirectory("omo-tools-lsp-user-")
++    const workspaceDirectory = createTemporaryDirectory("omo-tools-lsp-bootstrap-")
++    clearPluginConfigFileDetectionCache()
++
++    const { getInstalledLspServers } = await import(`./tools-lsp?t=${Date.now()}-bootstrap`)
++
++    // when
++    const servers = getInstalledLspServers({ configDirectory: userConfigDirectory, cwd: workspaceDirectory })
++
++    // then
++    expect(servers).toEqual([{ id: "lsp-tools-mcp", extensions: ["*"] }])
++  })
++
+   it("returns bundled lsp server info when MCP is enabled", async () => {
+     // given
+     const userConfigDirectory = createTemporaryDirectory("omo-tools-lsp-user-")
+     const workspaceDirectory = createTemporaryDirectory("omo-tools-lsp-enabled-")
+-    process.env.OPENCODE_CONFIG_DIR = userConfigDirectory
+-    process.chdir(workspaceDirectory)
++    createLspDistCli(workspaceDirectory)
+     clearPluginConfigFileDetectionCache()
+ 
+     const { getInstalledLspServers } = await import(`./tools-lsp?t=${Date.now()}-enabled`)
+ 
+     // when
+-    const servers = getInstalledLspServers()
++    const servers = getInstalledLspServers({ configDirectory: userConfigDirectory, cwd: workspaceDirectory })
+ 
+     // then
+     expect(servers).toEqual([{ id: "lsp-tools-mcp", extensions: ["*"] }])
+diff --git a/src/cli/doctor/checks/tools-lsp.ts b/src/cli/doctor/checks/tools-lsp.ts
+index b74c6079..b80020e1 100644
+--- a/src/cli/doctor/checks/tools-lsp.ts
++++ b/src/cli/doctor/checks/tools-lsp.ts
+@@ -7,7 +7,10 @@ type OmoConfigForDoctor = {
+   disabled_mcps?: string[]
+ }
+ 
+-const PROJECT_CONFIG_DIR = join(process.cwd(), ".opencode")
++type InstalledLspServersOptions = {
++  readonly configDirectory?: string
++  readonly cwd?: string
++}
+ 
+ function readOmoConfig(configDirectory: string): OmoConfigForDoctor | null {
+   const detected = detectPluginConfigFile(configDirectory)
+@@ -23,10 +26,11 @@ function readOmoConfig(configDirectory: string): OmoConfigForDoctor | null {
+   }
+ }
+ 
+-function isLspMcpDisabled(): boolean {
+-  const userConfigDirectory = getOpenCodeConfigDir({ binary: "opencode" })
++function isLspMcpDisabled(options: InstalledLspServersOptions): boolean {
++  const userConfigDirectory = options.configDirectory ?? getOpenCodeConfigDir({ binary: "opencode" })
++  const projectConfigDirectory = join(options.cwd ?? process.cwd(), ".opencode")
+   const userConfig = readOmoConfig(userConfigDirectory)
+-  const projectConfig = readOmoConfig(PROJECT_CONFIG_DIR)
++  const projectConfig = readOmoConfig(projectConfigDirectory)
+ 
+   const disabledMcps = new Set<string>([
+     ...(userConfig?.disabled_mcps ?? []),
+@@ -36,12 +40,12 @@ function isLspMcpDisabled(): boolean {
+   return disabledMcps.has("lsp")
+ }
+ 
+-export function getInstalledLspServers(): Array<{ id: string; extensions: string[] }> {
+-  if (isLspMcpDisabled()) {
++export function getInstalledLspServers(options: InstalledLspServersOptions = {}): Array<{ id: string; extensions: string[] }> {
++  if (isLspMcpDisabled(options)) {
+     return []
+   }
+ 
+-  const lspMcpConfig = createLspMcpConfig()
++  const lspMcpConfig = createLspMcpConfig({ cwd: options.cwd })
+ 
+   return lspMcpConfig.enabled ? [{ id: "lsp-tools-mcp", extensions: ["*"] }] : []
+ }
+diff --git a/src/mcp/lsp.test.ts b/src/mcp/lsp.test.ts
+index 271a39de..770500d0 100644
+--- a/src/mcp/lsp.test.ts
++++ b/src/mcp/lsp.test.ts
+@@ -37,6 +37,7 @@ describe("createLspMcpConfig", () => {
+     })
+ 
+     // then
++    expect(config.enabled).toBe(true)
+     expect(config.command).toEqual(["node", cliPath, "mcp"])
+   })
+ 
+@@ -56,14 +57,16 @@ describe("createLspMcpConfig", () => {
+     })
+ 
+     // then
++    expect(config.enabled).toBe(true)
+     expect(config.command).toEqual(["bun", sourceCliPath, "mcp"])
+   })
+ 
+-  it("still returns a built-in MCP config when the cli has not been built yet", () => {
++  it("returns a bootstrap command when no LSP cli entrypoint exists", () => {
+     // given
+     const packageRoot = createTemporaryDirectory("omo-lsp-missing-root-")
+     const moduleFilePath = join(packageRoot, "dist", "index.js")
+     mkdirSync(join(packageRoot, "dist"), { recursive: true })
++    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "oh-my-opencode" }), "utf-8")
+ 
+     // when
+     const config = createLspMcpConfig({
+@@ -74,7 +77,9 @@ describe("createLspMcpConfig", () => {
+     // then
+     expect(config.enabled).toBe(true)
+     expect(config.command[0]).toBe("node")
+-    expect(config.command[1]).toContain(join("packages", "lsp-tools-mcp", "dist", "cli.js"))
+-    expect(config.command[2]).toBe("mcp")
++    expect(config.command[1]).toBe("-e")
++    expect(config.command[2]).toContain("submodule")
++    expect(config.command[2]).toContain("npm")
++    expect(config.command[3]).toBe(packageRoot)
+   })
+ })
+diff --git a/src/mcp/lsp.ts b/src/mcp/lsp.ts
+index 70932829..ac7b0f99 100644
+--- a/src/mcp/lsp.ts
++++ b/src/mcp/lsp.ts
+@@ -6,6 +6,26 @@ const SUBMODULE_REL = "packages/lsp-tools-mcp"
+ const DIST_CLI_REL = "dist/cli.js"
+ const SOURCE_CLI_REL = "src/cli.ts"
+ const PROJECT_LSP_CONFIG = ".opencode/lsp.json"
++const LSP_BOOTSTRAP_SCRIPT = [
++  "const { existsSync } = require('node:fs')",
++  "const { join } = require('node:path')",
++  "const { spawnSync } = require('node:child_process')",
++  "const root = process.argv[1]",
++  "const submodule = join(root, 'packages/lsp-tools-mcp')",
++  "const dist = join(submodule, 'dist/cli.js')",
++  "const source = join(submodule, 'src/cli.ts')",
++  "const run = (command, args, stdio) => spawnSync(command, args, { cwd: root, env: process.env, stdio })",
++  "const finish = (result) => { if (result.error) { console.error(result.error.message); process.exit(1) } process.exit(result.status ?? 1) }",
++  "const runIfAvailable = (command, args) => { const result = run(command, args, 'inherit'); if (result.error) return false; finish(result); return true }",
++  "if (existsSync(dist)) finish(run(process.execPath, [dist, 'mcp'], 'inherit'))",
++  "if (existsSync(source)) runIfAvailable('bun', [source, 'mcp'])",
++  "const submoduleResult = run('git', ['submodule', 'update', '--init', '--recursive', 'packages/lsp-tools-mcp'], ['ignore', 'ignore', 'inherit'])",
++  "if (submoduleResult.error || submoduleResult.status !== 0) finish(submoduleResult)",
++  "if (existsSync(dist)) finish(run(process.execPath, [dist, 'mcp'], 'inherit'))",
++  "if (existsSync(source)) runIfAvailable('bun', [source, 'mcp'])",
++  "for (const [command, args] of [['npm', ['--prefix', submodule, 'install', '--no-package-lock', '--no-audit', '--no-fund']], ['npm', ['--prefix', submodule, 'run', 'build']]]) { const result = run(command, args, ['ignore', 'ignore', 'inherit']); if (result.error || result.status !== 0) finish(result) }",
++  "finish(run(process.execPath, [dist, 'mcp'], 'inherit'))",
++].join(";")
+ 
+ type LspMcpConfigOptions = {
+   readonly cwd?: string
+@@ -15,6 +35,7 @@ type LspMcpConfigOptions = {
+ 
+ type LspCommandCandidate = {
+   readonly command: string[]
++  readonly root: string
+   readonly path: string
+   readonly exists: boolean
+ }
+@@ -38,13 +59,23 @@ function addAncestorCommandCandidates(
+     const distCliPath = resolve(currentDirectory, SUBMODULE_REL, DIST_CLI_REL)
+     if (!seenPaths.has(distCliPath)) {
+       seenPaths.add(distCliPath)
+-      target.push({ command: ["node", distCliPath, "mcp"], path: distCliPath, exists: pathExists(distCliPath) })
++      target.push({
++        command: ["node", distCliPath, "mcp"],
++        root: currentDirectory,
++        path: distCliPath,
++        exists: pathExists(distCliPath),
++      })
+     }
+ 
+     const sourceCliPath = resolve(currentDirectory, SUBMODULE_REL, SOURCE_CLI_REL)
+     if (!seenPaths.has(sourceCliPath)) {
+       seenPaths.add(sourceCliPath)
+-      target.push({ command: ["bun", sourceCliPath, "mcp"], path: sourceCliPath, exists: pathExists(sourceCliPath) })
++      target.push({
++        command: ["bun", sourceCliPath, "mcp"],
++        root: currentDirectory,
++        path: sourceCliPath,
++        exists: pathExists(sourceCliPath),
++      })
+     }
+ 
+     const parentDirectory = resolve(currentDirectory, "..")
+@@ -64,7 +95,20 @@ function getModuleDirectory(moduleUrl: string): string | null {
+   }
+ }
+ 
+-function resolveLspCommand(options: LspMcpConfigOptions = {}): string[] {
++function findBootstrapRoot(candidates: readonly LspCommandCandidate[], pathExists: (path: string) => boolean): string {
++  return candidates.find((candidate) => pathExists(resolve(candidate.root, "package.json")))?.root ?? process.cwd()
++}
++
++function createBootstrapCandidate(root: string): LspCommandCandidate {
++  return {
++    command: ["node", "-e", LSP_BOOTSTRAP_SCRIPT, root],
++    root,
++    path: resolve(root, SUBMODULE_REL, DIST_CLI_REL),
++    exists: true,
++  }
++}
++
++function resolveLspCommand(options: LspMcpConfigOptions = {}): LspCommandCandidate {
+   const pathExists = options.exists ?? existsSync
+   const candidates: LspCommandCandidate[] = []
+   const seenPaths = new Set<string>()
+@@ -78,22 +122,24 @@ function resolveLspCommand(options: LspMcpConfigOptions = {}): string[] {
+ 
+   const distCandidate = candidates.find((candidate) => candidate.path.endsWith(DIST_CLI_REL) && candidate.exists)
+   if (distCandidate) {
+-    return distCandidate.command
++    return distCandidate
+   }
+ 
+   const sourceCandidate = candidates.find((candidate) => candidate.path.endsWith(SOURCE_CLI_REL) && candidate.exists)
+   if (sourceCandidate) {
+-    return sourceCandidate.command
++    return sourceCandidate
+   }
+ 
+-  return candidates[0]?.command ?? ["node", resolve(process.cwd(), SUBMODULE_REL, DIST_CLI_REL), "mcp"]
++  return createBootstrapCandidate(findBootstrapRoot(candidates, pathExists))
+ }
+ 
+ export function createLspMcpConfig(options: LspMcpConfigOptions = {}): LocalMcpConfig {
++  const resolvedCommand = resolveLspCommand(options)
++
+   return {
+     type: "local",
+-    command: resolveLspCommand(options),
+-    enabled: true,
++    command: resolvedCommand.command,
++    enabled: resolvedCommand.exists,
+     environment: {
+       LSP_TOOLS_MCP_PROJECT_CONFIG: PROJECT_LSP_CONFIG,
+     },
+diff --git a/src/mcp/zauc-mocks-mcp-index/index.test.ts b/src/mcp/zauc-mocks-mcp-index/index.test.ts
+index 7e152c12..079df42e 100644
+--- a/src/mcp/zauc-mocks-mcp-index/index.test.ts
++++ b/src/mcp/zauc-mocks-mcp-index/index.test.ts
+@@ -42,6 +42,20 @@ describe("createBuiltinMcps", () => {
+     expect(result.lsp).toBeDefined()
+   })
+ 
++  test("should keep lsp when it uses a bootstrap command", () => {
++    // given
++    mock.module("../lsp", () => ({
++      createLspMcpConfig: () => ({ type: "local", command: ["node", "-e", "bootstrap", "/repo"], enabled: true }),
++    }))
++    const { createBuiltinMcps } = require("../index") as typeof import("../index")
++
++    // when
++    const result = createBuiltinMcps([])
++
++    // then
++    expect(result.lsp).toBeDefined()
++  })
++
+   test("should return empty array when all MCPs are disabled", () => {
+     // given - disable all known MCPs
+     mock.module("../lsp", () => ({
+-- 
+2.39.2
+

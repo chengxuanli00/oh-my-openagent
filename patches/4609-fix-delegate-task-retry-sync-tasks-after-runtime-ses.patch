@@ -1,0 +1,463 @@
+From 613e4a6c12f720558b027cb8f09f4a5b09970ddf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Choi=20Kijin=20/=20=EC=B5=9C=20=EA=B8=B0=EC=A7=84=20/=20?=
+ =?UTF-8?q?=E3=83=81=E3=83=A7=E3=82=A4=20=E3=82=AD=E3=82=B8=E3=83=B3?=
+ <kichoi@lycorp.co.jp>
+Date: Tue, 28 Apr 2026 15:28:20 +0900
+Subject: [PATCH 4609/5749] fix(delegate-task): retry sync tasks after runtime
+ session errors
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/tools/delegate-task/executor-types.ts     |   1 +
+ .../delegate-task/sync-session-poller.test.ts |  36 +++++
+ .../delegate-task/sync-session-poller.ts      |  17 ++
+ src/tools/delegate-task/sync-task-fallback.ts |  14 +-
+ src/tools/delegate-task/sync-task.test.ts     |  90 +++++++++++
+ src/tools/delegate-task/sync-task.ts          | 147 +++++++++++++-----
+ 6 files changed, 268 insertions(+), 37 deletions(-)
+
+diff --git a/src/tools/delegate-task/executor-types.ts b/src/tools/delegate-task/executor-types.ts
+index 8b430c9c..7efc0837 100644
+--- a/src/tools/delegate-task/executor-types.ts
++++ b/src/tools/delegate-task/executor-types.ts
+@@ -31,6 +31,7 @@ export interface SessionMessage {
+     role?: string
+     time?: { created?: number }
+     finish?: string
++    error?: unknown
+     agent?: string
+     model?: { providerID: string; modelID: string; variant?: string }
+     modelID?: string
+diff --git a/src/tools/delegate-task/sync-session-poller.test.ts b/src/tools/delegate-task/sync-session-poller.test.ts
+index b8b2d85f..494ce099 100644
+--- a/src/tools/delegate-task/sync-session-poller.test.ts
++++ b/src/tools/delegate-task/sync-session-poller.test.ts
+@@ -28,6 +28,42 @@ describe("pollSyncSession", () => {
+   })
+ 
+   describe("native finish-based completion", () => {
++    test("returns terminal session error when assistant message contains info.error", async () => {
++      //#given
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      const mockClient = {
++        session: {
++          messages: async () => ({
++            data: [
++              { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++              {
++                info: {
++                  id: "msg_002",
++                  role: "assistant",
++                  time: { created: 2000 },
++                  error: { data: { message: "Forbidden: Selected provider is forbidden" } },
++                },
++                parts: [],
++              },
++            ],
++          }),
++          status: async () => ({ data: { "ses_test": { type: "idle" } } }),
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_test",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then
++      expect(result).toBe("Forbidden: Selected provider is forbidden")
++    })
++
+     test("detects completion when assistant message has terminal finish reason", async () => {
+       //#given - session messages with a terminal assistant finish ("end_turn")
+       //         and the assistant id > user id (native opencode condition)
+diff --git a/src/tools/delegate-task/sync-session-poller.ts b/src/tools/delegate-task/sync-session-poller.ts
+index d9bc40d0..81078622 100644
+--- a/src/tools/delegate-task/sync-session-poller.ts
++++ b/src/tools/delegate-task/sync-session-poller.ts
+@@ -3,6 +3,7 @@ import type { SessionMessage } from "./executor-types"
+ import { getDefaultSyncPollTimeoutMs, getTimingConfig } from "./timing"
+ import { log } from "../../shared/logger"
+ import { normalizeSDKResponse } from "../../shared"
++import { extractErrorMessage } from "../../features/background-agent/error-classifier"
+ 
+ const NON_TERMINAL_FINISH_REASONS = new Set(["tool-calls", "unknown"])
+ const PENDING_TOOL_PART_TYPES = new Set(["tool", "tool_use", "tool-call"])
+@@ -32,6 +33,16 @@ async function fetchSessionMessages(
+   return Array.isArray(rawData) ? (rawData as SessionMessage[]) : []
+ }
+ 
++function getTerminalSessionError(messages: SessionMessage[]): string | null {
++  const lastAssistant = [...messages].reverse().find((msg) => msg.info?.role === "assistant")
++  if (!lastAssistant?.info || !("error" in lastAssistant.info)) {
++    return null
++  }
++
++  const errorMessage = extractErrorMessage((lastAssistant.info as { error?: unknown }).error)
++  return errorMessage && errorMessage.length > 0 ? errorMessage : "Session error"
++}
++
+ export function isSessionComplete(messages: SessionMessage[]): boolean {
+   let lastUser: SessionMessage | undefined
+   let lastAssistant: SessionMessage | undefined
+@@ -137,6 +148,12 @@ export async function pollSyncSession(
+       continue
+     }
+ 
++    const sessionError = getTerminalSessionError(messages)
++    if (sessionError) {
++      log("[task] Poll detected terminal session error", { sessionID: input.sessionID, sessionError })
++      return sessionError
++    }
++
+     if (isSessionComplete(messages)) {
+       log("[task] Poll complete - terminal finish detected", { sessionID: input.sessionID, pollCount })
+       break
+diff --git a/src/tools/delegate-task/sync-task-fallback.ts b/src/tools/delegate-task/sync-task-fallback.ts
+index 6ad64ef3..fbbc2431 100644
+--- a/src/tools/delegate-task/sync-task-fallback.ts
++++ b/src/tools/delegate-task/sync-task-fallback.ts
+@@ -22,13 +22,14 @@ export async function retrySyncPromptWithFallbacks(input: {
+   categoryModel: DelegatedModelConfig | undefined
+   fallbackChain: FallbackEntry[] | undefined
+   sendPrompt: (categoryModel: DelegatedModelConfig) => Promise<string | null>
+-}): Promise<{ promptError: string | null; categoryModel: DelegatedModelConfig | undefined }> {
++}): Promise<{ promptError: string | null; categoryModel: DelegatedModelConfig | undefined; fallbackState?: ModelFallbackState }> {
+   const { sessionID, initialError, categoryModel, fallbackChain, sendPrompt } = input
+ 
+   if (!categoryModel || !fallbackChain || fallbackChain.length === 0) {
+     return {
+       promptError: initialError,
+       categoryModel,
++      fallbackState: undefined,
+     }
+   }
+ 
+@@ -48,6 +49,7 @@ export async function retrySyncPromptWithFallbacks(input: {
+       return {
+         promptError: finalError,
+         categoryModel,
++        fallbackState,
+       }
+     }
+ 
+@@ -57,6 +59,7 @@ export async function retrySyncPromptWithFallbacks(input: {
+       return {
+         promptError: null,
+         categoryModel: fallbackModel,
++        fallbackState,
+       }
+     }
+ 
+@@ -66,3 +69,12 @@ export async function retrySyncPromptWithFallbacks(input: {
+     fallbackState.pending = true
+   }
+ }
++
++export function getNextSyncFallbackModel(
++  sessionID: string,
++  fallbackState: ModelFallbackState | undefined,
++): DelegatedModelConfig | null {
++  if (!fallbackState) return null
++  const nextFallback = getNextReachableFallback(sessionID, fallbackState)
++  return nextFallback ? toDelegatedModelConfig(nextFallback) : null
++}
+diff --git a/src/tools/delegate-task/sync-task.test.ts b/src/tools/delegate-task/sync-task.test.ts
+index a81fe4eb..80c0572e 100644
+--- a/src/tools/delegate-task/sync-task.test.ts
++++ b/src/tools/delegate-task/sync-task.test.ts
+@@ -426,6 +426,96 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     expect(deleteCalls[0]).toBe("ses_test_12345678")
+   })
+ 
++  test("retries sync session on retryable runtime session error using next fallback model", async () => {
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ignored" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++    const createdSessions: string[] = []
++    const attemptedModels: Array<{ providerID: string; modelID: string; variant?: string } | undefined> = []
++    const polledSessions: string[] = []
++
++    const deps = {
++      createSyncSession: async () => {
++        const sessionID = createdSessions.length === 0 ? "ses_first" : "ses_second"
++        createdSessions.push(sessionID)
++        return { ok: true as const, sessionID }
++      },
++      sendSyncPrompt: async (_client: unknown, input: { categoryModel?: { providerID: string; modelID: string; variant?: string } }) => {
++        attemptedModels.push(input.categoryModel)
++        return null
++      },
++      pollSyncSession: async (_ctx: unknown, _client: unknown, input: { sessionID: string }) => {
++        polledSessions.push(input.sessionID)
++        return input.sessionID === "ses_first"
++          ? "Forbidden: Selected provider is forbidden"
++          : null
++      },
++      fetchSyncResult: async (_client: unknown, sessionID: string) => ({ ok: true as const, textContent: `Result from ${sessionID}` }),
++    }
++
++    const metadataCalls: any[] = []
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: (input: any) => { metadataCalls.push(input) },
++    }
++
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++      modelFallbackControllerAccessor: {
++        setSessionFallbackChain: () => {},
++        clearSessionFallbackChain: () => {},
++      },
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "quick",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    const initialModel = {
++      providerID: "genai-proxy-openai",
++      modelID: "gpt-5.4-mini",
++      variant: undefined,
++    }
++    const fallbackChain = [
++      { providers: ["genai-proxy-openai"], model: "gpt-5.4-mini" },
++      { providers: ["genai-proxy-aws"], model: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
++    ]
++
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "sisyphus-junior", initialModel, undefined, undefined, fallbackChain, deps)
++
++    expect(createdSessions).toEqual(["ses_first", "ses_second"])
++    expect(polledSessions).toEqual(["ses_first", "ses_second"])
++    expect(attemptedModels).toEqual([
++      { providerID: "genai-proxy-openai", modelID: "gpt-5.4-mini", variant: undefined },
++      { providerID: "genai-proxy-aws", modelID: "us.anthropic.claude-haiku-4-5-20251001-v1:0", variant: undefined },
++    ])
++    expect(result).toContain("Result from ses_second")
++    expect(deleteCalls).toContain("ses_first")
++
++    const finalMetadata = metadataCalls.at(-1)
++    expect(finalMetadata.metadata.sessionId).toBe("ses_second")
++    expect(finalMetadata.metadata.taskId).toBe("ses_second")
++    expect(finalMetadata.metadata.model).toEqual({
++      providerID: "genai-proxy-aws",
++      modelID: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
++      variant: undefined,
++    })
++  })
++
+   test("depth regression: blocks spawn when reserveSubagentSpawn throws depth limit error", async () => {
+     // This is a smoke test guarding against regressions where the depth limit
+     // would be silently bypassed (e.g. via a fallback path that hardcodes
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index b1a0d6f3..758d516f 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -9,9 +9,11 @@ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+ import { formatDuration } from "./time-formatter"
+ import { formatDetailedError } from "./error-formatting"
+ import { syncTaskDeps, type SyncTaskDeps } from "./sync-task-deps"
+-import { retrySyncPromptWithFallbacks } from "./sync-task-fallback"
++import { getNextSyncFallbackModel, retrySyncPromptWithFallbacks } from "./sync-task-fallback"
+ import { buildTaskMetadataBlock } from "../../features/tool-metadata-store/task-metadata-contract"
+ import { resolveMetadataModel } from "./resolve-metadata-model"
++import { shouldRetryError } from "../../shared/model-error-classifier"
++import type { ModelFallbackState } from "../../hooks/model-fallback/hook"
+ 
+ export async function executeSyncTask(
+   args: DelegateTaskArgs,
+@@ -147,44 +149,97 @@ export async function executeSyncTask(
+     }
+ 
+     let effectiveCategoryModel = categoryModel
+-    let promptError = await deps.sendSyncPrompt(client, {
+-      ...syncPromptInput,
+-      categoryModel: effectiveCategoryModel,
+-    })
+-    if (promptError) {
+-      const promptResult = await retrySyncPromptWithFallbacks({
+-        sessionID,
+-        initialError: promptError,
+-        categoryModel: effectiveCategoryModel,
+-        fallbackChain,
+-        sendPrompt: async (fallbackModel) => {
+-          return deps.sendSyncPrompt(client, {
+-            ...syncPromptInput,
+-            categoryModel: fallbackModel,
+-          })
+-        },
+-      })
+-
+-      promptError = promptResult.promptError
+-      effectiveCategoryModel = promptResult.categoryModel
++    let fallbackState: ModelFallbackState | undefined = effectiveCategoryModel && fallbackChain?.length
++      ? {
++          providerID: effectiveCategoryModel.providerID,
++          modelID: effectiveCategoryModel.modelID,
++          fallbackChain,
++          attemptCount: 0,
++          pending: true,
++        }
++      : undefined
++    let activeSessionID = sessionID
+ 
+-      if (promptError) {
+-        return promptError
+-      }
++    const cleanupRetrySession = (currentSessionID: string): void => {
++      subagentSessions.delete(currentSessionID)
++      syncSubagentSessions.delete(currentSessionID)
++      executorCtx.modelFallbackControllerAccessor?.clearSessionFallbackChain(currentSessionID)
++      SessionCategoryRegistry.remove(currentSessionID)
+     }
+ 
+     try {
+-      const pollError = await deps.pollSyncSession(ctx, client, {
+-        sessionID,
+-        agentToUse,
+-        toastManager,
+-        taskId,
+-      }, syncPollTimeoutMs)
+-      if (pollError) {
+-        return pollError
+-      }
++      while (true) {
++        let promptError = await deps.sendSyncPrompt(client, {
++          ...syncPromptInput,
++          sessionID: activeSessionID,
++          categoryModel: effectiveCategoryModel,
++        })
++        if (promptError) {
++          const promptResult = await retrySyncPromptWithFallbacks({
++            sessionID: activeSessionID,
++            initialError: promptError,
++            categoryModel: effectiveCategoryModel,
++            fallbackChain,
++            sendPrompt: async (fallbackModel) => {
++              return deps.sendSyncPrompt(client, {
++                ...syncPromptInput,
++                sessionID: activeSessionID,
++                categoryModel: fallbackModel,
++              })
++            },
++          })
++
++          promptError = promptResult.promptError
++          effectiveCategoryModel = promptResult.categoryModel
++          fallbackState = promptResult.fallbackState ?? fallbackState
++
++          if (promptError) {
++            return promptError
++          }
++        }
+ 
+-      const result = await deps.fetchSyncResult(client, sessionID)
++        const pollError = await deps.pollSyncSession(ctx, client, {
++          sessionID: activeSessionID,
++          agentToUse,
++          toastManager,
++          taskId,
++        }, syncPollTimeoutMs)
++        if (pollError) {
++          const nextFallbackModel = shouldRetryError({ message: pollError })
++            ? getNextSyncFallbackModel(activeSessionID, fallbackState)
++            : null
++          if (!nextFallbackModel) {
++            return pollError
++          }
++
++          cleanupRetrySession(activeSessionID)
++
++          const retrySessionResult = await deps.createSyncSession(client, {
++            parentSessionID: parentContext.sessionID,
++            agentToUse,
++            description: args.description,
++            defaultDirectory: directory,
++          })
++          if (!retrySessionResult.ok) {
++            return retrySessionResult.error
++          }
++
++          activeSessionID = retrySessionResult.sessionID
++          syncSessionID = retrySessionResult.sessionID
++          subagentSessions.add(activeSessionID)
++          syncSubagentSessions.add(activeSessionID)
++          setSessionAgent(activeSessionID, agentToUse)
++          executorCtx.modelFallbackControllerAccessor?.setSessionFallbackChain(activeSessionID, fallbackChain)
++
++          if (args.category) {
++            SessionCategoryRegistry.register(activeSessionID, args.category)
++          }
++
++          effectiveCategoryModel = nextFallbackModel
++          continue
++        }
++
++        const result = await deps.fetchSyncResult(client, activeSessionID)
+       if (!result.ok) {
+         return result.error
+       }
+@@ -205,6 +260,25 @@ export async function executeSyncTask(
+         modelRoutingNote = `\nModel: ${actualModelStr}${args.category ? ` (category: ${args.category})` : ""}`
+       }
+ 
++      await publishToolMetadata(ctx, {
++        title: args.description,
++        metadata: {
++          prompt: args.prompt,
++          agent: agentToUse,
++          category: args.category,
++          ...(args.requested_subagent_type !== undefined ? { requested_subagent_type: args.requested_subagent_type } : {}),
++          load_skills: args.load_skills,
++          description: args.description,
++          run_in_background: args.run_in_background,
++          taskId: activeSessionID,
++          sessionId: activeSessionID,
++          sync: true,
++          spawnDepth: spawnContext.childDepth,
++          command: args.command,
++          model: resolveMetadataModel(effectiveCategoryModel, parentContext.model),
++        },
++      })
++
+       return `Task completed in ${duration}.
+ 
+ Agent: ${agentToUse}${args.category ? ` (category: ${args.category})` : ""}${modelRoutingNote}
+@@ -214,11 +288,12 @@ Agent: ${agentToUse}${args.category ? ` (category: ${args.category})` : ""}${mod
+ ${result.textContent || "(No text output)"}
+ 
+ ${buildTaskMetadataBlock({
+-        sessionId: sessionID,
+-        taskId: sessionID,
++        sessionId: activeSessionID,
++        taskId: activeSessionID,
+         agent: agentToUse,
+         category: args.category,
+       })}`
++      }
+     } finally {
+       if (toastManager && taskId !== undefined) {
+         toastManager.removeTask(taskId)
+-- 
+2.39.2
+

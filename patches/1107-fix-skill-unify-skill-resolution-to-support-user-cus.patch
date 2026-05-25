@@ -1,0 +1,310 @@
+From 207a39b17a7ccee2640bdda27b169c094af50d82 Mon Sep 17 00:00:00 2001
+From: justsisyphus <sisyphus-dev-ai@users.noreply.github.com>
+Date: Fri, 16 Jan 2026 01:57:57 +0900
+Subject: [PATCH 1107/5749] fix(skill): unify skill resolution to support user
+ custom skills
+
+sisyphus_task was only loading builtin skills via resolveMultipleSkills().
+Now uses resolveMultipleSkillsAsync() which merges discoverSkills() + builtin skills.
+
+- Add getAllSkills(), extractSkillTemplate(), resolveMultipleSkillsAsync()
+- Update sisyphus_task to use async skill resolution
+- Refactor skill tool to reuse unified getAllSkills()
+- Add async skill resolution tests
+---
+ .../skill-content.test.ts                     |  86 ++++++++++++++-
+ .../opencode-skill-loader/skill-content.ts    | 104 ++++++++++++++++++
+ src/tools/sisyphus-task/tools.ts              |   9 +-
+ src/tools/skill/tools.ts                      |  11 +-
+ 4 files changed, 198 insertions(+), 12 deletions(-)
+
+diff --git a/src/features/opencode-skill-loader/skill-content.test.ts b/src/features/opencode-skill-loader/skill-content.test.ts
+index 66b432b6..23f455cc 100644
+--- a/src/features/opencode-skill-loader/skill-content.test.ts
++++ b/src/features/opencode-skill-loader/skill-content.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, it, expect } from "bun:test"
+-import { resolveSkillContent, resolveMultipleSkills } from "./skill-content"
++import { resolveSkillContent, resolveMultipleSkills, resolveSkillContentAsync, resolveMultipleSkillsAsync } from "./skill-content"
+ 
+ describe("resolveSkillContent", () => {
+ 	it("should return template for existing skill", () => {
+@@ -109,3 +109,87 @@ describe("resolveMultipleSkills", () => {
+ 		expect(result.resolved.size).toBe(2)
+ 	})
+ })
++
++describe("resolveSkillContentAsync", () => {
++	it("should return template for builtin skill", async () => {
++		// #given: builtin skill 'frontend-ui-ux'
++		// #when: resolving content async
++		const result = await resolveSkillContentAsync("frontend-ui-ux")
++
++		// #then: returns template string
++		expect(result).not.toBeNull()
++		expect(typeof result).toBe("string")
++		expect(result).toContain("Role: Designer-Turned-Developer")
++	})
++
++	it("should return null for non-existent skill", async () => {
++		// #given: non-existent skill name
++		// #when: resolving content async
++		const result = await resolveSkillContentAsync("definitely-not-a-skill-12345")
++
++		// #then: returns null
++		expect(result).toBeNull()
++	})
++})
++
++describe("resolveMultipleSkillsAsync", () => {
++	it("should resolve builtin skills", async () => {
++		// #given: builtin skill names
++		const skillNames = ["playwright", "frontend-ui-ux"]
++
++		// #when: resolving multiple skills async
++		const result = await resolveMultipleSkillsAsync(skillNames)
++
++		// #then: all builtin skills resolved
++		expect(result.resolved.size).toBe(2)
++		expect(result.notFound).toEqual([])
++		expect(result.resolved.get("playwright")).toContain("Playwright Browser Automation")
++		expect(result.resolved.get("frontend-ui-ux")).toContain("Designer-Turned-Developer")
++	})
++
++	it("should handle partial success with non-existent skills", async () => {
++		// #given: mix of existing and non-existing skills
++		const skillNames = ["playwright", "nonexistent-skill-12345"]
++
++		// #when: resolving multiple skills async
++		const result = await resolveMultipleSkillsAsync(skillNames)
++
++		// #then: existing skills resolved, non-existing in notFound
++		expect(result.resolved.size).toBe(1)
++		expect(result.notFound).toEqual(["nonexistent-skill-12345"])
++		expect(result.resolved.get("playwright")).toContain("Playwright Browser Automation")
++	})
++
++	it("should support git-master config injection", async () => {
++		// #given: git-master skill with config override
++		const skillNames = ["git-master"]
++		const options = {
++			gitMasterConfig: {
++				commit_footer: false,
++				include_co_authored_by: false,
++			},
++		}
++
++		// #when: resolving with git-master config
++		const result = await resolveMultipleSkillsAsync(skillNames, options)
++
++		// #then: config values injected into template
++		expect(result.resolved.size).toBe(1)
++		expect(result.notFound).toEqual([])
++		const gitMasterContent = result.resolved.get("git-master")
++		expect(gitMasterContent).toContain("commit_footer")
++		expect(gitMasterContent).toContain("DISABLED")
++	})
++
++	it("should handle empty array", async () => {
++		// #given: empty skill names
++		const skillNames: string[] = []
++
++		// #when: resolving multiple skills async
++		const result = await resolveMultipleSkillsAsync(skillNames)
++
++		// #then: empty results
++		expect(result.resolved.size).toBe(0)
++		expect(result.notFound).toEqual([])
++	})
++})
+diff --git a/src/features/opencode-skill-loader/skill-content.ts b/src/features/opencode-skill-loader/skill-content.ts
+index 6929ec32..98cf65cf 100644
+--- a/src/features/opencode-skill-loader/skill-content.ts
++++ b/src/features/opencode-skill-loader/skill-content.ts
+@@ -1,10 +1,64 @@
+ import { createBuiltinSkills } from "../builtin-skills/skills"
++import { discoverSkills } from "./loader"
++import type { LoadedSkill } from "./types"
++import { parseFrontmatter } from "../../shared/frontmatter"
++import { readFileSync } from "node:fs"
+ import type { GitMasterConfig } from "../../config/schema"
+ 
+ export interface SkillResolutionOptions {
+ 	gitMasterConfig?: GitMasterConfig
+ }
+ 
++let cachedSkills: LoadedSkill[] | null = null
++
++function clearSkillCache(): void {
++	cachedSkills = null
++}
++
++async function getAllSkills(): Promise<LoadedSkill[]> {
++	if (cachedSkills) return cachedSkills
++
++	const [discoveredSkills, builtinSkillDefs] = await Promise.all([
++		discoverSkills({ includeClaudeCodePaths: true }),
++		Promise.resolve(createBuiltinSkills()),
++	])
++
++	const builtinSkillsAsLoaded: LoadedSkill[] = builtinSkillDefs.map((skill) => ({
++		name: skill.name,
++		definition: {
++			name: skill.name,
++			description: skill.description,
++			template: skill.template,
++			model: skill.model,
++			agent: skill.agent,
++			subtask: skill.subtask,
++		},
++		scope: "builtin" as const,
++		license: skill.license,
++		compatibility: skill.compatibility,
++		metadata: skill.metadata as Record<string, string> | undefined,
++		allowedTools: skill.allowedTools,
++		mcpConfig: skill.mcpConfig,
++	}))
++
++	const discoveredNames = new Set(discoveredSkills.map((s) => s.name))
++	const uniqueBuiltins = builtinSkillsAsLoaded.filter((s) => !discoveredNames.has(s.name))
++
++	cachedSkills = [...discoveredSkills, ...uniqueBuiltins]
++	return cachedSkills
++}
++
++async function extractSkillTemplate(skill: LoadedSkill): Promise<string> {
++	if (skill.path) {
++		const content = readFileSync(skill.path, "utf-8")
++		const { body } = parseFrontmatter(content)
++		return body.trim()
++	}
++	return skill.definition.template || ""
++}
++
++export { clearSkillCache, getAllSkills, extractSkillTemplate }
++
+ function injectGitMasterConfig(template: string, config?: GitMasterConfig): string {
+ 	if (!config) return template
+ 
+@@ -60,3 +114,53 @@ export function resolveMultipleSkills(skillNames: string[], options?: SkillResol
+ 
+ 	return { resolved, notFound }
+ }
++
++export async function resolveSkillContentAsync(
++	skillName: string,
++	options?: SkillResolutionOptions
++): Promise<string | null> {
++	const allSkills = await getAllSkills()
++	const skill = allSkills.find((s) => s.name === skillName)
++	if (!skill) return null
++
++	const template = await extractSkillTemplate(skill)
++
++	if (skillName === "git-master" && options?.gitMasterConfig) {
++		return injectGitMasterConfig(template, options.gitMasterConfig)
++	}
++
++	return template
++}
++
++export async function resolveMultipleSkillsAsync(
++	skillNames: string[],
++	options?: SkillResolutionOptions
++): Promise<{
++	resolved: Map<string, string>
++	notFound: string[]
++}> {
++	const allSkills = await getAllSkills()
++	const skillMap = new Map<string, LoadedSkill>()
++	for (const skill of allSkills) {
++		skillMap.set(skill.name, skill)
++	}
++
++	const resolved = new Map<string, string>()
++	const notFound: string[] = []
++
++	for (const name of skillNames) {
++		const skill = skillMap.get(name)
++		if (skill) {
++			const template = await extractSkillTemplate(skill)
++			if (name === "git-master" && options?.gitMasterConfig) {
++				resolved.set(name, injectGitMasterConfig(template, options.gitMasterConfig))
++			} else {
++				resolved.set(name, template)
++			}
++		} else {
++			notFound.push(name)
++		}
++	}
++
++	return { resolved, notFound }
++}
+diff --git a/src/tools/sisyphus-task/tools.ts b/src/tools/sisyphus-task/tools.ts
+index 010791af..b499dd89 100644
+--- a/src/tools/sisyphus-task/tools.ts
++++ b/src/tools/sisyphus-task/tools.ts
+@@ -6,8 +6,8 @@ import type { SisyphusTaskArgs } from "./types"
+ import type { CategoryConfig, CategoriesConfig, GitMasterConfig } from "../../config/schema"
+ import { SISYPHUS_TASK_DESCRIPTION, DEFAULT_CATEGORIES, CATEGORY_PROMPT_APPENDS } from "./constants"
+ import { findNearestMessageWithFields, findFirstMessageWithAgent, MESSAGE_STORAGE } from "../../features/hook-message-injector"
+-import { resolveMultipleSkills } from "../../features/opencode-skill-loader/skill-content"
+-import { createBuiltinSkills } from "../../features/builtin-skills/skills"
++import { resolveMultipleSkillsAsync } from "../../features/opencode-skill-loader/skill-content"
++import { discoverSkills } from "../../features/opencode-skill-loader"
+ import { getTaskToastManager } from "../../features/task-toast-manager"
+ import type { ModelFallbackInfo } from "../../features/task-toast-manager/types"
+ import { subagentSessions, getSessionAgent } from "../../features/claude-code-session-state"
+@@ -196,9 +196,10 @@ export function createSisyphusTask(options: SisyphusTaskToolOptions): ToolDefini
+ 
+       let skillContent: string | undefined
+       if (args.skills.length > 0) {
+-        const { resolved, notFound } = resolveMultipleSkills(args.skills, { gitMasterConfig })
++        const { resolved, notFound } = await resolveMultipleSkillsAsync(args.skills, { gitMasterConfig })
+         if (notFound.length > 0) {
+-          const available = createBuiltinSkills().map(s => s.name).join(", ")
++          const allSkills = await discoverSkills({ includeClaudeCodePaths: true })
++          const available = allSkills.map(s => s.name).join(", ")
+           return `❌ Skills not found: ${notFound.join(", ")}. Available: ${available}`
+         }
+         skillContent = Array.from(resolved.values()).join("\n\n")
+diff --git a/src/tools/skill/tools.ts b/src/tools/skill/tools.ts
+index 24e0f548..9fdca067 100644
+--- a/src/tools/skill/tools.ts
++++ b/src/tools/skill/tools.ts
+@@ -1,10 +1,9 @@
+ import { dirname } from "node:path"
+-import { readFileSync } from "node:fs"
+ import { tool, type ToolDefinition } from "@opencode-ai/plugin"
+ import { TOOL_DESCRIPTION_NO_SKILLS, TOOL_DESCRIPTION_PREFIX } from "./constants"
+ import type { SkillArgs, SkillInfo, SkillLoadOptions } from "./types"
+-import { discoverSkills, type LoadedSkill } from "../../features/opencode-skill-loader"
+-import { parseFrontmatter } from "../../shared/frontmatter"
++import type { LoadedSkill } from "../../features/opencode-skill-loader"
++import { getAllSkills, extractSkillTemplate } from "../../features/opencode-skill-loader/skill-content"
+ import type { SkillMcpManager, SkillMcpClientInfo, SkillMcpServerContext } from "../../features/skill-mcp-manager"
+ import type { Tool, Resource, Prompt } from "@modelcontextprotocol/sdk/types.js"
+ 
+@@ -48,9 +47,7 @@ async function extractSkillBody(skill: LoadedSkill): Promise<string> {
+   }
+ 
+   if (skill.path) {
+-    const content = readFileSync(skill.path, "utf-8")
+-    const { body } = parseFrontmatter(content)
+-    return body.trim()
++    return extractSkillTemplate(skill)
+   }
+ 
+   const templateMatch = skill.definition.template?.match(/<skill-instruction>([\s\S]*?)<\/skill-instruction>/)
+@@ -135,7 +132,7 @@ export function createSkillTool(options: SkillLoadOptions = {}): ToolDefinition
+   const getSkills = async (): Promise<LoadedSkill[]> => {
+     if (options.skills) return options.skills
+     if (cachedSkills) return cachedSkills
+-    cachedSkills = await discoverSkills({ includeClaudeCodePaths: !options.opencodeOnly })
++    cachedSkills = await getAllSkills()
+     return cachedSkills
+   }
+ 
+-- 
+2.39.2
+

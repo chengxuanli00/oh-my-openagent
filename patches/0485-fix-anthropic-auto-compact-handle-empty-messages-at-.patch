@@ -1,0 +1,208 @@
+From 8406f3d6d78f8647869cacc72e3bb0ff50e7210d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 20 Dec 2025 14:47:42 +0900
+Subject: [PATCH 0485/5749] fix(anthropic-auto-compact): handle empty messages
+ at arbitrary indices
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add messageIndex field to ParsedTokenLimitError type for tracking message position
+- Extract message index from 'messages.N' format in error messages using regex
+- Update fixEmptyMessages to accept optional messageIndex parameter
+- Target specific empty message by index instead of fixing all empty messages
+- Apply replaceEmptyTextParts before injectTextPart for better coverage
+- Remove experimental flag requirement - non-empty content errors now auto-recover by default
+- Fixes issue where compaction could create empty messages at positions other than the last message
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/hooks/anthropic-auto-compact/executor.ts | 85 +++++++++++++++-----
+ src/hooks/anthropic-auto-compact/parser.ts   | 12 +++
+ src/hooks/anthropic-auto-compact/types.ts    |  1 +
+ 3 files changed, 76 insertions(+), 22 deletions(-)
+
+diff --git a/src/hooks/anthropic-auto-compact/executor.ts b/src/hooks/anthropic-auto-compact/executor.ts
+index d0cbeab5..c0ef482d 100644
+--- a/src/hooks/anthropic-auto-compact/executor.ts
++++ b/src/hooks/anthropic-auto-compact/executor.ts
+@@ -2,7 +2,12 @@ import type { AutoCompactState, FallbackState, RetryState, TruncateState } from
+ import type { ExperimentalConfig } from "../../config"
+ import { FALLBACK_CONFIG, RETRY_CONFIG, TRUNCATE_CONFIG } from "./types"
+ import { findLargestToolResult, truncateToolResult, truncateUntilTargetTokens } from "./storage"
+-import { findEmptyMessages, injectTextPart } from "../session-recovery/storage"
++import {
++  findEmptyMessages,
++  findEmptyMessageByIndex,
++  injectTextPart,
++  replaceEmptyTextParts,
++} from "../session-recovery/storage"
+ import { log } from "../../shared/logger"
+ 
+ type Client = {
+@@ -168,30 +173,61 @@ function getOrCreateEmptyContentAttempt(
+ async function fixEmptyMessages(
+   sessionID: string,
+   autoCompactState: AutoCompactState,
+-  client: Client
++  client: Client,
++  messageIndex?: number
+ ): Promise<boolean> {
+   const attempt = getOrCreateEmptyContentAttempt(autoCompactState, sessionID)
+   autoCompactState.emptyContentAttemptBySession.set(sessionID, attempt + 1)
+ 
+-  const emptyMessageIds = findEmptyMessages(sessionID)
+-  if (emptyMessageIds.length === 0) {
+-    await client.tui
+-      .showToast({
+-        body: {
+-          title: "Empty Content Error",
+-          message: "No empty messages found in storage. Cannot auto-recover.",
+-          variant: "error",
+-          duration: 5000,
+-        },
+-      })
+-      .catch(() => {})
+-    return false
++  let fixed = false
++  const fixedMessageIds: string[] = []
++
++  if (messageIndex !== undefined) {
++    const targetMessageId = findEmptyMessageByIndex(sessionID, messageIndex)
++    if (targetMessageId) {
++      const replaced = replaceEmptyTextParts(targetMessageId, "[user interrupted]")
++      if (replaced) {
++        fixed = true
++        fixedMessageIds.push(targetMessageId)
++      } else {
++        const injected = injectTextPart(sessionID, targetMessageId, "[user interrupted]")
++        if (injected) {
++          fixed = true
++          fixedMessageIds.push(targetMessageId)
++        }
++      }
++    }
+   }
+ 
+-  let fixed = false
+-  for (const messageID of emptyMessageIds) {
+-    const success = injectTextPart(sessionID, messageID, "[user interrupted]")
+-    if (success) fixed = true
++  if (!fixed) {
++    const emptyMessageIds = findEmptyMessages(sessionID)
++    if (emptyMessageIds.length === 0) {
++      await client.tui
++        .showToast({
++          body: {
++            title: "Empty Content Error",
++            message: "No empty messages found in storage. Cannot auto-recover.",
++            variant: "error",
++            duration: 5000,
++          },
++        })
++        .catch(() => {})
++      return false
++    }
++
++    for (const messageID of emptyMessageIds) {
++      const replaced = replaceEmptyTextParts(messageID, "[user interrupted]")
++      if (replaced) {
++        fixed = true
++        fixedMessageIds.push(messageID)
++      } else {
++        const injected = injectTextPart(sessionID, messageID, "[user interrupted]")
++        if (injected) {
++          fixed = true
++          fixedMessageIds.push(messageID)
++        }
++      }
++    }
+   }
+ 
+   if (fixed) {
+@@ -199,7 +235,7 @@ async function fixEmptyMessages(
+       .showToast({
+         body: {
+           title: "Session Recovery",
+-          message: `Fixed ${emptyMessageIds.length} empty messages. Retrying...`,
++          message: `Fixed ${fixedMessageIds.length} empty message(s). Retrying...`,
+           variant: "warning",
+           duration: 3000,
+         },
+@@ -361,10 +397,15 @@ export async function executeCompact(
+ 
+   const retryState = getOrCreateRetryState(autoCompactState, sessionID)
+ 
+-  if (experimental?.empty_message_recovery && errorData?.errorType?.includes("non-empty content")) {
++  if (errorData?.errorType?.includes("non-empty content")) {
+     const attempt = getOrCreateEmptyContentAttempt(autoCompactState, sessionID)
+     if (attempt < 3) {
+-      const fixed = await fixEmptyMessages(sessionID, autoCompactState, client as Client)
++      const fixed = await fixEmptyMessages(
++        sessionID,
++        autoCompactState,
++        client as Client,
++        errorData.messageIndex
++      )
+       if (fixed) {
+         autoCompactState.compactionInProgress.delete(sessionID)
+         setTimeout(() => {
+diff --git a/src/hooks/anthropic-auto-compact/parser.ts b/src/hooks/anthropic-auto-compact/parser.ts
+index 66664802..8d1170f2 100644
+--- a/src/hooks/anthropic-auto-compact/parser.ts
++++ b/src/hooks/anthropic-auto-compact/parser.ts
+@@ -28,6 +28,8 @@ const TOKEN_LIMIT_KEYWORDS = [
+   "non-empty content",
+ ]
+ 
++const MESSAGE_INDEX_PATTERN = /messages\.(\d+)/
++
+ function extractTokensFromMessage(message: string): { current: number; max: number } | null {
+   for (const pattern of TOKEN_LIMIT_PATTERNS) {
+     const match = message.match(pattern)
+@@ -40,6 +42,14 @@ function extractTokensFromMessage(message: string): { current: number; max: numb
+   return null
+ }
+ 
++function extractMessageIndex(text: string): number | undefined {
++  const match = text.match(MESSAGE_INDEX_PATTERN)
++  if (match) {
++    return parseInt(match[1], 10)
++  }
++  return undefined
++}
++
+ function isTokenLimitError(text: string): boolean {
+   const lower = text.toLowerCase()
+   return TOKEN_LIMIT_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()))
+@@ -52,6 +62,7 @@ export function parseAnthropicTokenLimitError(err: unknown): ParsedTokenLimitErr
+         currentTokens: 0,
+         maxTokens: 0,
+         errorType: "non-empty content",
++        messageIndex: extractMessageIndex(err),
+       }
+     }
+     if (isTokenLimitError(err)) {
+@@ -155,6 +166,7 @@ export function parseAnthropicTokenLimitError(err: unknown): ParsedTokenLimitErr
+       currentTokens: 0,
+       maxTokens: 0,
+       errorType: "non-empty content",
++      messageIndex: extractMessageIndex(combinedText),
+     }
+   }
+ 
+diff --git a/src/hooks/anthropic-auto-compact/types.ts b/src/hooks/anthropic-auto-compact/types.ts
+index 6fdb9d19..c97af58d 100644
+--- a/src/hooks/anthropic-auto-compact/types.ts
++++ b/src/hooks/anthropic-auto-compact/types.ts
+@@ -5,6 +5,7 @@ export interface ParsedTokenLimitError {
+   errorType: string
+   providerID?: string
+   modelID?: string
++  messageIndex?: number
+ }
+ 
+ export interface RetryState {
+-- 
+2.39.2
+

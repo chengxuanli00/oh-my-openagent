@@ -1,0 +1,628 @@
+From aa528e42c00f0abaa34337b44d2b5ee892f4b41b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 7 Apr 2026 15:10:38 +0900
+Subject: [PATCH 3998/5749] fix: propagate variant field in all promptAsync
+ continuation paths (#3081)
+
+All 5 continuation paths now send variant as top-level body field:
+- boulder-continuation-injector.ts
+- ralph-loop/continuation-prompt-injector.ts
+- todo-continuation-enforcer/continuation-injection.ts
+- unstable-agent-babysitter-hook.ts
+- session-recovery/resume.ts
+
+Plus type/helper updates in atlas, todo-continuation-enforcer,
+unstable-agent-babysitter, and session-recovery.
+
+TDD: 18 regression tests added, all pass. tsc clean.
+---
+ .../boulder-continuation-injector.test.ts     | 60 +++++++++++++++++++
+ .../atlas/boulder-continuation-injector.ts    | 18 ++++--
+ src/hooks/atlas/recent-model-resolver.ts      | 18 +++++-
+ src/hooks/atlas/types.ts                      |  2 +-
+ .../continuation-prompt-injector.test.ts      | 52 ++++++++++++++++
+ .../continuation-prompt-injector.ts           | 13 +++-
+ src/hooks/session-recovery/resume.test.ts     | 32 +++++++++-
+ src/hooks/session-recovery/resume.ts          |  8 ++-
+ src/hooks/session-recovery/types.ts           |  2 +
+ .../continuation-injection.test.ts            | 53 ++++++++++++++++
+ .../continuation-injection.ts                 |  8 ++-
+ src/hooks/todo-continuation-enforcer/types.ts |  4 +-
+ .../unstable-agent-babysitter/index.test.ts   | 41 +++++++++++++
+ .../task-message-analyzer.ts                  |  8 ++-
+ .../unstable-agent-babysitter-hook.ts         | 14 ++++-
+ 15 files changed, 310 insertions(+), 23 deletions(-)
+ create mode 100644 src/hooks/ralph-loop/continuation-prompt-injector.test.ts
+
+diff --git a/src/hooks/atlas/boulder-continuation-injector.test.ts b/src/hooks/atlas/boulder-continuation-injector.test.ts
+index a0686126..c72fdb78 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.test.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.test.ts
+@@ -121,4 +121,64 @@ describe("injectBoulderContinuation", () => {
+     expect(result).toBe("skipped_agent_unavailable")
+     expect(promptAsyncMock).not.toHaveBeenCalled()
+   })
++
++  test("#given recent prompt context includes variant #when injecting boulder continuation #then promptAsync receives variant as a top-level field", async () => {
++    // given
++    registerAgentName("atlas")
++    const capturedRequests: Array<{
++      body?: {
++        model?: { providerID: string; modelID: string }
++        variant?: string
++      }
++    }> = []
++    const promptAsyncMock = mock(async (request: unknown) => {
++      capturedRequests.push(request as typeof capturedRequests[number])
++      return undefined
++    })
++    const recentModel = {
++      providerID: "anthropic",
++      modelID: "claude-sonnet-4-20250514",
++      variant: "max",
++    }
++    const messagesMock = mock(async () => ({
++      data: [{
++        id: "msg_1",
++        info: {
++          agent: "atlas",
++          model: recentModel,
++          time: { created: Date.now() },
++        },
++      }],
++    }))
++
++    const ctx = {
++      directory: "/tmp",
++      client: {
++        session: {
++          messages: messagesMock,
++          promptAsync: promptAsyncMock,
++        },
++      },
++    } as unknown as PluginInput
++
++    // when
++    const result = await injectBoulderContinuation({
++      ctx,
++      sessionID: "ses_test_variant",
++      planName: "test-plan",
++      remaining: 1,
++      total: 2,
++      agent: "atlas",
++      sessionState: { promptFailureCount: 0 },
++    })
++
++    // then
++    expect(result).toBe("injected")
++    expect(capturedRequests).toHaveLength(1)
++    expect(capturedRequests[0]?.body?.model).toEqual({
++      providerID: "anthropic",
++      modelID: "claude-sonnet-4-20250514",
++    })
++    expect(capturedRequests[0]?.body?.variant).toBe("max")
++  })
+ })
+diff --git a/src/hooks/atlas/boulder-continuation-injector.ts b/src/hooks/atlas/boulder-continuation-injector.ts
+index ecb5c566..ad3a3cf2 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.ts
+@@ -71,12 +71,18 @@ export async function injectBoulderContinuation(input: {
+     const promptContext = await resolveRecentPromptContextForSession(ctx, sessionID)
+     const inheritedTools = resolveInheritedPromptTools(sessionID, promptContext.tools)
+ 
+-		await ctx.client.session.promptAsync({
+-			path: { id: sessionID },
+-			body: {
+-				agent: continuationAgent,
+-				...(promptContext.model !== undefined ? { model: promptContext.model } : {}),
+-				...(inheritedTools ? { tools: inheritedTools } : {}),
++    const launchModel = promptContext.model
++      ? { providerID: promptContext.model.providerID, modelID: promptContext.model.modelID }
++      : undefined
++    const launchVariant = promptContext.model?.variant
++
++    await ctx.client.session.promptAsync({
++      path: { id: sessionID },
++      body: {
++        agent: continuationAgent,
++        ...(launchModel ? { model: launchModel } : {}),
++        ...(launchVariant ? { variant: launchVariant } : {}),
++        ...(inheritedTools ? { tools: inheritedTools } : {}),
+         parts: [createInternalAgentTextPart(prompt)],
+       },
+       query: { directory: ctx.directory },
+diff --git a/src/hooks/atlas/recent-model-resolver.ts b/src/hooks/atlas/recent-model-resolver.ts
+index d7d8b9d9..e3acf169 100644
+--- a/src/hooks/atlas/recent-model-resolver.ts
++++ b/src/hooks/atlas/recent-model-resolver.ts
+@@ -40,7 +40,14 @@ export async function resolveRecentPromptContextForSession(
+       const model = info?.model
+       const tools = normalizePromptTools(info?.tools)
+       if (model?.providerID && model?.modelID) {
+-        return { model: { providerID: model.providerID, modelID: model.modelID }, tools }
++        return {
++          model: {
++            providerID: model.providerID,
++            modelID: model.modelID,
++            ...(model.variant ? { variant: model.variant } : {}),
++          },
++          tools,
++        }
+       }
+ 
+       if (info?.providerID && info?.modelID) {
+@@ -63,7 +70,14 @@ export async function resolveRecentPromptContextForSession(
+   if (!model?.providerID || !model?.modelID) {
+     return { tools }
+   }
+-  return { model: { providerID: model.providerID, modelID: model.modelID }, tools }
++  return {
++    model: {
++      providerID: model.providerID,
++      modelID: model.modelID,
++      ...(model.variant ? { variant: model.variant } : {}),
++    },
++    tools,
++  }
+ }
+ 
+ export async function resolveRecentModelForSession(
+diff --git a/src/hooks/atlas/types.ts b/src/hooks/atlas/types.ts
+index 68401a5b..534478da 100644
+--- a/src/hooks/atlas/types.ts
++++ b/src/hooks/atlas/types.ts
+@@ -2,7 +2,7 @@ import type { AgentOverrides } from "../../config"
+ import type { BackgroundManager } from "../../features/background-agent"
+ import type { TopLevelTaskRef } from "../../features/boulder-state"
+ 
+-export type ModelInfo = { providerID: string; modelID: string }
++export type ModelInfo = { providerID: string; modelID: string; variant?: string }
+ 
+ export interface AtlasHookOptions {
+   directory: string
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.test.ts b/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
+new file mode 100644
+index 00000000..95cd0729
+--- /dev/null
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.test.ts
+@@ -0,0 +1,52 @@
++import { describe, expect, test } from "bun:test"
++import { injectContinuationPrompt } from "./continuation-prompt-injector"
++
++describe("ralph-loop continuation prompt injector", () => {
++  test("#given inherited message model includes variant #when injecting continuation prompt #then promptAsync receives variant as a top-level field", async () => {
++    // given
++    let promptBody:
++      | {
++          model?: { providerID: string; modelID: string }
++          variant?: string
++        }
++      | undefined
++    const model = {
++      providerID: "openai",
++      modelID: "gpt-5.3-codex",
++      variant: "max",
++    }
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({
++            data: [{ info: { agent: "sisyphus", model } }],
++          }),
++          promptAsync: async (input: {
++            body: {
++              model?: { providerID: string; modelID: string }
++              variant?: string
++            }
++          }) => {
++            promptBody = input.body
++            return {}
++          },
++        },
++      },
++    }
++
++    // when
++    await injectContinuationPrompt(ctx as never, {
++      sessionID: "ses_ralph_variant",
++      prompt: "continue",
++      directory: "/tmp/test",
++      apiTimeoutMs: 50,
++    })
++
++    // then
++    expect(promptBody?.model).toEqual({
++      providerID: "openai",
++      modelID: "gpt-5.3-codex",
++    })
++    expect(promptBody?.variant).toBe("max")
++  })
++})
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.ts b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+index 58f31953..94df8deb 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-injector.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+@@ -11,7 +11,7 @@ import {
+ 
+ type MessageInfo = {
+ 	agent?: string
+-	model?: { providerID: string; modelID: string }
++	model?: { providerID: string; modelID: string; variant?: string }
+ 	modelID?: string
+ 	providerID?: string
+ 	tools?: Record<string, boolean | "allow" | "deny" | "ask">
+@@ -28,7 +28,7 @@ export async function injectContinuationPrompt(
+ 	},
+ ): Promise<void> {
+ 	let agent: string | undefined
+-	let model: { providerID: string; modelID: string } | undefined
++	let model: { providerID: string; modelID: string; variant?: string } | undefined
+ 	let tools: Record<string, boolean | "allow" | "deny" | "ask"> | undefined
+ 	const sourceSessionID = options.inheritFromSessionID ?? options.sessionID
+ 
+@@ -62,6 +62,7 @@ export async function injectContinuationPrompt(
+ 				? {
+ 					providerID: currentMessage.model.providerID,
+ 					modelID: currentMessage.model.modelID,
++					...(currentMessage.model.variant ? { variant: currentMessage.model.variant } : {}),
+ 				}
+ 				: undefined
+ 		tools = currentMessage?.tools
+@@ -69,11 +70,17 @@ export async function injectContinuationPrompt(
+ 
+ 	const inheritedTools = resolveInheritedPromptTools(sourceSessionID, tools)
+ 
++	const launchModel = model
++		? { providerID: model.providerID, modelID: model.modelID }
++		: undefined
++	const launchVariant = model?.variant
++
+ 	await ctx.client.session.promptAsync({
+ 		path: { id: options.sessionID },
+ 		body: {
+ 			...(agent !== undefined ? { agent } : {}),
+-			...(model !== undefined ? { model } : {}),
++			...(launchModel ? { model: launchModel } : {}),
++			...(launchVariant ? { variant: launchVariant } : {}),
+ 			...(inheritedTools ? { tools: inheritedTools } : {}),
+ 			parts: [createInternalAgentTextPart(options.prompt)],
+ 		},
+diff --git a/src/hooks/session-recovery/resume.test.ts b/src/hooks/session-recovery/resume.test.ts
+index fff66998..1c2c40c0 100644
+--- a/src/hooks/session-recovery/resume.test.ts
++++ b/src/hooks/session-recovery/resume.test.ts
+@@ -22,9 +22,35 @@ describe("session-recovery resume", () => {
+     expect(config.tools).toEqual({ question: false, bash: true })
+   })
+ 
+-  test("resumeSession sends inherited tools with continuation prompt", async () => {
++  test("#given the last user message includes model variant #when extracting resume config #then the variant is preserved", () => {
++    // given
++    const model = {
++      providerID: "openai",
++      modelID: "gpt-5.3-codex",
++      variant: "max",
++    }
++    const userMessage: MessageData = {
++      info: {
++        agent: "Hephaestus",
++        model,
++      },
++    }
++
++    // when
++    const config = extractResumeConfig(userMessage, "ses_resume_variant")
++
++    // then
++    expect(config.model).toEqual(model)
++  })
++
++  test("resumeSession sends inherited tools and variant with continuation prompt", async () => {
+     // given
+     let promptBody: Record<string, unknown> | undefined
++    const model = {
++      providerID: "openai",
++      modelID: "gpt-5.3-codex",
++      variant: "max",
++    }
+     const client = {
+       session: {
+         promptAsync: async (input: { body: Record<string, unknown> }) => {
+@@ -38,12 +64,14 @@ describe("session-recovery resume", () => {
+     const ok = await resumeSession(client as never, {
+       sessionID: "ses_resume_prompt",
+       agent: "Hephaestus",
+-      model: { providerID: "openai", modelID: "gpt-5.3-codex" },
++      model,
+       tools: { question: false, bash: true },
+     })
+ 
+     // then
+     expect(ok).toBe(true)
++    expect(promptBody?.model).toEqual({ providerID: "openai", modelID: "gpt-5.3-codex" })
++    expect(promptBody?.variant).toBe("max")
+     expect(promptBody?.tools).toEqual({ question: false, bash: true })
+     expect(Array.isArray(promptBody?.parts)).toBe(true)
+     const firstPart = (promptBody?.parts as Array<{ text?: string }>)?.[0]
+diff --git a/src/hooks/session-recovery/resume.ts b/src/hooks/session-recovery/resume.ts
+index e5d187d7..6c42b631 100644
+--- a/src/hooks/session-recovery/resume.ts
++++ b/src/hooks/session-recovery/resume.ts
+@@ -27,12 +27,18 @@ export function extractResumeConfig(userMessage: MessageData | undefined, sessio
+ export async function resumeSession(client: Client, config: ResumeConfig): Promise<boolean> {
+   try {
+     const inheritedTools = resolveInheritedPromptTools(config.sessionID, config.tools)
++    const launchModel = config.model
++      ? { providerID: config.model.providerID, modelID: config.model.modelID }
++      : undefined
++    const launchVariant = config.model?.variant
++
+     await client.session.promptAsync({
+       path: { id: config.sessionID },
+       body: {
+         parts: [createInternalAgentTextPart(RECOVERY_RESUME_TEXT)],
+         agent: config.agent,
+-        model: config.model,
++        ...(launchModel ? { model: launchModel } : {}),
++        ...(launchVariant ? { variant: launchVariant } : {}),
+         ...(inheritedTools ? { tools: inheritedTools } : {}),
+       },
+     })
+diff --git a/src/hooks/session-recovery/types.ts b/src/hooks/session-recovery/types.ts
+index 74730f54..3485d62b 100644
+--- a/src/hooks/session-recovery/types.ts
++++ b/src/hooks/session-recovery/types.ts
+@@ -73,6 +73,7 @@ export interface MessageData {
+     model?: {
+       providerID: string
+       modelID: string
++      variant?: string
+     }
+     system?: string
+     tools?: Record<string, boolean>
+@@ -94,6 +95,7 @@ export interface ResumeConfig {
+   model?: {
+     providerID: string
+     modelID: string
++    variant?: string
+   }
+   tools?: Record<string, boolean>
+ }
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
+index 8feac986..ab3d1e5c 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.test.ts
+@@ -119,4 +119,57 @@ describe("injectContinuation", () => {
+     // then
+     expect(injected).toBe(false)
+   })
++
++  test("#given resolved model info includes variant #when reinjecting continuation #then promptAsync receives variant as a top-level field", async () => {
++    // given
++    let capturedBody:
++      | {
++          model?: { providerID: string; modelID: string }
++          variant?: string
++        }
++      | undefined
++    const ctx = {
++      directory: "/tmp/test",
++      client: {
++        session: {
++          todo: async () => ({ data: [{ id: "1", content: "todo", status: "pending", priority: "high" }] }),
++          promptAsync: async (input: {
++            body: {
++              model?: { providerID: string; modelID: string }
++              variant?: string
++            }
++          }) => {
++            capturedBody = input.body
++            return {}
++          },
++        },
++      },
++    }
++    const sessionStateStore = {
++      getExistingState: () => ({ inFlight: false, lastInjectedAt: 0, consecutiveFailures: 0 }),
++    }
++    const model = {
++      providerID: "openai",
++      modelID: "gpt-5.3-codex",
++      variant: "max",
++    }
++
++    // when
++    await injectContinuation({
++      ctx: ctx as never,
++      sessionID: "ses_continuation_variant",
++      resolvedInfo: {
++        agent: "Hephaestus",
++        model,
++      },
++      sessionStateStore: sessionStateStore as never,
++    })
++
++    // then
++    expect(capturedBody?.model).toEqual({
++      providerID: "openai",
++      modelID: "gpt-5.3-codex",
++    })
++    expect(capturedBody?.variant).toBe("max")
++  })
+ })
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index a65146ff..aa52fcc5 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -174,11 +174,17 @@ ${todoList}`
+ 
+     const inheritedTools = resolveInheritedPromptTools(sessionID, tools)
+ 
++    const launchModel = model
++      ? { providerID: model.providerID, modelID: model.modelID }
++      : undefined
++    const launchVariant = model?.variant
++
+     await ctx.client.session.promptAsync({
+       path: { id: sessionID },
+       body: {
+         agent: promptAgent,
+-        ...(model !== undefined ? { model } : {}),
++        ...(launchModel ? { model: launchModel } : {}),
++        ...(launchVariant ? { variant: launchVariant } : {}),
+         ...(inheritedTools ? { tools: inheritedTools } : {}),
+         parts: [createInternalAgentTextPart(prompt)],
+       },
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index c773928c..aea9598f 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -45,7 +45,7 @@ export interface MessageInfo {
+   role?: string
+   error?: { name?: string; data?: unknown }
+   agent?: string
+-  model?: { providerID: string; modelID: string }
++  model?: { providerID: string; modelID: string; variant?: string }
+   providerID?: string
+   modelID?: string
+   tools?: Record<string, ToolPermission>
+@@ -57,7 +57,7 @@ export interface MessageWithInfo {
+ 
+ export interface ResolvedMessageInfo {
+   agent?: string
+-  model?: { providerID: string; modelID: string }
++  model?: { providerID: string; modelID: string; variant?: string }
+   tools?: Record<string, ToolPermission>
+ }
+ 
+diff --git a/src/hooks/unstable-agent-babysitter/index.test.ts b/src/hooks/unstable-agent-babysitter/index.test.ts
+index 38cd2a87..ac62a434 100644
+--- a/src/hooks/unstable-agent-babysitter/index.test.ts
++++ b/src/hooks/unstable-agent-babysitter/index.test.ts
+@@ -214,4 +214,45 @@ describe("unstable-agent-babysitter hook", () => {
+     expect(promptCalls.length).toBe(1)
+     Date.now = originalNow
+   })
++
++  test("#given the main session model includes variant #when injecting a babysitter reminder #then promptAsync receives variant as a top-level field", async () => {
++    // given
++    setMainSession("main-1")
++    const promptCalls: Array<{ input: unknown }> = []
++    const mainModel = {
++      providerID: "openai",
++      modelID: "gpt-4",
++      variant: "max",
++    }
++    const ctx = createMockPluginInput({
++      messagesBySession: {
++        "main-1": [
++          { info: { agent: "sisyphus", model: mainModel } },
++        ],
++        "bg-1": [
++          { info: { role: "assistant" }, parts: [{ type: "thinking", thinking: "deep thought" }] },
++        ],
++      },
++      promptCalls,
++    })
++    const backgroundManager = createBackgroundManager([createTask()])
++    const hook = createUnstableAgentBabysitterHook(ctx, {
++      backgroundManager,
++      config: { timeout_ms: 120000 },
++    })
++
++    // when
++    await hook.event({ event: { type: "session.idle", properties: { sessionID: "main-1" } } })
++
++    // then
++    expect(promptCalls.length).toBe(1)
++    const payload = promptCalls[0].input as {
++      body?: {
++        model?: { providerID: string; modelID: string }
++        variant?: string
++      }
++    }
++    expect(payload.body?.model).toEqual({ providerID: "openai", modelID: "gpt-4" })
++    expect(payload.body?.variant).toBe("max")
++  })
+ })
+diff --git a/src/hooks/unstable-agent-babysitter/task-message-analyzer.ts b/src/hooks/unstable-agent-babysitter/task-message-analyzer.ts
+index 8414c4ac..1214d2ca 100644
+--- a/src/hooks/unstable-agent-babysitter/task-message-analyzer.ts
++++ b/src/hooks/unstable-agent-babysitter/task-message-analyzer.ts
+@@ -5,7 +5,7 @@ export const THINKING_SUMMARY_MAX_CHARS = 500 as const
+ type MessageInfo = {
+   role?: string
+   agent?: string
+-  model?: { providerID: string; modelID: string }
++  model?: { providerID: string; modelID: string; variant?: string }
+   providerID?: string
+   modelID?: string
+   tools?: Record<string, boolean | "allow" | "deny" | "ask">
+@@ -33,7 +33,11 @@ export function getMessageInfo(value: unknown): MessageInfo | undefined {
+     ? info.model
+     : undefined
+   const model = modelValue && typeof modelValue.providerID === "string" && typeof modelValue.modelID === "string"
+-    ? { providerID: modelValue.providerID, modelID: modelValue.modelID }
++    ? {
++        providerID: modelValue.providerID,
++        modelID: modelValue.modelID,
++        ...(typeof modelValue.variant === "string" ? { variant: modelValue.variant } : {}),
++      }
+     : undefined
+   return {
+     role: typeof info.role === "string" ? info.role : undefined,
+diff --git a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+index 01823639..5821a173 100644
+--- a/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
++++ b/src/hooks/unstable-agent-babysitter/unstable-agent-babysitter-hook.ts
+@@ -30,6 +30,7 @@ type BabysitterContext = {
+         body: {
+           parts: Array<{ type: "text"; text: string }>
+           agent?: string
++          variant?: string
+           model?: { providerID: string; modelID: string }
+           tools?: Record<string, boolean>
+         }
+@@ -40,6 +41,7 @@ type BabysitterContext = {
+         body: {
+           parts: Array<{ type: "text"; text: string }>
+           agent?: string
++          variant?: string
+           model?: { providerID: string; modelID: string }
+           tools?: Record<string, boolean>
+         }
+@@ -58,9 +60,9 @@ type BabysitterOptions = {
+ async function resolveMainSessionTarget(
+   ctx: BabysitterContext,
+   sessionID: string
+-): Promise<{ agent?: string; model?: { providerID: string; modelID: string }; tools?: Record<string, boolean> }> {
++): Promise<{ agent?: string; model?: { providerID: string; modelID: string; variant?: string }; tools?: Record<string, boolean> }> {
+   let agent = getSessionAgent(sessionID)
+-  let model: { providerID: string; modelID: string } | undefined
++  let model: { providerID: string; modelID: string; variant?: string } | undefined
+   let tools: Record<string, boolean> | undefined
+ 
+   try {
+@@ -206,11 +208,17 @@ export function createUnstableAgentBabysitterHook(ctx: BabysitterContext, option
+       const { agent, model, tools } = await resolveMainSessionTarget(ctx, mainSessionID)
+ 
+       try {
++        const launchModel = model
++          ? { providerID: model.providerID, modelID: model.modelID }
++          : undefined
++        const launchVariant = model?.variant
++
+         await ctx.client.session.promptAsync({
+           path: { id: mainSessionID },
+           body: {
+             ...(agent ? { agent } : {}),
+-            ...(model ? { model } : {}),
++            ...(launchModel ? { model: launchModel } : {}),
++            ...(launchVariant ? { variant: launchVariant } : {}),
+             ...(tools ? { tools } : {}),
+             parts: [createInternalAgentTextPart(reminder)],
+           },
+-- 
+2.39.2
+

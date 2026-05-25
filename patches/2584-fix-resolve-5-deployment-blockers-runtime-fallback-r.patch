@@ -1,0 +1,996 @@
+From 8623f58a3819f2bcce28aa51d768f82ae2f56596 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 21 Feb 2026 05:59:30 +0900
+Subject: [PATCH 2584/5749] fix: resolve 5 deployment blockers
+ (runtime-fallback race, hashline legacy, tmux spawn, db open)
+
+- runtime-fallback: guard session.error with sessionRetryInFlight to prevent
+  double-advance during active retry; expand session.stop abort to include
+  sessionAwaitingFallbackResult; remove premature pendingFallbackModel clearing
+  from auto-retry finally block
+- hashline-edit: add HASHLINE_LEGACY_REF_PATTERN for backward-compatible
+  LINE:HEX dual-parse in parseLineRef and normalizeLineRef
+- tmux-subagent: defer session on null queryWindowState; unconditionally
+  re-queue deferred session on spawn failure (not just close+spawn)
+- ultrawork-db: wrap new Database(dbPath) in try/catch to handle corrupted DB
+- event: add try/catch guards around model-fallback logic in message.updated,
+  session.status, and session.error handlers
+---
+ src/features/tmux-subagent/manager.test.ts    | 132 ++++++++-
+ src/features/tmux-subagent/manager.ts         |  17 +-
+ src/hooks/runtime-fallback/auto-retry.ts      |   4 -
+ src/hooks/runtime-fallback/event-handler.ts   |  11 +-
+ src/hooks/runtime-fallback/index.test.ts      | 211 ++++++++++++++-
+ src/plugin/event.ts                           | 254 +++++++++---------
+ .../ultrawork-db-model-override.test.ts       |  22 ++
+ src/plugin/ultrawork-db-model-override.ts     |  12 +-
+ src/tools/hashline-edit/constants.ts          |   1 +
+ src/tools/hashline-edit/validation.test.ts    |  43 +++
+ src/tools/hashline-edit/validation.ts         |  28 +-
+ 11 files changed, 584 insertions(+), 151 deletions(-)
+
+diff --git a/src/features/tmux-subagent/manager.test.ts b/src/features/tmux-subagent/manager.test.ts
+index 67e1a5e8..97687198 100644
+--- a/src/features/tmux-subagent/manager.test.ts
++++ b/src/features/tmux-subagent/manager.test.ts
+@@ -1,8 +1,9 @@
+-import { describe, test, expect, mock, beforeEach } from 'bun:test'
++import { describe, test, expect, mock, beforeEach, spyOn } from 'bun:test'
+ import type { TmuxConfig } from '../../config/schema'
+ import type { WindowState, PaneAction } from './types'
+ import type { ActionResult, ExecuteContext } from './action-executor'
+ import type { TmuxUtilDeps } from './manager'
++import * as sharedModule from '../../shared'
+ 
+ type ExecuteActionsResult = {
+   success: boolean
+@@ -656,6 +657,135 @@ describe('TmuxSessionManager', () => {
+       expect((manager as any).deferredQueue).toEqual([])
+       expect(mockExecuteAction).toHaveBeenCalledTimes(0)
+     })
++
++    describe('spawn failure recovery', () => {
++      test('#given queryWindowState returns null #when onSessionCreated fires #then session is enqueued in deferred queue', async () => {
++        // given
++        mockIsInsideTmux.mockReturnValue(true)
++        mockQueryWindowState.mockImplementation(async () => null)
++        const logSpy = spyOn(sharedModule, 'log').mockImplementation(() => {})
++
++        const { TmuxSessionManager } = await import('./manager')
++        const ctx = createMockContext()
++        const config: TmuxConfig = {
++          enabled: true,
++          layout: 'main-vertical',
++          main_pane_size: 60,
++          main_pane_min_width: 80,
++          agent_pane_min_width: 40,
++        }
++        const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++        // when
++        await manager.onSessionCreated(
++          createSessionCreatedEvent('ses_null_state', 'ses_parent', 'Null State Task')
++        )
++
++        // then
++        expect(
++          logSpy.mock.calls.some(([message]) =>
++            String(message).includes('failed to query window state, deferring session')
++          )
++        ).toBe(true)
++        expect((manager as any).deferredQueue).toEqual(['ses_null_state'])
++
++        logSpy.mockRestore()
++      })
++
++      test('#given spawn fails without close action #when onSessionCreated fires #then session is enqueued in deferred queue', async () => {
++        // given
++        mockIsInsideTmux.mockReturnValue(true)
++        mockQueryWindowState.mockImplementation(async () => createWindowState())
++        mockExecuteActions.mockImplementation(async (actions) => ({
++          success: false,
++          spawnedPaneId: undefined,
++          results: actions.map((action) => ({
++            action,
++            result: { success: false, error: 'spawn failed' },
++          })),
++        }))
++        const logSpy = spyOn(sharedModule, 'log').mockImplementation(() => {})
++
++        const { TmuxSessionManager } = await import('./manager')
++        const ctx = createMockContext()
++        const config: TmuxConfig = {
++          enabled: true,
++          layout: 'main-vertical',
++          main_pane_size: 60,
++          main_pane_min_width: 80,
++          agent_pane_min_width: 40,
++        }
++        const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++        // when
++        await manager.onSessionCreated(
++          createSessionCreatedEvent('ses_fail_no_close', 'ses_parent', 'Spawn Fail No Close')
++        )
++
++        // then
++        expect(
++          logSpy.mock.calls.some(([message]) =>
++            String(message).includes('re-queueing deferred session after spawn failure')
++          )
++        ).toBe(true)
++        expect((manager as any).deferredQueue).toEqual(['ses_fail_no_close'])
++
++        logSpy.mockRestore()
++      })
++
++      test('#given spawn fails with close action that succeeded #when onSessionCreated fires #then session is still enqueued in deferred queue', async () => {
++        // given
++        mockIsInsideTmux.mockReturnValue(true)
++        mockQueryWindowState.mockImplementation(async () => createWindowState())
++        mockExecuteActions.mockImplementation(async () => ({
++          success: false,
++          spawnedPaneId: undefined,
++          results: [
++            {
++              action: { type: 'close', paneId: '%1', sessionId: 'ses_old' },
++              result: { success: true },
++            },
++            {
++              action: {
++                type: 'spawn',
++                sessionId: 'ses_fail_with_close',
++                description: 'Spawn Fail With Close',
++                targetPaneId: '%0',
++                splitDirection: '-h',
++              },
++              result: { success: false, error: 'spawn failed after close' },
++            },
++          ],
++        }))
++        const logSpy = spyOn(sharedModule, 'log').mockImplementation(() => {})
++
++        const { TmuxSessionManager } = await import('./manager')
++        const ctx = createMockContext()
++        const config: TmuxConfig = {
++          enabled: true,
++          layout: 'main-vertical',
++          main_pane_size: 60,
++          main_pane_min_width: 80,
++          agent_pane_min_width: 40,
++        }
++        const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++
++        // when
++        await manager.onSessionCreated(
++          createSessionCreatedEvent('ses_fail_with_close', 'ses_parent', 'Spawn Fail With Close')
++        )
++
++        // then
++        expect(
++          logSpy.mock.calls.some(([message]) =>
++            String(message).includes('re-queueing deferred session after spawn failure')
++          )
++        ).toBe(true)
++        expect((manager as any).deferredQueue).toEqual(['ses_fail_with_close'])
++
++        logSpy.mockRestore()
++      })
++    })
+   })
+ 
+   describe('onSessionDeleted', () => {
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index eef70b19..05199f4d 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -345,7 +345,8 @@ export class TmuxSessionManager {
+       try {
+         const state = await queryWindowState(sourcePaneId)
+         if (!state) {
+-          log("[tmux-session-manager] failed to query window state")
++          log("[tmux-session-manager] failed to query window state, deferring session")
++          this.enqueueDeferredSession(sessionId, title)
+           return
+         }
+ 
+@@ -407,10 +408,6 @@ export class TmuxSessionManager {
+           }
+         }
+ 
+-        const closeActionSucceeded = result.results.some(
+-          ({ action, result: actionResult }) => action.type === "close" && actionResult.success,
+-        )
+-
+         if (result.success && result.spawnedPaneId) {
+           const sessionReady = await this.waitForSessionReady(sessionId)
+ 
+@@ -445,12 +442,10 @@ export class TmuxSessionManager {
+             })),
+           })
+ 
+-          if (closeActionSucceeded) {
+-            log("[tmux-session-manager] re-queueing deferred session after close+spawn failure", {
+-              sessionId,
+-            })
+-            this.enqueueDeferredSession(sessionId, title)
+-          }
++          log("[tmux-session-manager] re-queueing deferred session after spawn failure", {
++            sessionId,
++          })
++          this.enqueueDeferredSession(sessionId, title)
+ 
+           if (result.spawnedPaneId) {
+             await executeAction(
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index bcb611ac..0ae86bb8 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -143,10 +143,6 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+     } catch (retryError) {
+       log(`[${HOOK_NAME}] Auto-retry failed (${source})`, { sessionID, error: String(retryError) })
+     } finally {
+-      const state = sessionStates.get(sessionID)
+-      if (state?.pendingFallbackModel === newModel) {
+-        state.pendingFallbackModel = undefined
+-      }
+       sessionRetryInFlight.delete(sessionID)
+     }
+   }
+diff --git a/src/hooks/runtime-fallback/event-handler.ts b/src/hooks/runtime-fallback/event-handler.ts
+index cfaf72e6..f73e6557 100644
+--- a/src/hooks/runtime-fallback/event-handler.ts
++++ b/src/hooks/runtime-fallback/event-handler.ts
+@@ -43,7 +43,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+ 
+     helpers.clearSessionFallbackTimeout(sessionID)
+ 
+-    if (sessionRetryInFlight.has(sessionID)) {
++    if (sessionRetryInFlight.has(sessionID) || sessionAwaitingFallbackResult.has(sessionID)) {
+       await helpers.abortSessionRequest(sessionID, "session.stop")
+     }
+ 
+@@ -92,6 +92,15 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+     }
+ 
+     const resolvedAgent = await helpers.resolveAgentForSessionFromContext(sessionID, agent)
++
++    if (sessionRetryInFlight.has(sessionID)) {
++      log(`[${HOOK_NAME}] session.error skipped — retry in flight`, {
++        sessionID,
++        retryInFlight: true,
++      })
++      return
++    }
++
+     sessionAwaitingFallbackResult.delete(sessionID)
+     helpers.clearSessionFallbackTimeout(sessionID)
+ 
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index 2e394db6..7660f195 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test"
+-import { createRuntimeFallbackHook, type RuntimeFallbackHook } from "./index"
++import { createRuntimeFallbackHook } from "./index"
+ import type { RuntimeFallbackConfig, OhMyOpenCodeConfig } from "../../config"
+ import * as sharedModule from "../../shared"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+@@ -2083,4 +2083,213 @@ describe("runtime-fallback", () => {
+       expect(maxLog).toBeDefined()
+     })
+   })
++
++  describe("race condition guards", () => {
++    test("session.error is skipped while retry request is in flight", async () => {
++      const never = new Promise<never>(() => {})
++
++      //#given
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }],
++            }),
++            promptAsync: async () => never,
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: {
++            categories: {
++              test: {
++                fallback_models: ["provider-a/model-a", "provider-b/model-b"],
++              },
++            },
++          },
++        }
++      )
++      const sessionID = "test-race-retry-in-flight"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "google/gemini-2.5-pro" } },
++        },
++      })
++
++      //#when - first error starts retry (promptAsync hangs, keeping retryInFlight set)
++      const firstErrorPromise = hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit" } },
++        },
++      })
++
++      await new Promise((resolve) => setTimeout(resolve, 0))
++
++      //#when - second error fires while first retry is in flight
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Second rate limit" } },
++        },
++      })
++
++      //#then
++      const skipLog = logCalls.find((call) => call.msg.includes("session.error skipped"))
++      expect(skipLog).toBeDefined()
++      expect(skipLog?.data).toMatchObject({ retryInFlight: true })
++
++      const fallbackLogs = logCalls.filter((call) => call.msg.includes("Preparing fallback"))
++      expect(fallbackLogs).toHaveLength(1)
++
++      void firstErrorPromise
++    })
++
++    test("consecutive session.errors advance chain normally when retry completes between them", async () => {
++      //#given
++      const hook = createRuntimeFallbackHook(createMockPluginInput(), {
++        config: createMockConfig({ notify_on_fallback: false }),
++        pluginConfig: {
++          categories: {
++            test: {
++              fallback_models: ["provider-a/model-a", "provider-b/model-b"],
++            },
++          },
++        },
++      })
++      const sessionID = "test-race-chain-advance"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "google/gemini-2.5-pro" } },
++        },
++      })
++
++      //#when - two errors fire sequentially (retry completes immediately between them)
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit" } },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit again" } },
++        },
++      })
++
++      //#then - both should advance the chain (no skip)
++      const fallbackLogs = logCalls.filter((call) => call.msg.includes("Preparing fallback"))
++      expect(fallbackLogs.length).toBeGreaterThanOrEqual(2)
++    })
++
++    test("session.stop aborts when sessionAwaitingFallbackResult is set", async () => {
++      const abortCalls: Array<{ path?: { id?: string } }> = []
++
++      //#given
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }],
++            }),
++            promptAsync: async () => ({}),
++            abort: async (args: unknown) => {
++              abortCalls.push(args as { path?: { id?: string } })
++              return {}
++            },
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: {
++            categories: {
++              test: {
++                fallback_models: ["provider-a/model-a", "provider-b/model-b"],
++              },
++            },
++          },
++        }
++      )
++      const sessionID = "test-race-stop-awaiting"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "google/gemini-2.5-pro" } },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit" } },
++        },
++      })
++
++      //#when
++      await hook.event({
++        event: {
++          type: "session.stop",
++          properties: { sessionID },
++        },
++      })
++
++      //#then
++      expect(abortCalls.some((call) => call.path?.id === sessionID)).toBe(true)
++    })
++
++    test("pendingFallbackModel advances chain on subsequent error even when persisted", async () => {
++      //#given
++      const hook = createRuntimeFallbackHook(createMockPluginInput(), {
++        config: createMockConfig({ notify_on_fallback: false }),
++        pluginConfig: {
++          categories: {
++            test: {
++              fallback_models: ["provider-a/model-a", "provider-b/model-b"],
++            },
++          },
++        },
++      })
++      const sessionID = "test-race-pending-persists"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "google/gemini-2.5-pro" } },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit" } },
++        },
++      })
++
++      const autoRetryLog = logCalls.find((call) => call.msg.includes("No user message found for auto-retry"))
++      expect(autoRetryLog).toBeDefined()
++
++      //#when - second error fires after retry completed (retryInFlight cleared)
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 429, message: "Rate limit again" } },
++        },
++      })
++
++      //#then - chain advances normally (not skipped), consistent with consecutive errors test
++      const fallbackLogs = logCalls.filter((call) => call.msg.includes("Preparing fallback"))
++      expect(fallbackLogs.length).toBeGreaterThanOrEqual(2)
++    })
++  })
+ })
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 248f207a..d9e9849f 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -14,6 +14,7 @@ import { resetMessageCursor } from "../shared"
+ import { lspManager } from "../tools"
+ import { shouldRetryError } from "../shared/model-error-classifier"
+ import { clearPendingModelFallback, clearSessionFallbackChain, setPendingModelFallback } from "../hooks/model-fallback/hook"
++import { log } from "../shared/logger"
+ import { clearSessionModel, setSessionModel } from "../shared/session-model-state"
+ 
+ import type { CreatedHooks } from "../create-hooks"
+@@ -250,25 +251,87 @@ export function createEventHandler(args: {
+       // Model fallback: in practice, API/model failures often surface as assistant message errors.
+       // session.error events are not guaranteed for all providers, so we also observe message.updated.
+       if (sessionID && role === "assistant") {
+-        const assistantMessageID = info?.id as string | undefined
+-        const assistantError = info?.error
+-        if (assistantMessageID && assistantError) {
+-          const lastHandled = lastHandledModelErrorMessageID.get(sessionID)
+-          if (lastHandled === assistantMessageID) {
+-            return
++        try {
++          const assistantMessageID = info?.id as string | undefined
++          const assistantError = info?.error
++          if (assistantMessageID && assistantError) {
++            const lastHandled = lastHandledModelErrorMessageID.get(sessionID)
++            if (lastHandled === assistantMessageID) {
++              return
++            }
++
++            const errorName = extractErrorName(assistantError)
++            const errorMessage = extractErrorMessage(assistantError)
++            const errorInfo = { name: errorName, message: errorMessage }
++
++            if (shouldRetryError(errorInfo)) {
++              // Prefer the agent/model/provider from the assistant message payload.
++              let agentName = agent ?? getSessionAgent(sessionID)
++              if (!agentName && sessionID === getMainSessionID()) {
++                if (errorMessage.includes("claude-opus") || errorMessage.includes("opus")) {
++                  agentName = "sisyphus"
++                } else if (errorMessage.includes("gpt-5")) {
++                  agentName = "hephaestus"
++                } else {
++                  agentName = "sisyphus"
++                }
++              }
++
++              if (agentName) {
++                const currentProvider = (info?.providerID as string | undefined) ?? "opencode"
++                const rawModel = (info?.modelID as string | undefined) ?? "claude-opus-4-6"
++                const currentModel = normalizeFallbackModelID(rawModel)
++
++                const setFallback = setPendingModelFallback(
++                  sessionID,
++                  agentName,
++                  currentProvider,
++                  currentModel,
++                )
++
++                if (setFallback && shouldAutoRetrySession(sessionID) && !hooks.stopContinuationGuard?.isStopped(sessionID)) {
++                  lastHandledModelErrorMessageID.set(sessionID, assistantMessageID)
++
++                  await ctx.client.session.abort({ path: { id: sessionID } }).catch(() => {})
++                  await ctx.client.session
++                    .prompt({
++                      path: { id: sessionID },
++                      body: { parts: [{ type: "text", text: "continue" }] },
++                      query: { directory: ctx.directory },
++                    })
++                    .catch(() => {})
++                }
++              }
++            }
+           }
++        } catch (err) {
++          log("[event] model-fallback error in message.updated:", { sessionID, error: err })
++        }
++      }
++    }
++
++    if (event.type === "session.status") {
++      const sessionID = props?.sessionID as string | undefined
++      const status = props?.status as
++        | { type?: string; attempt?: number; message?: string; next?: number }
++        | undefined
+ 
+-          const errorName = extractErrorName(assistantError)
+-          const errorMessage = extractErrorMessage(assistantError)
+-          const errorInfo = { name: errorName, message: errorMessage }
++      if (sessionID && status?.type === "retry") {
++        try {
++          const retryMessage = typeof status.message === "string" ? status.message : ""
++          const retryKey = `${status.attempt ?? "?"}:${status.next ?? "?"}:${retryMessage}`
++          if (lastHandledRetryStatusKey.get(sessionID) === retryKey) {
++            return
++          }
++          lastHandledRetryStatusKey.set(sessionID, retryKey)
+ 
++          const errorInfo = { name: undefined as string | undefined, message: retryMessage }
+           if (shouldRetryError(errorInfo)) {
+-            // Prefer the agent/model/provider from the assistant message payload.
+-            let agentName = agent ?? getSessionAgent(sessionID)
++            let agentName = getSessionAgent(sessionID)
+             if (!agentName && sessionID === getMainSessionID()) {
+-              if (errorMessage.includes("claude-opus") || errorMessage.includes("opus")) {
++              if (retryMessage.includes("claude-opus") || retryMessage.includes("opus")) {
+                 agentName = "sisyphus"
+-              } else if (errorMessage.includes("gpt-5")) {
++              } else if (retryMessage.includes("gpt-5")) {
+                 agentName = "hephaestus"
+               } else {
+                 agentName = "sisyphus"
+@@ -276,9 +339,11 @@ export function createEventHandler(args: {
+             }
+ 
+             if (agentName) {
+-              const currentProvider = (info?.providerID as string | undefined) ?? "opencode"
+-              const rawModel = (info?.modelID as string | undefined) ?? "claude-opus-4-6"
+-              const currentModel = normalizeFallbackModelID(rawModel)
++              const parsed = extractProviderModelFromErrorMessage(retryMessage)
++              const lastKnown = lastKnownModelBySession.get(sessionID)
++              const currentProvider = parsed.providerID ?? lastKnown?.providerID ?? "opencode"
++              let currentModel = parsed.modelID ?? lastKnown?.modelID ?? "claude-opus-4-6"
++              currentModel = normalizeFallbackModelID(currentModel)
+ 
+               const setFallback = setPendingModelFallback(
+                 sessionID,
+@@ -288,8 +353,6 @@ export function createEventHandler(args: {
+               )
+ 
+               if (setFallback && shouldAutoRetrySession(sessionID) && !hooks.stopContinuationGuard?.isStopped(sessionID)) {
+-                lastHandledModelErrorMessageID.set(sessionID, assistantMessageID)
+-
+                 await ctx.client.session.abort({ path: { id: sessionID } }).catch(() => {})
+                 await ctx.client.session
+                   .prompt({
+@@ -301,42 +364,64 @@ export function createEventHandler(args: {
+               }
+             }
+           }
++        } catch (err) {
++          log("[event] model-fallback error in session.status:", { sessionID, error: err })
+         }
+       }
+     }
+ 
+-    if (event.type === "session.status") {
+-      const sessionID = props?.sessionID as string | undefined
+-      const status = props?.status as
+-        | { type?: string; attempt?: number; message?: string; next?: number }
+-        | undefined
+-
+-      if (sessionID && status?.type === "retry") {
+-        const retryMessage = typeof status.message === "string" ? status.message : ""
+-        const retryKey = `${status.attempt ?? "?"}:${status.next ?? "?"}:${retryMessage}`
+-        if (lastHandledRetryStatusKey.get(sessionID) === retryKey) {
+-          return
+-        }
+-        lastHandledRetryStatusKey.set(sessionID, retryKey)
+-
+-        const errorInfo = { name: undefined, message: retryMessage }
+-        if (shouldRetryError(errorInfo)) {
++    if (event.type === "session.error") {
++      try {
++        const sessionID = props?.sessionID as string | undefined
++        const error = props?.error
++
++        const errorName = extractErrorName(error)
++        const errorMessage = extractErrorMessage(error)
++        const errorInfo = { name: errorName, message: errorMessage }
++
++        // First, try session recovery for internal errors (thinking blocks, tool results, etc.)
++        if (hooks.sessionRecovery?.isRecoverableError(error)) {
++          const messageInfo = {
++            id: props?.messageID as string | undefined,
++            role: "assistant" as const,
++            sessionID,
++            error,
++          }
++          const recovered = await hooks.sessionRecovery.handleSessionRecovery(messageInfo)
++
++          if (
++            recovered &&
++            sessionID &&
++            sessionID === getMainSessionID() &&
++            !hooks.stopContinuationGuard?.isStopped(sessionID)
++          ) {
++            await ctx.client.session
++              .prompt({
++                path: { id: sessionID },
++                body: { parts: [{ type: "text", text: "continue" }] },
++                query: { directory: ctx.directory },
++              })
++              .catch(() => {})
++          }
++        } 
++        // Second, try model fallback for model errors (rate limit, quota, provider issues, etc.)
++        else if (sessionID && shouldRetryError(errorInfo)) {
+           let agentName = getSessionAgent(sessionID)
++          
+           if (!agentName && sessionID === getMainSessionID()) {
+-            if (retryMessage.includes("claude-opus") || retryMessage.includes("opus")) {
++            if (errorMessage.includes("claude-opus") || errorMessage.includes("opus")) {
+               agentName = "sisyphus"
+-            } else if (retryMessage.includes("gpt-5")) {
++            } else if (errorMessage.includes("gpt-5")) {
+               agentName = "hephaestus"
+             } else {
+               agentName = "sisyphus"
+             }
+           }
+-
++          
+           if (agentName) {
+-            const parsed = extractProviderModelFromErrorMessage(retryMessage)
+-            const lastKnown = lastKnownModelBySession.get(sessionID)
+-            const currentProvider = parsed.providerID ?? lastKnown?.providerID ?? "opencode"
+-            let currentModel = parsed.modelID ?? lastKnown?.modelID ?? "claude-opus-4-6"
++            const parsed = extractProviderModelFromErrorMessage(errorMessage)
++            const currentProvider = props?.providerID as string || parsed.providerID || "opencode"
++            let currentModel = props?.modelID as string || parsed.modelID || "claude-opus-4-6"
+             currentModel = normalizeFallbackModelID(currentModel)
+ 
+             const setFallback = setPendingModelFallback(
+@@ -345,9 +430,10 @@ export function createEventHandler(args: {
+               currentProvider,
+               currentModel,
+             )
+-
++            
+             if (setFallback && shouldAutoRetrySession(sessionID) && !hooks.stopContinuationGuard?.isStopped(sessionID)) {
+               await ctx.client.session.abort({ path: { id: sessionID } }).catch(() => {})
++              
+               await ctx.client.session
+                 .prompt({
+                   path: { id: sessionID },
+@@ -358,87 +444,9 @@ export function createEventHandler(args: {
+             }
+           }
+         }
+-      }
+-    }
+-
+-    if (event.type === "session.error") {
+-      const sessionID = props?.sessionID as string | undefined
+-      const error = props?.error
+-
+-      const errorName = extractErrorName(error)
+-      const errorMessage = extractErrorMessage(error)
+-      const errorInfo = { name: errorName, message: errorMessage }
+-
+-      // First, try session recovery for internal errors (thinking blocks, tool results, etc.)
+-      if (hooks.sessionRecovery?.isRecoverableError(error)) {
+-        const messageInfo = {
+-          id: props?.messageID as string | undefined,
+-          role: "assistant" as const,
+-          sessionID,
+-          error,
+-        }
+-        const recovered = await hooks.sessionRecovery.handleSessionRecovery(messageInfo)
+-
+-        if (
+-          recovered &&
+-          sessionID &&
+-          sessionID === getMainSessionID() &&
+-          !hooks.stopContinuationGuard?.isStopped(sessionID)
+-        ) {
+-          await ctx.client.session
+-            .prompt({
+-              path: { id: sessionID },
+-              body: { parts: [{ type: "text", text: "continue" }] },
+-              query: { directory: ctx.directory },
+-            })
+-            .catch(() => {})
+-        }
+-      } 
+-      // Second, try model fallback for model errors (rate limit, quota, provider issues, etc.)
+-      else if (sessionID && shouldRetryError(errorInfo)) {
+-        // Get the current agent for this session, or default to "sisyphus" for main sessions
+-        let agentName = getSessionAgent(sessionID)
+-        
+-        // For main sessions, if no agent is set, try to infer from the error or default to sisyphus
+-        if (!agentName && sessionID === getMainSessionID()) {
+-          // Try to infer agent from model in error message
+-          if (errorMessage.includes("claude-opus") || errorMessage.includes("opus")) {
+-            agentName = "sisyphus"
+-          } else if (errorMessage.includes("gpt-5")) {
+-            agentName = "hephaestus"
+-          } else {
+-            // Default to sisyphus for main session errors
+-            agentName = "sisyphus"
+-          }
+-        }
+-        
+-        if (agentName) {
+-          const parsed = extractProviderModelFromErrorMessage(errorMessage)
+-          const currentProvider = props?.providerID as string || parsed.providerID || "opencode"
+-          let currentModel = props?.modelID as string || parsed.modelID || "claude-opus-4-6"
+-          currentModel = normalizeFallbackModelID(currentModel)
+-
+-          // Try to set pending model fallback
+-          const setFallback = setPendingModelFallback(
+-            sessionID,
+-            agentName,
+-            currentProvider,
+-            currentModel,
+-          )
+-          
+-          if (setFallback && shouldAutoRetrySession(sessionID) && !hooks.stopContinuationGuard?.isStopped(sessionID)) {
+-            // Abort the current session and prompt with "continue" to trigger the fallback
+-            await ctx.client.session.abort({ path: { id: sessionID } }).catch(() => {})
+-            
+-            await ctx.client.session
+-              .prompt({
+-                path: { id: sessionID },
+-                body: { parts: [{ type: "text", text: "continue" }] },
+-                query: { directory: ctx.directory },
+-              })
+-              .catch(() => {})
+-          }
+-        }
++      } catch (err) {
++        const sessionID = props?.sessionID as string | undefined
++        log("[event] model-fallback error in session.error:", { sessionID, error: err })
+       }
+     }
+   }
+diff --git a/src/plugin/ultrawork-db-model-override.test.ts b/src/plugin/ultrawork-db-model-override.test.ts
+index b647bb6d..db364a97 100644
+--- a/src/plugin/ultrawork-db-model-override.test.ts
++++ b/src/plugin/ultrawork-db-model-override.test.ts
+@@ -177,4 +177,26 @@ describe("scheduleDeferredModelOverride", () => {
+       expect.stringContaining("DB not found"),
+     )
+   })
++
++  test("should not crash when DB file exists but is corrupted", async () => {
++    //#given
++    const { chmodSync, writeFileSync } = await import("node:fs")
++    const corruptedDbPath = join(tempDir, "opencode", "opencode.db")
++    writeFileSync(corruptedDbPath, "this is not a valid sqlite database file")
++    chmodSync(corruptedDbPath, 0o000)
++
++    //#when
++    const { scheduleDeferredModelOverride } = await import("./ultrawork-db-model-override")
++    scheduleDeferredModelOverride(
++      "msg_corrupt",
++      { providerID: "anthropic", modelID: "claude-opus-4-6" },
++    )
++    await flushMicrotasks(5)
++
++    //#then
++    expect(logSpy).toHaveBeenCalledWith(
++      expect.stringContaining("Failed to open DB"),
++      expect.objectContaining({ messageId: "msg_corrupt" }),
++    )
++  })
+ })
+diff --git a/src/plugin/ultrawork-db-model-override.ts b/src/plugin/ultrawork-db-model-override.ts
+index 69d067e4..17d84a92 100644
+--- a/src/plugin/ultrawork-db-model-override.ts
++++ b/src/plugin/ultrawork-db-model-override.ts
+@@ -120,7 +120,17 @@ export function scheduleDeferredModelOverride(
+       return
+     }
+ 
+-    const db = new Database(dbPath)
++    let db: InstanceType<typeof Database>
++    try {
++      db = new Database(dbPath)
++    } catch (error) {
++      log("[ultrawork-db-override] Failed to open DB, skipping deferred override", {
++        messageId,
++        error: String(error),
++      })
++      return
++    }
++
+     try {
+       retryViaMicrotask(db, messageId, targetModel, variant, 0)
+     } catch (error) {
+diff --git a/src/tools/hashline-edit/constants.ts b/src/tools/hashline-edit/constants.ts
+index b62e345e..4ecf66c4 100644
+--- a/src/tools/hashline-edit/constants.ts
++++ b/src/tools/hashline-edit/constants.ts
+@@ -8,3 +8,4 @@ export const HASHLINE_DICT = Array.from({ length: 256 }, (_, i) => {
+ 
+ export const HASHLINE_REF_PATTERN = /^([0-9]+)#([ZPMQVRWSNKTXJBYH]{2})$/
+ export const HASHLINE_OUTPUT_PATTERN = /^([0-9]+)#([ZPMQVRWSNKTXJBYH]{2}):(.*)$/
++export const HASHLINE_LEGACY_REF_PATTERN = /^([0-9]+):([0-9a-fA-F]{2,})$/
+diff --git a/src/tools/hashline-edit/validation.test.ts b/src/tools/hashline-edit/validation.test.ts
+index 8b6870f6..4436b6b2 100644
+--- a/src/tools/hashline-edit/validation.test.ts
++++ b/src/tools/hashline-edit/validation.test.ts
+@@ -52,3 +52,46 @@ describe("validateLineRef", () => {
+     expect(() => validateLineRef(lines, "1#ZZ")).toThrow(/current hash/)
+   })
+ })
++
++describe("legacy LINE:HEX backward compatibility", () => {
++  it("parses legacy LINE:HEX ref", () => {
++    //#given
++    const ref = "42:ab"
++
++    //#when
++    const result = parseLineRef(ref)
++
++    //#then
++    expect(result).toEqual({ line: 42, hash: "ab" })
++  })
++
++  it("parses legacy LINE:HEX ref with uppercase hex", () => {
++    //#given
++    const ref = "10:FF"
++
++    //#when
++    const result = parseLineRef(ref)
++
++    //#then
++    expect(result).toEqual({ line: 10, hash: "FF" })
++  })
++
++  it("legacy ref fails validation with hash mismatch, not parse error", () => {
++    //#given
++    const lines = ["function hello() {"]
++
++    //#when / #then
++    expect(() => validateLineRef(lines, "1:ab")).toThrow(/Hash mismatch|current hash/)
++  })
++
++  it("extracts legacy ref from content with markers", () => {
++    //#given
++    const ref = ">>> 42:ab|const x = 1"
++
++    //#when
++    const result = parseLineRef(ref)
++
++    //#then
++    expect(result).toEqual({ line: 42, hash: "ab" })
++  })
++})
+diff --git a/src/tools/hashline-edit/validation.ts b/src/tools/hashline-edit/validation.ts
+index feb9d3cc..bb32f384 100644
+--- a/src/tools/hashline-edit/validation.ts
++++ b/src/tools/hashline-edit/validation.ts
+@@ -1,18 +1,21 @@
+ import { computeLineHash } from "./hash-computation"
+-import { HASHLINE_REF_PATTERN } from "./constants"
++import { HASHLINE_REF_PATTERN, HASHLINE_LEGACY_REF_PATTERN } from "./constants"
+ 
+ export interface LineRef {
+   line: number
+   hash: string
+ }
+ 
+-const LINE_REF_EXTRACT_PATTERN = /([0-9]+#[ZPMQVRWSNKTXJBYH]{2})/
++const LINE_REF_EXTRACT_PATTERN = /([0-9]+#[ZPMQVRWSNKTXJBYH]{2}|[0-9]+:[0-9a-fA-F]{2,})/
+ 
+ function normalizeLineRef(ref: string): string {
+   const trimmed = ref.trim()
+   if (HASHLINE_REF_PATTERN.test(trimmed)) {
+     return trimmed
+   }
++  if (HASHLINE_LEGACY_REF_PATTERN.test(trimmed)) {
++    return trimmed
++  }
+ 
+   const extracted = trimmed.match(LINE_REF_EXTRACT_PATTERN)
+   if (extracted) {
+@@ -25,15 +28,22 @@ function normalizeLineRef(ref: string): string {
+ export function parseLineRef(ref: string): LineRef {
+   const normalized = normalizeLineRef(ref)
+   const match = normalized.match(HASHLINE_REF_PATTERN)
+-  if (!match) {
+-    throw new Error(
+-      `Invalid line reference format: "${ref}". Expected format: "LINE#ID" (e.g., "42#VK")`
+-    )
++  if (match) {
++    return {
++      line: Number.parseInt(match[1], 10),
++      hash: match[2],
++    }
+   }
+-  return {
+-    line: Number.parseInt(match[1], 10),
+-    hash: match[2],
++  const legacyMatch = normalized.match(HASHLINE_LEGACY_REF_PATTERN)
++  if (legacyMatch) {
++    return {
++      line: Number.parseInt(legacyMatch[1], 10),
++      hash: legacyMatch[2],
++    }
+   }
++  throw new Error(
++    `Invalid line reference format: "${ref}". Expected format: "LINE#ID" (e.g., "42#VK")`
++  )
+ }
+ 
+ export function validateLineRef(lines: string[], ref: string): void {
+-- 
+2.39.2
+

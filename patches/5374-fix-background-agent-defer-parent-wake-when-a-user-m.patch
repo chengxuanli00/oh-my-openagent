@@ -1,0 +1,398 @@
+From 3294128271347647839fbf4682091fe3254a0661 Mon Sep 17 00:00:00 2001
+From: Claude Agent <agent@anthropic.com>
+Date: Sun, 17 May 2026 19:47:38 +0200
+Subject: [PATCH 5374/5749] fix(background-agent): defer parent-wake when a
+ user message just arrived (fixes #4120)
+
+When a background subagent emits [ALL BACKGROUND TASKS COMPLETE], the
+plugin queues a parent-wake that ultimately calls
+dispatchInternalPrompt against the parent session. If the user submits
+a new prompt inside the ~250 ms post-dispatch hold window, both writes
+land on the same OpenCode session-storage file at the same instant.
+OpenCode's @parcel/watcher (which the plugin itself does not depend on,
+but does indirectly trigger) batches those events into a TSFN callback
+and dispatches them into a JS env that the renderer has just torn down
+because the session view re-mounted around the user's new message ->
+napi_fatal_error / SIGABRT on macOS arm64. Removing the plugin removes
+the parent-wake, which is why removing OmO eliminates the crash.
+
+Mitigation:
+- Before flushPendingParentWake calls dispatchInternalPrompt, inspect
+  the parent session's message tail. If the most recent message is a
+  user message added inside PARENT_WAKE_USER_MESSAGE_IN_PROGRESS_WINDOW_MS
+  (default 2_000 ms), reschedule instead of dispatching. The user's own
+  prompt will drive the model; queued notifications will be re-flushed
+  on the next idle.
+- Best-effort unref() of the long-lived pending-retry and dispatched-
+  wake bookkeeping setTimeouts. They previously pinned the host event
+  loop and prolonged the teardown window during which the watcher race
+  can fire.
+
+The new option userMessageInProgressWindowMs is wired through
+BackgroundManager via a module-level constant and is independently
+testable.
+
+Regression test parent-wake-user-message-race.test.ts covers:
+- fresh user message -> dispatch deferred
+- latest message is assistant -> dispatch proceeds
+- user message older than window -> dispatch proceeds
+- window=0 disables the guard
+
+This is a surface-level mitigation of the most-likely root cause from
+the audit; a deeper fix (singleton guard against plugin
+double-instantiation under @opencode-ai/plugin@local reload, dispose
+lifecycle for OpenCode plugin reload) is out of scope here.
+---
+ src/features/background-agent/manager.ts      |   9 +
+ .../background-agent/parent-wake-notifier.ts  |  71 +++++++
+ .../parent-wake-user-message-race.test.ts     | 201 ++++++++++++++++++
+ 3 files changed, 281 insertions(+)
+ create mode 100644 src/features/background-agent/parent-wake-user-message-race.test.ts
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 9189dcdf..902b0b98 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -130,6 +130,14 @@ const PENDING_PARENT_WAKE_RETRY_MS = 1_000
+ const PENDING_PARENT_WAKE_DEBOUNCE_MS = 100
+ const PARENT_WAKE_ACCEPTED_MESSAGE_SKEW_MS = 5_000
+ const PARENT_WAKE_TOOL_CALL_DEFER_MAX_MS = 5_000
++/**
++ * Window during which a freshly-arrived user message in the parent session
++ * causes a queued parent-wake to defer instead of dispatching. Mitigates the
++ * macOS/Electron sidecar crash where parent-wake `promptAsync` collides with a
++ * user prompt and trips `@parcel/watcher` TSFN callbacks into a torn-down JS
++ * env. See issue #4120.
++ */
++const PARENT_WAKE_USER_MESSAGE_IN_PROGRESS_WINDOW_MS = 2_000
+ 
+ interface MessagePartInfo {
+   id?: string
+@@ -296,6 +304,7 @@ export class BackgroundManager {
+         acceptedMessageSkewMs: PARENT_WAKE_ACCEPTED_MESSAGE_SKEW_MS,
+         toolCallDeferMaxMs: PARENT_WAKE_TOOL_CALL_DEFER_MAX_MS,
+         failureRequeueWindowMs: PARENT_WAKE_FAILURE_REQUEUE_WINDOW_MS,
++        userMessageInProgressWindowMs: PARENT_WAKE_USER_MESSAGE_IN_PROGRESS_WINDOW_MS,
+       },
+     )
+     this.registerProcessCleanup()
+diff --git a/src/features/background-agent/parent-wake-notifier.ts b/src/features/background-agent/parent-wake-notifier.ts
+index 725dcfac..59f6f9df 100644
+--- a/src/features/background-agent/parent-wake-notifier.ts
++++ b/src/features/background-agent/parent-wake-notifier.ts
+@@ -51,6 +51,29 @@ type ParentWakeNotifierOptions = {
+   acceptedMessageSkewMs: number
+   toolCallDeferMaxMs: number
+   failureRequeueWindowMs: number
++  /**
++   * If the latest message in the parent session is a `user` message added
++   * within this window, the parent-wake injection is deferred. Prevents the
++   * race where a parent-wake `dispatchInternalPrompt` collides with a fresh
++   * user prompt, which on macOS/Electron has triggered native SIGABRT crashes
++   * inside OpenCode's `@parcel/watcher` TSFN callback path. See issue #4120.
++   */
++  userMessageInProgressWindowMs: number
++}
++
++type Unrefable = ReturnType<typeof setTimeout> & { unref?: () => unknown }
++
++function unrefTimerHandle(handle: ReturnType<typeof setTimeout>): void {
++  const maybeUnref = (handle as Unrefable).unref
++  if (typeof maybeUnref === "function") {
++    try {
++      maybeUnref.call(handle)
++    } catch {
++      // unref is best-effort; some runtimes (e.g. browser-like shims) don't
++      // expose it. Failing here would only make the host event loop pinned —
++      // not a hard error.
++    }
++  }
+ }
+ 
+ export class ParentWakeNotifier {
+@@ -132,6 +155,20 @@ export class ParentWakeNotifier {
+       return
+     }
+ 
++    if (await this.isUserMessageInProgress(sessionID)) {
++      // The user just sent a new message into the parent session. Dispatching
++      // a parent-wake right now would race their prompt and, on Electron-hosted
++      // OpenCode (macOS arm64), has been observed to crash the sidecar via
++      // @parcel/watcher TSFN callbacks firing into a torn-down JS env.
++      // The user's own message will drive the model; the queued notifications
++      // will be re-flushed on the next idle. See issue #4120.
++      this.schedulePendingParentWakeFlush(sessionID)
++      log("[background-agent] Deferred parent wake because user message just arrived:", {
++        sessionID,
++      })
++      return
++    }
++
+     this.pendingParentWakes.delete(sessionID)
+ 
+     const notificationContent = latestWake.notifications.join("\n\n")
+@@ -222,6 +259,10 @@ export class ParentWakeNotifier {
+         log("[background-agent] Failed to retry pending parent wake:", { sessionID, error })
+       })
+     }, delayMs ?? this.options.pendingRetryMs)
++    // Don't pin the host event loop with retry timers; the sidecar should be
++    // free to exit cleanly during teardown even if a wake is still pending.
++    // See issue #4120.
++    unrefTimerHandle(timer)
+ 
+     this.pendingParentWakeTimers.set(sessionID, timer)
+   }
+@@ -286,6 +327,9 @@ export class ParentWakeNotifier {
+       this.dispatchedParentWakeTimers.delete(sessionID)
+       this.dispatchedParentWakes.delete(sessionID)
+     }, this.options.failureRequeueWindowMs)
++    // Best-effort unref so the dispatched-wake bookkeeping doesn't keep the
++    // event loop alive past the natural teardown window (issue #4120).
++    unrefTimerHandle(timer)
+     this.dispatchedParentWakeTimers.set(sessionID, timer)
+   }
+ 
+@@ -391,6 +435,33 @@ export class ParentWakeNotifier {
+     ) ?? false
+   }
+ 
++  private async isUserMessageInProgress(sessionID: string): Promise<boolean> {
++    if (this.options.userMessageInProgressWindowMs <= 0) {
++      return false
++    }
++    const messages = await this.loadParentWakeSessionMessages(sessionID)
++    for (let index = messages.length - 1; index >= 0; index--) {
++      const message = messages[index]
++      if (!message) {
++        continue
++      }
++      const role = this.getParentWakeMessageRole(message)
++      if (role === "user") {
++        const createdAt = this.getParentWakeMessageCreatedAt(message)
++        if (createdAt === undefined) {
++          return false
++        }
++        return Date.now() - createdAt < this.options.userMessageInProgressWindowMs
++      }
++      if (role === "assistant" || role === "tool") {
++        // An assistant/tool message is more recent than the last user message,
++        // so the user is not actively prompting right now.
++        return false
++      }
++    }
++    return false
++  }
++
+   private async shouldDeferParentWakeForSessionHistory(sessionID: string, wake: PendingParentWake): Promise<boolean> {
+     const messages = await this.loadParentWakeSessionMessages(sessionID)
+     if (!this.latestAssistantTurnIsWaitingOnTools(messages)) {
+diff --git a/src/features/background-agent/parent-wake-user-message-race.test.ts b/src/features/background-agent/parent-wake-user-message-race.test.ts
+new file mode 100644
+index 00000000..9309f43c
+--- /dev/null
++++ b/src/features/background-agent/parent-wake-user-message-race.test.ts
+@@ -0,0 +1,201 @@
++import { describe, expect, test } from "bun:test"
++import { ParentWakeNotifier } from "./parent-wake-notifier"
++import { releaseAllPromptAsyncReservationsForTesting } from "../../hooks/shared/prompt-async-gate"
++
++type PromptAsyncCall = {
++  path: { id: string }
++  body: {
++    noReply?: boolean
++    parts?: unknown[]
++  }
++  query?: {
++    directory: string
++  }
++}
++
++type SessionMessageStub = {
++  info?: {
++    role?: string
++    finish?: string
++    time?: { created?: number }
++  }
++}
++
++function createNotifier(args: {
++  sessionStatuses?: Record<string, { type: string }>
++  sessionMessages: SessionMessageStub[]
++  userMessageInProgressWindowMs?: number
++}): {
++  notifier: ParentWakeNotifier
++  promptAsyncCalls: PromptAsyncCall[]
++} {
++  const promptAsyncCalls: PromptAsyncCall[] = []
++  const client = {
++    session: {
++      messages: async () => ({ data: args.sessionMessages }),
++      status: async () => ({ data: args.sessionStatuses ?? {} }),
++      promptAsync: async (call: PromptAsyncCall) => {
++        promptAsyncCalls.push(call)
++        return { data: {} }
++      },
++      abort: async () => ({ data: {} }),
++    },
++  } as unknown as Parameters<typeof ParentWakeNotifier>[0] extends never
++    ? never
++    : ConstructorParameters<typeof ParentWakeNotifier>[0]["client"]
++
++  const notifier = new ParentWakeNotifier(
++    {
++      client,
++      directory: "/tmp/test-omo",
++      enqueueNotificationForParent: async (_sessionID, operation) => {
++        await operation()
++      },
++    },
++    {
++      pendingRetryMs: 1_000,
++      acceptedMessageSkewMs: 5_000,
++      toolCallDeferMaxMs: 5_000,
++      failureRequeueWindowMs: 5_000,
++      userMessageInProgressWindowMs: args.userMessageInProgressWindowMs ?? 2_000,
++    },
++  )
++
++  return { notifier, promptAsyncCalls }
++}
++
++describe("ParentWakeNotifier — user message race guard (issue #4120)", () => {
++  test("#given latest message is a user message just added #when flushing pending wake #then dispatch is deferred (no promptAsync)", async () => {
++    // given
++    const { notifier, promptAsyncCalls } = createNotifier({
++      sessionMessages: [
++        {
++          info: {
++            role: "assistant",
++            finish: "stop",
++            time: { created: Date.now() - 10_000 },
++          },
++        },
++        {
++          info: {
++            role: "user",
++            time: { created: Date.now() - 100 },
++          },
++        },
++      ],
++    })
++    notifier.queuePendingParentWake(
++      "parent-1",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    // when
++    await notifier.flushPendingParentWake("parent-1")
++
++    // then
++    expect(promptAsyncCalls).toHaveLength(0)
++    expect(notifier.getPendingParentWakes().has("parent-1")).toBe(true)
++
++    notifier.shutdown()
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
++  test("#given latest message is an assistant message #when flushing pending wake #then dispatch proceeds", async () => {
++    // given
++    const { notifier, promptAsyncCalls } = createNotifier({
++      sessionMessages: [
++        {
++          info: {
++            role: "user",
++            time: { created: Date.now() - 60_000 },
++          },
++        },
++        {
++          info: {
++            role: "assistant",
++            finish: "stop",
++            time: { created: Date.now() - 100 },
++          },
++        },
++      ],
++    })
++    notifier.queuePendingParentWake(
++      "parent-2",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    // when
++    await notifier.flushPendingParentWake("parent-2")
++
++    // then
++    expect(promptAsyncCalls).toHaveLength(1)
++    expect(promptAsyncCalls[0]?.path.id).toBe("parent-2")
++
++    notifier.shutdown()
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
++  test("#given user message is older than the race window #when flushing pending wake #then dispatch proceeds", async () => {
++    // given
++    const { notifier, promptAsyncCalls } = createNotifier({
++      sessionMessages: [
++        {
++          info: {
++            role: "user",
++            time: { created: Date.now() - 5_000 },
++          },
++        },
++      ],
++      userMessageInProgressWindowMs: 2_000,
++    })
++    notifier.queuePendingParentWake(
++      "parent-3",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    // when
++    await notifier.flushPendingParentWake("parent-3")
++
++    // then
++    expect(promptAsyncCalls).toHaveLength(1)
++
++    notifier.shutdown()
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
++  test("#given race window is disabled (0 ms) #when flushing #then guard is skipped even for fresh user message", async () => {
++    // given
++    const { notifier, promptAsyncCalls } = createNotifier({
++      sessionMessages: [
++        {
++          info: {
++            role: "user",
++            time: { created: Date.now() - 10 },
++          },
++        },
++      ],
++      userMessageInProgressWindowMs: 0,
++    })
++    notifier.queuePendingParentWake(
++      "parent-4",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    // when
++    await notifier.flushPendingParentWake("parent-4")
++
++    // then
++    expect(promptAsyncCalls).toHaveLength(1)
++
++    notifier.shutdown()
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++})
+-- 
+2.39.2
+

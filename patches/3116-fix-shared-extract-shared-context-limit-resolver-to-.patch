@@ -1,0 +1,394 @@
+From 59f0f06e71c411efd8d66dcc73576b6682be0ed2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 21:45:44 +0900
+Subject: [PATCH 3116/5749] fix(shared): extract shared context limit resolver
+ to eliminate monitor/truncator drift
+
+- New context-limit-resolver.ts with resolveActualContextLimit() shared helper
+- Anthropic provider detection now uses .includes('anthropic') instead of hard-coded IDs
+- Both context-window-monitor and dynamic-truncator use the shared resolver
+- Added missing test cases: Anthropic+1M disabled+cached limit, non-Anthropic without cache
+---
+ ...indow-monitor.model-context-limits.test.ts | 47 +++++++++++
+ src/hooks/context-window-monitor.ts           | 35 +++------
+ src/shared/context-limit-resolver.test.ts     | 77 +++++++++++++++++++
+ src/shared/context-limit-resolver.ts          | 32 ++++++++
+ src/shared/dynamic-truncator.test.ts          | 16 ++++
+ src/shared/dynamic-truncator.ts               | 46 ++++-------
+ src/shared/index.ts                           |  1 +
+ 7 files changed, 197 insertions(+), 57 deletions(-)
+ create mode 100644 src/shared/context-limit-resolver.test.ts
+ create mode 100644 src/shared/context-limit-resolver.ts
+
+diff --git a/src/hooks/context-window-monitor.model-context-limits.test.ts b/src/hooks/context-window-monitor.model-context-limits.test.ts
+index 1c826d96..6dca2df5 100644
+--- a/src/hooks/context-window-monitor.model-context-limits.test.ts
++++ b/src/hooks/context-window-monitor.model-context-limits.test.ts
+@@ -134,4 +134,51 @@ describe("context-window-monitor modelContextLimitsCache", () => {
+       })
+     })
+   })
++
++  describe("#given Anthropic provider with cached context limit and 1M mode disabled", () => {
++    describe("#when cached usage exceeds the Anthropic default limit", () => {
++      it("#then should ignore the cached limit and append the reminder from the default Anthropic limit", async () => {
++        // given
++        const modelContextLimitsCache = new Map<string, number>()
++        modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 500000)
++
++        const hook = createContextWindowMonitorHook({} as never, {
++          anthropicContext1MEnabled: false,
++          modelContextLimitsCache,
++        })
++        const sessionID = "ses_anthropic_default_overrides_cached_limit"
++
++        await hook.event({
++          event: {
++            type: "message.updated",
++            properties: {
++              info: {
++                role: "assistant",
++                sessionID,
++                providerID: "anthropic",
++                modelID: "claude-sonnet-4-5",
++                finish: true,
++                tokens: {
++                  input: 150000,
++                  output: 0,
++                  reasoning: 0,
++                  cache: { read: 10000, write: 0 },
++                },
++              },
++            },
++          },
++        })
++
++        // when
++        const output = createOutput()
++        await hook["tool.execute.after"]({ tool: "bash", sessionID, callID: "call_1" }, output)
++
++        // then
++        expect(output.output).toContain("context remaining")
++        expect(output.output).toContain("200,000-token context window")
++        expect(output.output).not.toContain("500,000-token context window")
++        expect(output.output).not.toContain("1,000,000-token context window")
++      })
++    })
++  })
+ })
+diff --git a/src/hooks/context-window-monitor.ts b/src/hooks/context-window-monitor.ts
+index 74d524e7..3d137ae6 100644
+--- a/src/hooks/context-window-monitor.ts
++++ b/src/hooks/context-window-monitor.ts
+@@ -1,22 +1,12 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
++import {
++  resolveActualContextLimit,
++  type ContextLimitModelCacheState,
++} from "../shared/context-limit-resolver"
+ import { createSystemDirective, SystemDirectiveTypes } from "../shared/system-directive"
+ 
+-const DEFAULT_ANTHROPIC_ACTUAL_LIMIT = 200_000
+ const CONTEXT_WARNING_THRESHOLD = 0.70
+ 
+-type ModelCacheStateLike = {
+-  anthropicContext1MEnabled: boolean
+-  modelContextLimitsCache?: Map<string, number>
+-}
+-
+-function getAnthropicActualLimit(modelCacheState?: ModelCacheStateLike): number {
+-  return (modelCacheState?.anthropicContext1MEnabled ?? false) ||
+-    process.env.ANTHROPIC_1M_CONTEXT === "true" ||
+-    process.env.VERTEX_ANTHROPIC_1M_CONTEXT === "true"
+-    ? 1_000_000
+-    : DEFAULT_ANTHROPIC_ACTUAL_LIMIT
+-}
+-
+ function createContextReminder(actualLimit: number): string {
+   const limitTokens = actualLimit.toLocaleString()
+ 
+@@ -40,13 +30,9 @@ interface CachedTokenState {
+   tokens: TokenInfo
+ }
+ 
+-function isAnthropicProvider(providerID: string): boolean {
+-  return providerID === "anthropic" || providerID === "google-vertex-anthropic"
+-}
+-
+ export function createContextWindowMonitorHook(
+   _ctx: PluginInput,
+-  modelCacheState?: ModelCacheStateLike,
++  modelCacheState?: ContextLimitModelCacheState,
+ ) {
+   const remindedSessions = new Set<string>()
+   const tokenCache = new Map<string, CachedTokenState>()
+@@ -62,12 +48,11 @@ export function createContextWindowMonitorHook(
+     const cached = tokenCache.get(sessionID)
+     if (!cached) return
+ 
+-    const modelSpecificLimit = !isAnthropicProvider(cached.providerID)
+-      ? modelCacheState?.modelContextLimitsCache?.get(`${cached.providerID}/${cached.modelID}`)
+-      : undefined
+-    const actualLimit = isAnthropicProvider(cached.providerID)
+-      ? getAnthropicActualLimit(modelCacheState)
+-      : modelSpecificLimit
++    const actualLimit = resolveActualContextLimit(
++      cached.providerID,
++      cached.modelID,
++      modelCacheState,
++    )
+ 
+     if (!actualLimit) return
+ 
+diff --git a/src/shared/context-limit-resolver.test.ts b/src/shared/context-limit-resolver.test.ts
+new file mode 100644
+index 00000000..5ce62a8d
+--- /dev/null
++++ b/src/shared/context-limit-resolver.test.ts
+@@ -0,0 +1,77 @@
++import process from "node:process"
++import { afterEach, describe, expect, it } from "bun:test"
++
++import { resolveActualContextLimit } from "./context-limit-resolver"
++
++const ANTHROPIC_CONTEXT_ENV_KEY = "ANTHROPIC_1M_CONTEXT"
++const VERTEX_CONTEXT_ENV_KEY = "VERTEX_ANTHROPIC_1M_CONTEXT"
++
++const originalAnthropicContextEnv = process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++const originalVertexContextEnv = process.env[VERTEX_CONTEXT_ENV_KEY]
++
++function resetContextLimitEnv(): void {
++  if (originalAnthropicContextEnv === undefined) {
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++  } else {
++    process.env[ANTHROPIC_CONTEXT_ENV_KEY] = originalAnthropicContextEnv
++  }
++
++  if (originalVertexContextEnv === undefined) {
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++  } else {
++    process.env[VERTEX_CONTEXT_ENV_KEY] = originalVertexContextEnv
++  }
++}
++
++describe("resolveActualContextLimit", () => {
++  afterEach(() => {
++    resetContextLimitEnv()
++  })
++
++  it("returns the default Anthropic limit when 1M mode is disabled despite a cached limit", () => {
++    // given
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++    const modelContextLimitsCache = new Map<string, number>()
++    modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 123456)
++
++    // when
++    const actualLimit = resolveActualContextLimit("anthropic", "claude-sonnet-4-5", {
++      anthropicContext1MEnabled: false,
++      modelContextLimitsCache,
++    })
++
++    // then
++    expect(actualLimit).toBe(200000)
++  })
++
++  it("treats Anthropics aliases as Anthropic providers", () => {
++    // given
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++
++    // when
++    const actualLimit = resolveActualContextLimit(
++      "aws-bedrock-anthropic",
++      "claude-sonnet-4-5",
++      { anthropicContext1MEnabled: false },
++    )
++
++    // then
++    expect(actualLimit).toBe(200000)
++  })
++
++  it("returns null for non-Anthropic providers without a cached limit", () => {
++    // given
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++
++    // when
++    const actualLimit = resolveActualContextLimit("openai", "gpt-5", {
++      anthropicContext1MEnabled: false,
++    })
++
++    // then
++    expect(actualLimit).toBeNull()
++  })
++})
+diff --git a/src/shared/context-limit-resolver.ts b/src/shared/context-limit-resolver.ts
+new file mode 100644
+index 00000000..cb3c64e8
+--- /dev/null
++++ b/src/shared/context-limit-resolver.ts
+@@ -0,0 +1,32 @@
++import process from "node:process"
++
++const DEFAULT_ANTHROPIC_ACTUAL_LIMIT = 200_000
++
++export type ContextLimitModelCacheState = {
++  anthropicContext1MEnabled: boolean
++  modelContextLimitsCache?: Map<string, number>
++}
++
++function isAnthropicProvider(providerID: string): boolean {
++  return providerID.toLowerCase().includes("anthropic")
++}
++
++function getAnthropicActualLimit(modelCacheState?: ContextLimitModelCacheState): number {
++  return (modelCacheState?.anthropicContext1MEnabled ?? false) ||
++    process.env.ANTHROPIC_1M_CONTEXT === "true" ||
++    process.env.VERTEX_ANTHROPIC_1M_CONTEXT === "true"
++    ? 1_000_000
++    : DEFAULT_ANTHROPIC_ACTUAL_LIMIT
++}
++
++export function resolveActualContextLimit(
++  providerID: string,
++  modelID: string,
++  modelCacheState?: ContextLimitModelCacheState,
++): number | null {
++  if (isAnthropicProvider(providerID)) {
++    return getAnthropicActualLimit(modelCacheState)
++  }
++
++  return modelCacheState?.modelContextLimitsCache?.get(`${providerID}/${modelID}`) ?? null
++}
+diff --git a/src/shared/dynamic-truncator.test.ts b/src/shared/dynamic-truncator.test.ts
+index 34e9933a..3e19512a 100644
+--- a/src/shared/dynamic-truncator.test.ts
++++ b/src/shared/dynamic-truncator.test.ts
+@@ -125,6 +125,22 @@ describe("getContextWindowUsage", () => {
+     expect(usage?.remainingTokens).toBe(82144)
+   })
+ 
++  it("returns null for non-anthropic providers without a cached limit", async () => {
++    // given
++    const ctx = createContextUsageMockContext(180000, {
++      providerID: "openai",
++      modelID: "gpt-5",
++    })
++
++    // when
++    const usage = await getContextWindowUsage(ctx as never, "ses_no_cached_limit", {
++      anthropicContext1MEnabled: false,
++    })
++
++    // then
++    expect(usage).toBeNull()
++  })
++
+   describe("#given Anthropic provider with cached context limit and 1M mode enabled", () => {
+     describe("#when context usage is resolved", () => {
+       it("#then should ignore the cached limit and use the 1M Anthropic limit", async () => {
+diff --git a/src/shared/dynamic-truncator.ts b/src/shared/dynamic-truncator.ts
+index ac937f08..3b445759 100644
+--- a/src/shared/dynamic-truncator.ts
++++ b/src/shared/dynamic-truncator.ts
+@@ -1,27 +1,13 @@
+ import type { PluginInput } from "@opencode-ai/plugin";
++import {
++	resolveActualContextLimit,
++	type ContextLimitModelCacheState,
++} from "./context-limit-resolver"
+ import { normalizeSDKResponse } from "./normalize-sdk-response"
+ 
+-const DEFAULT_ANTHROPIC_ACTUAL_LIMIT = 200_000;
+ const CHARS_PER_TOKEN_ESTIMATE = 4;
+ const DEFAULT_TARGET_MAX_TOKENS = 50_000;
+ 
+-type ModelCacheStateLike = {
+-	anthropicContext1MEnabled: boolean;
+-	modelContextLimitsCache?: Map<string, number>;
+-}
+-
+-function getAnthropicActualLimit(modelCacheState?: ModelCacheStateLike): number {
+-	return (modelCacheState?.anthropicContext1MEnabled ?? false) ||
+-		process.env.ANTHROPIC_1M_CONTEXT === "true" ||
+-		process.env.VERTEX_ANTHROPIC_1M_CONTEXT === "true"
+-		? 1_000_000
+-		: DEFAULT_ANTHROPIC_ACTUAL_LIMIT;
+-}
+-
+-function isAnthropicProvider(providerID: string): boolean {
+-	return providerID === "anthropic" || providerID === "google-vertex-anthropic";
+-}
+-
+ interface AssistantMessageInfo {
+ 	role: "assistant";
+ 	providerID?: string;
+@@ -125,7 +111,7 @@ export function truncateToTokenLimit(
+ export async function getContextWindowUsage(
+ 	ctx: PluginInput,
+ 	sessionID: string,
+-	modelCacheState?: ModelCacheStateLike,
++	modelCacheState?: ContextLimitModelCacheState,
+ ): Promise<{
+ 	usedTokens: number;
+ 	remainingTokens: number;
+@@ -148,18 +134,14 @@ export async function getContextWindowUsage(
+ 		const lastTokens = lastAssistant?.tokens;
+ 		if (!lastAssistant || !lastTokens) return null;
+ 
+-		const modelSpecificLimit =
+-			lastAssistant.providerID !== undefined &&
+-			lastAssistant.modelID !== undefined &&
+-			!isAnthropicProvider(lastAssistant.providerID)
+-				? modelCacheState?.modelContextLimitsCache?.get(
+-					`${lastAssistant.providerID}/${lastAssistant.modelID}`,
+-				)
+-				: undefined;
+ 		const actualLimit =
+-			lastAssistant.providerID !== undefined && isAnthropicProvider(lastAssistant.providerID)
+-				? getAnthropicActualLimit(modelCacheState)
+-				: modelSpecificLimit ?? null;
++			lastAssistant.providerID !== undefined
++				? resolveActualContextLimit(
++					lastAssistant.providerID,
++					lastAssistant.modelID ?? "",
++					modelCacheState,
++				)
++				: null;
+ 
+ 		if (!actualLimit) return null;
+ 
+@@ -184,7 +166,7 @@ export async function dynamicTruncate(
+ 	sessionID: string,
+ 	output: string,
+ 	options: TruncationOptions = {},
+-	modelCacheState?: ModelCacheStateLike,
++	modelCacheState?: ContextLimitModelCacheState,
+ ): Promise<TruncationResult> {
+ 	if (typeof output !== 'string') {
+ 		return { result: String(output ?? ''), truncated: false };
+@@ -219,7 +201,7 @@ export async function dynamicTruncate(
+ 
+ export function createDynamicTruncator(
+ 	ctx: PluginInput,
+-	modelCacheState?: ModelCacheStateLike,
++	modelCacheState?: ContextLimitModelCacheState,
+ ) {
+ 	return {
+ 		truncate: (
+diff --git a/src/shared/index.ts b/src/shared/index.ts
+index 39b36482..5f4f4e44 100644
+--- a/src/shared/index.ts
++++ b/src/shared/index.ts
+@@ -45,6 +45,7 @@ export type {
+ export * from "./model-availability"
+ export * from "./fallback-model-availability"
+ export * from "./connected-providers-cache"
++export * from "./context-limit-resolver"
+ export * from "./session-utils"
+ export * from "./tmux"
+ export * from "./model-suggestion-retry"
+-- 
+2.39.2
+

@@ -1,0 +1,425 @@
+From 927cc84fa5a9abcbe4b8036cd728168ea31f620f Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 21 May 2026 12:32:43 +0900
+Subject: [PATCH 5610/5749] fix(background-agent): refresh stale checks from
+ session activity
+
+---
+ .../manager-session-activity.test.ts          | 105 ++++++++++++++
+ .../background-agent/session-activity.ts      |  41 ++++++
+ .../task-poller-session-activity.test.ts      | 131 ++++++++++++++++++
+ src/features/background-agent/task-poller.ts  |  56 +++++++-
+ 4 files changed, 332 insertions(+), 1 deletion(-)
+ create mode 100644 src/features/background-agent/manager-session-activity.test.ts
+ create mode 100644 src/features/background-agent/session-activity.ts
+ create mode 100644 src/features/background-agent/task-poller-session-activity.test.ts
+
+diff --git a/src/features/background-agent/manager-session-activity.test.ts b/src/features/background-agent/manager-session-activity.test.ts
+new file mode 100644
+index 00000000..69ec9a4e
+--- /dev/null
++++ b/src/features/background-agent/manager-session-activity.test.ts
+@@ -0,0 +1,105 @@
++import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
++import { tmpdir } from "node:os"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import { BackgroundManager } from "./manager"
++import type { BackgroundTask } from "./types"
++
++type PollingManager = {
++  readonly pollRunningTasks: () => Promise<void>
++  readonly tasks: Map<string, BackgroundTask>
++}
++
++function createPluginContext(client: unknown): PluginInput {
++  const directory = tmpdir()
++  return unsafeTestValue<PluginInput>({
++    project: {
++      id: "test-project",
++      worktree: directory,
++      time: { created: Date.now() },
++    },
++    directory,
++    worktree: directory,
++    serverUrl: new URL("http://localhost:4096"),
++    $: {},
++    client,
++  })
++}
++
++function createRunningTask(overrides: Partial<BackgroundTask> = {}): BackgroundTask {
++  return {
++    id: "bg_test_session_activity",
++    sessionId: "ses-active",
++    parentSessionId: "parent-session",
++    parentMessageId: "parent-message",
++    description: "test task",
++    prompt: "test prompt",
++    agent: "explore",
++    status: "running",
++    startedAt: new Date(Date.now() - 120_000),
++    progress: { toolCalls: 0, lastUpdate: new Date() },
++    ...overrides,
++  }
++}
++
++describe("BackgroundManager persisted session activity stale checks", () => {
++  const originalDateNow = Date.now
++  const fixedTime = new Date("2026-05-21T03:00:00.000Z").getTime()
++
++  afterEach(() => {
++    Date.now = originalDateNow
++    mock.restore()
++  })
++
++  test("keeps a busy task running when session.get reports fresh activity", async () => {
++    //#given - live event progress is stale, but OpenCode session metadata was updated recently
++    spyOn(globalThis.Date, "now").mockReturnValue(fixedTime)
++    let abortCallCount = 0
++    const sessionGet = mock(async () => ({
++      data: {
++        id: "ses-active",
++        time: { updated: fixedTime - 10_000 },
++      },
++    }))
++    const client = {
++      session: {
++        status: async () => ({ data: { "ses-active": { type: "busy" } } }),
++        get: sessionGet,
++        prompt: async () => ({}),
++        promptAsync: async () => ({}),
++        abort: async () => {
++          abortCallCount += 1
++          return {}
++        },
++        todo: async () => ({ data: [] }),
++        messages: async () => ({ data: [] }),
++      },
++    }
++    const manager = new BackgroundManager({
++      pluginContext: createPluginContext(client),
++      config: { staleTimeoutMs: 180_000 },
++      enableParentSessionNotifications: false,
++    })
++    const task = createRunningTask({
++      startedAt: new Date(Date.now() - 45 * 60 * 1000),
++      progress: {
++        toolCalls: 3,
++        lastUpdate: new Date(Date.now() - 45 * 60 * 1000),
++      },
++    })
++    const pollingManager = unsafeTestValue<PollingManager>(manager)
++    pollingManager.tasks.set(task.id, task)
++
++    //#when - polling reaches stale confirmation for the active child session
++    await pollingManager.pollRunningTasks()
++
++    //#then - persisted activity refreshes the task instead of aborting it
++    expect(task.status).toBe("running")
++    expect(task.error).toBeUndefined()
++    expect(task.progress?.lastUpdate).toEqual(new Date(fixedTime - 10_000))
++    expect(abortCallCount).toBe(0)
++    expect(sessionGet).toHaveBeenCalledTimes(1)
++
++    await manager.shutdown()
++  })
++})
+diff --git a/src/features/background-agent/session-activity.ts b/src/features/background-agent/session-activity.ts
+new file mode 100644
+index 00000000..463f6216
+--- /dev/null
++++ b/src/features/background-agent/session-activity.ts
+@@ -0,0 +1,41 @@
++import { isRecord, log } from "../../shared"
++import type { OpencodeClient } from "./opencode-client"
++
++export type SessionActivityResolver = (sessionID: string) => Promise<Date | undefined>
++
++function dateFromMillis(value: unknown): Date | undefined {
++  if (typeof value !== "number") return undefined
++  if (!Number.isFinite(value) || value < 0) return undefined
++  return new Date(value)
++}
++
++export function extractSessionActivityDate(sessionInfo: unknown): Date | undefined {
++  if (!isRecord(sessionInfo)) return undefined
++  const time = isRecord(sessionInfo.time) ? sessionInfo.time : undefined
++  return dateFromMillis(time?.updated) ?? dateFromMillis(sessionInfo.time_updated)
++}
++
++export async function getSessionActivityFromClient(
++  client: OpencodeClient,
++  sessionID: string,
++  directory?: string,
++): Promise<Date | undefined> {
++  const sessionGet = client.session.get
++  if (typeof sessionGet !== "function") return undefined
++
++  try {
++    const response = await sessionGet({
++      path: { id: sessionID },
++      ...(directory ? { query: { directory } } : {}),
++    })
++    const sessionInfo = isRecord(response) && "data" in response ? response.data : response
++    return extractSessionActivityDate(sessionInfo)
++  } catch (error) {
++    if (error instanceof Error) {
++      log("[background-agent] Failed to read session activity:", { sessionID, error: error.message })
++      return undefined
++    }
++    log("[background-agent] Failed to read session activity:", { sessionID, error })
++    return undefined
++  }
++}
+diff --git a/src/features/background-agent/task-poller-session-activity.test.ts b/src/features/background-agent/task-poller-session-activity.test.ts
+new file mode 100644
+index 00000000..de4b687d
+--- /dev/null
++++ b/src/features/background-agent/task-poller-session-activity.test.ts
+@@ -0,0 +1,131 @@
++import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
++import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import { checkAndInterruptStaleTasks } from "./task-poller"
++import type { BackgroundTask } from "./types"
++
++function createRunningTask(overrides: Partial<BackgroundTask> = {}): BackgroundTask {
++  return {
++    id: "task-1",
++    sessionId: "ses-1",
++    parentSessionId: "parent-ses-1",
++    parentMessageId: "msg-1",
++    description: "test",
++    prompt: "test",
++    agent: "explore",
++    status: "running",
++    startedAt: new Date(Date.now() - 120_000),
++    ...overrides,
++  }
++}
++
++describe("checkAndInterruptStaleTasks persisted session activity", () => {
++  const mockClient = unsafeTestValue<Parameters<typeof checkAndInterruptStaleTasks>[0]["client"]>({
++    session: {
++      abort: mock(() => Promise.resolve()),
++      get: mock(() => Promise.resolve({ data: { id: "ses-1" } })),
++    },
++  })
++  const mockConcurrencyManager = unsafeTestValue<Parameters<typeof checkAndInterruptStaleTasks>[0]["concurrencyManager"]>({
++    release: mock(() => {}),
++  })
++  const mockNotify = mock(() => Promise.resolve())
++
++  const originalDateNow = Date.now
++  const fixedTime = new Date("2026-05-21T03:00:00.000Z").getTime()
++
++  afterEach(() => {
++    Date.now = originalDateNow
++    mockClient.session.abort.mockClear()
++    mockConcurrencyManager.release.mockClear()
++    mockNotify.mockClear()
++  })
++
++  test("keeps a busy task running when persisted session activity is fresh", async () => {
++    //#given - in-memory progress is stale, but OpenCode storage shows recent child-session activity
++    spyOn(globalThis.Date, "now").mockReturnValue(fixedTime)
++    const staleActivity = new Date(Date.now() - 45 * 60 * 1000)
++    const freshActivity = new Date(Date.now() - 10_000)
++    const task = createRunningTask({
++      startedAt: staleActivity,
++      progress: {
++        toolCalls: 2,
++        lastUpdate: staleActivity,
++      },
++    })
++
++    //#when - stale checking can refresh activity from the persisted session timestamp
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient,
++      config: { staleTimeoutMs: 180_000 },
++      concurrencyManager: mockConcurrencyManager,
++      notifyParentSession: mockNotify,
++      sessionStatuses: { "ses-1": { type: "busy" } },
++      getSessionActivity: async () => freshActivity,
++    })
++
++    //#then - task stays running and future stale checks use the persisted activity timestamp
++    expect(task.status).toBe("running")
++    expect(task.progress?.lastUpdate).toEqual(freshActivity)
++    expect(mockNotify).not.toHaveBeenCalled()
++  })
++
++  test("keeps a busy task with no local progress running when persisted session activity is fresh", async () => {
++    //#given - no progress event reached the manager, but OpenCode storage shows recent activity
++    spyOn(globalThis.Date, "now").mockReturnValue(fixedTime)
++    const staleStart = new Date(Date.now() - 15 * 60 * 1000)
++    const freshActivity = new Date(Date.now() - 10_000)
++    const task = createRunningTask({
++      startedAt: staleStart,
++      progress: undefined,
++    })
++
++    //#when - message staleness confirmation refreshes from persisted session metadata
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient,
++      config: { messageStalenessTimeoutMs: 180_000 },
++      concurrencyManager: mockConcurrencyManager,
++      notifyParentSession: mockNotify,
++      sessionStatuses: { "ses-1": { type: "busy" } },
++      getSessionActivity: async () => freshActivity,
++    })
++
++    //#then - the task stays running and receives a progress timestamp for future stale checks
++    expect(task.status).toBe("running")
++    expect(task.progress?.lastUpdate).toEqual(freshActivity)
++    expect(mockNotify).not.toHaveBeenCalled()
++  })
++
++  test("cancels a busy task when persisted session activity is also stale", async () => {
++    //#given - local progress is older than persisted activity, but both are outside the stale window
++    spyOn(globalThis.Date, "now").mockReturnValue(fixedTime)
++    const localActivity = new Date(Date.now() - 45 * 60 * 1000)
++    const stalePersistedActivity = new Date(Date.now() - 10 * 60 * 1000)
++    const task = createRunningTask({
++      startedAt: localActivity,
++      progress: {
++        toolCalls: 2,
++        lastUpdate: localActivity,
++      },
++    })
++
++    //#when - the persisted timestamp confirms the child session is truly stale
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient,
++      config: { staleTimeoutMs: 180_000 },
++      concurrencyManager: mockConcurrencyManager,
++      notifyParentSession: mockNotify,
++      sessionStatuses: { "ses-1": { type: "busy" } },
++      getSessionActivity: async () => stalePersistedActivity,
++    })
++
++    //#then - cancellation still happens, but the stale age reflects persisted activity
++    expect(task.status).toBe("cancelled")
++    expect(task.error).toContain("Stale timeout")
++    expect(task.error).toContain("10min")
++    expect(task.progress?.lastUpdate).toEqual(stalePersistedActivity)
++    expect(mockNotify).toHaveBeenCalledWith(task)
++  })
++})
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index 9190e499..6b6a42de 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -19,6 +19,7 @@ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
+ import { MIN_SESSION_GONE_POLLS, verifySessionExists } from "./session-existence"
+ 
+ import { isActiveSessionStatus } from "./session-status-classifier"
++import { getSessionActivityFromClient, type SessionActivityResolver } from "./session-activity"
+ 
+ const TERMINAL_TASK_STATUSES = new Set<BackgroundTask["status"]>([
+   "completed",
+@@ -111,6 +112,38 @@ export function pruneStaleTasksAndNotifications(args: {
+ 
+ export type SessionStatusMap = Record<string, { type: string }>
+ 
++async function refreshTaskActivityFromSession(
++  task: BackgroundTask,
++  getSessionActivity: SessionActivityResolver,
++): Promise<number | undefined> {
++  if (!task.sessionId) return undefined
++
++  let activity: Date | undefined
++  try {
++    activity = await getSessionActivity(task.sessionId)
++  } catch (error) {
++    if (error instanceof Error) {
++      log("[background-agent] Error refreshing task session activity:", { taskId: task.id, error: error.message })
++      return undefined
++    }
++    log("[background-agent] Error refreshing task session activity:", { taskId: task.id, error })
++    return undefined
++  }
++
++  const activityTime = activity?.getTime()
++  if (activityTime === undefined || !Number.isFinite(activityTime)) return undefined
++
++  const baseline = task.progress?.lastUpdate.getTime() ?? task.startedAt?.getTime()
++  if (baseline !== undefined && activityTime <= baseline) return activityTime
++
++  if (!task.progress) {
++    task.progress = { toolCalls: 0, lastUpdate: new Date(activityTime) }
++  } else {
++    task.progress.lastUpdate = new Date(activityTime)
++  }
++  return activityTime
++}
++
+ export async function checkAndInterruptStaleTasks(args: {
+   tasks: Iterable<BackgroundTask>
+   client: OpencodeClient
+@@ -120,6 +153,7 @@ export async function checkAndInterruptStaleTasks(args: {
+   notifyParentSession: (task: BackgroundTask) => Promise<void>
+   sessionStatuses?: SessionStatusMap
+   onTaskInterrupted?: (task: BackgroundTask) => void
++  getSessionActivity?: SessionActivityResolver
+ }): Promise<void> {
+   const {
+     tasks,
+@@ -137,6 +171,8 @@ export async function checkAndInterruptStaleTasks(args: {
+   const abortPromises: Array<Promise<unknown>> = []
+ 
+   const messageStalenessMs = config?.messageStalenessTimeoutMs ?? DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS
++  const getSessionActivity = args.getSessionActivity
++    ?? ((id: string) => getSessionActivityFromClient(client, id, directory))
+ 
+   for (const task of tasks) {
+     if (task.status !== "running") continue
+@@ -157,6 +193,9 @@ export async function checkAndInterruptStaleTasks(args: {
+ 
+     const sessionGone = sessionMissing && (task.consecutiveMissedPolls ?? 0) >= MIN_SESSION_GONE_POLLS
+     const shouldSkipInactivityTimeout = task.teamRunId !== undefined && !sessionGone
++    const shouldRefreshFromSessionActivity = !sessionGone
++      && sessionStatus !== undefined
++      && isActiveSessionStatus(sessionStatus)
+ 
+     if (!task.progress?.lastUpdate) {
+       if (shouldSkipInactivityTimeout) continue
+@@ -164,6 +203,11 @@ export async function checkAndInterruptStaleTasks(args: {
+       const effectiveTimeout = sessionGone ? sessionGoneTimeoutMs : messageStalenessMs
+       if (runtime <= effectiveTimeout) continue
+ 
++      if (shouldRefreshFromSessionActivity) {
++        const activityTime = await refreshTaskActivityFromSession(task, getSessionActivity)
++        if (activityTime !== undefined && now - activityTime <= effectiveTimeout) continue
++      }
++
+       if (sessionGone && await verifySessionExists(client, sessionID, directory)) {
+         task.consecutiveMissedPolls = 0
+         continue
+@@ -197,9 +241,19 @@ export async function checkAndInterruptStaleTasks(args: {
+ 
+     if (runtime < MIN_RUNTIME_BEFORE_STALE_MS) continue
+ 
+-    const timeSinceLastUpdate = now - task.progress.lastUpdate.getTime()
++    let timeSinceLastUpdate = now - task.progress.lastUpdate.getTime()
+     const effectiveStaleTimeout = sessionGone ? sessionGoneTimeoutMs : staleTimeoutMs
+     if (timeSinceLastUpdate <= effectiveStaleTimeout) continue
++
++    if (shouldRefreshFromSessionActivity) {
++      const activityTime = await refreshTaskActivityFromSession(task, getSessionActivity)
++      const refreshedLastUpdate = task.progress?.lastUpdate.getTime() ?? activityTime
++      if (refreshedLastUpdate !== undefined && now - refreshedLastUpdate <= effectiveStaleTimeout) continue
++      if (refreshedLastUpdate !== undefined) {
++        timeSinceLastUpdate = now - refreshedLastUpdate
++      }
++    }
++
+     if (task.status !== "running") continue
+ 
+     if (sessionGone && await verifySessionExists(client, sessionID, directory)) {
+-- 
+2.39.2
+

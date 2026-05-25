@@ -1,0 +1,519 @@
+From 670d8ab175d482be1dcda3b0a30c059df9c486a0 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 27 Mar 2026 13:59:06 +0900
+Subject: [PATCH 3562/5749] fix(#2852): forward model overrides from
+ categories/agent config to subagents
+
+- fix(switcher): use lastIndexOf for multi-slash model IDs (e.g. aws/anthropic/claude-sonnet-4)
+- fix(model-resolution): same lastIndexOf fix in doctor parseProviderModel
+- fix(call-omo-agent): resolve model from agent config and forward to both
+  background and sync executors via DelegatedModelConfig
+- fix(subagent-resolver): inherit category model/variant when agent uses
+  category reference without explicit model override
+- test: add model override forwarding tests for call-omo-agent
+- test: add multi-slash model ID test for switcher
+---
+ src/cli/doctor/checks/model-resolution.ts     |   2 +-
+ src/create-managers.ts                        |   2 +
+ src/hooks/preemptive-compaction.test.ts       |   5 +-
+ src/hooks/preemptive-compaction.ts            |   7 ++
+ src/hooks/think-mode/switcher.test.ts         |  13 +++
+ src/hooks/think-mode/switcher.ts              |   3 +-
+ src/shared/tmux/tmux-utils/server-health.ts   |   9 ++
+ .../call-omo-agent/background-executor.ts     |   3 +
+ src/tools/call-omo-agent/sync-executor.ts     |   4 +
+ src/tools/call-omo-agent/tools.test.ts        | 100 ++++++++++++++++++
+ src/tools/call-omo-agent/tools.ts             |  36 +++++--
+ src/tools/delegate-task/subagent-resolver.ts  |  18 ++--
+ 12 files changed, 185 insertions(+), 17 deletions(-)
+
+diff --git a/src/cli/doctor/checks/model-resolution.ts b/src/cli/doctor/checks/model-resolution.ts
+index 706b18f4..ea7d538e 100644
+--- a/src/cli/doctor/checks/model-resolution.ts
++++ b/src/cli/doctor/checks/model-resolution.ts
+@@ -9,7 +9,7 @@ import { buildEffectiveResolution, getEffectiveModel } from "./model-resolution-
+ import type { AgentResolutionInfo, CategoryResolutionInfo, ModelResolutionInfo, OmoConfig } from "./model-resolution-types"
+ 
+ function parseProviderModel(value: string): { providerID: string; modelID: string } | null {
+-  const slashIndex = value.indexOf("/")
++  const slashIndex = value.lastIndexOf("/")
+   if (slashIndex <= 0 || slashIndex === value.length - 1) {
+     return null
+   }
+diff --git a/src/create-managers.ts b/src/create-managers.ts
+index 0aefd0e2..d6e548de 100644
+--- a/src/create-managers.ts
++++ b/src/create-managers.ts
+@@ -9,6 +9,7 @@ import { initTaskToastManager } from "./features/task-toast-manager"
+ import { TmuxSessionManager } from "./features/tmux-subagent"
+ import { createConfigHandler } from "./plugin-handlers"
+ import { log } from "./shared"
++import { markServerRunningInProcess } from "./shared/tmux/tmux-utils/server-health"
+ 
+ export type Managers = {
+   tmuxSessionManager: TmuxSessionManager
+@@ -26,6 +27,7 @@ export function createManagers(args: {
+ }): Managers {
+   const { ctx, pluginConfig, tmuxConfig, modelCacheState, backgroundNotificationHookEnabled } = args
+ 
++  markServerRunningInProcess()
+   const tmuxSessionManager = new TmuxSessionManager(ctx, tmuxConfig)
+ 
+   const backgroundManager = new BackgroundManager(
+diff --git a/src/hooks/preemptive-compaction.test.ts b/src/hooks/preemptive-compaction.test.ts
+index e5d266c3..54025242 100644
+--- a/src/hooks/preemptive-compaction.test.ts
++++ b/src/hooks/preemptive-compaction.test.ts
+@@ -451,7 +451,9 @@ describe("preemptive-compaction", () => {
+ 
+     expect(ctx.client.session.summarize).toHaveBeenCalledTimes(1)
+ 
+-    // when - new message with high tokens (context grew after compaction)
++    // when - advance past the 60s cooldown window, then new message with high tokens
++    const originalNow = Date.now
++    Date.now = () => originalNow() + 61_000
+     await hook.event({
+       event: {
+         type: "message.updated",
+@@ -480,6 +482,7 @@ describe("preemptive-compaction", () => {
+ 
+     // then - summarize should fire again
+     expect(ctx.client.session.summarize).toHaveBeenCalledTimes(2)
++    Date.now = originalNow
+   })
+ 
+   // #given modelContextLimitsCache has model-specific limit (256k)
+diff --git a/src/hooks/preemptive-compaction.ts b/src/hooks/preemptive-compaction.ts
+index 77923494..d11c1a7e 100644
+--- a/src/hooks/preemptive-compaction.ts
++++ b/src/hooks/preemptive-compaction.ts
+@@ -10,6 +10,7 @@ import { createPostCompactionDegradationMonitor } from "./preemptive-compaction-
+ 
+ const PREEMPTIVE_COMPACTION_TIMEOUT_MS = 120_000
+ const PREEMPTIVE_COMPACTION_THRESHOLD = 0.78
++const PREEMPTIVE_COMPACTION_COOLDOWN_MS = 60_000
+ 
+ declare function setTimeout(handler: () => void, timeout?: number): unknown
+ declare function clearTimeout(timeoutID: unknown): void
+@@ -68,6 +69,7 @@ export function createPreemptiveCompactionHook(
+ ) {
+   const compactionInProgress = new Set<string>()
+   const compactedSessions = new Set<string>()
++  const lastCompactionTime = new Map<string, number>()
+   const tokenCache = new Map<string, CachedCompactionState>()
+ 
+   const postCompactionMonitor = createPostCompactionDegradationMonitor({
+@@ -85,6 +87,9 @@ export function createPreemptiveCompactionHook(
+     const { sessionID } = input
+     if (compactedSessions.has(sessionID) || compactionInProgress.has(sessionID)) return
+ 
++    const lastTime = lastCompactionTime.get(sessionID)
++    if (lastTime && Date.now() - lastTime < PREEMPTIVE_COMPACTION_COOLDOWN_MS) return
++
+     const cached = tokenCache.get(sessionID)
+     if (!cached) return
+ 
+@@ -127,6 +132,7 @@ export function createPreemptiveCompactionHook(
+       )
+ 
+       compactedSessions.add(sessionID)
++      lastCompactionTime.set(sessionID, Date.now())
+     } catch (error) {
+       log("[preemptive-compaction] Compaction failed", { sessionID, error: String(error) })
+     } finally {
+@@ -142,6 +148,7 @@ export function createPreemptiveCompactionHook(
+       if (sessionID) {
+         compactionInProgress.delete(sessionID)
+         compactedSessions.delete(sessionID)
++        lastCompactionTime.delete(sessionID)
+         tokenCache.delete(sessionID)
+         postCompactionMonitor.clear(sessionID)
+       }
+diff --git a/src/hooks/think-mode/switcher.test.ts b/src/hooks/think-mode/switcher.test.ts
+index e699da91..bbe01bed 100644
+--- a/src/hooks/think-mode/switcher.test.ts
++++ b/src/hooks/think-mode/switcher.test.ts
+@@ -146,6 +146,19 @@ describe("think-mode switcher", () => {
+         expect(getHighVariant("custom-llm/gemini-3.1-pro")).toBe("custom-llm/gemini-3-1-pro-high")
+       })
+ 
++      it("should handle multi-slash model IDs (#2852)", () => {
++        // given model IDs with multiple slashes (e.g. aws/anthropic/claude-sonnet-4)
++        const variant = getHighVariant("aws/anthropic/claude-sonnet-4-6")
++
++        // then should split at last slash, preserving full provider prefix
++        expect(variant).toBe("aws/anthropic/claude-sonnet-4-6-high")
++      })
++
++      it("should return null for multi-slash unknown models", () => {
++        // given multi-slash model ID without high variant mapping
++        expect(getHighVariant("aws/anthropic/unknown-model")).toBeNull()
++      })
++
+       it("should return null for prefixed models without high variant mapping", () => {
+         // given prefixed model IDs without high variant mapping
+         expect(getHighVariant("vertex_ai/unknown-model")).toBeNull()
+diff --git a/src/hooks/think-mode/switcher.ts b/src/hooks/think-mode/switcher.ts
+index f458d9b6..66aa39f5 100644
+--- a/src/hooks/think-mode/switcher.ts
++++ b/src/hooks/think-mode/switcher.ts
+@@ -26,9 +26,10 @@ import { normalizeModelID } from "../../shared"
+  * extractModelPrefix("vertex_ai/claude-sonnet-4-6") // { prefix: "vertex_ai/", base: "claude-sonnet-4-6" }
+  * extractModelPrefix("claude-sonnet-4-6") // { prefix: "", base: "claude-sonnet-4-6" }
+  * extractModelPrefix("openai/gpt-5.4") // { prefix: "openai/", base: "gpt-5.4" }
++ * extractModelPrefix("aws/anthropic/claude-sonnet-4") // { prefix: "aws/anthropic/", base: "claude-sonnet-4" }
+  */
+ function extractModelPrefix(modelID: string): { prefix: string; base: string } {
+-  const slashIndex = modelID.indexOf("/")
++  const slashIndex = modelID.lastIndexOf("/")
+   if (slashIndex === -1) {
+     return { prefix: "", base: modelID }
+   }
+diff --git a/src/shared/tmux/tmux-utils/server-health.ts b/src/shared/tmux/tmux-utils/server-health.ts
+index d9e3aee7..a3627100 100644
+--- a/src/shared/tmux/tmux-utils/server-health.ts
++++ b/src/shared/tmux/tmux-utils/server-health.ts
+@@ -1,11 +1,20 @@
+ let serverAvailable: boolean | null = null
+ let serverCheckUrl: string | null = null
++let inProcessServerRunning = false
+ 
+ function delay(milliseconds: number): Promise<void> {
+ 	return new Promise((resolve) => setTimeout(resolve, milliseconds))
+ }
+ 
++export function markServerRunningInProcess(): void {
++	inProcessServerRunning = true
++}
++
+ export async function isServerRunning(serverUrl: string): Promise<boolean> {
++	if (inProcessServerRunning) {
++		return true
++	}
++
+ 	if (serverCheckUrl === serverUrl && serverAvailable === true) {
+ 		return true
+ 	}
+diff --git a/src/tools/call-omo-agent/background-executor.ts b/src/tools/call-omo-agent/background-executor.ts
+index ad0c2b1c..13f6f6d2 100644
+--- a/src/tools/call-omo-agent/background-executor.ts
++++ b/src/tools/call-omo-agent/background-executor.ts
+@@ -2,6 +2,7 @@ import type { CallOmoAgentArgs } from "./types"
+ import type { BackgroundManager } from "../../features/background-agent"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { log } from "../../shared"
++import type { DelegatedModelConfig } from "../../shared/model-resolution-types"
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { resolveMessageContext } from "../../features/hook-message-injector"
+ import { getSessionAgent } from "../../features/claude-code-session-state"
+@@ -20,6 +21,7 @@ export async function executeBackground(
+   manager: BackgroundManager,
+   client: PluginInput["client"],
+   fallbackChain?: FallbackEntry[],
++  model?: DelegatedModelConfig,
+ ): Promise<string> {
+   try {
+     const messageDir = getMessageDir(toolContext.sessionID)
+@@ -50,6 +52,7 @@ export async function executeBackground(
+       parentMessageID: toolContext.messageID,
+       parentAgent,
+       parentTools: getSessionTools(toolContext.sessionID),
++      model,
+       fallbackChain,
+     })
+ 
+diff --git a/src/tools/call-omo-agent/sync-executor.ts b/src/tools/call-omo-agent/sync-executor.ts
+index 015b81b5..77a1c23e 100644
+--- a/src/tools/call-omo-agent/sync-executor.ts
++++ b/src/tools/call-omo-agent/sync-executor.ts
+@@ -3,6 +3,7 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { subagentSessions, syncSubagentSessions } from "../../features/claude-code-session-state"
+ import { clearSessionFallbackChain, setSessionFallbackChain } from "../../hooks/model-fallback/hook"
+ import { getAgentToolRestrictions, log } from "../../shared"
++import type { DelegatedModelConfig } from "../../shared/model-resolution-types"
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { waitForCompletion } from "./completion-poller"
+ import { processMessages } from "./message-processor"
+@@ -46,6 +47,7 @@ export async function executeSync(
+   deps: ExecuteSyncDeps = defaultDeps,
+   fallbackChain?: FallbackEntry[],
+   spawnReservation?: SpawnReservation,
++  model?: DelegatedModelConfig,
+ ): Promise<string> {
+   let sessionID: string | undefined
+   let createdSessionForExecution = false
+@@ -88,6 +90,8 @@ export async function executeSync(
+             question: false,
+           },
+           parts: [{ type: "text", text: args.prompt }],
++          ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
++          ...(model?.variant ? { variant: model.variant } : {}),
+         },
+       })
+     } catch (error) {
+diff --git a/src/tools/call-omo-agent/tools.test.ts b/src/tools/call-omo-agent/tools.test.ts
+index bbb21587..45038a2b 100644
+--- a/src/tools/call-omo-agent/tools.test.ts
++++ b/src/tools/call-omo-agent/tools.test.ts
+@@ -165,6 +165,106 @@ describe("createCallOmoAgent", () => {
+     ])
+   })
+ 
++  test("forwards model override from agent config to background executor (#2852)", async () => {
++    //#given
++    const launch = mock((_input: { model?: { providerID: string; modelID: string }; fallbackChain?: unknown[] }) => Promise.resolve({
++      id: "task-model",
++      sessionID: "sub-session",
++      description: "Test task",
++      agent: "explore",
++      status: "pending",
++    }))
++    const managerWithLaunch = {
++      launch,
++      getTask: mock(() => undefined),
++    }
++    const toolDef = createCallOmoAgent(
++      mockCtx,
++      managerWithLaunch,
++      [],
++      {
++        explore: {
++          model: "aws/anthropic/claude-sonnet-4",
++        },
++      },
++    )
++    const executeFunc = toolDef.execute as Function
++
++    //#when
++    await executeFunc(
++      {
++        description: "Test model override",
++        prompt: "Test prompt",
++        subagent_type: "explore",
++        run_in_background: true,
++      },
++      { sessionID: "test", messageID: "msg", agent: "test", abort: new AbortController().signal }
++    )
++
++    //#then
++    const firstLaunchCall = launch.mock.calls[0]
++    if (firstLaunchCall === undefined) {
++      throw new Error("Expected launch to be called")
++    }
++
++    const [launchArgs] = firstLaunchCall
++    expect(launchArgs.model).toEqual({
++      providerID: "aws",
++      modelID: "anthropic/claude-sonnet-4",
++    })
++  })
++
++  test("forwards model variant from agent config to background executor (#2852)", async () => {
++    //#given
++    const launch = mock((_input: { model?: { providerID: string; modelID: string; variant?: string } }) => Promise.resolve({
++      id: "task-variant",
++      sessionID: "sub-session",
++      description: "Test task",
++      agent: "explore",
++      status: "pending",
++    }))
++    const managerWithLaunch = {
++      launch,
++      getTask: mock(() => undefined),
++    }
++    const toolDef = createCallOmoAgent(
++      mockCtx,
++      managerWithLaunch,
++      [],
++      {
++        explore: {
++          model: "openai/gpt-5.4",
++          variant: "high",
++        },
++      },
++    )
++    const executeFunc = toolDef.execute as Function
++
++    //#when
++    await executeFunc(
++      {
++        description: "Test variant",
++        prompt: "Test prompt",
++        subagent_type: "explore",
++        run_in_background: true,
++      },
++      { sessionID: "test", messageID: "msg", agent: "test", abort: new AbortController().signal }
++    )
++
++    //#then
++    const firstLaunchCall = launch.mock.calls[0]
++    if (firstLaunchCall === undefined) {
++      throw new Error("Expected launch to be called")
++    }
++
++    const [launchArgs] = firstLaunchCall
++    expect(launchArgs.model).toEqual({
++      providerID: "openai",
++      modelID: "gpt-5.4",
++      variant: "high",
++    })
++  })
++
+   test("should return a tool error when sync spawn depth validation fails", async () => {
+     //#given
+     reserveSubagentSpawnMock.mockRejectedValueOnce(new Error("Subagent spawn blocked: child depth 4 exceeds background_task.maxDepth=3."))
+diff --git a/src/tools/call-omo-agent/tools.ts b/src/tools/call-omo-agent/tools.ts
+index 14219dc2..13388f06 100644
+--- a/src/tools/call-omo-agent/tools.ts
++++ b/src/tools/call-omo-agent/tools.ts
+@@ -3,20 +3,22 @@ import { ALLOWED_AGENTS, CALL_OMO_AGENT_DESCRIPTION } from "./constants"
+ import type { AllowedAgentType, CallOmoAgentArgs, ToolContextWithMetadata } from "./types"
+ import type { BackgroundManager } from "../../features/background-agent"
+ import type { CategoriesConfig, AgentOverrides } from "../../config/schema"
++import type { DelegatedModelConfig } from "../../shared/model-resolution-types"
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { AGENT_MODEL_REQUIREMENTS } from "../../shared/model-requirements"
+ import { getAgentConfigKey } from "../../shared/agent-display-names"
++import { normalizeModelFormat } from "../../shared/model-format-normalizer"
+ import { normalizeFallbackModels } from "../../shared/model-resolver"
+ import { buildFallbackChainFromModels } from "../../shared/fallback-chain-from-models"
+ import { log } from "../../shared"
+ import { executeBackground } from "./background-executor"
+ import { executeSync } from "./sync-executor"
+ 
+-function resolveFallbackChainForCallOmoAgent(args: {
++function resolveModelAndFallbackChain(args: {
+   subagentType: string
+   agentOverrides?: AgentOverrides
+   userCategories?: CategoriesConfig
+-}): FallbackEntry[] | undefined {
++}): { model: DelegatedModelConfig | undefined; fallbackChain: FallbackEntry[] | undefined } {
+   const { subagentType, agentOverrides, userCategories } = args
+   const agentConfigKey = getAgentConfigKey(subagentType)
+   const agentRequirement = AGENT_MODEL_REQUIREMENTS[agentConfigKey]
+@@ -26,14 +28,32 @@ function resolveFallbackChainForCallOmoAgent(args: {
+       ? Object.entries(agentOverrides).find(([key]) => key.toLowerCase() === agentConfigKey)?.[1]
+       : undefined)
+ 
++  let model: DelegatedModelConfig | undefined
++  if (agentOverride?.model) {
++    const normalized = normalizeModelFormat(agentOverride.model)
++    if (normalized) {
++      model = agentOverride.variant ? { ...normalized, variant: agentOverride.variant } : normalized
++      log("[call_omo_agent] Resolved model override from agent config", {
++        agent: subagentType,
++        model: agentOverride.model,
++        variant: agentOverride.variant,
++      })
++    }
++  }
++
+   const normalizedFallbackModels = normalizeFallbackModels(
+     agentOverride?.fallback_models
+     ?? (agentOverride?.category ? userCategories?.[agentOverride.category]?.fallback_models : undefined)
+   )
+-  const defaultProviderID = agentRequirement?.fallbackChain?.[0]?.providers?.[0] ?? "opencode"
++  const defaultProviderID = model?.providerID
++    ?? agentRequirement?.fallbackChain?.[0]?.providers?.[0]
++    ?? "opencode"
+   const configuredFallbackChain = buildFallbackChainFromModels(normalizedFallbackModels, defaultProviderID)
+ 
+-  return configuredFallbackChain ?? agentRequirement?.fallbackChain
++  return {
++    model,
++    fallbackChain: configuredFallbackChain ?? agentRequirement?.fallbackChain,
++  }
+ }
+ 
+ export function createCallOmoAgent(
+@@ -82,7 +102,7 @@ export function createCallOmoAgent(
+         return `Error: Agent "${normalizedAgent}" is disabled via disabled_agents configuration. Remove it from disabled_agents in your oh-my-opencode.json to use it.`
+       }
+ 
+-      const fallbackChain = resolveFallbackChainForCallOmoAgent({
++      const { model: resolvedModel, fallbackChain } = resolveModelAndFallbackChain({
+         subagentType: args.subagent_type,
+         agentOverrides,
+         userCategories,
+@@ -92,21 +112,21 @@ export function createCallOmoAgent(
+         if (args.session_id) {
+           return `Error: session_id is not supported in background mode. Use run_in_background=false to continue an existing session.`
+         }
+-        return await executeBackground(args, toolCtx, backgroundManager, ctx.client, fallbackChain)
++        return await executeBackground(args, toolCtx, backgroundManager, ctx.client, fallbackChain, resolvedModel)
+       }
+ 
+       if (!args.session_id) {
+         let spawnReservation: Awaited<ReturnType<BackgroundManager["reserveSubagentSpawn"]>> | undefined
+         try {
+           spawnReservation = await backgroundManager.reserveSubagentSpawn(toolCtx.sessionID)
+-          return await executeSync(args, toolCtx, ctx, undefined, fallbackChain, spawnReservation)
++          return await executeSync(args, toolCtx, ctx, undefined, fallbackChain, spawnReservation, resolvedModel)
+         } catch (error) {
+           spawnReservation?.rollback()
+           return `Error: ${error instanceof Error ? error.message : String(error)}`
+         }
+       }
+ 
+-      return await executeSync(args, toolCtx, ctx, undefined, fallbackChain)
++      return await executeSync(args, toolCtx, ctx, undefined, fallbackChain, undefined, resolvedModel)
+     },
+   })
+ }
+diff --git a/src/tools/delegate-task/subagent-resolver.ts b/src/tools/delegate-task/subagent-resolver.ts
+index df6fe737..1171eabf 100644
+--- a/src/tools/delegate-task/subagent-resolver.ts
++++ b/src/tools/delegate-task/subagent-resolver.ts
+@@ -101,12 +101,15 @@ Create the work plan directly - that's your job as the planning agent.`,
+     const agentOverride = agentOverrides?.[agentConfigKey as keyof typeof agentOverrides]
+       ?? (agentOverrides ? Object.entries(agentOverrides).find(([key]) => key.toLowerCase() === agentConfigKey)?.[1] : undefined)
+     const agentRequirement = AGENT_MODEL_REQUIREMENTS[agentConfigKey]
++    const agentCategoryModel = agentOverride?.category
++      ? userCategories?.[agentOverride.category]?.model
++      : undefined
+     const normalizedAgentFallbackModels = normalizeFallbackModels(
+       agentOverride?.fallback_models
+       ?? (agentOverride?.category ? userCategories?.[agentOverride.category]?.fallback_models : undefined)
+     )
+ 
+-    if (agentOverride?.model || agentRequirement || matchedAgent.model) {
++    if (agentOverride?.model || agentCategoryModel || agentRequirement || matchedAgent.model) {
+       const availableModels = await getAvailableModelsForDelegateTask(client)
+ 
+       const normalizedMatchedModel = matchedAgent.model
+@@ -117,7 +120,7 @@ Create the work plan directly - that's your job as the planning agent.`,
+         : undefined
+ 
+       const resolution = resolveModelForDelegateTask({
+-        userModel: agentOverride?.model,
++        userModel: agentOverride?.model ?? agentCategoryModel,
+         userFallbackModels: flattenToFallbackModelStrings(normalizedAgentFallbackModels),
+         categoryDefaultModel: matchedAgentModelStr,
+         fallbackChain: agentRequirement?.fallbackChain,
+@@ -133,16 +136,19 @@ Create the work plan directly - that's your job as the planning agent.`,
+           const variantToUse = agentOverride?.variant ?? resolution.variant
+           categoryModel = variantToUse ? { ...normalized, variant: variantToUse } : normalized
+         }
+-      } else if (resolutionSkipped && agentOverride?.model) {
++      } else if (resolutionSkipped && (agentOverride?.model ?? agentCategoryModel)) {
+         // Cold cache: resolution was skipped but user explicitly configured a model.
+         // Honor the user override directly — don't fall through to hardcoded fallback chain.
+-        const normalized = normalizeModelFormat(agentOverride.model)
++        const normalized = normalizeModelFormat((agentOverride?.model ?? agentCategoryModel)!)
+         if (normalized) {
+-          const variantToUse = agentOverride?.variant
++          const agentCategoryVariant = agentOverride?.category
++            ? userCategories?.[agentOverride.category]?.variant
++            : undefined
++          const variantToUse = agentOverride?.variant ?? agentCategoryVariant
+           categoryModel = variantToUse ? { ...normalized, variant: variantToUse } : normalized
+           log("[delegate-task] Cold cache: using explicit user override for subagent", {
+             agent: agentToUse,
+-            model: agentOverride.model,
++            model: agentOverride?.model ?? agentCategoryModel,
+           })
+         }
+       }
+-- 
+2.39.2
+

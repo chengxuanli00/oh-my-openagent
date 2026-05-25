@@ -1,0 +1,255 @@
+From b1203b95013675409757a81ac01541f1ba4994d0 Mon Sep 17 00:00:00 2001
+From: minpeter <minpeter@friendli.ai>
+Date: Thu, 26 Feb 2026 17:43:49 +0900
+Subject: [PATCH 2790/5749] Fix hashline-edit deduplication and validation
+
+- Canonicalize anchors in dedupe keys to handle whitespace variants
+- Make lines field required in edit operations
+- Only allow unanchored append/prepend to create missing files
+- Reorder delete/rename validation to prevent edge cases
+- Add allow_non_gpt_model and max_prompt_tokens to config schema
+  ```
+---
+ src/tools/hashline-edit/edit-deduplication.ts | 12 ++-
+ .../hashline-edit/edit-operations.test.ts     | 22 +++++-
+ .../hashline-edit/hashline-edit-executor.ts   | 16 ++--
+ src/tools/hashline-edit/tool-description.ts   |  2 +-
+ src/tools/hashline-edit/tools.test.ts         | 77 +++++++++++++++++++
+ src/tools/hashline-edit/tools.ts              |  1 -
+ src/tools/hashline-edit/validation.ts         |  2 +-
+ 7 files changed, 117 insertions(+), 15 deletions(-)
+
+diff --git a/src/tools/hashline-edit/edit-deduplication.ts b/src/tools/hashline-edit/edit-deduplication.ts
+index e689bb53..8818b61a 100644
+--- a/src/tools/hashline-edit/edit-deduplication.ts
++++ b/src/tools/hashline-edit/edit-deduplication.ts
+@@ -1,18 +1,24 @@
+ import type { HashlineEdit } from "./types"
+ import { toNewLines } from "./edit-text-normalization"
++import { normalizeLineRef } from "./validation"
+ 
+ function normalizeEditPayload(payload: string | string[]): string {
+   return toNewLines(payload).join("\n")
+ }
+ 
++function canonicalAnchor(anchor: string | undefined): string {
++  if (!anchor) return ""
++  return normalizeLineRef(anchor)
++}
++
+ function buildDedupeKey(edit: HashlineEdit): string {
+   switch (edit.op) {
+     case "replace":
+-      return `replace|${edit.pos}|${edit.end ?? ""}|${normalizeEditPayload(edit.lines)}`
++      return `replace|${canonicalAnchor(edit.pos)}|${edit.end ? canonicalAnchor(edit.end) : ""}|${normalizeEditPayload(edit.lines)}`
+     case "append":
+-      return `append|${edit.pos ?? ""}|${normalizeEditPayload(edit.lines)}`
++      return `append|${canonicalAnchor(edit.pos)}|${normalizeEditPayload(edit.lines)}`
+     case "prepend":
+-      return `prepend|${edit.pos ?? ""}|${normalizeEditPayload(edit.lines)}`
++      return `prepend|${canonicalAnchor(edit.pos)}|${normalizeEditPayload(edit.lines)}`
+     default:
+       return JSON.stringify(edit)
+   }
+diff --git a/src/tools/hashline-edit/edit-operations.test.ts b/src/tools/hashline-edit/edit-operations.test.ts
+index 5d8ad08b..40585210 100644
+--- a/src/tools/hashline-edit/edit-operations.test.ts
++++ b/src/tools/hashline-edit/edit-operations.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "bun:test"
+-import { applyHashlineEdits } from "./edit-operations"
++import { applyHashlineEdits, applyHashlineEditsWithReport } from "./edit-operations"
+ import { applyAppend, applyInsertAfter, applyPrepend, applyReplaceLines, applySetLine } from "./edit-operation-primitives"
+ import { computeLineHash } from "./hash-computation"
+ import type { HashlineEdit } from "./types"
+@@ -389,3 +389,23 @@ describe("hashline edit operations", () => {
+     expect(result).toEqual("replaced A\nline 3\nreplaced B")
+   })
+ })
++
++describe("dedupe anchor canonicalization", () => {
++  it("deduplicates edits with whitespace-variant anchors", () => {
++    //#given
++    const content = "line 1\nline 2"
++    const lines = content.split("\n")
++    const canonical = `1#${computeLineHash(1, lines[0])}`
++    const spaced = ` 1 # ${computeLineHash(1, lines[0])} `
++
++    //#when
++    const report = applyHashlineEditsWithReport(content, [
++      { op: "append", pos: canonical, lines: ["inserted"] },
++      { op: "append", pos: spaced, lines: ["inserted"] },
++    ])
++
++    //#then
++    expect(report.deduplicatedEdits).toBe(1)
++    expect(report.content).toBe("line 1\ninserted\nline 2")
++  })
++})
+diff --git a/src/tools/hashline-edit/hashline-edit-executor.ts b/src/tools/hashline-edit/hashline-edit-executor.ts
+index e20ebbf9..d316307d 100644
+--- a/src/tools/hashline-edit/hashline-edit-executor.ts
++++ b/src/tools/hashline-edit/hashline-edit-executor.ts
+@@ -33,7 +33,7 @@ function resolveToolCallID(ctx: ToolContextWithCallID): string | undefined {
+ 
+ function canCreateFromMissingFile(edits: HashlineEdit[]): boolean {
+   if (edits.length === 0) return false
+-  return edits.every((edit) => edit.op === "append" || edit.op === "prepend")
++  return edits.every((edit) => (edit.op === "append" || edit.op === "prepend") && !edit.pos)
+ }
+ 
+ function buildSuccessMeta(
+@@ -86,19 +86,19 @@ export async function executeHashlineEditTool(args: HashlineEditArgs, context: T
+     const filePath = args.filePath
+     const { delete: deleteMode, rename } = args
+ 
+-    if (!deleteMode && (!args.edits || !Array.isArray(args.edits) || args.edits.length === 0)) {
+-      return "Error: edits parameter must be a non-empty array"
+-    }
+-
+-    const edits = deleteMode ? [] : normalizeHashlineEdits(args.edits)
+-
+     if (deleteMode && rename) {
+       return "Error: delete and rename cannot be used together"
+     }
+-    if (deleteMode && edits.length > 0) {
++    if (deleteMode && args.edits.length > 0) {
+       return "Error: delete mode requires edits to be an empty array"
+     }
+ 
++    if (!deleteMode && (!args.edits || !Array.isArray(args.edits) || args.edits.length === 0)) {
++      return "Error: edits parameter must be a non-empty array"
++    }
++
++    const edits = deleteMode ? [] : normalizeHashlineEdits(args.edits)
++
+     const file = Bun.file(filePath)
+     const exists = await file.exists()
+     if (!exists && !deleteMode && !canCreateFromMissingFile(edits)) {
+diff --git a/src/tools/hashline-edit/tool-description.ts b/src/tools/hashline-edit/tool-description.ts
+index 0b0ee00f..2d452ccf 100644
+--- a/src/tools/hashline-edit/tool-description.ts
++++ b/src/tools/hashline-edit/tool-description.ts
+@@ -10,7 +10,7 @@ WORKFLOW:
+ VALIDATION:
+   Payload shape: { "filePath": string, "edits": [...], "delete"?: boolean, "rename"?: string }
+   Each edit must be one of: replace, append, prepend
+-  Edit shape: { "op": "replace"|"append"|"prepend", "pos"?: "LINE#ID", "end"?: "LINE#ID", "lines"?: string|string[]|null }
++  Edit shape: { "op": "replace"|"append"|"prepend", "pos"?: "LINE#ID", "end"?: "LINE#ID", "lines": string|string[]|null }
+   lines must contain plain replacement text only (no LINE#ID prefixes, no diff + markers)
+   CRITICAL: all operations validate against the same pre-edit file snapshot and apply bottom-up. Refs/tags are interpreted against the last-read version of the file.
+ 
+diff --git a/src/tools/hashline-edit/tools.test.ts b/src/tools/hashline-edit/tools.test.ts
+index cb76b834..1158ca3d 100644
+--- a/src/tools/hashline-edit/tools.test.ts
++++ b/src/tools/hashline-edit/tools.test.ts
+@@ -341,4 +341,81 @@ describe("createHashlineEditTool", () => {
+     //#then
+     expect(envelope.lineEnding).toBe("\r\n")
+   })
++
++  it("rejects delete=true with non-empty edits before normalization", async () => {
++    //#given
++    const filePath = path.join(tempDir, "delete-reject.txt")
++    fs.writeFileSync(filePath, "line1")
++
++    //#when
++    const result = await tool.execute(
++      {
++        filePath,
++        delete: true,
++        edits: [{ op: "replace", pos: "1#ZZ", lines: "bad" }],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(result).toContain("delete mode requires edits to be an empty array")
++    expect(fs.existsSync(filePath)).toBe(true)
++  })
++
++  it("rejects delete=true combined with rename", async () => {
++    //#given
++    const filePath = path.join(tempDir, "delete-rename.txt")
++    fs.writeFileSync(filePath, "line1")
++
++    //#when
++    const result = await tool.execute(
++      {
++        filePath,
++        delete: true,
++        rename: path.join(tempDir, "new-name.txt"),
++        edits: [],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(result).toContain("delete and rename cannot be used together")
++    expect(fs.existsSync(filePath)).toBe(true)
++  })
++
++  it("rejects missing file creation with anchored append", async () => {
++    //#given
++    const filePath = path.join(tempDir, "nonexistent.txt")
++
++    //#when
++    const result = await tool.execute(
++      {
++        filePath,
++        edits: [{ op: "append", pos: "1#ZZ", lines: ["bad"] }],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(result).toContain("File not found")
++  })
++
++  it("allows missing file creation with unanchored append", async () => {
++    //#given
++    const filePath = path.join(tempDir, "newfile.txt")
++
++    //#when
++    const result = await tool.execute(
++      {
++        filePath,
++        edits: [{ op: "append", lines: ["created"] }],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(fs.existsSync(filePath)).toBe(true)
++    expect(fs.readFileSync(filePath, "utf-8")).toBe("created")
++    expect(result).toBe(`Updated ${filePath}`)
++  })
+ })
+diff --git a/src/tools/hashline-edit/tools.ts b/src/tools/hashline-edit/tools.ts
+index 13265029..bd2bf1f9 100644
+--- a/src/tools/hashline-edit/tools.ts
++++ b/src/tools/hashline-edit/tools.ts
+@@ -31,7 +31,6 @@ export function createHashlineEditTool(): ToolDefinition {
+             end: tool.schema.string().optional().describe("Range end anchor in LINE#ID format"),
+             lines: tool.schema
+               .union([tool.schema.string(), tool.schema.array(tool.schema.string()), tool.schema.null()])
+-              .optional()
+               .describe("Replacement or inserted lines. null/[] deletes with replace"),
+           })
+         )
+diff --git a/src/tools/hashline-edit/validation.ts b/src/tools/hashline-edit/validation.ts
+index fc5b395a..ed606155 100644
+--- a/src/tools/hashline-edit/validation.ts
++++ b/src/tools/hashline-edit/validation.ts
+@@ -15,7 +15,7 @@ const MISMATCH_CONTEXT = 2
+ 
+ const LINE_REF_EXTRACT_PATTERN = /([0-9]+#[ZPMQVRWSNKTXJBYH]{2})/
+ 
+-function normalizeLineRef(ref: string): string {
++export function normalizeLineRef(ref: string): string {
+   const originalTrimmed = ref.trim()
+   let trimmed = originalTrimmed
+   trimmed = trimmed.replace(/^(?:>>>|[+-])\s*/, "")
+-- 
+2.39.2
+

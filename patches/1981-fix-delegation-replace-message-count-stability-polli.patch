@@ -1,0 +1,652 @@
+From 11f587194f39b7652d6e320b998e1cf41c738b20 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 9 Feb 2026 15:37:19 +0900
+Subject: [PATCH 1981/5749] fix(delegation): replace message-count-stability
+ polling with native finish-based completion detection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sync task completion was fragile — detecting premature stability during
+brief idle periods between tool calls. Now mirrors opencode's native
+SessionPrompt.loop() logic: checks assistant finish reason is terminal
+(not tool-calls/unknown) and assistant.id > user.id.
+
+Also switches sync prompt sender from blocking HTTP (promptSync) to
+async fire-and-forget (promptAsync) to avoid JSON parse errors in ACP.
+---
+ src/tools/delegate-task/executor-types.ts     |   2 +
+ src/tools/delegate-task/sync-continuation.ts  |  43 ++-
+ src/tools/delegate-task/sync-prompt-sender.ts |   4 +-
+ .../delegate-task/sync-session-poller.test.ts | 329 ++++++++++++++++++
+ .../delegate-task/sync-session-poller.ts      |  52 +--
+ src/tools/delegate-task/tools.test.ts         |  19 +-
+ 6 files changed, 395 insertions(+), 54 deletions(-)
+ create mode 100644 src/tools/delegate-task/sync-session-poller.test.ts
+
+diff --git a/src/tools/delegate-task/executor-types.ts b/src/tools/delegate-task/executor-types.ts
+index 534ebb68..136f6dbf 100644
+--- a/src/tools/delegate-task/executor-types.ts
++++ b/src/tools/delegate-task/executor-types.ts
+@@ -23,8 +23,10 @@ export interface ParentContext {
+ 
+ export interface SessionMessage {
+   info?: {
++    id?: string
+     role?: string
+     time?: { created?: number }
++    finish?: string
+     agent?: string
+     model?: { providerID: string; modelID: string; variant?: string }
+     modelID?: string
+diff --git a/src/tools/delegate-task/sync-continuation.ts b/src/tools/delegate-task/sync-continuation.ts
+index 8852a355..7c3eadd8 100644
+--- a/src/tools/delegate-task/sync-continuation.ts
++++ b/src/tools/delegate-task/sync-continuation.ts
+@@ -5,9 +5,11 @@ import { storeToolMetadata } from "../../features/tool-metadata-store"
+ import { getTaskToastManager } from "../../features/task-toast-manager"
+ import { getAgentToolRestrictions } from "../../shared/agent-tool-restrictions"
+ import { getMessageDir } from "../../shared/session-utils"
+-import { promptSyncWithModelSuggestionRetry } from "../../shared/model-suggestion-retry"
++import { promptWithModelSuggestionRetry } from "../../shared/model-suggestion-retry"
+ import { findNearestMessageWithFields } from "../../features/hook-message-injector"
+ import { formatDuration } from "./time-formatter"
++import { pollSyncSession } from "./sync-session-poller"
++import { fetchSyncResult } from "./sync-result-fetcher"
+ 
+ export async function executeSyncContinuation(
+   args: DelegateTaskArgs,
+@@ -45,11 +47,11 @@ export async function executeSyncContinuation(
+     storeToolMetadata(ctx.sessionID, ctx.callID, syncContMeta)
+   }
+ 
+-  try {
+-    let resumeAgent: string | undefined
+-    let resumeModel: { providerID: string; modelID: string } | undefined
+-    let resumeVariant: string | undefined
++  let resumeAgent: string | undefined
++  let resumeModel: { providerID: string; modelID: string } | undefined
++  let resumeVariant: string | undefined
+ 
++  try {
+     try {
+       const messagesResp = await client.session.messages({ path: { id: args.session_id! } })
+       const messages = (messagesResp.data ?? []) as SessionMessage[]
+@@ -74,7 +76,7 @@ export async function executeSyncContinuation(
+ 
+     const allowTask = isPlanFamily(resumeAgent)
+ 
+-    await promptSyncWithModelSuggestionRetry(client, {
++    await promptWithModelSuggestionRetry(client, {
+       path: { id: args.session_id! },
+       body: {
+         ...(resumeAgent !== undefined ? { agent: resumeAgent } : {}),
+@@ -97,40 +99,35 @@ export async function executeSyncContinuation(
+     return `Failed to send continuation prompt: ${errorMessage}\n\nSession ID: ${args.session_id}`
+   }
+ 
+-  const messagesResult = await client.session.messages({
+-    path: { id: args.session_id! },
++  const pollError = await pollSyncSession(ctx, client, {
++    sessionID: args.session_id!,
++    agentToUse: resumeAgent ?? "continue",
++    toastManager,
++    taskId,
+   })
++  if (pollError) {
++    return pollError
++  }
+ 
+-  if (messagesResult.error) {
++  const result = await fetchSyncResult(client, args.session_id!)
++  if (!result.ok) {
+     if (toastManager) {
+       toastManager.removeTask(taskId)
+     }
+-    return `Error fetching result: ${messagesResult.error}\n\nSession ID: ${args.session_id}`
++    return result.error
+   }
+ 
+-  const messages = ((messagesResult as { data?: unknown }).data ?? messagesResult) as SessionMessage[]
+-  const assistantMessages = messages
+-    .filter((m) => m.info?.role === "assistant")
+-    .sort((a, b) => (b.info?.time?.created ?? 0) - (a.info?.time?.created ?? 0))
+-  const lastMessage = assistantMessages[0]
+-
+   if (toastManager) {
+     toastManager.removeTask(taskId)
+   }
+ 
+-  if (!lastMessage) {
+-    return `No assistant response found.\n\nSession ID: ${args.session_id}`
+-  }
+-
+-  const textParts = lastMessage?.parts?.filter((p) => p.type === "text" || p.type === "reasoning") ?? []
+-  const textContent = textParts.map((p) => p.text ?? "").filter(Boolean).join("\n")
+   const duration = formatDuration(startTime)
+ 
+   return `Task continued and completed in ${duration}.
+ 
+ ---
+ 
+-${textContent || "(No text output)"}
++${result.textContent || "(No text output)"}
+ 
+ <task_metadata>
+ session_id: ${args.session_id}
+diff --git a/src/tools/delegate-task/sync-prompt-sender.ts b/src/tools/delegate-task/sync-prompt-sender.ts
+index 083e9df2..ae45874c 100644
+--- a/src/tools/delegate-task/sync-prompt-sender.ts
++++ b/src/tools/delegate-task/sync-prompt-sender.ts
+@@ -1,6 +1,6 @@
+ import type { DelegateTaskArgs, OpencodeClient } from "./types"
+ import { isPlanFamily } from "./constants"
+-import { promptSyncWithModelSuggestionRetry } from "../../shared/model-suggestion-retry"
++import { promptWithModelSuggestionRetry } from "../../shared/model-suggestion-retry"
+ import { formatDetailedError } from "./error-formatting"
+ 
+ export async function sendSyncPrompt(
+@@ -17,7 +17,7 @@ export async function sendSyncPrompt(
+ ): Promise<string | null> {
+   try {
+     const allowTask = isPlanFamily(input.agentToUse)
+-    await promptSyncWithModelSuggestionRetry(client, {
++    await promptWithModelSuggestionRetry(client, {
+       path: { id: input.sessionID },
+       body: {
+         agent: input.agentToUse,
+diff --git a/src/tools/delegate-task/sync-session-poller.test.ts b/src/tools/delegate-task/sync-session-poller.test.ts
+new file mode 100644
+index 00000000..ecb0fcf3
+--- /dev/null
++++ b/src/tools/delegate-task/sync-session-poller.test.ts
+@@ -0,0 +1,329 @@
++declare const require: (name: string) => any
++const { describe, test, expect, beforeEach, afterEach } = require("bun:test")
++import { __setTimingConfig, __resetTimingConfig } from "./timing"
++
++function createMockCtx(aborted = false) {
++  const controller = new AbortController()
++  if (aborted) controller.abort()
++  return {
++    sessionID: "parent-session",
++    messageID: "parent-message",
++    abort: controller.signal,
++  }
++}
++
++describe("pollSyncSession", () => {
++  beforeEach(() => {
++    __setTimingConfig({
++      POLL_INTERVAL_MS: 10,
++      MIN_STABILITY_TIME_MS: 0,
++      STABILITY_POLLS_REQUIRED: 1,
++      MAX_POLL_TIME_MS: 5000,
++    })
++  })
++
++  afterEach(() => {
++    __resetTimingConfig()
++  })
++
++  describe("native finish-based completion", () => {
++    test("detects completion when assistant message has terminal finish reason", async () => {
++      //#given - session messages with a terminal assistant finish ("end_turn")
++      //         and the assistant id > user id (native opencode condition)
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      let pollCount = 0
++      const mockClient = {
++        session: {
++          messages: async () => ({
++            data: [
++              { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++              {
++                info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++                parts: [{ type: "text", text: "Done" }],
++              },
++            ],
++          }),
++          status: async () => {
++            pollCount++
++            return { data: { "ses_test": { type: "idle" } } }
++          },
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_test",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then - should return null (success, no error)
++      expect(result).toBeNull()
++    })
++
++    test("keeps polling when assistant finish is tool-calls (non-terminal)", async () => {
++      //#given - first poll returns tool-calls finish, second returns end_turn
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      let callCount = 0
++      const mockClient = {
++        session: {
++          messages: async () => {
++            callCount++
++            if (callCount <= 2) {
++              return {
++                data: [
++                  { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                  {
++                    info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "tool-calls" },
++                    parts: [{ type: "tool-call", text: "calling tool" }],
++                  },
++                ],
++              }
++            }
++            return {
++              data: [
++                { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                {
++                  info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "tool-calls" },
++                  parts: [{ type: "tool-call", text: "calling tool" }],
++                },
++                { info: { id: "msg_003", role: "user", time: { created: 3000 } } },
++                {
++                  info: { id: "msg_004", role: "assistant", time: { created: 4000 }, finish: "end_turn" },
++                  parts: [{ type: "text", text: "Final answer" }],
++                },
++              ],
++            }
++          },
++          status: async () => ({ data: { "ses_test": { type: "idle" } } }),
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_test",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then
++      expect(result).toBeNull()
++      expect(callCount).toBeGreaterThan(2)
++    })
++
++    test("keeps polling when finish is 'unknown' (non-terminal)", async () => {
++      //#given
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      let callCount = 0
++      const mockClient = {
++        session: {
++          messages: async () => {
++            callCount++
++            if (callCount <= 1) {
++              return {
++                data: [
++                  { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                  {
++                    info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "unknown" },
++                    parts: [],
++                  },
++                ],
++              }
++            }
++            return {
++              data: [
++                { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                {
++                  info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "unknown" },
++                  parts: [],
++                },
++                { info: { id: "msg_003", role: "user", time: { created: 3000 } } },
++                {
++                  info: { id: "msg_004", role: "assistant", time: { created: 4000 }, finish: "stop" },
++                  parts: [{ type: "text", text: "Done" }],
++                },
++              ],
++            }
++          },
++          status: async () => ({ data: { "ses_test": { type: "idle" } } }),
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_test",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then
++      expect(result).toBeNull()
++      expect(callCount).toBeGreaterThan(1)
++    })
++
++    test("does not complete when assistant id < user id (user sent after assistant)", async () => {
++      //#given - assistant finished but user message came after it (agent still processing)
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      let callCount = 0
++      const mockClient = {
++        session: {
++          messages: async () => {
++            callCount++
++            if (callCount <= 1) {
++              return {
++                data: [
++                  { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                  {
++                    info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++                    parts: [{ type: "text", text: "Partial" }],
++                  },
++                  { info: { id: "msg_003", role: "user", time: { created: 3000 } } },
++                ],
++              }
++            }
++            return {
++              data: [
++                { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                {
++                  info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++                  parts: [{ type: "text", text: "Partial" }],
++                },
++                { info: { id: "msg_003", role: "user", time: { created: 3000 } } },
++                {
++                  info: { id: "msg_004", role: "assistant", time: { created: 4000 }, finish: "end_turn" },
++                  parts: [{ type: "text", text: "Final" }],
++                },
++              ],
++            }
++          },
++          status: async () => ({ data: { "ses_test": { type: "idle" } } }),
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_test",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then
++      expect(result).toBeNull()
++      expect(callCount).toBeGreaterThan(1)
++    })
++  })
++
++  describe("abort handling", () => {
++    test("returns abort message when signal is aborted", async () => {
++      //#given
++      const { pollSyncSession } = require("./sync-session-poller")
++      const mockClient = {
++        session: {
++          messages: async () => ({ data: [] }),
++          status: async () => ({ data: {} }),
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(true), mockClient, {
++        sessionID: "ses_abort",
++        agentToUse: "test-agent",
++        toastManager: { removeTask: () => {} },
++        taskId: "task_123",
++      })
++
++      //#then
++      expect(result).toContain("Task aborted")
++      expect(result).toContain("ses_abort")
++    })
++  })
++
++  describe("timeout handling", () => {
++    test("returns null on timeout (graceful)", async () => {
++      //#given - never returns a terminal finish, but timeout is very short
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      __setTimingConfig({
++        POLL_INTERVAL_MS: 10,
++        MIN_STABILITY_TIME_MS: 0,
++        STABILITY_POLLS_REQUIRED: 1,
++        MAX_POLL_TIME_MS: 50,
++      })
++
++      const mockClient = {
++        session: {
++          messages: async () => ({
++            data: [
++              { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++            ],
++          }),
++          status: async () => ({ data: { "ses_timeout": { type: "idle" } } }),
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_timeout",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then - timeout returns null (not an error, result is fetched separately)
++      expect(result).toBeNull()
++    })
++  })
++
++  describe("non-idle session status", () => {
++    test("skips message check when session is not idle", async () => {
++      //#given
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      let statusCallCount = 0
++      let messageCallCount = 0
++      const mockClient = {
++        session: {
++          messages: async () => {
++            messageCallCount++
++            return {
++              data: [
++                { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                {
++                  info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++                  parts: [{ type: "text", text: "Done" }],
++                },
++              ],
++            }
++          },
++          status: async () => {
++            statusCallCount++
++            if (statusCallCount <= 2) {
++              return { data: { "ses_busy": { type: "running" } } }
++            }
++            return { data: { "ses_busy": { type: "idle" } } }
++          },
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_busy",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then - should have waited for idle before checking messages
++      expect(result).toBeNull()
++      expect(statusCallCount).toBeGreaterThanOrEqual(3)
++    })
++  })
++})
+diff --git a/src/tools/delegate-task/sync-session-poller.ts b/src/tools/delegate-task/sync-session-poller.ts
+index a9060e68..00f6fd96 100644
+--- a/src/tools/delegate-task/sync-session-poller.ts
++++ b/src/tools/delegate-task/sync-session-poller.ts
+@@ -1,7 +1,27 @@
+ import type { ToolContextWithMetadata, OpencodeClient } from "./types"
++import type { SessionMessage } from "./executor-types"
+ import { getTimingConfig } from "./timing"
+ import { log } from "../../shared/logger"
+ 
++const NON_TERMINAL_FINISH_REASONS = new Set(["tool-calls", "unknown"])
++
++export function isSessionComplete(messages: SessionMessage[]): boolean {
++  let lastUser: SessionMessage | undefined
++  let lastAssistant: SessionMessage | undefined
++
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const msg = messages[i]
++    if (!lastAssistant && msg.info?.role === "assistant") lastAssistant = msg
++    if (!lastUser && msg.info?.role === "user") lastUser = msg
++    if (lastUser && lastAssistant) break
++  }
++
++  if (!lastAssistant?.info?.finish) return false
++  if (NON_TERMINAL_FINISH_REASONS.has(lastAssistant.info.finish)) return false
++  if (!lastUser?.info?.id || !lastAssistant?.info?.id) return false
++  return lastUser.info.id < lastAssistant.info.id
++}
++
+ export async function pollSyncSession(
+   ctx: ToolContextWithMetadata,
+   client: OpencodeClient,
+@@ -14,8 +34,6 @@ export async function pollSyncSession(
+ ): Promise<string | null> {
+   const syncTiming = getTimingConfig()
+   const pollStart = Date.now()
+-  let lastMsgCount = 0
+-  let stablePolls = 0
+   let pollCount = 0
+ 
+   log("[task] Starting poll loop", { sessionID: input.sessionID, agentToUse: input.agentToUse })
+@@ -35,45 +53,29 @@ export async function pollSyncSession(
+     const sessionStatus = allStatuses[input.sessionID]
+ 
+     if (pollCount % 10 === 0) {
+-    log("[task] Poll status", {
++      log("[task] Poll status", {
+         sessionID: input.sessionID,
+         pollCount,
+         elapsed: Math.floor((Date.now() - pollStart) / 1000) + "s",
+         sessionStatus: sessionStatus?.type ?? "not_in_status",
+-        stablePolls,
+-        lastMsgCount,
+       })
+     }
+ 
+     if (sessionStatus && sessionStatus.type !== "idle") {
+-      stablePolls = 0
+-      lastMsgCount = 0
+-      continue
+-    }
+-
+-    const elapsed = Date.now() - pollStart
+-    if (elapsed < syncTiming.MIN_STABILITY_TIME_MS) {
+       continue
+     }
+ 
+-    const messagesCheck = await client.session.messages({ path: { id: input.sessionID } })
+-    const msgs = ((messagesCheck as { data?: unknown }).data ?? messagesCheck) as Array<unknown>
+-    const currentMsgCount = msgs.length
++    const messagesResult = await client.session.messages({ path: { id: input.sessionID } })
++    const msgs = ((messagesResult as { data?: unknown }).data ?? messagesResult) as SessionMessage[]
+ 
+-    if (currentMsgCount === lastMsgCount) {
+-      stablePolls++
+-      if (stablePolls >= syncTiming.STABILITY_POLLS_REQUIRED) {
+-      log("[task] Poll complete - messages stable", { sessionID: input.sessionID, pollCount, currentMsgCount })
+-        break
+-      }
+-    } else {
+-      stablePolls = 0
+-      lastMsgCount = currentMsgCount
++    if (isSessionComplete(msgs)) {
++      log("[task] Poll complete - terminal finish detected", { sessionID: input.sessionID, pollCount })
++      break
+     }
+   }
+ 
+   if (Date.now() - pollStart >= syncTiming.MAX_POLL_TIME_MS) {
+-  log("[task] Poll timeout reached", { sessionID: input.sessionID, pollCount, lastMsgCount, stablePolls })
++    log("[task] Poll timeout reached", { sessionID: input.sessionID, pollCount })
+   }
+ 
+   return null
+diff --git a/src/tools/delegate-task/tools.test.ts b/src/tools/delegate-task/tools.test.ts
+index 2d91acaa..312c79a8 100644
+--- a/src/tools/delegate-task/tools.test.ts
++++ b/src/tools/delegate-task/tools.test.ts
+@@ -1073,11 +1073,16 @@ describe("sisyphus-task", () => {
+          messages: async () => ({
+            data: [
+              {
+-               info: { role: "assistant", time: { created: Date.now() } },
++               info: { id: "msg_001", role: "user", time: { created: Date.now() } },
++               parts: [{ type: "text", text: "Continue the task" }],
++             },
++             {
++               info: { id: "msg_002", role: "assistant", time: { created: Date.now() + 1 }, finish: "end_turn" },
+                parts: [{ type: "text", text: "This is the continued task result" }],
+              },
+            ],
+          }),
++         status: async () => ({ data: { "ses_continue_test": { type: "idle" } } }),
+        },
+        config: { get: async () => ({ data: { model: SYSTEM_DEFAULT_MODEL } }) },
+        app: {
+@@ -1125,11 +1130,12 @@ describe("sisyphus-task", () => {
+     const mockClient = {
+       session: {
+         prompt: promptMock,
+-        promptAsync: async () => ({ data: {} }),
++        promptAsync: promptMock,
+         messages: async () => ({
+           data: [
+             {
+               info: {
++                id: "msg_001",
+                 role: "user",
+                 agent: "sisyphus-junior",
+                 model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
+@@ -1139,11 +1145,12 @@ describe("sisyphus-task", () => {
+               parts: [{ type: "text", text: "previous message" }],
+             },
+             {
+-              info: { role: "assistant", time: { created: Date.now() + 1 } },
++              info: { id: "msg_002", role: "assistant", time: { created: Date.now() + 1 }, finish: "end_turn" },
+               parts: [{ type: "text", text: "Completed." }],
+             },
+           ],
+         }),
++        status: async () => ({ data: { "ses_var_test": { type: "idle" } } }),
+       },
+       config: { get: async () => ({ data: { model: SYSTEM_DEFAULT_MODEL } }) },
+       app: {
+@@ -1316,7 +1323,11 @@ describe("sisyphus-task", () => {
+            messages: async () => ({
+              data: [
+                {
+-                 info: { role: "assistant", time: { created: Date.now() } },
++                 info: { id: "msg_001", role: "user", time: { created: Date.now() } },
++                 parts: [{ type: "text", text: "Do something" }],
++               },
++               {
++                 info: { id: "msg_002", role: "assistant", time: { created: Date.now() + 1 }, finish: "end_turn" },
+                  parts: [{ type: "text", text: "Sync task completed successfully" }],
+                },
+              ],
+-- 
+2.39.2
+

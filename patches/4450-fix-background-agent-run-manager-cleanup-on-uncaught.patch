@@ -1,0 +1,376 @@
+From b9d2acdcf9b49067ad23a8f0dd8d8ceb62333439 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 18 Apr 2026 19:32:04 +0900
+Subject: [PATCH 4450/5749] fix(background-agent): run manager cleanup on
+ uncaughtException and unhandledRejection
+
+Signal handlers covered SIGINT/SIGTERM/SIGBREAK/beforeExit/exit, but a
+synchronous throw or a top-level rejected promise terminated the process
+without letting TmuxSessionManager (or any other registered manager) run
+its shutdown hook. That reliably left orphan tmux panes after an opencode
+crash.
+
+Added registration for uncaughtException and unhandledRejection that fan
+out through the existing cleanupAll() path, set process.exitCode = 1,
+and arm the same 6 second forced-exit guard we use for signals. Test
+helpers hold process-level spies so the new tests do not leak listeners
+between runs.
+---
+ .../process-cleanup.test-helpers.ts           |  27 ++++
+ .../background-agent/process-cleanup.test.ts  | 148 ++++++++++++++----
+ .../background-agent/process-cleanup.ts       |  56 +++++--
+ 3 files changed, 183 insertions(+), 48 deletions(-)
+ create mode 100644 src/features/background-agent/process-cleanup.test-helpers.ts
+
+diff --git a/src/features/background-agent/process-cleanup.test-helpers.ts b/src/features/background-agent/process-cleanup.test-helpers.ts
+new file mode 100644
+index 00000000..c0a3dfa2
+--- /dev/null
++++ b/src/features/background-agent/process-cleanup.test-helpers.ts
+@@ -0,0 +1,27 @@
++type ProcessCleanupEvent =
++  | NodeJS.Signals
++  | "beforeExit"
++  | "exit"
++  | "uncaughtException"
++  | "unhandledRejection"
++
++export function getNewListener(
++  signal: ProcessCleanupEvent,
++  existingListeners: Function[],
++): () => void {
++  const listener = process
++    .listeners(signal)
++    .find((registeredListener) => !existingListeners.includes(registeredListener))
++
++  if (typeof listener !== "function") {
++    throw new Error(`Expected a ${signal} listener to be registered`)
++  }
++
++  return listener
++}
++
++export async function flushMicrotasks(): Promise<void> {
++  for (let iteration = 0; iteration < 10; iteration += 1) {
++    await Promise.resolve()
++  }
++}
+diff --git a/src/features/background-agent/process-cleanup.test.ts b/src/features/background-agent/process-cleanup.test.ts
+index 7d01aaa2..4d2975fe 100644
+--- a/src/features/background-agent/process-cleanup.test.ts
++++ b/src/features/background-agent/process-cleanup.test.ts
+@@ -1,3 +1,5 @@
++/// <reference types="bun-types" />
++
+ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
+ 
+ import {
+@@ -5,36 +7,12 @@ import {
+   registerManagerForCleanup,
+   unregisterManagerForCleanup,
+ } from "./process-cleanup"
++import { flushMicrotasks, getNewListener } from "./process-cleanup.test-helpers"
+ 
+ type CleanupManager = {
+   shutdown: () => void | Promise<void>
+ }
+ 
+-type ProcessCleanupEvent = NodeJS.Signals | "beforeExit" | "exit"
+-
+-function getNewListener(
+-  signal: ProcessCleanupEvent,
+-  existingListeners: Function[],
+-): () => void {
+-  const listener = process
+-    .listeners(signal)
+-    .find((registeredListener) => !existingListeners.includes(registeredListener))
+-
+-  expect(listener).toBeDefined()
+-
+-  if (typeof listener !== "function") {
+-    throw new Error(`Expected a ${signal} listener to be registered`)
+-  }
+-
+-  return listener
+-}
+-
+-async function flushMicrotasks(): Promise<void> {
+-  for (let iteration = 0; iteration < 10; iteration += 1) {
+-    await Promise.resolve()
+-  }
+-}
+-
+ describe("#given process cleanup registration", () => {
+   const registeredManagers: CleanupManager[] = []
+   const originalExitCode = process.exitCode
+@@ -92,13 +70,7 @@ describe("#given process cleanup registration", () => {
+ 
+     test("#when cleanup finishes after SIGINT #then the fallback exit timer is cleared", async () => {
+       const sigintListenersBefore = process.listeners("SIGINT")
+-      const timeoutHandle = setTimeout(() => undefined, 0)
+-      clearTimeout(timeoutHandle)
+-
+-      const setTimeoutImplementation: typeof setTimeout = () => timeoutHandle
+-      const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(
+-        setTimeoutImplementation,
+-      )
++      const setTimeoutSpy = spyOn(globalThis, "setTimeout")
+       const clearTimeoutSpy = spyOn(globalThis, "clearTimeout")
+ 
+       try {
+@@ -117,11 +89,10 @@ describe("#given process cleanup registration", () => {
+         await flushMicrotasks()
+ 
+         expect(setTimeoutSpy).toHaveBeenCalledTimes(1)
+-        expect(clearTimeoutSpy).toHaveBeenCalledWith(timeoutHandle)
++        expect(clearTimeoutSpy).toHaveBeenCalledTimes(1)
+       } finally {
+         setTimeoutSpy.mockRestore()
+         clearTimeoutSpy.mockRestore()
+-        clearTimeout(timeoutHandle)
+       }
+     })
+   })
+@@ -163,6 +134,32 @@ describe("#given process cleanup registration", () => {
+ 
+       expect(process.listeners("SIGINT")).toHaveLength(sigintListenersAfterFirstRegistration)
+     })
++
++    test("#given two managers registered #when uncaughtException fires #then both shutdowns called", async () => {
++      const exitSpy = spyOn(process, "exit").mockImplementation((code?: number): never => {
++        throw new Error(`Unexpected process.exit(${String(code)})`)
++      })
++      const shutdownOne = mock(() => {})
++      const shutdownTwo = mock(() => {})
++      const managerOne = { shutdown: shutdownOne }
++      const managerTwo = { shutdown: shutdownTwo }
++      registeredManagers.push(managerOne, managerTwo)
++
++      try {
++        registerManagerForCleanup(managerOne)
++        registerManagerForCleanup(managerTwo)
++
++        process.emit("uncaughtException", new Error("boom"))
++        await flushMicrotasks()
++
++        expect(shutdownOne).toHaveBeenCalledTimes(1)
++        expect(shutdownTwo).toHaveBeenCalledTimes(1)
++        expect(process.exitCode).toBe(1)
++        expect(exitSpy).not.toHaveBeenCalled()
++      } finally {
++        exitSpy.mockRestore()
++      }
++    })
+   })
+ 
+   describe("#given cleanup managers are unregistered", () => {
+@@ -202,5 +199,88 @@ describe("#given process cleanup registration", () => {
+       expect(remainingManagerShutdown).toHaveBeenCalledTimes(1)
+       expect(removedManagerShutdown).not.toHaveBeenCalled()
+     })
++
++    test("#given uncaughtException handler registered #when manager is unregistered via unregisterManagerForCleanup #then subsequent events do not invoke that manager", () => {
++      const uncaughtExceptionListenersBefore = process.listeners("uncaughtException")
++      const shutdown = mock(() => {})
++      const manager = { shutdown }
++      registeredManagers.push(manager)
++
++      registerManagerForCleanup(manager)
++      expect(process.listeners("uncaughtException")).toHaveLength(
++        uncaughtExceptionListenersBefore.length + 1,
++      )
++
++      unregisterManagerForCleanup(manager)
++      registeredManagers.length = 0
++      process.emit("uncaughtException", new Error("boom"))
++
++      expect(shutdown).not.toHaveBeenCalled()
++    })
++  })
++
++  describe("#given uncaught exception and rejection cleanup", () => {
++    test("#given manager registered AND process emits uncaughtException #when event fires #then manager.shutdown() called AND process.exitCode set to 1", async () => {
++      const exitSpy = spyOn(process, "exit").mockImplementation((code?: number): never => {
++        throw new Error(`Unexpected process.exit(${String(code)})`)
++      })
++      const shutdown = mock(() => {})
++      const manager = { shutdown }
++      registeredManagers.push(manager)
++
++      try {
++        registerManagerForCleanup(manager)
++
++        process.emit("uncaughtException", new Error("boom"))
++        await flushMicrotasks()
++
++        expect(shutdown).toHaveBeenCalledTimes(1)
++        expect(process.exitCode).toBe(1)
++        expect(exitSpy).not.toHaveBeenCalled()
++      } finally {
++        exitSpy.mockRestore()
++      }
++    })
++
++    test("#given manager registered AND process emits unhandledRejection #when event fires #then manager.shutdown() called AND process.exitCode set to 1", async () => {
++      const exitSpy = spyOn(process, "exit").mockImplementation((code?: number): never => {
++        throw new Error(`Unexpected process.exit(${String(code)})`)
++      })
++      const shutdown = mock(() => {})
++      const manager = { shutdown }
++      registeredManagers.push(manager)
++
++      try {
++        registerManagerForCleanup(manager)
++
++        process.emit("unhandledRejection", new Error("boom"), Promise.resolve())
++        await flushMicrotasks()
++
++        expect(shutdown).toHaveBeenCalledTimes(1)
++        expect(process.exitCode).toBe(1)
++        expect(exitSpy).not.toHaveBeenCalled()
++      } finally {
++        exitSpy.mockRestore()
++      }
++    })
++
++    test("#given _resetForTesting() called #when event fires #then no cleanup runs", () => {
++      const uncaughtExceptionListenersBefore = process.listeners("uncaughtException")
++      const shutdown = mock(() => {})
++      const manager = { shutdown }
++
++      registerManagerForCleanup(manager)
++      expect(process.listeners("uncaughtException")).toHaveLength(
++        uncaughtExceptionListenersBefore.length + 1,
++      )
++
++      _resetForTesting()
++      process.emit("uncaughtException", new Error("boom"))
++
++      expect(shutdown).not.toHaveBeenCalled()
++      expect(process.listeners("uncaughtException")).toHaveLength(
++        uncaughtExceptionListenersBefore.length,
++      )
++    })
+   })
+ })
+diff --git a/src/features/background-agent/process-cleanup.ts b/src/features/background-agent/process-cleanup.ts
+index 29be1958..20f8fab0 100644
+--- a/src/features/background-agent/process-cleanup.ts
++++ b/src/features/background-agent/process-cleanup.ts
+@@ -1,33 +1,51 @@
+ import { log } from "../../shared"
+ 
+-type ProcessCleanupEvent = NodeJS.Signals | "beforeExit" | "exit"
++type ProcessCleanupSignal = NodeJS.Signals | "beforeExit" | "exit"
++type ProcessCleanupErrorEvent = "uncaughtException" | "unhandledRejection"
++
++function scheduleForcedExit(cleanupResult: void | Promise<void>, exitCode: number): void {
++  process.exitCode = exitCode
++  const exitTimeout = setTimeout(() => process.exit(), 6000)
++  void Promise.resolve(cleanupResult).finally(() => {
++    clearTimeout(exitTimeout)
++  })
++}
+ 
+ function registerProcessSignal(
+-  signal: ProcessCleanupEvent,
++  signal: ProcessCleanupSignal,
+   handler: () => void | Promise<void>,
+   exitAfter: boolean
+ ): () => void {
+   const listener = () => {
+     const cleanupResult = handler()
+     if (exitAfter) {
+-      process.exitCode = 0
+-      const exitTimeout = setTimeout(() => process.exit(), 6000)
+-      void Promise.resolve(cleanupResult).finally(() => {
+-        clearTimeout(exitTimeout)
+-      })
++      scheduleForcedExit(cleanupResult, 0)
+     }
+   }
+   process.on(signal, listener)
+   return listener
+ }
+ 
++function registerErrorEvent(
++  signal: ProcessCleanupErrorEvent,
++  handler: (error: unknown) => void | Promise<void>
++): (error: unknown) => void {
++  const listener = (error: unknown) => {
++    log(`[background-agent] ${signal} received during shutdown cleanup:`, error)
++    scheduleForcedExit(handler(error), 1)
++  }
++  process.on(signal, listener)
++  return listener
++}
++
+ interface CleanupTarget {
+   shutdown(): void | Promise<void>
+ }
+ 
+ const cleanupManagers = new Set<CleanupTarget>()
+ let cleanupRegistered = false
+-const cleanupHandlers = new Map<ProcessCleanupEvent, () => void>()
++const cleanupSignalHandlers = new Map<ProcessCleanupSignal, () => void>()
++const cleanupErrorHandlers = new Map<ProcessCleanupErrorEvent, (error: unknown) => void>()
+ 
+ export function registerManagerForCleanup(manager: CleanupTarget): void {
+   cleanupManagers.add(manager)
+@@ -59,9 +77,9 @@ export function registerManagerForCleanup(manager: CleanupTarget): void {
+     return cleanupPromise
+   }
+ 
+-  const registerSignal = (signal: ProcessCleanupEvent, exitAfter: boolean): void => {
++  const registerSignal = (signal: ProcessCleanupSignal, exitAfter: boolean): void => {
+     const listener = registerProcessSignal(signal, cleanupAll, exitAfter)
+-    cleanupHandlers.set(signal, listener)
++    cleanupSignalHandlers.set(signal, listener)
+   }
+ 
+   registerSignal("SIGINT", true)
+@@ -71,6 +89,8 @@ export function registerManagerForCleanup(manager: CleanupTarget): void {
+   }
+   registerSignal("beforeExit", false)
+   registerSignal("exit", false)
++  cleanupErrorHandlers.set("uncaughtException", registerErrorEvent("uncaughtException", cleanupAll))
++  cleanupErrorHandlers.set("unhandledRejection", registerErrorEvent("unhandledRejection", cleanupAll))
+ }
+ 
+ export function unregisterManagerForCleanup(manager: CleanupTarget): void {
+@@ -78,10 +98,14 @@ export function unregisterManagerForCleanup(manager: CleanupTarget): void {
+ 
+   if (cleanupManagers.size > 0) return
+ 
+-  for (const [signal, listener] of cleanupHandlers.entries()) {
++  for (const [signal, listener] of cleanupSignalHandlers.entries()) {
++    process.off(signal, listener)
++  }
++  for (const [signal, listener] of cleanupErrorHandlers.entries()) {
+     process.off(signal, listener)
+   }
+-  cleanupHandlers.clear()
++  cleanupSignalHandlers.clear()
++  cleanupErrorHandlers.clear()
+   cleanupRegistered = false
+ }
+ 
+@@ -90,9 +114,13 @@ export function _resetForTesting(): void {
+   for (const manager of [...cleanupManagers]) {
+     cleanupManagers.delete(manager)
+   }
+-  for (const [signal, listener] of cleanupHandlers.entries()) {
++  for (const [signal, listener] of cleanupSignalHandlers.entries()) {
++    process.off(signal, listener)
++  }
++  for (const [signal, listener] of cleanupErrorHandlers.entries()) {
+     process.off(signal, listener)
+   }
+-  cleanupHandlers.clear()
++  cleanupSignalHandlers.clear()
++  cleanupErrorHandlers.clear()
+   cleanupRegistered = false
+ }
+-- 
+2.39.2
+

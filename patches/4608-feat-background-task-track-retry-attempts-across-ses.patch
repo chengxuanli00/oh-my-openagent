@@ -1,0 +1,1619 @@
+From a4968a3d1dd76579ecfb3b802a1b02e944949353 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Choi=20Kijin=20/=20=EC=B5=9C=20=EA=B8=B0=EC=A7=84=20/=20?=
+ =?UTF-8?q?=E3=83=81=E3=83=A7=E3=82=A4=20=E3=82=AD=E3=82=B8=E3=83=B3?=
+ <kichoi@lycorp.co.jp>
+Date: Tue, 28 Apr 2026 15:27:35 +0900
+Subject: [PATCH 4608/5749] feat(background-task): track retry attempts across
+ sessions
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../background-agent/attempt-lifecycle.ts     | 174 ++++++
+ src/features/background-agent/constants.ts    |   1 +
+ .../fallback-retry-handler.test.ts            |  70 +++
+ .../fallback-retry-handler.ts                 |  73 ++-
+ src/features/background-agent/manager.test.ts | 576 +++++++++++++++++-
+ src/features/background-agent/manager.ts      | 278 +++++++--
+ src/features/background-agent/spawner.test.ts |   2 +-
+ src/features/background-agent/types.ts        |  27 +
+ 8 files changed, 1146 insertions(+), 55 deletions(-)
+ create mode 100644 src/features/background-agent/attempt-lifecycle.ts
+
+diff --git a/src/features/background-agent/attempt-lifecycle.ts b/src/features/background-agent/attempt-lifecycle.ts
+new file mode 100644
+index 00000000..428e60b9
+--- /dev/null
++++ b/src/features/background-agent/attempt-lifecycle.ts
+@@ -0,0 +1,174 @@
++import type { DelegatedModelConfig } from "../../shared/model-resolution-types"
++import type { BackgroundTask, BackgroundTaskAttempt, BackgroundTaskStatus } from "./types"
++
++type TerminalAttemptStatus = Extract<BackgroundTaskStatus, "completed" | "error" | "cancelled" | "interrupt">
++
++function toAttemptModel(model: DelegatedModelConfig | undefined): Pick<BackgroundTaskAttempt, "providerID" | "modelID" | "variant"> {
++  return {
++    providerID: model?.providerID,
++    modelID: model?.modelID,
++    variant: model?.variant,
++  }
++}
++
++function toTaskModel(attempt: BackgroundTaskAttempt): DelegatedModelConfig | undefined {
++  if (!attempt.providerID || !attempt.modelID) {
++    return undefined
++  }
++
++  return {
++    providerID: attempt.providerID,
++    modelID: attempt.modelID,
++    ...(attempt.variant ? { variant: attempt.variant } : {}),
++  }
++}
++
++function getAttemptIndex(task: BackgroundTask, attemptID: string): number {
++  return task.attempts?.findIndex((attempt) => attempt.attemptID === attemptID) ?? -1
++}
++
++function getAttempt(task: BackgroundTask, attemptID: string): BackgroundTaskAttempt | undefined {
++  const index = getAttemptIndex(task, attemptID)
++  return index === -1 ? undefined : task.attempts?.[index]
++}
++
++function isTerminalStatus(status: BackgroundTaskStatus): status is TerminalAttemptStatus {
++  return status === "completed" || status === "error" || status === "cancelled" || status === "interrupt"
++}
++
++export function getCurrentAttempt(task: BackgroundTask): BackgroundTaskAttempt | undefined {
++  if (!task.currentAttemptID) {
++    return undefined
++  }
++
++  return getAttempt(task, task.currentAttemptID)
++}
++
++export function ensureCurrentAttempt(
++  task: BackgroundTask,
++  model: DelegatedModelConfig | undefined = task.model,
++): BackgroundTaskAttempt {
++  const existingAttempt = getCurrentAttempt(task)
++  if (existingAttempt) {
++    return existingAttempt
++  }
++
++  const attempt: BackgroundTaskAttempt = {
++    attemptID: `att_${crypto.randomUUID().slice(0, 8)}`,
++    attemptNumber: (task.attempts?.length ?? 0) + 1,
++    sessionID: task.sessionID,
++    ...toAttemptModel(model),
++    status: task.status,
++    error: task.error,
++    startedAt: task.startedAt,
++    completedAt: task.completedAt,
++  }
++
++  task.attempts = [...(task.attempts ?? []), attempt]
++  task.currentAttemptID = attempt.attemptID
++  return attempt
++}
++
++export function projectTaskFromCurrentAttempt(task: BackgroundTask): BackgroundTask {
++  const currentAttempt = getCurrentAttempt(task)
++  if (!currentAttempt) {
++    return task
++  }
++
++  task.status = currentAttempt.status
++  task.sessionID = currentAttempt.sessionID
++  task.startedAt = currentAttempt.startedAt
++  task.completedAt = currentAttempt.completedAt
++  task.error = currentAttempt.error
++  task.model = toTaskModel(currentAttempt)
++
++  return task
++}
++
++export function startAttempt(task: BackgroundTask, model: DelegatedModelConfig | undefined): BackgroundTaskAttempt {
++  const attempt: BackgroundTaskAttempt = {
++    attemptID: `att_${crypto.randomUUID().slice(0, 8)}`,
++    attemptNumber: (task.attempts?.length ?? 0) + 1,
++    ...toAttemptModel(model),
++    status: "pending",
++  }
++
++  task.attempts = [...(task.attempts ?? []), attempt]
++  task.currentAttemptID = attempt.attemptID
++  task.status = "pending"
++  task.sessionID = undefined
++  task.startedAt = undefined
++  task.completedAt = undefined
++  task.error = undefined
++  task.model = model
++
++  return attempt
++}
++
++export function bindAttemptSession(
++  task: BackgroundTask,
++  attemptID: string,
++  sessionID: string,
++  model: DelegatedModelConfig | undefined,
++): BackgroundTaskAttempt | undefined {
++  ensureCurrentAttempt(task, model)
++  if (task.currentAttemptID !== attemptID) {
++    return undefined
++  }
++
++  const attempt = getAttempt(task, attemptID)
++  if (!attempt || isTerminalStatus(attempt.status)) {
++    return undefined
++  }
++
++  attempt.sessionID = sessionID
++  attempt.status = "running"
++  attempt.startedAt = new Date()
++  attempt.completedAt = undefined
++  attempt.error = undefined
++  attempt.providerID = model?.providerID ?? attempt.providerID
++  attempt.modelID = model?.modelID ?? attempt.modelID
++  attempt.variant = model?.variant ?? attempt.variant
++
++  return getCurrentAttempt(projectTaskFromCurrentAttempt(task))
++}
++
++export function finalizeAttempt(
++  task: BackgroundTask,
++  attemptID: string,
++  status: TerminalAttemptStatus,
++  error?: string,
++): BackgroundTaskAttempt | undefined {
++  const attempt = getAttempt(task, attemptID)
++  if (!attempt) {
++    return undefined
++  }
++
++  attempt.status = status
++  attempt.completedAt = new Date()
++  attempt.error = error
++
++  if (task.currentAttemptID === attemptID) {
++    projectTaskFromCurrentAttempt(task)
++  }
++
++  return attempt
++}
++
++export function scheduleRetryAttempt(
++  task: BackgroundTask,
++  failedAttemptID: string,
++  nextModel: DelegatedModelConfig,
++  error?: string,
++): BackgroundTaskAttempt | undefined {
++  const failedAttempt = finalizeAttempt(task, failedAttemptID, "error", error)
++  if (!failedAttempt || task.currentAttemptID !== failedAttemptID) {
++    return undefined
++  }
++
++  return startAttempt(task, nextModel)
++}
++
++export function findAttemptBySession(task: BackgroundTask, sessionID: string): BackgroundTaskAttempt | undefined {
++  return task.attempts?.find((attempt) => attempt.sessionID === sessionID)
++}
+diff --git a/src/features/background-agent/constants.ts b/src/features/background-agent/constants.ts
+index 4129a251..b622bae3 100644
+--- a/src/features/background-agent/constants.ts
++++ b/src/features/background-agent/constants.ts
+@@ -45,6 +45,7 @@ export interface Todo {
+ }
+ 
+ export interface QueueItem {
++  attemptID: string
+   task: BackgroundTask
+   input: LaunchInput
+ }
+diff --git a/src/features/background-agent/fallback-retry-handler.test.ts b/src/features/background-agent/fallback-retry-handler.test.ts
+index 78e632bd..6456f1d0 100644
+--- a/src/features/background-agent/fallback-retry-handler.test.ts
++++ b/src/features/background-agent/fallback-retry-handler.test.ts
+@@ -259,6 +259,57 @@ describe("tryFallbackRetry", () => {
+       expect(queue![0].task).toBe(args.task)
+       expect(args.processKey).toHaveBeenCalledWith(key)
+     })
++
++    test("finalizes the failed attempt, creates a new pending attempt, and enqueues its explicit attemptID", async () => {
++      const args = createDefaultArgs({
++        status: "running",
++        sessionID: "session-attempt-1",
++        startedAt: new Date("2026-04-27T00:00:00.000Z"),
++        attempts: [
++          {
++            attemptID: "attempt-1",
++            attemptNumber: 1,
++            sessionID: "session-attempt-1",
++            providerID: "provider-a",
++            modelID: "original-model",
++            status: "running",
++            startedAt: new Date("2026-04-27T00:00:00.000Z"),
++          },
++        ],
++        currentAttemptID: "attempt-1",
++      })
++
++      await tryFallbackRetry(args)
++
++      expect(args.task.attempts).toHaveLength(2)
++      expect(args.task.attempts?.[0]).toMatchObject({
++        attemptID: "attempt-1",
++        sessionID: "session-attempt-1",
++        status: "error",
++        error: "model overloaded",
++      })
++      expect(args.task.attempts?.[0]?.completedAt).toBeInstanceOf(Date)
++
++      const nextAttempt = args.task.attempts?.[1]
++      expect(nextAttempt).toBeDefined()
++      expect(nextAttempt?.attemptNumber).toBe(2)
++      expect(nextAttempt?.providerID).toBe("provider-a")
++      expect(nextAttempt?.modelID).toBe("fallback-model-1")
++      expect(nextAttempt?.status).toBe("pending")
++
++      expect(args.task.currentAttemptID).toBe(nextAttempt?.attemptID)
++      expect(args.task.status).toBe("pending")
++      expect(args.task.model).toEqual({
++        providerID: "provider-a",
++        modelID: "fallback-model-1",
++        variant: undefined,
++      })
++
++      const key = `${args.task.model!.providerID}/${args.task.model!.modelID}`
++      const queue = args.queuesByKey.get(key)
++      expect(queue).toBeDefined()
++      expect((queue?.[0] as QueueItem & { attemptID?: string })?.attemptID).toBe(nextAttempt?.attemptID)
++    })
+   })
+ 
+   describe("#given non-retryable error", () => {
+@@ -343,6 +394,25 @@ describe("tryFallbackRetry", () => {
+     })
+   })
+ 
++  describe("#given first fallback is a no-op for the current model", () => {
++    test("skips the no-op fallback and advances to the next distinct model", async () => {
++      const args = createDefaultArgs({
++        model: { providerID: "provider-a", modelID: "fallback-model-1" },
++        fallbackChain: [
++          { model: "fallback-model-1", providers: ["provider-a"], variant: undefined },
++          { model: "fallback-model-2", providers: ["provider-b"], variant: undefined },
++        ],
++      })
++
++      const result = await tryFallbackRetry(args)
++
++      expect(result).toBe(true)
++      expect(args.task.model?.providerID).toBe("provider-b")
++      expect(args.task.model?.modelID).toBe("fallback-model-2")
++      expect(args.task.attemptCount).toBe(2)
++    })
++  })
++
+   describe("#given disconnected fallback providers with connected preferred provider", () => {
+     test("keeps fallback entry and selects connected preferred provider", async () => {
+       ;(readProviderModelsCache as any).mockReturnValueOnce({ connected: ["provider-a"] })
+diff --git a/src/features/background-agent/fallback-retry-handler.ts b/src/features/background-agent/fallback-retry-handler.ts
+index 58549cc9..52fb2ab5 100644
+--- a/src/features/background-agent/fallback-retry-handler.ts
++++ b/src/features/background-agent/fallback-retry-handler.ts
+@@ -11,6 +11,11 @@ import {
+ } from "../../shared/model-error-classifier"
+ import { transformModelForProvider } from "../../shared/provider-model-id-transform"
+ import { abortWithTimeout } from "./abort-with-timeout"
++import { ensureCurrentAttempt, scheduleRetryAttempt } from "./attempt-lifecycle"
++
++function canonicalizeModelID(modelID: string): string {
++  return modelID.toLowerCase().replace(/\./g, "-")
++}
+ 
+ export async function tryFallbackRetry(args: {
+   task: BackgroundTask
+@@ -21,8 +26,16 @@ export async function tryFallbackRetry(args: {
+   idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>>
+   queuesByKey: Map<string, QueueItem[]>
+   processKey: (key: string) => void
++  onRetrying?: (details: {
++    task: BackgroundTask
++    source: string
++    previousSessionID?: string
++    failedModel?: string
++    failedError?: string
++    nextModel: string
++  }) => void
+ }): Promise<boolean> {
+-  const { task, errorInfo, source, concurrencyManager, client, idleDeferralTimers, queuesByKey, processKey } = args
++  const { task, errorInfo, source, concurrencyManager, client, idleDeferralTimers, queuesByKey, processKey, onRetrying } = args
+   const fallbackChain = task.fallbackChain
+   const canRetry =
+     shouldRetryError(errorInfo) &&
+@@ -48,6 +61,7 @@ export async function tryFallbackRetry(args: {
+ 
+   let selectedAttemptCount = attemptCount
+   let nextFallback: FallbackEntry | undefined
++  let nextProviderID: string | undefined
+   while (fallbackChain && selectedAttemptCount < fallbackChain.length) {
+     const candidate = getNextFallback(fallbackChain, selectedAttemptCount)
+     if (!candidate) break
+@@ -61,12 +75,31 @@ export async function tryFallbackRetry(args: {
+       })
+       continue
+     }
++    const candidateProviderID = selectFallbackProvider(
++      candidate.providers,
++      task.model?.providerID,
++    )
++    const candidateModelID = transformModelForProvider(candidateProviderID, candidate.model)
++    const isNoOpFallback =
++      !!task.model &&
++      candidateProviderID.toLowerCase() === task.model.providerID.toLowerCase() &&
++      canonicalizeModelID(candidateModelID) === canonicalizeModelID(task.model.modelID)
++    if (isNoOpFallback) {
++      log("[background-agent] Skipping no-op fallback:", {
++        taskId: task.id,
++        source,
++        model: candidate.model,
++        providers: candidate.providers,
++      })
++      continue
++    }
+     nextFallback = candidate
++    nextProviderID = candidateProviderID
+     break
+   }
+   if (!nextFallback) return false
+ 
+-  const providerID = selectFallbackProvider(
++  const providerID = nextProviderID ?? selectFallbackProvider(
+     nextFallback.providers,
+     task.model?.providerID,
+   )
+@@ -92,19 +125,39 @@ export async function tryFallbackRetry(args: {
+   }
+ 
+   const previousSessionID = task.sessionID
++  const previousModel = task.model
+ 
+-  task.attemptCount = selectedAttemptCount
+   const transformedModelId = transformModelForProvider(providerID, nextFallback.model)
+-  task.model = {
++  const nextModel = {
+     providerID,
+     modelID: transformedModelId,
+     variant: nextFallback.variant,
+   }
+-  task.status = "pending"
+-  task.sessionID = undefined
+-  task.startedAt = undefined
++  task.attemptCount = selectedAttemptCount
++  const failedAttemptID = ensureCurrentAttempt(task, previousModel).attemptID
++  const nextAttempt = failedAttemptID
++    ? scheduleRetryAttempt(task, failedAttemptID, nextModel, errorInfo.message)
++    : undefined
++  if (!nextAttempt) {
++    return false
++  }
++
+   task.queuedAt = new Date()
+-  task.error = undefined
++  task.retryNotification = {
++    previousSessionID,
++    failedModel: previousModel ? `${previousModel.providerID}/${previousModel.modelID}` : undefined,
++    failedError: errorInfo.message,
++    nextModel: `${providerID}/${transformedModelId}`,
++  }
++
++  onRetrying?.({
++    task,
++    source,
++    previousSessionID,
++    failedModel: task.retryNotification.failedModel,
++    failedError: errorInfo.message,
++    nextModel: `${providerID}/${transformedModelId}`,
++  })
+ 
+   const key = task.model ? `${task.model.providerID}/${task.model.modelID}` : task.agent
+   const queue = queuesByKey.get(key) ?? []
+@@ -117,7 +170,7 @@ export async function tryFallbackRetry(args: {
+     parentModel: task.parentModel,
+     parentAgent: task.parentAgent,
+     parentTools: task.parentTools,
+-    model: task.model,
++    model: nextModel,
+     fallbackChain: task.fallbackChain,
+     category: task.category,
+     isUnstableAgent: task.isUnstableAgent,
+@@ -127,7 +180,7 @@ export async function tryFallbackRetry(args: {
+     await abortWithTimeout(client, previousSessionID).catch(() => {})
+   }
+ 
+-  queue.push({ task, input: retryInput })
++  queue.push({ task, input: retryInput, attemptID: nextAttempt.attemptID })
+   queuesByKey.set(key, queue)
+   processKey(key)
+   return true
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 8c855ebc..6783c679 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -172,7 +172,7 @@ class MockBackgroundManager {
+   }
+ }
+ 
+-function createMockTask(overrides: Partial<BackgroundTask> & { id: string; sessionID: string; parentSessionID: string }): BackgroundTask {
++function createMockTask(overrides: Partial<BackgroundTask> & { id: string; parentSessionID: string; sessionID?: string }): BackgroundTask {
+   return {
+     parentMessageID: "mock-message-id",
+     description: "test task",
+@@ -195,6 +195,21 @@ function createBackgroundManager(): BackgroundManager {
+   return new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
+ }
+ 
++function createBackgroundManagerWithOptions(options: unknown): BackgroundManager {
++  const client = {
++    session: {
++      prompt: async () => ({}),
++      promptAsync: async () => ({}),
++      abort: async () => ({}),
++    },
++  }
++  return new BackgroundManager(
++    { client, directory: tmpdir() } as unknown as PluginInput,
++    undefined,
++    options as ConstructorParameters<typeof BackgroundManager>[2],
++  )
++}
++
+ function getConcurrencyManager(manager: BackgroundManager): ConcurrencyManager {
+   return (manager as unknown as { concurrencyManager: ConcurrencyManager }).concurrencyManager
+ }
+@@ -271,6 +286,325 @@ function createToastRemoveTaskTracker(): { removeTaskCalls: string[]; resetToast
+   }
+ }
+ 
++describe("BackgroundManager session.error fallback hydration", () => {
++  test("hydrates fallbackChain from session fallback state before retrying sync child-session errors", async () => {
++    //#given
++    const fallbackChain = [
++      { model: "fallback-model-1", providers: ["provider-a"], variant: undefined },
++    ]
++    const getSessionFallbackChain = mock((sessionID: string) =>
++      sessionID === "child-session" ? fallbackChain : undefined,
++    )
++    const manager = createBackgroundManagerWithOptions({
++      modelFallbackControllerAccessor: {
++        getSessionFallbackChain,
++      },
++    })
++    const task = createMockTask({
++      id: "task-sync-fallback",
++      sessionID: "child-session",
++      parentSessionID: "parent-session",
++      fallbackChain: undefined,
++    })
++    let capturedFallbackChain: BackgroundTask["fallbackChain"]
++    ;(manager as unknown as {
++      tryFallbackRetry: (task: BackgroundTask, errorInfo: { name?: string; message?: string }, source: string) => Promise<boolean>
++    }).tryFallbackRetry = async (retryTask) => {
++      capturedFallbackChain = retryTask.fallbackChain
++      return true
++    }
++
++    //#when
++    await (manager as unknown as {
++      handleSessionErrorEvent: (args: {
++        task: BackgroundTask
++        errorInfo: { name?: string; message?: string }
++        errorName: string | undefined
++        errorMessage: string | undefined
++      }) => Promise<void>
++    }).handleSessionErrorEvent({
++      task,
++      errorInfo: {
++        name: "APIError",
++        message: "Forbidden: Selected provider is forbidden",
++      },
++      errorName: "APIError",
++      errorMessage: "Forbidden: Selected provider is forbidden",
++    })
++
++    //#then
++    expect(getSessionFallbackChain).toHaveBeenCalledWith("child-session")
++    expect(task.fallbackChain).toEqual(fallbackChain)
++    expect(capturedFallbackChain).toEqual(fallbackChain)
++  })
++})
++
++describe("BackgroundManager prompt rejection fallback routing", () => {
++  test("routes launch-time prompt rejections into tryFallbackRetry before marking interrupt", async () => {
++    //#given
++    const promptError = {
++      name: "APIError",
++      data: { message: "Forbidden: Selected provider is forbidden" },
++    }
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: tmpdir() } }),
++        create: async () => ({ data: { id: "ses_launch_retry" } }),
++        promptAsync: async () => {
++          throw promptError
++        },
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    stubNotifyParentSession(manager)
++    ;(manager as unknown as {
++      reserveSubagentSpawn: () => Promise<{
++        spawnContext: { rootSessionID: string; parentDepth: number; childDepth: number }
++        descendantCount: number
++        commit: () => number
++        rollback: () => void
++      }>
++    }).reserveSubagentSpawn = async () => ({
++      spawnContext: { rootSessionID: "parent-session", parentDepth: 0, childDepth: 1 },
++      descendantCount: 1,
++      commit: () => 1,
++      rollback: () => {},
++    })
++    const retried: Array<{ taskId: string; errorInfo: { name?: string; message?: string }; source: string }> = []
++    ;(manager as unknown as {
++      tryFallbackRetry: (task: BackgroundTask, errorInfo: { name?: string; message?: string }, source: string) => Promise<boolean>
++    }).tryFallbackRetry = async (task, errorInfo, source) => {
++      retried.push({ taskId: task.id, errorInfo, source })
++      task.status = "pending"
++      task.error = undefined
++      return true
++    }
++
++    //#when
++    const launchedTask = await manager.launch({
++      description: "background retry test",
++      prompt: "say hi",
++      agent: "sisyphus-junior",
++      parentSessionID: "parent-session",
++      parentMessageID: "parent-message",
++      model: { providerID: "genai-proxy-openai", modelID: "gpt-5.4-mini" },
++      fallbackChain: [{ model: "claude-haiku-4-5", providers: ["anthropic"] }],
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    const storedTask = getTaskMap(manager).get(launchedTask.id)
++    expect(retried).toHaveLength(1)
++    expect(retried[0]?.source).toBe("promptAsync.launch")
++    expect(retried[0]?.errorInfo).toEqual({
++      name: "APIError",
++      message: "Forbidden: Selected provider is forbidden",
++    })
++    expect(storedTask?.status).toBe("pending")
++  })
++
++  test("routes resume-time prompt rejections into tryFallbackRetry before marking interrupt", async () => {
++    //#given
++    const promptError = {
++      name: "APIError",
++      data: { message: "Forbidden: Selected provider is forbidden" },
++    }
++    const client = {
++      session: {
++        promptAsync: async () => {
++          throw promptError
++        },
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    stubNotifyParentSession(manager)
++    const task: BackgroundTask = {
++      id: "bg_resume_retry",
++      sessionID: "ses_resume_retry",
++      parentSessionID: "parent-session",
++      parentMessageID: "parent-message",
++      description: "resume retry test",
++      prompt: "say hi",
++      agent: "sisyphus-junior",
++      status: "completed",
++      startedAt: new Date(),
++      completedAt: new Date(),
++      model: { providerID: "genai-proxy-openai", modelID: "gpt-5.4-mini" },
++      fallbackChain: [{ model: "claude-haiku-4-5", providers: ["anthropic"] }],
++      concurrencyGroup: "genai-proxy-openai/gpt-5.4-mini",
++    }
++    getTaskMap(manager).set(task.id, task)
++    const retried: Array<{ taskId: string; errorInfo: { name?: string; message?: string }; source: string }> = []
++    ;(manager as unknown as {
++      tryFallbackRetry: (task: BackgroundTask, errorInfo: { name?: string; message?: string }, source: string) => Promise<boolean>
++    }).tryFallbackRetry = async (retryTask, errorInfo, source) => {
++      retried.push({ taskId: retryTask.id, errorInfo, source })
++      retryTask.status = "pending"
++      retryTask.error = undefined
++      return true
++    }
++
++    //#when
++    await manager.resume({
++      sessionId: "ses_resume_retry",
++      prompt: "continue",
++      parentSessionID: "parent-session",
++      parentMessageID: "parent-message-2",
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    const storedTask = getTaskMap(manager).get(task.id)
++    expect(retried).toHaveLength(1)
++    expect(retried[0]?.source).toBe("promptAsync.resume")
++    expect(retried[0]?.errorInfo).toEqual({
++      name: "APIError",
++      message: "Forbidden: Selected provider is forbidden",
++    })
++    expect(storedTask?.status).toBe("pending")
++  })
++})
++
++describe("BackgroundManager retry observability", () => {
++  test("queues a parent-visible retry notification when fallback retry is scheduled", async () => {
++    //#given
++    const client = {
++      session: {
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    const task = createMockTask({
++      id: "bg_retry_observable",
++      parentSessionID: "parent-session",
++      fallbackChain: [{ model: "claude-haiku-4-5", providers: ["anthropic"] }],
++      attemptCount: 0,
++      status: "running",
++      attempts: [
++        {
++          attemptID: "att_retry_visibility",
++          attemptNumber: 1,
++          sessionID: "ses_retry_visibility",
++          providerID: "genai-proxy-openai",
++          modelID: "gpt-5.4-mini",
++          status: "running",
++        },
++      ],
++      currentAttemptID: "att_retry_visibility",
++    })
++    getTaskMap(manager).set(task.id, task)
++    const queuePendingNotification = mock(() => {})
++    ;(manager as unknown as {
++      queuePendingNotification: (sessionID: string | undefined, notification: string) => void
++    }).queuePendingNotification = queuePendingNotification
++
++    //#when
++    await (manager as unknown as {
++      tryFallbackRetry: (task: BackgroundTask, errorInfo: { name?: string; message?: string }, source: string) => Promise<boolean>
++    }).tryFallbackRetry(task, {
++      name: "APIError",
++      message: "Forbidden: Selected provider is forbidden",
++    }, "promptAsync.launch")
++
++    //#then
++    expect(queuePendingNotification).toHaveBeenCalledTimes(1)
++    const [sessionID, notification] = queuePendingNotification.mock.calls[0]
++    expect(sessionID).toBe("parent-session")
++    expect(notification).toContain("[BACKGROUND TASK RETRYING]")
++    expect(notification).toContain("ses_retry_visibility")
++    expect(notification).toContain("genai-proxy-openai/gpt-5.4-mini")
++    expect(notification).toContain("anthropic/claude-haiku-4.5")
++  })
++
++  test("queues a second parent-visible notification once the retry session ID is created", async () => {
++    //#given
++    const queuePendingNotification = mock(() => {})
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: tmpdir() } }),
++        create: async () => ({ data: { id: "ses_retry_created" } }),
++        promptAsync: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    ;(manager as unknown as {
++      queuePendingNotification: (sessionID: string | undefined, notification: string) => void
++    }).queuePendingNotification = queuePendingNotification
++    const task = createMockTask({
++      id: "bg_retry_ready",
++      parentSessionID: "parent-session",
++      status: "pending",
++      attemptCount: 1,
++      queuedAt: new Date(),
++      model: { providerID: "anthropic", modelID: "claude-haiku-4.5" },
++      fallbackChain: [{ model: "claude-haiku-4-5", providers: ["anthropic"] }],
++      concurrencyGroup: "anthropic/claude-haiku-4.5",
++      retryNotification: {
++        nextModel: "anthropic/claude-haiku-4.5",
++      },
++      attempts: [
++        {
++          attemptID: "att_retry_failed",
++          attemptNumber: 1,
++          sessionID: "ses_retry_visibility",
++          providerID: "genai-proxy-openai",
++          modelID: "gpt-5.4-mini",
++          status: "error",
++          error: "Forbidden: Selected provider is forbidden",
++        },
++        {
++          attemptID: "att_retry_ready",
++          attemptNumber: 2,
++          providerID: "anthropic",
++          modelID: "claude-haiku-4.5",
++          status: "pending",
++        },
++      ],
++      currentAttemptID: "att_retry_ready",
++    })
++    getTaskMap(manager).set(task.id, task)
++    const taskInput = {
++      description: task.description,
++      prompt: task.prompt,
++      agent: task.agent,
++      parentSessionID: task.parentSessionID,
++      parentMessageID: task.parentMessageID,
++      model: task.model,
++      fallbackChain: task.fallbackChain,
++      category: task.category,
++    }
++    type RetryReadyQueueItem = {
++      task: BackgroundTask
++      input: typeof taskInput
++      attemptID: string
++    }
++    const item: RetryReadyQueueItem = {
++      task,
++      input: taskInput,
++      attemptID: task.currentAttemptID ?? "att_retry_ready",
++    }
++
++    //#when
++    await (manager as unknown as {
++      startTask: (queueItem: RetryReadyQueueItem) => Promise<void>
++    }).startTask(item)
++
++    //#then
++    const notifications = queuePendingNotification.mock.calls.map((call) => call[1])
++    const retryReadyNotification = notifications.find((notification) => notification.includes("[BACKGROUND TASK RETRY SESSION READY]"))
++    const expectedRetryLink = `http://127.0.0.1:4096/${Buffer.from(tmpdir()).toString("base64url")}/session/ses_retry_created`
++    expect(retryReadyNotification).toBeDefined()
++    expect(retryReadyNotification).toContain("**Retry attempt:** 2")
++    expect(retryReadyNotification).toContain("ses_retry_created")
++    expect(retryReadyNotification).toContain(expectedRetryLink)
++    expect(retryReadyNotification).toContain("ses_retry_visibility")
++    expect(retryReadyNotification).toContain("genai-proxy-openai/gpt-5.4-mini")
++    expect(retryReadyNotification).toContain("Forbidden: Selected provider is forbidden")
++  })
++})
++
+ function getCleanupSignals(): Array<NodeJS.Signals | "beforeExit" | "exit"> {
+   const signals: Array<NodeJS.Signals | "beforeExit" | "exit"> = ["SIGINT", "SIGTERM", "beforeExit", "exit"]
+   if (process.platform === "win32") {
+@@ -2037,6 +2371,43 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+       expect(task.sessionID).toBeUndefined()
+     })
+ 
++    test("should initialize attempt state for a newly launched task", async () => {
++      // given
++      const input = {
++        description: "Test task",
++        prompt: "Do something",
++        agent: "test-agent",
++        parentSessionID: "parent-session",
++        parentMessageID: "parent-message",
++        model: {
++          providerID: "openai",
++          modelID: "gpt-5.4-mini",
++          variant: "medium",
++        },
++      }
++
++      // when
++      const task = await manager.launch(input)
++
++      // then
++      expect(task.attempts).toHaveLength(1)
++      expect(task.currentAttemptID).toBe(task.attempts?.[0]?.attemptID)
++      expect(task.attempts?.[0]).toEqual({
++        attemptID: task.currentAttemptID,
++        attemptNumber: 1,
++        providerID: "openai",
++        modelID: "gpt-5.4-mini",
++        variant: "medium",
++        status: "pending",
++      })
++
++      expect(task.status).toBe("pending")
++      expect(task.model).toEqual(input.model)
++      expect(task.queuedAt).toBeInstanceOf(Date)
++      expect(task.startedAt).toBeUndefined()
++      expect(task.sessionID).toBeUndefined()
++    })
++
+   test("should return immediately even with concurrency limit", async () => {
+     // given
+     const config = { defaultConcurrency: 1 }
+@@ -5545,3 +5916,206 @@ describe("BackgroundManager - tool permission spread order", () => {
+     manager.shutdown()
+   })
+ })
++
++describe("BackgroundManager.launch - attempt state initialization", () => {
++  test("newly launched task has attempt state with attemptNumber 1 and currentAttemptID pointing at it", async () => {
++    //#given
++    const manager = createBackgroundManager()
++    ;(manager as unknown as {
++      reserveSubagentSpawn: () => Promise<{
++        spawnContext: { rootSessionID: string; parentDepth: number; childDepth: number }
++        descendantCount: number
++        commit: () => number
++        rollback: () => void
++      }>
++    }).reserveSubagentSpawn = async () => ({
++      spawnContext: { rootSessionID: "parent-session", parentDepth: 0, childDepth: 1 },
++      descendantCount: 1,
++      commit: () => 1,
++      rollback: () => {},
++    })
++
++    //#when
++    const task = await manager.launch({
++      description: "attempt state test",
++      prompt: "do something",
++      agent: "explore",
++      parentSessionID: "parent-session",
++      parentMessageID: "parent-message",
++      model: { providerID: "anthropic", modelID: "claude-haiku-4.5" },
++    })
++
++    //#then
++    const stored = getTaskMap(manager).get(task.id)
++
++    expect(stored?.attempts).toBeDefined()
++    expect(stored?.attempts).toHaveLength(1)
++
++    const firstAttempt = stored?.attempts?.[0]
++    expect(firstAttempt?.attemptNumber).toBe(1)
++    expect(firstAttempt?.status).toBe("pending")
++    expect(firstAttempt?.providerID).toBe("anthropic")
++    expect(firstAttempt?.modelID).toBe("claude-haiku-4.5")
++
++    expect(stored?.currentAttemptID).toBeDefined()
++    expect(stored?.currentAttemptID).toBe(firstAttempt?.attemptID)
++
++    expect(stored?.status).toBeDefined()
++    expect(stored?.model).toBeDefined()
++    expect(stored?.parentSessionID).toBe("parent-session")
++
++    manager.shutdown()
++  })
++})
++
++describe("BackgroundManager attempt lifecycle bindings", () => {
++  test("startTask binds the created session to the queued attempt ID and mirrors task projection", async () => {
++    //#given
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: "/test/dir" } }),
++        create: async () => ({ data: { id: "session-attempt-2" } }),
++        promptAsync: async () => ({}),
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    const task: BackgroundTask = {
++      id: "task-attempt-binding",
++      status: "pending",
++      queuedAt: new Date(),
++      description: "retry binding task",
++      prompt: "continue",
++      agent: "sisyphus-junior",
++      parentSessionID: "parent-session",
++      parentMessageID: "parent-message",
++      model: { providerID: "anthropic", modelID: "claude-haiku-4.5", variant: "max" },
++      attempts: [
++        {
++          attemptID: "attempt-1",
++          attemptNumber: 1,
++          sessionID: "session-attempt-1",
++          providerID: "openai",
++          modelID: "gpt-5.4-mini",
++          status: "error",
++          error: "first attempt failed",
++          startedAt: new Date("2026-04-27T00:00:00.000Z"),
++          completedAt: new Date("2026-04-27T00:00:05.000Z"),
++        },
++        {
++          attemptID: "attempt-2",
++          attemptNumber: 2,
++          providerID: "anthropic",
++          modelID: "claude-haiku-4.5",
++          variant: "max",
++          status: "pending",
++        },
++      ],
++      currentAttemptID: "attempt-2",
++      attemptCount: 1,
++    }
++    const input: import("./types").LaunchInput = {
++      description: task.description,
++      prompt: task.prompt,
++      agent: task.agent,
++      parentSessionID: task.parentSessionID,
++      parentMessageID: task.parentMessageID,
++      model: task.model,
++    }
++
++    //#when
++    await (manager as unknown as {
++      startTask: (item: { task: BackgroundTask; input: import("./types").LaunchInput; attemptID: string }) => Promise<void>
++    }).startTask({ task, input, attemptID: "attempt-2" })
++
++    //#then
++    const activeAttempt = task.attempts?.find((attempt) => attempt.attemptID === "attempt-2")
++    expect(activeAttempt).toBeDefined()
++    expect(activeAttempt?.sessionID).toBe("session-attempt-2")
++    expect(activeAttempt?.status).toBe("running")
++    expect(activeAttempt?.startedAt).toBeInstanceOf(Date)
++    expect(task.currentAttemptID).toBe("attempt-2")
++    expect(task.sessionID).toBe("session-attempt-2")
++    expect(task.status).toBe("running")
++    expect(task.attempts?.[0]).toMatchObject({
++      attemptID: "attempt-1",
++      sessionID: "session-attempt-1",
++      status: "error",
++      error: "first attempt failed",
++    })
++
++    manager.shutdown()
++  })
++
++  test("historical attempt session IDs resolve to the task while stale session.error events leave the current attempt unchanged", async () => {
++    //#given
++    const manager = createBackgroundManager()
++    const task: BackgroundTask = {
++      id: "task-stale-session-event",
++      status: "running",
++      queuedAt: new Date("2026-04-27T00:00:00.000Z"),
++      startedAt: new Date("2026-04-27T00:00:10.000Z"),
++      sessionID: "session-attempt-2",
++      description: "ignore stale retry events",
++      prompt: "continue",
++      agent: "explore",
++      parentSessionID: "parent-session",
++      parentMessageID: "parent-message",
++      model: { providerID: "anthropic", modelID: "claude-haiku-4.5" },
++      attempts: [
++        {
++          attemptID: "attempt-1",
++          attemptNumber: 1,
++          sessionID: "session-attempt-1",
++          providerID: "openai",
++          modelID: "gpt-5.4-mini",
++          status: "error",
++          error: "first attempt failed",
++          startedAt: new Date("2026-04-27T00:00:00.000Z"),
++          completedAt: new Date("2026-04-27T00:00:05.000Z"),
++        },
++        {
++          attemptID: "attempt-2",
++          attemptNumber: 2,
++          sessionID: "session-attempt-2",
++          providerID: "anthropic",
++          modelID: "claude-haiku-4.5",
++          status: "running",
++          startedAt: new Date("2026-04-27T00:00:10.000Z"),
++        },
++      ],
++      currentAttemptID: "attempt-2",
++    }
++    getTaskMap(manager).set(task.id, task)
++
++    //#when
++    const resolvedTask = manager.findBySession("session-attempt-1")
++    manager.handleEvent({
++      type: "session.error",
++      properties: {
++        sessionID: "session-attempt-1",
++        error: { name: "UnknownError", message: "late event from old session" },
++      },
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(resolvedTask?.id).toBe(task.id)
++    expect(task.currentAttemptID).toBe("attempt-2")
++    expect(task.sessionID).toBe("session-attempt-2")
++    expect(task.status).toBe("running")
++    expect(task.error).toBeUndefined()
++    expect(task.attempts?.[0]).toMatchObject({
++      attemptID: "attempt-1",
++      status: "error",
++      error: "first attempt failed",
++    })
++    expect(task.attempts?.[1]).toMatchObject({
++      attemptID: "attempt-2",
++      sessionID: "session-attempt-2",
++      status: "running",
++    })
++
++    manager.shutdown()
++  })
++})
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index f418580c..f8f80fcd 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -1,8 +1,10 @@
+ 
+ import type { PluginInput } from "@opencode-ai/plugin"
++import type { ModelFallbackControllerAccessor } from "../../hooks/model-fallback"
+ import { isAgentNotFoundError, FALLBACK_AGENT, buildFallbackBody } from "./spawner"
+ import type {
+   BackgroundTask,
++  BackgroundTaskAttempt,
+   LaunchInput,
+   ResumeInput,
+ } from "./types"
+@@ -30,6 +32,7 @@ import {
+   POLLING_INTERVAL_MS,
+   TASK_CLEANUP_DELAY_MS,
+   TASK_TTL_MS,
++  type QueueItem,
+ } from "./constants"
+ 
+ import { subagentSessions } from "../claude-code-session-state"
+@@ -47,6 +50,14 @@ import {
+   isRecord,
+ } from "./error-classifier"
+ import { tryFallbackRetry } from "./fallback-retry-handler"
++import {
++  bindAttemptSession,
++  ensureCurrentAttempt,
++  findAttemptBySession,
++  finalizeAttempt,
++  getCurrentAttempt,
++  startAttempt,
++} from "./attempt-lifecycle"
+ import { registerManagerForCleanup, unregisterManagerForCleanup } from "./process-cleanup"
+ import {
+   findNearestMessageExcludingCompaction,
+@@ -119,9 +130,38 @@ interface Todo {
+   id: string
+ }
+ 
+-interface QueueItem {
+-  task: BackgroundTask
+-  input: LaunchInput
++function formatAttemptModelSummary(attempt: Pick<BackgroundTaskAttempt, "providerID" | "modelID"> | undefined): string | undefined {
++  if (!attempt?.providerID || !attempt.modelID) {
++    return undefined
++  }
++
++  return `${attempt.providerID}/${attempt.modelID}`
++}
++
++function getPreviousAttempt(task: BackgroundTask, attemptID: string | undefined): BackgroundTaskAttempt | undefined {
++  if (!attemptID || !task.attempts || task.attempts.length === 0) {
++    return undefined
++  }
++
++  const attemptIndex = task.attempts.findIndex((attempt) => attempt.attemptID === attemptID)
++  if (attemptIndex <= 0) {
++    return undefined
++  }
++
++  return task.attempts[attemptIndex - 1]
++}
++
++function cloneAttempts(task: BackgroundTask): BackgroundTaskAttempt[] | undefined {
++  if (!task.attempts) {
++    return undefined
++  }
++
++  return task.attempts.map((attempt) => ({ ...attempt }))
++}
++
++function buildLocalSessionUrl(directory: string, sessionID: string): string {
++  const encodedDirectory = Buffer.from(directory).toString("base64url")
++  return `http://127.0.0.1:4096/${encodedDirectory}/session/${sessionID}`
+ }
+ 
+ export interface SubagentSessionCreatedEvent {
+@@ -163,6 +203,7 @@ export class BackgroundManager {
+   private rootDescendantCounts: Map<string, number>
+   private preStartDescendantReservations: Set<string>
+   private enableParentSessionNotifications: boolean
++  private modelFallbackControllerAccessor?: ModelFallbackControllerAccessor
+   readonly taskHistory = new TaskHistory()
+   private cachedCircuitBreakerSettings?: CircuitBreakerSettings
+ 
+@@ -174,6 +215,7 @@ export class BackgroundManager {
+       onSubagentSessionCreated?: OnSubagentSessionCreated
+       onShutdown?: () => void | Promise<void>
+       enableParentSessionNotifications?: boolean
++      modelFallbackControllerAccessor?: ModelFallbackControllerAccessor
+     }
+   ) {
+     this.tasks = new Map()
+@@ -190,6 +232,7 @@ export class BackgroundManager {
+     this.rootDescendantCounts = new Map()
+     this.preStartDescendantReservations = new Set()
+     this.enableParentSessionNotifications = options?.enableParentSessionNotifications ?? true
++    this.modelFallbackControllerAccessor = options?.modelFallbackControllerAccessor
+     this.registerProcessCleanup()
+   }
+ 
+@@ -324,6 +367,7 @@ export class BackgroundManager {
+         attemptCount: 0,
+         category: input.category,
+       }
++      const firstAttempt = startAttempt(task, input.model)
+ 
+       this.tasks.set(task.id, task)
+       this.taskHistory.record(input.parentSessionID, { id: task.id, agent: input.agent, description: input.description, status: "pending", category: input.category })
+@@ -338,7 +382,7 @@ export class BackgroundManager {
+       // Add to queue
+       const key = this.getConcurrencyKeyFromInput(input)
+       const queue = this.queuesByKey.get(key) ?? []
+-      queue.push({ task, input })
++      queue.push({ task, input, attemptID: firstAttempt.attemptID })
+       this.queuesByKey.set(key, queue)
+ 
+       log("[background-agent] Task queued:", { taskId: task.id, key, queueLength: queue.length })
+@@ -399,9 +443,13 @@ export class BackgroundManager {
+ 
+           // Mark task as error so the parent polling loop detects the failure
+           // instead of leaving it in a zombie "running" state with no prompt sent
+-          item.task.status = "error"
+-          item.task.error = error instanceof Error ? error.message : String(error)
+-          item.task.completedAt = new Date()
++          if (item.task.currentAttemptID) {
++            finalizeAttempt(item.task, item.task.currentAttemptID, "error", error instanceof Error ? error.message : String(error))
++          } else {
++            item.task.status = "error"
++            item.task.error = error instanceof Error ? error.message : String(error)
++            item.task.completedAt = new Date()
++          }
+ 
+           if (item.task.concurrencyKey) {
+             this.concurrencyManager.release(item.task.concurrencyKey)
+@@ -430,6 +478,7 @@ export class BackgroundManager {
+ 
+   private async startTask(item: QueueItem): Promise<void> {
+     const { task, input } = item
++    const attemptID = item.attemptID ?? ensureCurrentAttempt(task, input.model).attemptID
+ 
+     log("[background-agent] Starting task:", {
+       taskId: task.id,
+@@ -512,9 +561,17 @@ export class BackgroundManager {
+       return
+     }
+ 
+-    task.status = "running"
+-    task.startedAt = new Date()
+-    task.sessionID = sessionID
++    const boundAttempt = bindAttemptSession(task, attemptID, sessionID, input.model)
++    if (!boundAttempt) {
++      await this.abortSessionWithLogging(sessionID, "stale attempt binding cleanup")
++      subagentSessions.delete(sessionID)
++      if (task.rootSessionID) {
++        this.unregisterRootDescendant(task.rootSessionID)
++      }
++      this.concurrencyManager.release(concurrencyKey)
++      return
++    }
++
+     task.progress = {
+       toolCalls: 0,
+       lastUpdate: new Date(),
+@@ -522,6 +579,39 @@ export class BackgroundManager {
+     task.concurrencyKey = concurrencyKey
+     task.concurrencyGroup = concurrencyKey
+ 
++    if (task.retryNotification) {
++      const attemptNumber = boundAttempt.attemptNumber
++      const retrySessionUrl = buildLocalSessionUrl(this.directory, sessionID)
++      const previousAttempt = getPreviousAttempt(task, boundAttempt.attemptID)
++      const failedSessionID = previousAttempt?.sessionID ?? task.retryNotification.previousSessionID
++      const failedSessionLine = failedSessionID
++        ? `\n- Failed session: \`${failedSessionID}\``
++        : ""
++      const failedModel = formatAttemptModelSummary(previousAttempt) ?? task.retryNotification.failedModel
++      const failedModelLine = failedModel
++        ? `\n- Failed model: \`${failedModel}\``
++        : ""
++      const failedError = previousAttempt?.error ?? task.retryNotification.failedError
++      const failedErrorLine = failedError
++        ? `\n- Error: ${failedError}`
++        : ""
++      const retryModel = formatAttemptModelSummary(boundAttempt) ?? task.retryNotification.nextModel
++      this.queuePendingNotification(
++        task.parentSessionID,
++        `<system-reminder>
++[BACKGROUND TASK RETRY SESSION READY]
++**ID:** \`${task.id}\`
++**Description:** ${task.description}
++**Retry attempt:** ${attemptNumber}
++**Retry session:** \`${sessionID}\`
++**Retry link:** ${retrySessionUrl}${failedSessionLine}${failedModelLine}${failedErrorLine}${retryModel ? `\n- Model: \`${retryModel}\`` : ""}
++
++The fallback retry session is now created and can be inspected directly.
++</system-reminder>`
++      )
++      task.retryNotification = undefined
++    }
++
+     this.taskHistory.record(input.parentSessionID, { id: task.id, sessionID, agent: input.agent, description: input.description, status: "running", category: input.category, startedAt: task.startedAt })
+     this.startPolling()
+ 
+@@ -601,14 +691,25 @@ export class BackgroundManager {
+       log("[background-agent] promptAsync error:", error)
+       const existingTask = this.findBySession(sessionID)
+       if (existingTask) {
+-        existingTask.status = "interrupt"
+-        const errorMessage = error instanceof Error ? error.message : String(error)
+-        if (errorMessage.includes("agent.name") || errorMessage.includes("undefined") || isAgentNotFoundError(error)) {
+-          existingTask.error = `Agent "${input.agent}" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.`
++        const errorInfo = {
++          name: extractErrorName(error),
++          message: extractErrorMessage(error),
++        }
++        if (await this.tryFallbackRetry(existingTask, errorInfo, "promptAsync.launch")) {
++          return
++        }
++
++        const errorMessage = errorInfo.message ?? (error instanceof Error ? error.message : String(error))
++        const terminalError = errorMessage.includes("agent.name") || errorMessage.includes("undefined") || isAgentNotFoundError(error)
++          ? `Agent "${input.agent}" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.`
++          : errorMessage
++        if (existingTask.currentAttemptID) {
++          finalizeAttempt(existingTask, existingTask.currentAttemptID, "interrupt", terminalError)
+         } else {
+-          existingTask.error = errorMessage
++          existingTask.status = "interrupt"
++          existingTask.error = terminalError
++          existingTask.completedAt = new Date()
+         }
+-        existingTask.completedAt = new Date()
+         if (existingTask.rootSessionID) {
+           this.unregisterRootDescendant(existingTask.rootSessionID)
+         }
+@@ -665,10 +766,35 @@ export class BackgroundManager {
+       if (task.sessionID === sessionID) {
+         return task
+       }
++      if (findAttemptBySession(task, sessionID)) {
++        return task
++      }
+     }
+     return undefined
+   }
+ 
++  private resolveTaskAttemptBySession(sessionID: string): { task: BackgroundTask; attemptID?: string; isCurrent: boolean } | undefined {
++    const task = this.findBySession(sessionID)
++    if (!task) {
++      return undefined
++    }
++
++    const attempt = findAttemptBySession(task, sessionID)
++    if (!attempt) {
++      return {
++        task,
++        attemptID: undefined,
++        isCurrent: task.sessionID === sessionID,
++      }
++    }
++
++    return {
++      task,
++      attemptID: attempt.attemptID,
++      isCurrent: task.currentAttemptID === attempt.attemptID,
++    }
++  }
++
+   private getConcurrencyKeyFromInput(input: LaunchInput): string {
+     if (input.model) {
+       return `${input.model.providerID}/${input.model.modelID}`
+@@ -883,8 +1009,16 @@ export class BackgroundManager {
+       },
+     }).catch(async (error) => {
+       log("[background-agent] resume prompt error:", error)
++      const errorInfo = {
++        name: extractErrorName(error),
++        message: extractErrorMessage(error),
++      }
++      if (await this.tryFallbackRetry(existingTask, errorInfo, "promptAsync.resume")) {
++        return
++      }
++
+       existingTask.status = "interrupt"
+-      const errorMessage = error instanceof Error ? error.message : String(error)
++      const errorMessage = errorInfo.message ?? (error instanceof Error ? error.message : String(error))
+       existingTask.error = errorMessage
+       existingTask.completedAt = new Date()
+       if (existingTask.rootSessionID) {
+@@ -986,8 +1120,11 @@ export class BackgroundManager {
+ 
+       if (role !== "assistant") return
+ 
+-      const task = this.findBySession(sessionID)
+-      if (!task || task.status !== "running") return
++      const resolved = this.resolveTaskAttemptBySession(sessionID)
++      if (!resolved?.isCurrent) return
++
++      const { task } = resolved
++      if (task.status !== "running") return
+ 
+       const assistantError = (info as Record<string, unknown>)["error"]
+       if (!assistantError) return
+@@ -1009,8 +1146,10 @@ export class BackgroundManager {
+       const sessionID = partInfo?.sessionID
+       if (!sessionID) return
+ 
+-      const task = this.findBySession(sessionID)
+-      if (!task) return
++      const resolved = this.resolveTaskAttemptBySession(sessionID)
++      if (!resolved?.isCurrent) return
++
++      const { task } = resolved
+ 
+       if (this.hasOutputSignalFromPart(partInfo)) {
+         this.markSessionOutputObserved(sessionID)
+@@ -1113,7 +1252,10 @@ export class BackgroundManager {
+       if (!props || typeof props !== "object") return
+       handleSessionIdleBackgroundEvent({
+         properties: props as Record<string, unknown>,
+-        findBySession: (id) => this.findBySession(id),
++        findBySession: (id) => {
++          const resolved = this.resolveTaskAttemptBySession(id)
++          return resolved?.isCurrent ? resolved.task : undefined
++        },
+         idleDeferralTimers: this.idleDeferralTimers,
+         validateSessionHasOutput: (id) => this.validateSessionHasOutput(id),
+         checkSessionTodos: (id) => this.checkSessionTodos(id),
+@@ -1126,8 +1268,11 @@ export class BackgroundManager {
+       const sessionID = typeof props?.sessionID === "string" ? props.sessionID : undefined
+       if (!sessionID) return
+ 
+-      const task = this.findBySession(sessionID)
+-      if (!task || task.status !== "running") return
++      const resolved = this.resolveTaskAttemptBySession(sessionID)
++      if (!resolved?.isCurrent) return
++
++      const { task } = resolved
++      if (task.status !== "running") return
+ 
+       const errorObj = props?.error as { name?: string; message?: string } | undefined
+       const errorName = errorObj?.name
+@@ -1156,9 +1301,9 @@ export class BackgroundManager {
+       this.clearSessionTodoObservation(sessionID)
+ 
+       const tasksToCancel = new Map<string, BackgroundTask>()
+-      const directTask = this.findBySession(sessionID)
+-      if (directTask) {
+-        tasksToCancel.set(directTask.id, directTask)
++      const directTask = this.resolveTaskAttemptBySession(sessionID)
++      if (directTask?.isCurrent) {
++        tasksToCancel.set(directTask.task.id, directTask.task)
+       }
+       for (const descendant of this.getAllDescendantTasks(sessionID)) {
+         tasksToCancel.set(descendant.id, descendant)
+@@ -1213,8 +1358,11 @@ export class BackgroundManager {
+       const status = props?.status as { type?: string; message?: string } | undefined
+       if (!sessionID || status?.type !== "retry") return
+ 
+-      const task = this.findBySession(sessionID)
+-      if (!task || task.status !== "running") return
++      const resolved = this.resolveTaskAttemptBySession(sessionID)
++      if (!resolved?.isCurrent) return
++
++      const { task } = resolved
++      if (task.status !== "running") return
+ 
+       const errorMessage = typeof status.message === "string" ? status.message : undefined
+       const errorInfo = { name: "SessionRetry", message: errorMessage }
+@@ -1235,6 +1383,13 @@ export class BackgroundManager {
+   }): Promise<void> {
+     const { task, errorInfo, errorMessage, errorName } = args
+ 
++    if (!task.fallbackChain && task.sessionID) {
++      const sessionFallbackChain = this.modelFallbackControllerAccessor?.getSessionFallbackChain(task.sessionID)
++      if (sessionFallbackChain?.length) {
++        task.fallbackChain = sessionFallbackChain
++      }
++    }
++
+     // Agent-not-found errors are handled by the prompt catch block with agent fallback.
+     // Do not also trigger model fallback retry — that would race with the agent retry.
+     if (isAgentNotFoundError({ message: errorInfo.message } as Error)) {
+@@ -1262,9 +1417,13 @@ export class BackgroundManager {
+       canRetry,
+     })
+ 
+-    task.status = "error"
+-    task.error = errorMsg
+-    task.completedAt = new Date()
++    if (task.currentAttemptID) {
++      finalizeAttempt(task, task.currentAttemptID, "error", errorMsg)
++    } else {
++      task.status = "error"
++      task.error = errorMsg
++      task.completedAt = new Date()
++    }
+     if (task.rootSessionID) {
+       this.unregisterRootDescendant(task.rootSessionID)
+     }
+@@ -1319,6 +1478,26 @@ export class BackgroundManager {
+       idleDeferralTimers: this.idleDeferralTimers,
+       queuesByKey: this.queuesByKey,
+       processKey: (key: string) => this.processKey(key),
++      onRetrying: ({ task, source }) => {
++        const currentAttempt = getCurrentAttempt(task)
++        const previousAttempt = getPreviousAttempt(task, currentAttempt?.attemptID)
++        const sourceText = source ? ` via ${source}` : ""
++        const failedSessionLine = previousAttempt?.sessionID ? `\n- Failed session: \`${previousAttempt.sessionID}\`` : ""
++        const failedModel = formatAttemptModelSummary(previousAttempt)
++        const failedModelLine = failedModel ? `\n- Failed model: \`${failedModel}\`` : ""
++        const failedErrorLine = previousAttempt?.error ? `\n- Error: ${previousAttempt.error}` : ""
++        const nextModel = formatAttemptModelSummary(currentAttempt)
++        this.queuePendingNotification(
++          task.parentSessionID,
++          `<system-reminder>
++[BACKGROUND TASK RETRYING]
++**ID:** \`${task.id}\`
++**Description:** ${task.description}${sourceText}${failedSessionLine}${failedModelLine}${failedErrorLine}${nextModel ? `\n- Next model: \`${nextModel}\`` : ""}
++
++The task was re-queued on a fallback model after a retryable failure.
++</system-reminder>`
++        )
++      },
+     })
+     return result.then((retried) => {
+       if (retried && previousSessionID) {
+@@ -1537,14 +1716,18 @@ export class BackgroundManager {
+     }
+ 
+     const wasRunning = task.status === "running"
+-    task.status = "cancelled"
+-    task.completedAt = new Date()
++    if (task.currentAttemptID) {
++      finalizeAttempt(task, task.currentAttemptID, "cancelled", reason)
++    } else {
++      task.status = "cancelled"
++      task.completedAt = new Date()
++      if (reason) {
++        task.error = reason
++      }
++    }
+     if (wasRunning && task.rootSessionID) {
+       this.unregisterRootDescendant(task.rootSessionID)
+     }
+-    if (reason) {
+-      task.error = reason
+-    }
+     this.taskHistory.record(task.parentSessionID, { id: task.id, sessionID: task.sessionID, agent: task.agent, description: task.description, status: "cancelled", category: task.category, startedAt: task.startedAt, completedAt: task.completedAt })
+ 
+     if (task.concurrencyKey) {
+@@ -1657,8 +1840,12 @@ export class BackgroundManager {
+     }
+ 
+     // Atomically mark as completed to prevent race conditions
+-    task.status = "completed"
+-    task.completedAt = new Date()
++    if (task.currentAttemptID) {
++      finalizeAttempt(task, task.currentAttemptID, "completed")
++    } else {
++      task.status = "completed"
++      task.completedAt = new Date()
++    }
+     this.taskHistory.record(task.parentSessionID, { id: task.id, sessionID: task.sessionID, agent: task.agent, description: task.description, status: "completed", category: task.category, startedAt: task.startedAt, completedAt: task.completedAt })
+ 
+     if (task.rootSessionID) {
+@@ -1722,6 +1909,7 @@ export class BackgroundManager {
+       description: task.description,
+       status: task.status,
+       error: task.error,
++      attempts: cloneAttempts(task),
+     })
+ 
+     // Update pending tracking and check if all tasks complete
+@@ -1743,7 +1931,7 @@ export class BackgroundManager {
+     }
+ 
+     const completedTasks = allComplete
+-      ? (this.completedTaskSummaries.get(task.parentSessionID) ?? [{ id: task.id, description: task.description, status: task.status, error: task.error }])
++      ? (this.completedTaskSummaries.get(task.parentSessionID) ?? [{ id: task.id, description: task.description, status: task.status, error: task.error, attempts: cloneAttempts(task) }])
+       : []
+ 
+     if (allComplete) {
+@@ -1950,9 +2138,13 @@ export class BackgroundManager {
+   }
+ 
+   private async failCrashedTask(task: BackgroundTask, errorMessage: string): Promise<void> {
+-    task.status = "error"
+-    task.error = errorMessage
+-    task.completedAt = new Date()
++    if (task.currentAttemptID) {
++      finalizeAttempt(task, task.currentAttemptID, "error", errorMessage)
++    } else {
++      task.status = "error"
++      task.error = errorMessage
++      task.completedAt = new Date()
++    }
+     if (task.rootSessionID) {
+       this.unregisterRootDescendant(task.rootSessionID)
+     }
+diff --git a/src/features/background-agent/spawner.test.ts b/src/features/background-agent/spawner.test.ts
+index eb2cc294..88a5e423 100644
+--- a/src/features/background-agent/spawner.test.ts
++++ b/src/features/background-agent/spawner.test.ts
+@@ -378,7 +378,7 @@ describe("background-agent spawner fallback model promotion", () => {
+ 
+     //#when
+     await startTask(
+-      { task, input },
++      { task, input, attemptID: "att_test123" },
+       {
+         client,
+         directory: "/tmp/test",
+diff --git a/src/features/background-agent/types.ts b/src/features/background-agent/types.ts
+index 5edbe102..030fdc01 100644
+--- a/src/features/background-agent/types.ts
++++ b/src/features/background-agent/types.ts
+@@ -26,6 +26,21 @@ export interface TaskProgress {
+   lastMessageAt?: Date
+ }
+ 
++export type BackgroundTaskAttemptStatus = BackgroundTaskStatus
++
++export interface BackgroundTaskAttempt {
++  attemptID: string
++  attemptNumber: number
++  sessionID?: string
++  providerID?: string
++  modelID?: string
++  variant?: string
++  status: BackgroundTaskAttemptStatus
++  error?: string
++  startedAt?: Date
++  completedAt?: Date
++}
++
+ export interface BackgroundTask {
+   id: string
+   sessionID?: string
+@@ -61,6 +76,18 @@ export interface BackgroundTask {
+   isUnstableAgent?: boolean
+   /** Category used for this task (e.g., 'quick', 'visual-engineering') */
+   category?: string
++  /** Pending retry notification details for the next spawned retry session */
++  retryNotification?: {
++    previousSessionID?: string
++    failedModel?: string
++    failedError?: string
++    nextModel: string
++  }
++
++  /** Structured attempt history for retry observability */
++  attempts?: BackgroundTaskAttempt[]
++  /** ID of the currently active attempt */
++  currentAttemptID?: string
+ 
+   /** Last message count for stability detection */
+   lastMsgCount?: number
+-- 
+2.39.2
+

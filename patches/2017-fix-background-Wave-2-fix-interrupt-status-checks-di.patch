@@ -1,0 +1,438 @@
+From 1199e2b83923c404ce2dc7863e348cf584f7cb58 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 10 Feb 2026 19:20:59 +0900
+Subject: [PATCH 2017/5749] fix(background): Wave 2 - fix interrupt status
+ checks, display text, error recovery grace, LSP JSONC
+
+- fix(background): include "interrupt" status in all terminal status checks (3 files)
+- fix(background): display "INTERRUPTED" instead of "CANCELLED" for interrupted tasks
+- fix(cli): add error recovery grace period in poll-for-completion
+- fix(lsp): use JSONC parser for config loading to support comments
+
+All changes verified with tests and typecheck.
+---
+ src/cli/run/poll-for-completion.ts            | 24 +++++---
+ .../parent-session-notifier.test.ts           | 39 +++++++++++++
+ .../parent-session-notifier.ts                |  2 +-
+ .../create-background-task.test.ts            | 56 +++++++++++++++++++
+ .../background-task/create-background-task.ts |  2 +-
+ .../background-agent-executor.test.ts         | 55 ++++++++++++++++++
+ .../background-agent-executor.ts              |  2 +-
+ .../background-executor.test.ts               | 55 ++++++++++++++++++
+ .../call-omo-agent/background-executor.ts     |  2 +-
+ src/tools/lsp/server-config-loader.test.ts    | 39 +++++++++++++
+ src/tools/lsp/server-config-loader.ts         |  5 +-
+ 11 files changed, 268 insertions(+), 13 deletions(-)
+ create mode 100644 src/features/background-agent/parent-session-notifier.test.ts
+ create mode 100644 src/tools/background-task/create-background-task.test.ts
+ create mode 100644 src/tools/call-omo-agent/background-agent-executor.test.ts
+ create mode 100644 src/tools/call-omo-agent/background-executor.test.ts
+ create mode 100644 src/tools/lsp/server-config-loader.test.ts
+
+diff --git a/src/cli/run/poll-for-completion.ts b/src/cli/run/poll-for-completion.ts
+index 947b692c..f6eac108 100644
+--- a/src/cli/run/poll-for-completion.ts
++++ b/src/cli/run/poll-for-completion.ts
+@@ -5,6 +5,7 @@ import { checkCompletionConditions } from "./completion"
+ 
+ const DEFAULT_POLL_INTERVAL_MS = 500
+ const DEFAULT_REQUIRED_CONSECUTIVE = 3
++const ERROR_GRACE_CYCLES = 3
+ 
+ export interface PollOptions {
+   pollIntervalMs?: number
+@@ -21,19 +22,28 @@ export async function pollForCompletion(
+   const requiredConsecutive =
+     options.requiredConsecutive ?? DEFAULT_REQUIRED_CONSECUTIVE
+   let consecutiveCompleteChecks = 0
++  let errorCycleCount = 0
+ 
+   while (!abortController.signal.aborted) {
+     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+ 
+     // ERROR CHECK FIRST — errors must not be masked by other gates
+     if (eventState.mainSessionError) {
+-      console.error(
+-        pc.red(`\n\nSession ended with error: ${eventState.lastError}`)
+-      )
+-      console.error(
+-        pc.yellow("Check if todos were completed before the error.")
+-      )
+-      return 1
++      errorCycleCount++
++      if (errorCycleCount >= ERROR_GRACE_CYCLES) {
++        console.error(
++          pc.red(`\n\nSession ended with error: ${eventState.lastError}`)
++        )
++        console.error(
++          pc.yellow("Check if todos were completed before the error.")
++        )
++        return 1
++      }
++      // Continue polling during grace period to allow recovery
++      continue
++    } else {
++      // Reset error counter when error clears (recovery succeeded)
++      errorCycleCount = 0
+     }
+ 
+     if (!eventState.mainSessionIdle) {
+diff --git a/src/features/background-agent/parent-session-notifier.test.ts b/src/features/background-agent/parent-session-notifier.test.ts
+new file mode 100644
+index 00000000..098e84bb
+--- /dev/null
++++ b/src/features/background-agent/parent-session-notifier.test.ts
+@@ -0,0 +1,39 @@
++declare const require: (name: string) => any
++const { describe, test, expect } = require("bun:test")
++import type { BackgroundTask } from "./types"
++import { buildBackgroundTaskNotificationText } from "./background-task-notification-template"
++
++describe("notifyParentSession", () => {
++  test("displays INTERRUPTED for interrupted tasks", () => {
++    // given
++    const task: BackgroundTask = {
++      id: "test-task",
++      parentSessionID: "parent-session",
++      parentMessageID: "parent-message",
++      description: "Test task",
++      prompt: "Test prompt",
++      agent: "test-agent",
++      status: "interrupt",
++      startedAt: new Date(),
++      completedAt: new Date(),
++    }
++    const duration = "1s"
++    const statusText = task.status === "completed" ? "COMPLETED" : task.status === "interrupt" ? "INTERRUPTED" : "CANCELLED"
++    const allComplete = false
++    const remainingCount = 1
++    const completedTasks: BackgroundTask[] = []
++
++    // when
++    const notification = buildBackgroundTaskNotificationText({
++      task,
++      duration,
++      statusText,
++      allComplete,
++      remainingCount,
++      completedTasks,
++    })
++
++    // then
++    expect(notification).toContain("INTERRUPTED")
++  })
++})
+\ No newline at end of file
+diff --git a/src/features/background-agent/parent-session-notifier.ts b/src/features/background-agent/parent-session-notifier.ts
+index 2c2ff05a..28fb3a37 100644
+--- a/src/features/background-agent/parent-session-notifier.ts
++++ b/src/features/background-agent/parent-session-notifier.ts
+@@ -36,7 +36,7 @@ export async function notifyParentSession(
+   const allComplete = !pendingSet || pendingSet.size === 0
+   const remainingCount = pendingSet?.size ?? 0
+ 
+-  const statusText = task.status === "completed" ? "COMPLETED" : "CANCELLED"
++  const statusText = task.status === "completed" ? "COMPLETED" : task.status === "interrupt" ? "INTERRUPTED" : "CANCELLED"
+ 
+   const completedTasks = allComplete
+     ? Array.from(state.tasks.values()).filter(
+diff --git a/src/tools/background-task/create-background-task.test.ts b/src/tools/background-task/create-background-task.test.ts
+new file mode 100644
+index 00000000..5cfd07c4
+--- /dev/null
++++ b/src/tools/background-task/create-background-task.test.ts
+@@ -0,0 +1,56 @@
++import { describe, test, expect, mock } from "bun:test"
++import type { BackgroundManager } from "../../features/background-agent"
++import { createBackgroundTask } from "./create-background-task"
++
++describe("createBackgroundTask", () => {
++  const mockManager = {
++    launch: mock(() => Promise.resolve({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "pending",
++    })),
++    getTask: mock(),
++  } as unknown as BackgroundManager
++
++  const tool = createBackgroundTask(mockManager)
++
++  const testContext = {
++    sessionID: "test-session",
++    messageID: "test-message",
++    agent: "test-agent",
++    abort: new AbortController().signal,
++  }
++
++  const testArgs = {
++    description: "Test background task",
++    prompt: "Test prompt",
++    agent: "test-agent",
++  }
++
++  test("detects interrupted task as failure", async () => {
++    //#given
++    mockManager.launch.mockResolvedValueOnce({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "pending",
++    })
++    mockManager.getTask.mockReturnValueOnce({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "interrupt",
++    })
++
++    //#when
++    const result = await tool.execute(testArgs, testContext)
++
++    //#then
++    expect(result).toContain("Task entered error state")
++    expect(result).toContain("test-task-id")
++  })
++})
+\ No newline at end of file
+diff --git a/src/tools/background-task/create-background-task.ts b/src/tools/background-task/create-background-task.ts
+index a3411dc4..a7a365d2 100644
+--- a/src/tools/background-task/create-background-task.ts
++++ b/src/tools/background-task/create-background-task.ts
+@@ -79,7 +79,7 @@ export function createBackgroundTask(manager: BackgroundManager): ToolDefinition
+           }
+           await delay(WAIT_FOR_SESSION_INTERVAL_MS)
+           const updated = manager.getTask(task.id)
+-          if (!updated || updated.status === "error") {
++          if (!updated || updated.status === "error" || updated.status === "cancelled" || updated.status === "interrupt") {
+             return `Task ${!updated ? "was deleted" : `entered error state`}\.\n\nTask ID: ${task.id}`
+           }
+           sessionId = updated?.sessionID
+diff --git a/src/tools/call-omo-agent/background-agent-executor.test.ts b/src/tools/call-omo-agent/background-agent-executor.test.ts
+new file mode 100644
+index 00000000..2c080e7e
+--- /dev/null
++++ b/src/tools/call-omo-agent/background-agent-executor.test.ts
+@@ -0,0 +1,55 @@
++import { describe, test, expect, mock } from "bun:test"
++import type { BackgroundManager } from "../../features/background-agent"
++import { executeBackgroundAgent } from "./background-agent-executor"
++
++describe("executeBackgroundAgent", () => {
++  const mockManager = {
++    launch: mock(() => Promise.resolve({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "pending",
++    })),
++    getTask: mock(),
++  } as unknown as BackgroundManager
++
++  const testContext = {
++    sessionID: "test-session",
++    messageID: "test-message",
++    agent: "test-agent",
++    abort: new AbortController().signal,
++  }
++
++  const testArgs = {
++    description: "Test background task",
++    prompt: "Test prompt",
++    subagent_type: "test-agent",
++  }
++
++  test("detects interrupted task as failure", async () => {
++    //#given
++    mockManager.launch.mockResolvedValueOnce({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "pending",
++    })
++    mockManager.getTask.mockReturnValueOnce({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "interrupt",
++    })
++
++    //#when
++    const result = await executeBackgroundAgent(testArgs, testContext, mockManager)
++
++    //#then
++    expect(result).toContain("Task failed to start")
++    expect(result).toContain("interrupt")
++    expect(result).toContain("test-task-id")
++  })
++})
+\ No newline at end of file
+diff --git a/src/tools/call-omo-agent/background-agent-executor.ts b/src/tools/call-omo-agent/background-agent-executor.ts
+index 0993c7fe..35cb5fe1 100644
+--- a/src/tools/call-omo-agent/background-agent-executor.ts
++++ b/src/tools/call-omo-agent/background-agent-executor.ts
+@@ -48,7 +48,7 @@ export async function executeBackgroundAgent(
+ 				return `Task aborted while waiting for session to start.\n\nTask ID: ${task.id}`
+ 			}
+ 			const updated = manager.getTask(task.id)
+-			if (updated?.status === "error" || updated?.status === "cancelled") {
++			if (updated?.status === "error" || updated?.status === "cancelled" || updated?.status === "interrupt") {
+ 				return `Task failed to start (status: ${updated.status}).\n\nTask ID: ${task.id}`
+ 			}
+ 			await new Promise<void>((resolve) => {
+diff --git a/src/tools/call-omo-agent/background-executor.test.ts b/src/tools/call-omo-agent/background-executor.test.ts
+new file mode 100644
+index 00000000..8323c651
+--- /dev/null
++++ b/src/tools/call-omo-agent/background-executor.test.ts
+@@ -0,0 +1,55 @@
++import { describe, test, expect, mock } from "bun:test"
++import type { BackgroundManager } from "../../features/background-agent"
++import { executeBackground } from "./background-executor"
++
++describe("executeBackground", () => {
++  const mockManager = {
++    launch: mock(() => Promise.resolve({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "pending",
++    })),
++    getTask: mock(),
++  } as unknown as BackgroundManager
++
++  const testContext = {
++    sessionID: "test-session",
++    messageID: "test-message",
++    agent: "test-agent",
++    abort: new AbortController().signal,
++  }
++
++  const testArgs = {
++    description: "Test background task",
++    prompt: "Test prompt",
++    subagent_type: "test-agent",
++  }
++
++  test("detects interrupted task as failure", async () => {
++    //#given
++    mockManager.launch.mockResolvedValueOnce({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "pending",
++    })
++    mockManager.getTask.mockReturnValueOnce({
++      id: "test-task-id",
++      sessionID: null,
++      description: "Test task",
++      agent: "test-agent",
++      status: "interrupt",
++    })
++
++    //#when
++    const result = await executeBackground(testArgs, testContext, mockManager)
++
++    //#then
++    expect(result).toContain("Task failed to start")
++    expect(result).toContain("interrupt")
++    expect(result).toContain("test-task-id")
++  })
++})
+\ No newline at end of file
+diff --git a/src/tools/call-omo-agent/background-executor.ts b/src/tools/call-omo-agent/background-executor.ts
+index 3a838edb..a89fff40 100644
+--- a/src/tools/call-omo-agent/background-executor.ts
++++ b/src/tools/call-omo-agent/background-executor.ts
+@@ -52,7 +52,7 @@ export async function executeBackground(
+         return `Task aborted while waiting for session to start.\n\nTask ID: ${task.id}`
+       }
+       const updated = manager.getTask(task.id)
+-      if (updated?.status === "error" || updated?.status === "cancelled") {
++      if (updated?.status === "error" || updated?.status === "cancelled" || updated?.status === "interrupt") {
+         return `Task failed to start (status: ${updated.status}).\n\nTask ID: ${task.id}`
+       }
+       await new Promise(resolve => setTimeout(resolve, WAIT_FOR_SESSION_INTERVAL_MS))
+diff --git a/src/tools/lsp/server-config-loader.test.ts b/src/tools/lsp/server-config-loader.test.ts
+new file mode 100644
+index 00000000..da510387
+--- /dev/null
++++ b/src/tools/lsp/server-config-loader.test.ts
+@@ -0,0 +1,39 @@
++import { describe, it, expect } from "bun:test"
++import { writeFileSync, unlinkSync } from "fs"
++import { join } from "path"
++import { tmpdir } from "os"
++import { loadJsonFile } from "./server-config-loader"
++
++describe("loadJsonFile", () => {
++  it("parses JSONC config files with comments correctly", () => {
++    // given
++    const testData = {
++      lsp: {
++        typescript: {
++          command: ["tsserver"],
++          extensions: [".ts", ".tsx"]
++        }
++      }
++    }
++    const jsoncContent = `{
++  // LSP configuration for TypeScript
++  "lsp": {
++    "typescript": {
++      "command": ["tsserver"],
++      "extensions": [".ts", ".tsx"] // TypeScript extensions
++    }
++  }
++}`
++    const tempPath = join(tmpdir(), "test-config.jsonc")
++    writeFileSync(tempPath, jsoncContent, "utf-8")
++
++    // when
++    const result = loadJsonFile<typeof testData>(tempPath)
++
++    // then
++    expect(result).toEqual(testData)
++
++    // cleanup
++    unlinkSync(tempPath)
++  })
++})
+\ No newline at end of file
+diff --git a/src/tools/lsp/server-config-loader.ts b/src/tools/lsp/server-config-loader.ts
+index ec8bd183..945c710e 100644
+--- a/src/tools/lsp/server-config-loader.ts
++++ b/src/tools/lsp/server-config-loader.ts
+@@ -4,6 +4,7 @@ import { join } from "path"
+ import { BUILTIN_SERVERS } from "./constants"
+ import type { ResolvedServer } from "./types"
+ import { getOpenCodeConfigDir } from "../../shared"
++import { parseJsonc } from "../../shared/jsonc-parser"
+ 
+ interface LspEntry {
+   disabled?: boolean
+@@ -24,10 +25,10 @@ interface ServerWithSource extends ResolvedServer {
+   source: ConfigSource
+ }
+ 
+-function loadJsonFile<T>(path: string): T | null {
++export function loadJsonFile<T>(path: string): T | null {
+   if (!existsSync(path)) return null
+   try {
+-    return JSON.parse(readFileSync(path, "utf-8")) as T
++    return parseJsonc(readFileSync(path, "utf-8")) as T
+   } catch {
+     return null
+   }
+-- 
+2.39.2
+

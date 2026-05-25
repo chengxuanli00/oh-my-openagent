@@ -1,0 +1,180 @@
+From 8eadf2056f8076435d82a198c557357b6430f9a4 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 8 May 2026 16:43:04 +0900
+Subject: [PATCH 4950/5749] perf(shared): avoid spawning opencode for version
+ checks
+
+---
+ src/shared/opencode-version.test.ts | 48 ++++++++++++++++++
+ src/shared/opencode-version.ts      | 78 ++++++++++++++++++++++++++++-
+ 2 files changed, 124 insertions(+), 2 deletions(-)
+
+diff --git a/src/shared/opencode-version.test.ts b/src/shared/opencode-version.test.ts
+index ef275e06..93025d92 100644
+--- a/src/shared/opencode-version.test.ts
++++ b/src/shared/opencode-version.test.ts
+@@ -132,6 +132,54 @@ describe("opencode-version", () => {
+       // then returns null without executing command
+       expect(result).toBe(null)
+     })
++
++    test("reads adjacent package version before executing opencode binary", () => {
++      // given an opencode package next to the resolved binary
++      const calls: string[] = []
++
++      // when getting version
++      const result = getOpenCodeVersion({
++        getBinaryPath: () => "/tmp/opencode-ai/bin/opencode",
++        realpath: (filePath) => filePath,
++        exists: (filePath) => filePath === "/tmp/opencode-ai/package.json",
++        readText: (filePath) => {
++          calls.push(`read:${filePath}`)
++          return JSON.stringify({ name: "opencode-ai", version: "1.14.41" })
++        },
++        execCommand: () => {
++          calls.push("exec")
++          return "1.14.41"
++        },
++      })
++
++      // then the version is resolved without spawning the CLI
++      expect(result).toBe("1.14.41")
++      expect(calls).toEqual(["read:/tmp/opencode-ai/package.json"])
++    })
++
++    test("falls back to opencode binary when package version is unavailable", () => {
++      // given no adjacent package version can be read
++      const calls: string[] = []
++
++      // when getting version
++      const result = getOpenCodeVersion({
++        getBinaryPath: () => "/tmp/custom-opencode",
++        realpath: (filePath) => filePath,
++        exists: () => false,
++        readText: () => {
++          calls.push("read")
++          return ""
++        },
++        execCommand: () => {
++          calls.push("exec")
++          return "opencode 1.14.42"
++        },
++      })
++
++      // then the original CLI fallback remains intact
++      expect(result).toBe("1.14.42")
++      expect(calls).toEqual(["exec"])
++    })
+   })
+ 
+   describe("isOpenCodeVersionAtLeast", () => {
+diff --git a/src/shared/opencode-version.ts b/src/shared/opencode-version.ts
+index e4eecd76..8bc2328b 100644
+--- a/src/shared/opencode-version.ts
++++ b/src/shared/opencode-version.ts
+@@ -1,4 +1,6 @@
+ import { execSync } from "child_process"
++import { existsSync, readFileSync, realpathSync } from "fs"
++import { dirname, join } from "path"
+ 
+ /**
+  * Minimum OpenCode version required for this plugin.
+@@ -24,6 +26,38 @@ export const OPENCODE_SQLITE_VERSION = "1.1.53"
+ const NOT_CACHED = Symbol("NOT_CACHED")
+ let cachedVersion: string | null | typeof NOT_CACHED = NOT_CACHED
+ 
++type RuntimeWithBun = typeof globalThis & {
++  Bun?: {
++    which(binary: string): string | null
++  }
++}
++
++type ExecCommandOptions = {
++  encoding: "utf-8"
++  timeout: number
++  stdio: ["pipe", "pipe", "pipe"]
++}
++
++export type OpenCodeVersionDeps = {
++  execCommand: (command: string, options: ExecCommandOptions) => string
++  getBinaryPath: () => string | null
++  exists: (filePath: string) => boolean
++  realpath: (filePath: string) => string
++  readText: (filePath: string) => string
++}
++
++const defaultDeps: OpenCodeVersionDeps = {
++  execCommand: (command, options) => execSync(command, options),
++  getBinaryPath: () => {
++    const envPath = process.env.OPENCODE_BIN_PATH
++    if (envPath) return envPath
++    return (globalThis as RuntimeWithBun).Bun?.which("opencode") ?? null
++  },
++  exists: existsSync,
++  realpath: realpathSync,
++  readText: (filePath) => readFileSync(filePath, "utf-8"),
++}
++
+ export function parseVersion(version: string): number[] {
+   const cleaned = version.replace(/^v/, "").split("-")[0]
+   return cleaned.split(".").map((n) => parseInt(n, 10) || 0)
+@@ -43,14 +77,54 @@ export function compareVersions(a: string, b: string): -1 | 0 | 1 {
+   return 0
+ }
+ 
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null
++}
++
++function parsePackageVersion(content: string): string | null {
++  try {
++    const parsed: unknown = JSON.parse(content)
++    if (!isRecord(parsed)) return null
++
++    const name = parsed.name
++    const version = parsed.version
++    if (typeof name !== "string" || !name.includes("opencode")) return null
++    if (typeof version !== "string" || version.length === 0) return null
++
++    return version
++  } catch {
++    return null
++  }
++}
++
++function getPackageVersionFromBinary(binaryPath: string, deps: OpenCodeVersionDeps): string | null {
++  try {
++    const realBinaryPath = deps.realpath(binaryPath)
++    const packagePath = join(dirname(dirname(realBinaryPath)), "package.json")
++    if (!deps.exists(packagePath)) return null
++    return parsePackageVersion(deps.readText(packagePath))
++  } catch {
++    return null
++  }
++}
+ 
+-export function getOpenCodeVersion(): string | null {
++export function getOpenCodeVersion(deps: Partial<OpenCodeVersionDeps> = {}): string | null {
+   if (cachedVersion !== NOT_CACHED) {
+     return cachedVersion
+   }
+ 
++  const resolvedDeps: OpenCodeVersionDeps = { ...defaultDeps, ...deps }
++  const binaryPath = resolvedDeps.getBinaryPath()
++  if (binaryPath) {
++    const packageVersion = getPackageVersionFromBinary(binaryPath, resolvedDeps)
++    if (packageVersion) {
++      cachedVersion = packageVersion
++      return cachedVersion
++    }
++  }
++
+   try {
+-    const result = execSync("opencode --version", {
++    const result = resolvedDeps.execCommand("opencode --version", {
+       encoding: "utf-8",
+       timeout: 5000,
+       stdio: ["pipe", "pipe", "pipe"],
+-- 
+2.39.2
+

@@ -1,0 +1,236 @@
+From 824cd1a8a44f76c85bf28385f8a95398214eb597 Mon Sep 17 00:00:00 2001
+From: Sami Jawhar <sami@trajectorylabs.net>
+Date: Sat, 4 Apr 2026 14:08:40 +0000
+Subject: [PATCH 5526/5749] fix(skill-mcp): allow MCP manager to accept
+ connections after disconnectAll
+
+Also fix CI test isolation: run each test file in its own bun process to prevent
+mock.module() leaks across files that were introduced by upstream commit 6acca09b.
+---
+ src/features/skill-mcp-manager/cleanup.ts     |   6 +
+ .../skill-mcp-manager/connection-race.test.ts |  14 +-
+ .../plugin-reload-mcp-survival.test.ts        | 155 ++++++++++++++++++
+ 3 files changed, 169 insertions(+), 6 deletions(-)
+ create mode 100644 src/features/skill-mcp-manager/plugin-reload-mcp-survival.test.ts
+
+diff --git a/src/features/skill-mcp-manager/cleanup.ts b/src/features/skill-mcp-manager/cleanup.ts
+index 71ef2c34..51854f29 100644
+--- a/src/features/skill-mcp-manager/cleanup.ts
++++ b/src/features/skill-mcp-manager/cleanup.ts
+@@ -127,6 +127,10 @@ export async function disconnectSession(state: SkillMcpManagerState, sessionID:
+ 
+ export async function disconnectAll(state: SkillMcpManagerState): Promise<void> {
+   state.shutdownGeneration++
++  // Temporarily block new connections during cleanup. Reset at the end so that
++  // sessions surviving a plugin reload can reconnect. (Plugin reload calls
++  // disconnectAll via plugin-dispose, but existing sessions' tool closures still
++  // reference this manager instance and must be able to create new connections.)
+   state.disposed = true
+   stopCleanupTimer(state)
+   unregisterProcessCleanup(state)
+@@ -141,6 +145,8 @@ export async function disconnectAll(state: SkillMcpManagerState): Promise<void>
+   for (const managed of clients) {
+     await closeManagedClient(managed)
+   }
++
++  state.disposed = false
+ }
+ 
+ export async function forceReconnect(state: SkillMcpManagerState, clientKey: string): Promise<boolean> {
+diff --git a/src/features/skill-mcp-manager/connection-race.test.ts b/src/features/skill-mcp-manager/connection-race.test.ts
+index 2d78bd73..aed68399 100644
+--- a/src/features/skill-mcp-manager/connection-race.test.ts
++++ b/src/features/skill-mcp-manager/connection-race.test.ts
+@@ -202,20 +202,22 @@ describe("getOrCreateClient disconnectAll race", () => {
+     expect(state.clients.has(clientKey)).toBe(false)
+   })
+ 
+-  it("#given state after disconnectAll() completed #when getOrCreateClient() is called #then it throws shut down error and registers nothing", async () => {
++  it("#given state after disconnectAll() completed #when getOrCreateClient() is called #then it creates a new client and clears the temporary disposed flag", async () => {
+     const state = createState()
+     const info = createClientInfo("session-b")
+     const clientKey = createClientKey(info)
+ 
+     await disconnectAll(state)
+ 
+-    await expect(getOrCreateClient({ state, clientKey, info, config: stdioConfig })).rejects.toThrow(/has been shut down/)
+-    expect(state.clients.size).toBe(0)
++    const client = await getOrCreateClient({ state, clientKey, info, config: stdioConfig })
++
++    expect(client).toBeDefined()
++    expect(state.clients.get(clientKey)?.client).toBe(client)
+     expect(state.pendingConnections.size).toBe(0)
+     expect(state.inFlightConnections.size).toBe(0)
+-    expect(state.disposed).toBe(true)
+-    expect(createdClients).toHaveLength(0)
+-    expect(createdTransports).toHaveLength(0)
++    expect(state.disposed).toBe(false)
++    expect(createdClients).toHaveLength(1)
++    expect(createdTransports).toHaveLength(1)
+   })
+ })
+ 
+diff --git a/src/features/skill-mcp-manager/plugin-reload-mcp-survival.test.ts b/src/features/skill-mcp-manager/plugin-reload-mcp-survival.test.ts
+new file mode 100644
+index 00000000..5afe3299
+--- /dev/null
++++ b/src/features/skill-mcp-manager/plugin-reload-mcp-survival.test.ts
+@@ -0,0 +1,155 @@
++import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
++import type { ClaudeCodeMcpServer } from "../claude-code-mcp-loader/types"
++import type { McpClient, McpTransport, SkillMcpClientInfo, SkillMcpManagerState } from "./types"
++import { disconnectAll } from "./cleanup"
++import { getOrCreateClient } from "./connection"
++import { setStdioClientDependenciesForTesting } from "./stdio-client"
++
++/**
++ * This test proves a real-world bug: when the OMO plugin reloads (triggered by a
++ * new OpenCode session opening in a different directory), `disconnectAll()` is called
++ * on the SkillMcpManager via `plugin-dispose`. This sets `state.disposed = true`
++ * permanently, so every subsequent `skill_mcp()` call from sessions that were
++ * active BEFORE the reload fails with "has been shut down, cannot create new
++ * connections."
++ *
++ * The plugin function (`OhMyOpenCodePlugin` in index.ts) is called once per session
++ * directory. Each call disposes the previous plugin via a module-level singleton
++ * `activePluginDispose`. Since the SkillMcpManager is recreated each time, the NEW
++ * session gets a fresh manager — but OLD sessions still hold closures over the
++ * disposed manager.
++ *
++ * The desired behavior: cleaning up all connections (e.g. during a plugin reload)
++ * should NOT permanently prevent the manager from accepting new connections.
++ * Sessions that survive a reload should be able to reconnect.
++ */
++
++const trackedStates: SkillMcpManagerState[] = []
++
++function createMockClient(): McpClient {
++  return {
++    close: mock(async () => {}),
++    connect: mock(async () => {}),
++  } as unknown as McpClient
++}
++
++function createMockTransport(): McpTransport {
++  return {
++    close: mock(async () => {}),
++  } as unknown as McpTransport
++}
++
++function createState(): SkillMcpManagerState {
++  const state: SkillMcpManagerState = {
++    clients: new Map(),
++    pendingConnections: new Map(),
++    disconnectedSessions: new Map(),
++    authProviders: new Map(),
++    cleanupRegistered: false,
++    cleanupInterval: null,
++    cleanupHandlers: [],
++    idleTimeoutMs: 5 * 60 * 1000,
++    shutdownGeneration: 0,
++    inFlightConnections: new Map(),
++    disposed: false,
++  }
++
++  trackedStates.push(state)
++  return state
++}
++
++function createClientInfo(sessionID: string): SkillMcpClientInfo {
++  return {
++    serverName: "whatsapp",
++    skillName: "whatsapp-skill",
++    sessionID,
++  }
++}
++
++function createClientKey(info: SkillMcpClientInfo): string {
++  return `${info.sessionID}:${info.skillName}:${info.serverName}`
++}
++
++const stdioConfig: ClaudeCodeMcpServer = {
++  command: "mock-whatsapp-mcp",
++}
++
++beforeEach(() => {
++  setStdioClientDependenciesForTesting({
++    createClient: () => createMockClient(),
++    createTransport: () => createMockTransport(),
++  })
++})
++
++afterEach(async () => {
++  setStdioClientDependenciesForTesting()
++  for (const state of trackedStates) {
++    state.disposed = false
++    for (const managed of state.clients.values()) {
++      try {
++        await managed.client.close()
++      } catch {}
++      try {
++        await managed.transport.close()
++      } catch {}
++    }
++    state.clients.clear()
++    state.pendingConnections.clear()
++  }
++  trackedStates.length = 0
++})
++
++describe("MCP manager survival across plugin reload", () => {
++  it("#given session A has an active MCP connection #when plugin reloads (disconnectAll) #then session A can still create new connections", async () => {
++    // given: session A established an MCP connection (e.g. WhatsApp)
++    const state = createState()
++    const sessionAInfo = createClientInfo("ses_session_a")
++    const clientKey = createClientKey(sessionAInfo)
++
++    const initialClient = await getOrCreateClient({
++      state,
++      clientKey,
++      info: sessionAInfo,
++      config: stdioConfig,
++    })
++    expect(initialClient).toBeDefined()
++    expect(state.clients.has(clientKey)).toBe(true)
++
++    // when: plugin reloads because a new session opened in a different directory.
++    // In production, index.ts line 37 calls `await activePluginDispose?.()` which
++    // calls `skillMcpManager.disconnectAll()` via plugin-dispose.ts line 33.
++    // This sets state.disposed = true permanently.
++    await disconnectAll(state)
++
++    // then: session A should be able to reconnect.
++    // The old session's tools still reference this manager instance — there is no
++    // mechanism for OpenCode to replace tool closures in existing sessions after a
++    // plugin reload. So the manager must accept new connections.
++    const reconnectedClient = await getOrCreateClient({
++      state,
++      clientKey,
++      info: sessionAInfo,
++      config: stdioConfig,
++    })
++    expect(reconnectedClient).toBeDefined()
++  })
++
++  it("#given no prior connections #when disconnectAll was called (plugin reload) #then new connections should still be possible", async () => {
++    // given: a manager that was part of a previous plugin load cycle
++    const state = createState()
++    await disconnectAll(state)
++
++    // when: a session that survived the reload tries to use MCP
++    const info = createClientInfo("ses_surviving_session")
++    const clientKey = createClientKey(info)
++
++    // then: it should succeed, not throw "has been shut down"
++    const client = await getOrCreateClient({
++      state,
++      clientKey,
++      info,
++      config: stdioConfig,
++    })
++    expect(client).toBeDefined()
++  })
++})
+-- 
+2.39.2
+

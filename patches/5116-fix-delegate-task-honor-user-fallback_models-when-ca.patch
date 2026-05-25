@@ -1,0 +1,148 @@
+From 711b75345b30b841045ffb52e89f00cead732886 Mon Sep 17 00:00:00 2001
+From: Jacob Schechter <jxs0mb0@fpl.com>
+Date: Tue, 12 May 2026 19:07:54 -0500
+Subject: [PATCH 5116/5749] fix(delegate-task): honor user fallback_models when
+ category primary is unreachable
+
+resolveModelForDelegateTask returned input.userModel immediately without
+availability checking when it was set, silently ignoring the user's
+configured fallback_models. Effect: a team-mode category member
+(e.g. hyperplan's 'artistry' category) configured with
+
+  { model: "opencode/gemini-3.1-pro", fallback_models: [...] }
+
+spawned with the unreachable primary even though a listed fallback was
+reachable, leading to a dropped/broken team member instead of graceful
+degradation.
+
+Now, when the provider-models cache is warm AND userFallbackModels is
+non-empty, the function verifies userModel is reachable via
+fuzzyMatchModel. If not, it iterates userFallbackModels and promotes the
+first reachable entry. Cold-cache (first-run) behavior is preserved -
+the userModel is returned as-is when availability data is unavailable,
+matching the existing 'trust the user' contract covered by the
+pre-cache test fixtures.
+
+Adds three regression tests covering: (1) unreachable primary + reachable
+fallback -> fallback promoted, (2) reachable primary + reachable fallback
+-> primary kept (fast path), (3) unreachable primary + unreachable
+fallback -> legacy trust-user behavior preserved.
+---
+ .../delegate-task/model-selection.test.ts     | 44 +++++++++++++++++++
+ src/tools/delegate-task/model-selection.ts    | 44 +++++++++++++++++--
+ 2 files changed, 85 insertions(+), 3 deletions(-)
+
+diff --git a/src/tools/delegate-task/model-selection.test.ts b/src/tools/delegate-task/model-selection.test.ts
+index cd1f8b6e..cc823a57 100644
+--- a/src/tools/delegate-task/model-selection.test.ts
++++ b/src/tools/delegate-task/model-selection.test.ts
+@@ -170,6 +170,50 @@ describe("resolveModelForDelegateTask", () => {
+ 				expect(result).toEqual({ model: "openai/gpt-5.2", variant: "medium", matchedFallback: true })
+ 			})
+ 		})
++
++		describe("#when user primary model is unreachable and user fallback_models are provided", () => {
++			test("#then promotes the first reachable user fallback (regression: bug where fallback_models were ignored when userModel set)", () => {
++				const result = resolveModelForDelegateTask({
++					userModel: "opencode/gemini-3.1-pro high",
++					userFallbackModels: [
++						"amazon-bedrock/us.anthropic.claude-opus-4-7 max",
++						"opencode/claude-opus-4-7 max",
++						"openai/gpt-5.5",
++					],
++					availableModels: new Set([
++						"openai/gpt-5.5",
++						"openai/gpt-5.5-pro",
++						"amazon-bedrock/us.anthropic.claude-opus-4-7",
++					]),
++				})
++
++				expect(result).toEqual({
++					model: "amazon-bedrock/us.anthropic.claude-opus-4-7",
++					variant: "max",
++					matchedFallback: true,
++				})
++			})
++
++			test("#then keeps the user primary when it IS reachable (fast path preserved)", () => {
++				const result = resolveModelForDelegateTask({
++					userModel: "openai/gpt-5.5 xhigh",
++					userFallbackModels: ["openai/gpt-5.4"],
++					availableModels: new Set(["openai/gpt-5.5", "openai/gpt-5.4"]),
++				})
++
++				expect(result).toEqual({ model: "openai/gpt-5.5", variant: "xhigh" })
++			})
++
++			test("#then returns the user primary as-is when no user fallback is reachable either (trust-user legacy behavior)", () => {
++				const result = resolveModelForDelegateTask({
++					userModel: "opencode/gemini-3.1-pro high",
++					userFallbackModels: ["google/gemini-3.1-pro"],
++					availableModels: new Set(["openai/gpt-5.5"]),
++				})
++
++				expect(result).toEqual({ model: "opencode/gemini-3.1-pro", variant: "high" })
++			})
++		})
+ 	})
+ 
+ 	describe("#given provider cache exists and connected providers are known", () => {
+diff --git a/src/tools/delegate-task/model-selection.ts b/src/tools/delegate-task/model-selection.ts
+index 43fa4741..2fe61130 100644
+--- a/src/tools/delegate-task/model-selection.ts
++++ b/src/tools/delegate-task/model-selection.ts
+@@ -57,10 +57,48 @@ export function resolveModelForDelegateTask(input: {
+   const userModel = normalizeModel(input.userModel)
+   if (userModel) {
+     const parsed = parseUserFallbackModel(userModel)
+-    if (parsed?.variant) {
+-      return { model: parsed.baseModel, variant: parsed.variant }
++    const userResult = parsed?.variant
++      ? { model: parsed.baseModel, variant: parsed.variant }
++      : { model: userModel }
++
++    // When the availability cache is warm AND the user provided fallback_models,
++    // verify the user's explicit primary model is actually reachable. If it is
++    // not but one of their configured fallback_models is, promote that fallback
++    // instead of returning an unreachable model. Cold cache (no availability
++    // data yet) preserves the legacy "trust the user" behavior.
++    const userFallbackModels = input.userFallbackModels
++    if (
++      input.availableModels.size > 0 &&
++      userFallbackModels &&
++      userFallbackModels.length > 0
++    ) {
++      const providerHint = parsed?.providerHint
++      const primaryMatch = fuzzyMatchModel(userResult.model, input.availableModels, providerHint)
++      if (!primaryMatch) {
++        for (const fallbackModel of userFallbackModels) {
++          const parsedFallback = parseUserFallbackModel(fallbackModel)
++          if (!parsedFallback) continue
++          const fbMatch = fuzzyMatchModel(
++            parsedFallback.baseModel,
++            input.availableModels,
++            parsedFallback.providerHint,
++          )
++          if (fbMatch) {
++            log("[resolveModelForDelegateTask] user primary model unreachable; promoting user fallback_models entry", {
++              userPrimary: userResult.model,
++              selectedFallback: fbMatch,
++            })
++            return {
++              model: fbMatch,
++              variant: parsedFallback.variant,
++              matchedFallback: true,
++            }
++          }
++        }
++      }
+     }
+-    return { model: userModel }
++
++    return userResult
+   }
+ 
+   const connectedProviders = input.availableModels.size === 0 ? readConnectedProvidersCache() : null
+-- 
+2.39.2
+

@@ -1,0 +1,157 @@
+From 4516b2e484d60d1deb87623b0ef7af392145183b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 20:38:44 +0900
+Subject: [PATCH 3100/5749] fix: prioritize Anthropic 1M limits over cached
+ context limits
+
+---
+ ...indow-monitor.model-context-limits.test.ts | 44 +++++++++++++++++++
+ src/hooks/context-window-monitor.ts           | 12 ++---
+ src/shared/dynamic-truncator.test.ts          | 28 ++++++++++++
+ src/shared/dynamic-truncator.ts               | 11 ++---
+ 4 files changed, 84 insertions(+), 11 deletions(-)
+
+diff --git a/src/hooks/context-window-monitor.model-context-limits.test.ts b/src/hooks/context-window-monitor.model-context-limits.test.ts
+index 531b8796..1c826d96 100644
+--- a/src/hooks/context-window-monitor.model-context-limits.test.ts
++++ b/src/hooks/context-window-monitor.model-context-limits.test.ts
+@@ -90,4 +90,48 @@ describe("context-window-monitor modelContextLimitsCache", () => {
+     expect(output.output).toContain("[Context Status: 72.5% used (190,000/262,144 tokens), 27.5% remaining]")
+     expect(output.output).not.toContain("1,000,000")
+   })
++
++  describe("#given Anthropic provider with cached context limit and 1M mode enabled", () => {
++    describe("#when cached usage would exceed 200K but stay below 1M", () => {
++      it("#then should ignore the cached limit and skip the reminder", async () => {
++        // given
++        const modelContextLimitsCache = new Map<string, number>()
++        modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 200000)
++
++        const hook = createContextWindowMonitorHook({} as never, {
++          anthropicContext1MEnabled: true,
++          modelContextLimitsCache,
++        })
++        const sessionID = "ses_anthropic_1m_overrides_cached_limit"
++
++        await hook.event({
++          event: {
++            type: "message.updated",
++            properties: {
++              info: {
++                role: "assistant",
++                sessionID,
++                providerID: "anthropic",
++                modelID: "claude-sonnet-4-5",
++                finish: true,
++                tokens: {
++                  input: 300000,
++                  output: 0,
++                  reasoning: 0,
++                  cache: { read: 0, write: 0 },
++                },
++              },
++            },
++          },
++        })
++
++        // when
++        const output = createOutput()
++        await hook["tool.execute.after"]({ tool: "bash", sessionID, callID: "call_1" }, output)
++
++        // then
++        expect(output.output).toBe("original")
++      })
++    })
++  })
+ })
+diff --git a/src/hooks/context-window-monitor.ts b/src/hooks/context-window-monitor.ts
+index ec5d9306..74d524e7 100644
+--- a/src/hooks/context-window-monitor.ts
++++ b/src/hooks/context-window-monitor.ts
+@@ -62,12 +62,12 @@ export function createContextWindowMonitorHook(
+     const cached = tokenCache.get(sessionID)
+     if (!cached) return
+ 
+-    const cachedLimit = modelCacheState?.modelContextLimitsCache?.get(
+-      `${cached.providerID}/${cached.modelID}`
+-    )
+-    const actualLimit =
+-      cachedLimit ??
+-      (isAnthropicProvider(cached.providerID) ? getAnthropicActualLimit(modelCacheState) : null)
++    const modelSpecificLimit = !isAnthropicProvider(cached.providerID)
++      ? modelCacheState?.modelContextLimitsCache?.get(`${cached.providerID}/${cached.modelID}`)
++      : undefined
++    const actualLimit = isAnthropicProvider(cached.providerID)
++      ? getAnthropicActualLimit(modelCacheState)
++      : modelSpecificLimit
+ 
+     if (!actualLimit) return
+ 
+diff --git a/src/shared/dynamic-truncator.test.ts b/src/shared/dynamic-truncator.test.ts
+index a468b8a4..34e9933a 100644
+--- a/src/shared/dynamic-truncator.test.ts
++++ b/src/shared/dynamic-truncator.test.ts
+@@ -124,4 +124,32 @@ describe("getContextWindowUsage", () => {
+     expect(usage?.usagePercentage).toBeCloseTo(180000 / 262144)
+     expect(usage?.remainingTokens).toBe(82144)
+   })
++
++  describe("#given Anthropic provider with cached context limit and 1M mode enabled", () => {
++    describe("#when context usage is resolved", () => {
++      it("#then should ignore the cached limit and use the 1M Anthropic limit", async () => {
++        // given
++        delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++        delete process.env[VERTEX_CONTEXT_ENV_KEY]
++
++        const modelContextLimitsCache = new Map<string, number>()
++        modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 200000)
++
++        const ctx = createContextUsageMockContext(300000, {
++          providerID: "anthropic",
++          modelID: "claude-sonnet-4-5",
++        })
++
++        // when
++        const usage = await getContextWindowUsage(ctx as never, "ses_cached_anthropic_1m", {
++          anthropicContext1MEnabled: true,
++          modelContextLimitsCache,
++        })
++
++        // then
++        expect(usage?.usagePercentage).toBe(0.3)
++        expect(usage?.remainingTokens).toBe(700000)
++      })
++    })
++  })
+ })
+diff --git a/src/shared/dynamic-truncator.ts b/src/shared/dynamic-truncator.ts
+index 1de2321f..ac937f08 100644
+--- a/src/shared/dynamic-truncator.ts
++++ b/src/shared/dynamic-truncator.ts
+@@ -148,17 +148,18 @@ export async function getContextWindowUsage(
+ 		const lastTokens = lastAssistant?.tokens;
+ 		if (!lastAssistant || !lastTokens) return null;
+ 
+-		const cachedLimit =
+-			lastAssistant.providerID !== undefined && lastAssistant.modelID !== undefined
++		const modelSpecificLimit =
++			lastAssistant.providerID !== undefined &&
++			lastAssistant.modelID !== undefined &&
++			!isAnthropicProvider(lastAssistant.providerID)
+ 				? modelCacheState?.modelContextLimitsCache?.get(
+ 					`${lastAssistant.providerID}/${lastAssistant.modelID}`,
+ 				)
+ 				: undefined;
+ 		const actualLimit =
+-			cachedLimit ??
+-			(lastAssistant.providerID !== undefined && isAnthropicProvider(lastAssistant.providerID)
++			lastAssistant.providerID !== undefined && isAnthropicProvider(lastAssistant.providerID)
+ 				? getAnthropicActualLimit(modelCacheState)
+-				: null);
++				: modelSpecificLimit ?? null;
+ 
+ 		if (!actualLimit) return null;
+ 
+-- 
+2.39.2
+

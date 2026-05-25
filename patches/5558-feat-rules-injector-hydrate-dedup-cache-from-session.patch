@@ -1,0 +1,752 @@
+From fbe423a2d4c596367771ce56ab4ddee49372493b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 20 May 2026 13:58:13 +0900
+Subject: [PATCH 5558/5749] feat(rules-injector): hydrate dedup cache from
+ session transcript
+
+Ports the codex-rules transcript-aware dedup strategy: when a session cache is fresh (process restart or compaction-cleared cache), the injector now scans prior tool outputs for the `[Rule: <relativePath>]` banner and pre-populates the cache so duplicate rule injections are suppressed even when the persistent JSON has been lost. Hydration runs at most once per session per process, fails open on transport errors, and is short-circuited when the same banner reappears.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/hooks/rules-injector/hook.ts              | 159 ++++++++--------
+ src/hooks/rules-injector/injector.test.ts     | 104 +++++++++++
+ src/hooks/rules-injector/injector.ts          |  27 ++-
+ .../transcript-hydration.test.ts              | 172 ++++++++++++++++++
+ .../rules-injector/transcript-hydration.ts    | 147 +++++++++++++++
+ 5 files changed, 531 insertions(+), 78 deletions(-)
+ create mode 100644 src/hooks/rules-injector/transcript-hydration.test.ts
+ create mode 100644 src/hooks/rules-injector/transcript-hydration.ts
+
+diff --git a/src/hooks/rules-injector/hook.ts b/src/hooks/rules-injector/hook.ts
+index 51cd3114..0ba08af5 100644
+--- a/src/hooks/rules-injector/hook.ts
++++ b/src/hooks/rules-injector/hook.ts
+@@ -1,106 +1,115 @@
+ import type { PluginInput } from "@opencode-ai/plugin";
+ import { createDynamicTruncator } from "../../shared/dynamic-truncator";
+ import { resolveSessionEventID } from "../../shared/event-session-id";
+-import { getRuleInjectionFilePath } from "./output-path";
+-import { createSessionCacheStore, createSessionRuleScanCacheStore } from "./cache";
++import {
++	createSessionCacheStore,
++	createSessionRuleScanCacheStore,
++} from "./cache";
+ import { clearParsedRuleCache, createRuleInjectionProcessor } from "./injector";
++import { getRuleInjectionFilePath } from "./output-path";
+ import { clearProjectRootCache } from "./project-root-finder";
++import { createTranscriptHydrationStore } from "./transcript-hydration";
+ 
+ interface ToolExecuteInput {
+-  tool: string;
+-  sessionID: string;
+-  callID: string;
++	tool: string;
++	sessionID: string;
++	callID: string;
+ }
+ 
+ interface ToolExecuteOutput {
+-  title: string;
+-  output: string;
+-  metadata: unknown;
++	title: string;
++	output: string;
++	metadata: unknown;
+ }
+ 
+ interface ToolExecuteBeforeOutput {
+-  args: unknown;
++	args: unknown;
+ }
+ 
+ interface EventInput {
+-  event: {
+-    type: string;
+-    properties?: unknown;
+-  };
++	event: {
++		type: string;
++		properties?: unknown;
++	};
+ }
+ 
+ const TRACKED_TOOLS = ["read", "write", "edit", "multiedit"];
+ 
+ export function createRulesInjectorHook(
+-  ctx: PluginInput,
+-  modelCacheState?: { anthropicContext1MEnabled: boolean },
+-  options?: { skipClaudeUserRules?: boolean },
++	ctx: PluginInput,
++	modelCacheState?: { anthropicContext1MEnabled: boolean },
++	options?: { skipClaudeUserRules?: boolean },
+ ) {
+-  const truncator = createDynamicTruncator(ctx, modelCacheState);
+-  const { getSessionCache, clearSessionCache } = createSessionCacheStore();
+-  const { getSessionRuleScanCache, clearSessionRuleScanCache } =
+-    createSessionRuleScanCacheStore();
+-  const { processFilePathForInjection } = createRuleInjectionProcessor({
+-    workspaceDirectory: ctx.directory,
+-    truncator,
+-    getSessionCache,
+-    getSessionRuleScanCache,
+-    ruleFinderOptions: options?.skipClaudeUserRules
+-      ? { skipClaudeUserRules: true }
+-      : undefined,
+-  });
++	const truncator = createDynamicTruncator(ctx, modelCacheState);
++	const { getSessionCache, clearSessionCache } = createSessionCacheStore();
++	const { getSessionRuleScanCache, clearSessionRuleScanCache } =
++		createSessionRuleScanCacheStore();
++	const transcriptHydration = createTranscriptHydrationStore({
++		client: ctx.client,
++	});
++	const { processFilePathForInjection } = createRuleInjectionProcessor({
++		workspaceDirectory: ctx.directory,
++		truncator,
++		getSessionCache,
++		getSessionRuleScanCache,
++		transcriptHydration,
++		ruleFinderOptions: options?.skipClaudeUserRules
++			? { skipClaudeUserRules: true }
++			: undefined,
++	});
+ 
+-  function clearSessionState(sessionID: string): void {
+-    clearSessionCache(sessionID);
+-    clearSessionRuleScanCache(sessionID);
+-    clearParsedRuleCache();
+-  }
++	function clearSessionState(sessionID: string): void {
++		clearSessionCache(sessionID);
++		clearSessionRuleScanCache(sessionID);
++		transcriptHydration.clearSession(sessionID);
++		clearParsedRuleCache();
++	}
+ 
+-  const toolExecuteAfter = async (
+-    input: ToolExecuteInput,
+-    output: ToolExecuteOutput
+-  ) => {
+-    const toolName = input.tool.toLowerCase();
++	const toolExecuteAfter = async (
++		input: ToolExecuteInput,
++		output: ToolExecuteOutput,
++	) => {
++		const toolName = input.tool.toLowerCase();
+ 
+-    if (TRACKED_TOOLS.includes(toolName)) {
+-      const filePath = getRuleInjectionFilePath(output);
+-      if (!filePath) return;
+-      await processFilePathForInjection(filePath, input.sessionID, output);
+-      return;
+-    }
+-  };
++		if (TRACKED_TOOLS.includes(toolName)) {
++			const filePath = getRuleInjectionFilePath(output);
++			if (!filePath) return;
++			await processFilePathForInjection(filePath, input.sessionID, output);
++			return;
++		}
++	};
+ 
+-  const toolExecuteBefore = async (
+-    input: ToolExecuteInput,
+-    output: ToolExecuteBeforeOutput
+-  ): Promise<void> => {
+-    void input;
+-    void output;
+-  };
++	const toolExecuteBefore = async (
++		input: ToolExecuteInput,
++		output: ToolExecuteBeforeOutput,
++	): Promise<void> => {
++		void input;
++		void output;
++	};
+ 
+-  const eventHandler = async ({ event }: EventInput) => {
+-    const props = event.properties as Record<string, unknown> | undefined;
++	const eventHandler = async ({ event }: EventInput) => {
++		const props = event.properties as Record<string, unknown> | undefined;
+ 
+-    if (event.type === "session.deleted") {
+-      const sessionID = resolveSessionEventID(props);
+-      if (sessionID) {
+-        clearSessionState(sessionID);
+-      }
+-      clearProjectRootCache();
+-    }
++		if (event.type === "session.deleted") {
++			const sessionID = resolveSessionEventID(props);
++			if (sessionID) {
++				clearSessionState(sessionID);
++			}
++			clearProjectRootCache();
++		}
+ 
+-    if (event.type === "session.compacted") {
+-      const sessionID = resolveSessionEventID(props);
+-      if (sessionID) {
+-        clearSessionState(sessionID);
+-      }
+-      clearProjectRootCache();
+-    }
+-  };
++		if (event.type === "session.compacted") {
++			const sessionID = resolveSessionEventID(props);
++			if (sessionID) {
++				clearSessionState(sessionID);
++			}
++			clearProjectRootCache();
++		}
++	};
+ 
+-  return {
+-    "tool.execute.before": toolExecuteBefore,
+-    "tool.execute.after": toolExecuteAfter,
+-    event: eventHandler,
+-  };
++	return {
++		"tool.execute.before": toolExecuteBefore,
++		"tool.execute.after": toolExecuteAfter,
++		event: eventHandler,
++	};
+ }
+diff --git a/src/hooks/rules-injector/injector.test.ts b/src/hooks/rules-injector/injector.test.ts
+index b34c94df..796d0847 100644
+--- a/src/hooks/rules-injector/injector.test.ts
++++ b/src/hooks/rules-injector/injector.test.ts
+@@ -398,4 +398,108 @@ describe("createRuleInjectionProcessor", () => {
+ 		expect(trackedReadFileCount).toBe(2);
+ 		expect(trackedShouldApplyRuleCount).toBe(2);
+ 	});
++
++	it("#given transcript hydration reports prior rule banner #when same rule matches #then rule is skipped and cache absorbs the realPath", async () => {
++		// given
++		const hydratedRelativePath =
++			".github/instructions/typescript.instructions.md";
++		const sessionCaches = new Map<
++			string,
++			{ contentHashes: Set<string>; realPaths: Set<string> }
++		>();
++		const processor = createRuleInjectionProcessor({
++			workspaceDirectory: projectRoot,
++			truncator: {
++				truncate: async (_sessionID: string, content: string) => ({
++					result: content,
++					truncated: false,
++				}),
++			},
++			getSessionCache: (sessionID: string) => {
++				if (!sessionCaches.has(sessionID)) {
++					sessionCaches.set(sessionID, {
++						contentHashes: new Set<string>(),
++						realPaths: new Set<string>(),
++					});
++				}
++				const cache = sessionCaches.get(sessionID);
++				if (!cache) throw new Error("session cache should exist");
++				return cache;
++			},
++			homedir: () => homeRoot,
++			shouldApplyRule: () => ({ applies: true, reason: "matched" }),
++			isDuplicateByRealPath: (realPath: string, cache: ReadonlySet<string>) =>
++				cache.has(realPath),
++			createContentHash: (content: string) => `hash:${content}`,
++			isDuplicateByContentHash: (hash: string, cache: ReadonlySet<string>) =>
++				cache.has(hash),
++			transcriptHydration: {
++				hydrateSession: async () => new Set([hydratedRelativePath]),
++			},
++		});
++
++		// when
++		const output = createOutput();
++		await processor.processFilePathForInjection(
++			targetFile,
++			"session-1",
++			output,
++		);
++
++		// then
++		expect(output.output).toBe("");
++		const cache = sessionCaches.get("session-1");
++		expect(cache?.realPaths.has(ruleRealPath)).toBe(true);
++	});
++
++	it("#given transcript hydration reports unrelated rule #when injecting #then rule is still injected", async () => {
++		// given
++		const sessionCaches = new Map<
++			string,
++			{ contentHashes: Set<string>; realPaths: Set<string> }
++		>();
++		const processor = createRuleInjectionProcessor({
++			workspaceDirectory: projectRoot,
++			truncator: {
++				truncate: async (_sessionID: string, content: string) => ({
++					result: content,
++					truncated: false,
++				}),
++			},
++			getSessionCache: (sessionID: string) => {
++				if (!sessionCaches.has(sessionID)) {
++					sessionCaches.set(sessionID, {
++						contentHashes: new Set<string>(),
++						realPaths: new Set<string>(),
++					});
++				}
++				const cache = sessionCaches.get(sessionID);
++				if (!cache) throw new Error("session cache should exist");
++				return cache;
++			},
++			homedir: () => homeRoot,
++			shouldApplyRule: () => ({ applies: true, reason: "matched" }),
++			isDuplicateByRealPath: (realPath: string, cache: ReadonlySet<string>) =>
++				cache.has(realPath),
++			createContentHash: (content: string) => `hash:${content}`,
++			isDuplicateByContentHash: (hash: string, cache: ReadonlySet<string>) =>
++				cache.has(hash),
++			transcriptHydration: {
++				hydrateSession: async () => new Set(["some/other/rule.md"]),
++			},
++		});
++
++		// when
++		const output = createOutput();
++		await processor.processFilePathForInjection(
++			targetFile,
++			"session-1",
++			output,
++		);
++
++		// then
++		expect(output.output).toContain(
++			"[Rule: .github/instructions/typescript.instructions.md]",
++		);
++	});
+ });
+diff --git a/src/hooks/rules-injector/injector.ts b/src/hooks/rules-injector/injector.ts
+index 365da972..4f90e455 100644
+--- a/src/hooks/rules-injector/injector.ts
++++ b/src/hooks/rules-injector/injector.ts
+@@ -1,8 +1,8 @@
+ import { readFileSync, statSync } from "node:fs";
+ import { homedir } from "node:os";
+ import { relative, resolve } from "node:path";
++import type { SessionInjectedRulesCache } from "./cache";
+ import { findProjectRoot, findRuleFiles } from "./finder";
+-import type { FindRuleFilesOptions } from "./rule-file-finder";
+ import {
+ 	createContentHash,
+ 	isDuplicateByContentHash,
+@@ -10,9 +10,9 @@ import {
+ 	shouldApplyRule,
+ } from "./matcher";
+ import { parseRuleFrontmatter } from "./parser";
+-import { saveInjectedRules } from "./storage";
+-import type { SessionInjectedRulesCache } from "./cache";
++import type { FindRuleFilesOptions } from "./rule-file-finder";
+ import type { RuleScanCache } from "./rule-scan-cache";
++import { saveInjectedRules } from "./storage";
+ import type { RuleMetadata } from "./types";
+ 
+ type ToolExecuteOutput = {
+@@ -61,6 +61,7 @@ const MAX_PARSED_RULE_CACHE_ENTRIES = 256;
+ const MAX_PARSED_RULE_CACHE_BODY_BYTES = 64 * 1024;
+ const MAX_MATCH_DECISION_CACHE_ENTRIES = 4096;
+ const parsedRuleCache = new Map<string, ParsedRuleEntry>();
++const EMPTY_TRANSCRIPT_SET: ReadonlySet<string> = new Set();
+ 
+ export function clearParsedRuleCache(): void {
+ 	parsedRuleCache.clear();
+@@ -98,6 +99,10 @@ function resolveFilePath(
+ 	return resolve(workspaceDirectory, path);
+ }
+ 
++export interface TranscriptHydrationHook {
++	hydrateSession(sessionID: string): Promise<ReadonlySet<string>>;
++}
++
+ export function createRuleInjectionProcessor(deps: {
+ 	workspaceDirectory: string;
+ 	truncator: DynamicTruncator;
+@@ -112,6 +117,7 @@ export function createRuleInjectionProcessor(deps: {
+ 	createContentHash?: typeof createContentHash;
+ 	isDuplicateByContentHash?: typeof isDuplicateByContentHash;
+ 	saveInjectedRules?: typeof saveInjectedRules;
++	transcriptHydration?: TranscriptHydrationHook;
+ }): {
+ 	processFilePathForInjection: (
+ 		filePath: string,
+@@ -134,6 +140,7 @@ export function createRuleInjectionProcessor(deps: {
+ 		isDuplicateByContentHash:
+ 			isDuplicateByContentHashImpl = isDuplicateByContentHash,
+ 		saveInjectedRules: saveInjectedRulesImpl = saveInjectedRules,
++		transcriptHydration,
+ 	} = deps;
+ 
+ 	const matchDecisionCache: MatchDecisionCache = new Map();
+@@ -188,6 +195,10 @@ export function createRuleInjectionProcessor(deps: {
+ 		const ruleScanCache = getSessionRuleScanCache?.(sessionID);
+ 		const home = getHomeDir();
+ 
++		const transcriptRelativePaths = transcriptHydration
++			? await transcriptHydration.hydrateSession(sessionID)
++			: EMPTY_TRANSCRIPT_SET;
++
+ 		const ruleFileCandidates = findRuleFiles(
+ 			projectRoot,
+ 			home,
+@@ -259,6 +270,16 @@ export function createRuleInjectionProcessor(deps: {
+ 					? relative(projectRoot, candidate.path)
+ 					: candidate.path;
+ 
++				if (transcriptRelativePaths.has(relativePath)) {
++					// Rule banner already present in the live transcript - record it in
++					// the persistent cache so subsequent calls also dedup correctly,
++					// then skip emitting another copy.
++					cache.realPaths.add(candidate.realPath);
++					cache.contentHashes.add(contentHash);
++					dirty = true;
++					continue;
++				}
++
+ 				toInject.push({
+ 					relativePath,
+ 					matchReason,
+diff --git a/src/hooks/rules-injector/transcript-hydration.test.ts b/src/hooks/rules-injector/transcript-hydration.test.ts
+new file mode 100644
+index 00000000..c51bce74
+--- /dev/null
++++ b/src/hooks/rules-injector/transcript-hydration.test.ts
+@@ -0,0 +1,172 @@
++import { describe, expect, it, mock } from "bun:test";
++import type { PluginInput } from "@opencode-ai/plugin";
++import { createTranscriptHydrationStore } from "./transcript-hydration";
++
++type SessionClient = PluginInput["client"]["session"];
++
++function makeClient(
++	messages: (sessionID: string) => Promise<{ data: unknown }>,
++): PluginInput["client"] {
++	const session = {
++		messages: mock(async (args: { path: { id: string } }) =>
++			messages(args.path.id),
++		),
++	} as unknown as SessionClient;
++	return { session } as unknown as PluginInput["client"];
++}
++
++function ruleMarker(relativePath: string, body = "Rule body."): string {
++	return `\n\n[Rule: ${relativePath}]\n[Match: glob]\n${body}`;
++}
++
++describe("createTranscriptHydrationStore", () => {
++	it("#given transcript with rule markers #when hydrateSession runs #then returns matched relativePaths", async () => {
++		// given
++		const transcript = {
++			data: [
++				{
++					parts: [
++						{
++							type: "tool",
++							output:
++								ruleMarker("AGENTS.md") +
++								ruleMarker(".omo/rules/typescript.md"),
++						},
++					],
++				},
++			],
++		};
++		const store = createTranscriptHydrationStore({
++			client: makeClient(async () => transcript),
++		});
++
++		// when
++		const relativePaths = await store.hydrateSession("session-1");
++
++		// then
++		expect([...relativePaths].sort()).toEqual([
++			".omo/rules/typescript.md",
++			"AGENTS.md",
++		]);
++	});
++
++	it("#given empty transcript #when hydrateSession runs #then returns empty set", async () => {
++		// given
++		const store = createTranscriptHydrationStore({
++			client: makeClient(async () => ({ data: [] })),
++		});
++
++		// when
++		const result = await store.hydrateSession("session-1");
++
++		// then
++		expect(result.size).toBe(0);
++	});
++
++	it("#given hydrateSession called twice #when second call runs #then session.messages fetched only once", async () => {
++		// given
++		let callCount = 0;
++		const store = createTranscriptHydrationStore({
++			client: makeClient(async () => {
++				callCount += 1;
++				return {
++					data: [
++						{ parts: [{ type: "tool", output: ruleMarker("AGENTS.md") }] },
++					],
++				};
++			}),
++		});
++
++		// when
++		await store.hydrateSession("session-1");
++		await store.hydrateSession("session-1");
++
++		// then
++		expect(callCount).toBe(1);
++	});
++
++	it("#given concurrent hydrateSession calls #when both await #then only one fetch is in-flight", async () => {
++		// given
++		let resolveFetch: (() => void) | undefined;
++		let callCount = 0;
++		const store = createTranscriptHydrationStore({
++			client: makeClient(
++				() =>
++					new Promise((resolve) => {
++						callCount += 1;
++						resolveFetch = () =>
++							resolve({
++								data: [
++									{
++										parts: [{ type: "tool", output: ruleMarker("AGENTS.md") }],
++									},
++								],
++							});
++					}),
++			),
++		});
++
++		// when
++		const a = store.hydrateSession("session-1");
++		const b = store.hydrateSession("session-1");
++		resolveFetch?.();
++		const [resultA, resultB] = await Promise.all([a, b]);
++
++		// then
++		expect(callCount).toBe(1);
++		expect([...resultA]).toEqual(["AGENTS.md"]);
++		expect([...resultB]).toEqual(["AGENTS.md"]);
++	});
++
++	it("#given fetch error #when hydrateSession runs #then returns empty set without throwing", async () => {
++		// given
++		const store = createTranscriptHydrationStore({
++			client: makeClient(async () => {
++				throw new Error("network down");
++			}),
++		});
++
++		// when
++		const result = await store.hydrateSession("session-1");
++
++		// then
++		expect(result.size).toBe(0);
++	});
++
++	it("#given hydrated session #when clearSession then re-hydrate #then transcript is rescanned", async () => {
++		// given
++		let callCount = 0;
++		const store = createTranscriptHydrationStore({
++			client: makeClient(async () => {
++				callCount += 1;
++				return {
++					data: [
++						{ parts: [{ type: "tool", output: ruleMarker("AGENTS.md") }] },
++					],
++				};
++			}),
++		});
++		await store.hydrateSession("session-1");
++
++		// when
++		store.clearSession("session-1");
++		await store.hydrateSession("session-1");
++
++		// then
++		expect(callCount).toBe(2);
++	});
++
++	it("#given marker line embedded inside larger text #when hydrate scans #then it still picks up the relativePath", async () => {
++		// given
++		const text = `some output\n\n[Rule: docs/AGENTS.md]\n[Match: alwaysApply]\nbody continues here\nmore lines`;
++		const store = createTranscriptHydrationStore({
++			client: makeClient(async () => ({ data: [{ output: text }] })),
++		});
++
++		// when
++		const result = await store.hydrateSession("session-1");
++
++		// then
++		expect([...result]).toEqual(["docs/AGENTS.md"]);
++	});
++});
+diff --git a/src/hooks/rules-injector/transcript-hydration.ts b/src/hooks/rules-injector/transcript-hydration.ts
+new file mode 100644
+index 00000000..79623f64
+--- /dev/null
++++ b/src/hooks/rules-injector/transcript-hydration.ts
+@@ -0,0 +1,147 @@
++import type { PluginInput } from "@opencode-ai/plugin";
++
++/**
++ * Pattern that matches the injector's own rule banner emitted into tool
++ * outputs. The capture group is the rule's path relative to project root.
++ *
++ * @see processFilePathForInjection in ./injector.ts where the marker is emitted.
++ */
++const RULE_MARKER_PATTERN = /\[Rule: ([^\]\n]+)\]\n\[Match: [^\]\n]+\]/g;
++
++/**
++ * Safety caps so transcript scanning cannot dominate a hook invocation when
++ * the session has accumulated a large number of messages. The newest
++ * messages are scanned first so that recent injections are detected even
++ * when the cap fires.
++ */
++const HYDRATION_MAX_MESSAGES = 200;
++const HYDRATION_MAX_CHARS = 1_000_000;
++
++export interface TranscriptHydrationDeps {
++	readonly client: PluginInput["client"];
++}
++
++export interface TranscriptHydrationStore {
++	hydrateSession(sessionID: string): Promise<ReadonlySet<string>>;
++	getHydratedRelativePaths(sessionID: string): ReadonlySet<string>;
++	clearSession(sessionID: string): void;
++}
++
++interface SessionHydrationState {
++	relativePaths: Set<string>;
++	hydrated: boolean;
++	inflight?: Promise<void>;
++}
++
++/**
++ * Builds an in-memory store keyed by sessionID that lazily scans the session
++ * transcript for `[Rule: <relativePath>]` markers and exposes the set of
++ * already-injected rule relative paths. The store is consulted by the
++ * injector before emitting a rule so a process that lost its persisted cache
++ * file but whose model context still contains prior `[Rule: ...]` markers
++ * does not re-inject duplicates.
++ */
++export function createTranscriptHydrationStore(
++	deps: TranscriptHydrationDeps,
++): TranscriptHydrationStore {
++	const states = new Map<string, SessionHydrationState>();
++
++	function ensureState(sessionID: string): SessionHydrationState {
++		const existing = states.get(sessionID);
++		if (existing !== undefined) {
++			return existing;
++		}
++		const state: SessionHydrationState = {
++			relativePaths: new Set(),
++			hydrated: false,
++		};
++		states.set(sessionID, state);
++		return state;
++	}
++
++	async function hydrateSession(
++		sessionID: string,
++	): Promise<ReadonlySet<string>> {
++		const state = ensureState(sessionID);
++		if (state.hydrated) {
++			return state.relativePaths;
++		}
++		if (state.inflight === undefined) {
++			state.inflight = (async () => {
++				try {
++					const fetched = await fetchTranscriptRelativePaths(
++						deps.client,
++						sessionID,
++					);
++					for (const relativePath of fetched) {
++						state.relativePaths.add(relativePath);
++					}
++				} catch {
++					// best-effort: a hydration failure must never block injection.
++				} finally {
++					state.hydrated = true;
++					state.inflight = undefined;
++				}
++			})();
++		}
++		await state.inflight;
++		return state.relativePaths;
++	}
++
++	function getHydratedRelativePaths(sessionID: string): ReadonlySet<string> {
++		return states.get(sessionID)?.relativePaths ?? EMPTY_SET;
++	}
++
++	function clearSession(sessionID: string): void {
++		states.delete(sessionID);
++	}
++
++	return { hydrateSession, getHydratedRelativePaths, clearSession };
++}
++
++const EMPTY_SET: ReadonlySet<string> = new Set();
++
++async function fetchTranscriptRelativePaths(
++	client: PluginInput["client"],
++	sessionID: string,
++): Promise<Set<string>> {
++	const relativePaths = new Set<string>();
++	const response = (await client.session.messages({
++		path: { id: sessionID },
++	})) as { data?: unknown };
++	const data = Array.isArray(response.data) ? response.data : [];
++	const start = Math.max(0, data.length - HYDRATION_MAX_MESSAGES);
++	let scannedChars = 0;
++	for (let index = data.length - 1; index >= start; index -= 1) {
++		const text = collectMessageText(data[index]);
++		scannedChars += text.length;
++		for (const match of text.matchAll(RULE_MARKER_PATTERN)) {
++			const relativePath = match[1];
++			if (relativePath !== undefined) {
++				relativePaths.add(relativePath);
++			}
++		}
++		if (scannedChars > HYDRATION_MAX_CHARS) {
++			break;
++		}
++	}
++	return relativePaths;
++}
++
++function collectMessageText(
++	value: unknown,
++	accumulator: string[] = [],
++): string {
++	if (typeof value === "string") {
++		accumulator.push(value);
++	} else if (Array.isArray(value)) {
++		for (const item of value) {
++			collectMessageText(item, accumulator);
++		}
++	} else if (value !== null && typeof value === "object") {
++		for (const item of Object.values(value)) {
++			collectMessageText(item, accumulator);
++		}
++	}
++	return accumulator.join("\n");
++}
+-- 
+2.39.2
+

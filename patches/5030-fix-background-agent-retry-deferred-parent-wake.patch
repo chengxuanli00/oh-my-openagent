@@ -1,0 +1,167 @@
+From a5cc4984335e2763e8f9acd18c940dc3bd7e6c60 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 11 May 2026 12:38:04 +0900
+Subject: [PATCH 5030/5749] fix(background-agent): retry deferred parent wake
+
+---
+ src/features/background-agent/manager.ts      | 42 ++++++++++++++++++-
+ .../task-completion-cleanup.test.ts           | 31 +++++++++++++-
+ 2 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 540c65d5..071a33cd 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -106,6 +106,8 @@ const BACKGROUND_PARENT_WAKE_PROMPT = `<system-reminder>
+ A background task notification was already added to this session. Continue from that notification.
+ </system-reminder>`
+ 
++const PENDING_PARENT_WAKE_RETRY_MS = 1_000
++
+ interface MessagePartInfo {
+   id?: string
+   sessionID?: string
+@@ -228,6 +230,7 @@ export class BackgroundManager {
+   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
+   private pendingParentWakes: Map<string, ParentWakePromptContext> = new Map()
++  private pendingParentWakeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private observedOutputSessions: Set<string> = new Set()
+   private observedIncompleteTodosBySession: Map<string, boolean> = new Map()
+   private rootDescendantCounts: Map<string, number>
+@@ -2233,6 +2236,7 @@ The task was re-queued on a fallback model after a retryable failure.
+           })
+           if (shouldDeferReply) {
+             this.pendingParentWakes.set(task.parentSessionId, parentPromptContext)
++            this.schedulePendingParentWakeFlush(task.parentSessionId)
+           }
+           log("[background-agent] Sent notification to parent session:", {
+             taskId: task.id,
+@@ -2296,17 +2300,23 @@ The task was re-queued on a fallback model after a retryable failure.
+ 
+   private async flushPendingParentWake(sessionID: string): Promise<void> {
+     const wakeContext = this.pendingParentWakes.get(sessionID)
+-    if (!wakeContext) return
++    if (!wakeContext) {
++      this.clearPendingParentWakeTimer(sessionID)
++      return
++    }
+ 
+     if (await this.isSessionActive(sessionID)) {
++      this.schedulePendingParentWakeFlush(sessionID)
+       return
+     }
+ 
+     this.pendingParentWakes.delete(sessionID)
++    this.clearPendingParentWakeTimer(sessionID)
+     await settleAfterSessionIdle()
+ 
+     if (await this.isSessionActive(sessionID)) {
+       this.pendingParentWakes.set(sessionID, wakeContext)
++      this.schedulePendingParentWakeFlush(sessionID)
+       return
+     }
+ 
+@@ -2325,6 +2335,31 @@ The task was re-queued on a fallback model after a retryable failure.
+     }
+   }
+ 
++  private schedulePendingParentWakeFlush(sessionID: string): void {
++    if (this.pendingParentWakeTimers.has(sessionID)) {
++      return
++    }
++
++    const timer = setTimeout(() => {
++      this.pendingParentWakeTimers.delete(sessionID)
++      void this.enqueueNotificationForParent(sessionID, () => this.flushPendingParentWake(sessionID)).catch((error) => {
++        log("[background-agent] Failed to retry pending parent wake:", { sessionID, error })
++      })
++    }, PENDING_PARENT_WAKE_RETRY_MS)
++
++    this.pendingParentWakeTimers.set(sessionID, timer)
++  }
++
++  private clearPendingParentWakeTimer(sessionID: string): void {
++    const timer = this.pendingParentWakeTimers.get(sessionID)
++    if (!timer) {
++      return
++    }
++
++    clearTimeout(timer)
++    this.pendingParentWakeTimers.delete(sessionID)
++  }
++
+   private pruneStaleTasksAndNotifications(allStatuses?: SessionStatusMap): void {
+     pruneStaleTasksAndNotifications({
+       tasks: this.tasks,
+@@ -2638,6 +2673,11 @@ The task was re-queued on a fallback model after a retryable failure.
+     }
+     this.idleDeferralTimers.clear()
+ 
++    for (const timer of this.pendingParentWakeTimers.values()) {
++      clearTimeout(timer)
++    }
++    this.pendingParentWakeTimers.clear()
++
+     for (const sessionID of trackedSessionIDs) {
+       subagentSessions.delete(sessionID)
+       SessionCategoryRegistry.remove(sessionID)
+diff --git a/src/features/background-agent/task-completion-cleanup.test.ts b/src/features/background-agent/task-completion-cleanup.test.ts
+index f8cdf51a..881b35d1 100644
+--- a/src/features/background-agent/task-completion-cleanup.test.ts
++++ b/src/features/background-agent/task-completion-cleanup.test.ts
+@@ -155,6 +155,10 @@ function waitForDeferredWake(): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, 180))
+ }
+ 
++function waitForDeferredWakeRetry(): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, 1_180))
++}
++
+ function getRequiredTimer(manager: BackgroundManager, taskID: string): ReturnType<typeof setTimeout> {
+   const timer = getCompletionTimers(manager).get(taskID)
+   expect(timer).toBeDefined()
+@@ -208,7 +212,7 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+     })
+   })
+ 
+-  describe("#given 2 tasks for same parent and both completed", () => {
++  describe("#given background tasks for same parent", () => {
+     test("#when the second completion notification is sent #then ALL BACKGROUND TASKS COMPLETE notification still works correctly", async () => {
+       // given
+       const { manager, promptAsyncCalls } = createManager(true)
+@@ -290,6 +294,31 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+       expect(wakePayload).toContain("BACKGROUND TASK NOTIFICATION READY")
+       expect(wakePayload).not.toContain("ALL BACKGROUND TASKS COMPLETE")
+     })
++
++    test("#when a single background task finishes during a stale busy parent status #then wake prompt is sent after the parent becomes idle", async () => {
++      // given
++      const sessionStatuses: Record<string, { type: string }> = {
++        "parent-1": { type: "busy" },
++      }
++      const { manager, promptAsyncCalls } = createManager(true, sessionStatuses)
++      managerUnderTest = manager
++      const task = createTask({ id: "task-a", parentSessionId: "parent-1", description: "task A", status: "completed", completedAt: new Date("2026-03-11T00:01:00.000Z") })
++      getTasks(manager).set(task.id, task)
++      getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++
++      // when
++      await notifyParentSessionForTest(manager, task)
++      sessionStatuses["parent-1"] = { type: "idle" }
++      await waitForDeferredWakeRetry()
++
++      // then
++      expect(promptAsyncCalls).toHaveLength(2)
++      expect(promptAsyncCalls[0]?.body.noReply).toBe(true)
++      expect(promptAsyncCalls[1]?.body.noReply).toBe(false)
++      const wakePayload = JSON.stringify(promptAsyncCalls[1]?.body.parts)
++      expect(wakePayload).toContain("BACKGROUND TASK NOTIFICATION READY")
++      expect(wakePayload).not.toContain("ALL BACKGROUND TASKS COMPLETE")
++    })
+   })
+ 
+   describe("#given a completed task with cleanup timer scheduled", () => {
+-- 
+2.39.2
+

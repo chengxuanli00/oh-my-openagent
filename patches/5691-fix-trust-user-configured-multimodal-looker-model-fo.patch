@@ -1,0 +1,232 @@
+From bfc507895b1c807dabddb7155d23a9fade996d89 Mon Sep 17 00:00:00 2001
+From: bellman <bellman@bellmanui-MacBookAir.local>
+Date: Sun, 24 May 2026 00:30:40 +0900
+Subject: [PATCH 5691/5749] fix: trust user-configured multimodal-looker model
+ for vision (#4209)
+
+When a user explicitly configures a model for the multimodal-looker
+agent (e.g. zhipuai-coding-plan/glm-5.1), treat that model as
+vision-capable even when its provider config does not declare
+modalities.input or capabilities.input.image. This unblocks
+vision-capable models that the provider config does not advertise.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ src/plugin-handlers/config-handler.ts         | 18 +++-
+ .../provider-config-handler.test.ts           | 86 +++++++++++++++++++
+ .../provider-config-handler.ts                | 52 +++++++----
+ 3 files changed, 138 insertions(+), 18 deletions(-)
+
+diff --git a/src/plugin-handlers/config-handler.ts b/src/plugin-handlers/config-handler.ts
+index 36961021..4ba6979f 100644
+--- a/src/plugin-handlers/config-handler.ts
++++ b/src/plugin-handlers/config-handler.ts
+@@ -13,6 +13,18 @@ import { clearFormatterCache } from "../tools/hashline-edit/formatter-trigger"
+ 
+ export { resolveCategoryConfig } from "./category-config-resolver";
+ 
++function collectTrustedVisionCapableModels(
++  pluginConfig: OhMyOpenCodeConfig,
++): string[] {
++  const trusted: string[] = []
++  const multimodalLookerOverride = pluginConfig.agents?.["multimodal-looker"]
++  const configuredModel = multimodalLookerOverride?.model
++  if (typeof configuredModel === "string" && configuredModel.includes("/")) {
++    trusted.push(configuredModel)
++  }
++  return trusted
++}
++
+ export interface ConfigHandlerDeps {
+   ctx: { directory: string; client?: any };
+   pluginConfig: OhMyOpenCodeConfig;
+@@ -26,7 +38,11 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
+     const formatterConfig = config.formatter;
+ 
+     setAdditionalAllowedMcpEnvVars(pluginConfig.mcp_env_allowlist ?? [])
+-    applyProviderConfig({ config, modelCacheState });
++    applyProviderConfig({
++      config,
++      modelCacheState,
++      trustedVisionCapableModels: collectTrustedVisionCapableModels(pluginConfig),
++    });
+     clearFormatterCache()
+ 
+     const pluginComponents = await loadPluginComponents({ pluginConfig });
+diff --git a/src/plugin-handlers/provider-config-handler.test.ts b/src/plugin-handlers/provider-config-handler.test.ts
+index 890715e7..8d11bf18 100644
+--- a/src/plugin-handlers/provider-config-handler.test.ts
++++ b/src/plugin-handlers/provider-config-handler.test.ts
+@@ -97,6 +97,92 @@ describe("applyProviderConfig", () => {
+     ])
+   })
+ 
++  test("trusts user-configured multimodal-looker model even when provider config omits modalities", () => {
++    // given - user configures glm-5.1 as multimodal-looker but provider model entry has no modalities/capabilities
++    const modelCacheState = createModelCacheState()
++    const visionCapableModelsCache = modelCacheState.visionCapableModelsCache
++    if (!visionCapableModelsCache) {
++      throw new Error("visionCapableModelsCache should be initialized")
++    }
++    const config = {
++      provider: {
++        "zhipuai-coding-plan": {
++          models: {
++            "glm-5.1": {
++              limit: { context: 200000 },
++            },
++          },
++        },
++      },
++    } satisfies Record<string, unknown>
++
++    // when
++    applyProviderConfig({
++      config,
++      modelCacheState,
++      trustedVisionCapableModels: ["zhipuai-coding-plan/glm-5.1"],
++    })
++
++    // then - trusted model is in cache even though provider config did not declare image support
++    expect(Array.from(visionCapableModelsCache.keys())).toEqual([
++      "zhipuai-coding-plan/glm-5.1",
++    ])
++    expect(readVisionCapableModelsCache()).toEqual([
++      { providerID: "zhipuai-coding-plan", modelID: "glm-5.1" },
++    ])
++  })
++
++  test("does not duplicate a trusted model already discovered via provider modalities", () => {
++    // given
++    const modelCacheState = createModelCacheState()
++    const visionCapableModelsCache = modelCacheState.visionCapableModelsCache
++    if (!visionCapableModelsCache) {
++      throw new Error("visionCapableModelsCache should be initialized")
++    }
++    const config = {
++      provider: {
++        google: {
++          models: {
++            "gemini-3-flash": {
++              modalities: { input: ["text", "image"] },
++            },
++          },
++        },
++      },
++    } satisfies Record<string, unknown>
++
++    // when
++    applyProviderConfig({
++      config,
++      modelCacheState,
++      trustedVisionCapableModels: ["google/gemini-3-flash"],
++    })
++
++    // then
++    expect(Array.from(visionCapableModelsCache.keys())).toEqual([
++      "google/gemini-3-flash",
++    ])
++  })
++
++  test("ignores malformed trusted vision-capable model strings", () => {
++    // given - entries missing provider or model are skipped silently
++    const modelCacheState = createModelCacheState()
++    const visionCapableModelsCache = modelCacheState.visionCapableModelsCache
++    if (!visionCapableModelsCache) {
++      throw new Error("visionCapableModelsCache should be initialized")
++    }
++
++    // when
++    applyProviderConfig({
++      config: { provider: {} },
++      modelCacheState,
++      trustedVisionCapableModels: ["no-slash", "/missing-provider", "provider-only/"],
++    })
++
++    // then
++    expect(visionCapableModelsCache.size).toBe(0)
++  })
++
+   test("clears stale vision-capable models when provider config changes", () => {
+     // given
+     const modelCacheState = createModelCacheState()
+diff --git a/src/plugin-handlers/provider-config-handler.ts b/src/plugin-handlers/provider-config-handler.ts
+index 5bc2e995..2dec94ae 100644
+--- a/src/plugin-handlers/provider-config-handler.ts
++++ b/src/plugin-handlers/provider-config-handler.ts
+@@ -26,9 +26,19 @@ function supportsImageInput(modelConfig: ProviderModelConfig | undefined): boole
+   return modelConfig?.capabilities?.input?.image === true
+ }
+ 
++function parseTrustedModel(modelString: string): VisionCapableModel | undefined {
++  const [providerID, ...modelIDParts] = modelString.split("/")
++  const modelID = modelIDParts.join("/")
++  if (!providerID || modelID.length === 0) {
++    return undefined
++  }
++  return { providerID, modelID }
++}
++
+ export function applyProviderConfig(params: {
+   config: Record<string, unknown>;
+   modelCacheState: ModelCacheState;
++  trustedVisionCapableModels?: string[];
+ }): void {
+   const providers = params.config.provider as
+     | Record<string, ProviderConfig>
+@@ -47,27 +57,35 @@ export function applyProviderConfig(params: {
+   visionCapableModelsCache.clear()
+   setVisionCapableModelsCache(visionCapableModelsCache)
+ 
+-  if (!providers) return;
++  if (providers) {
++    for (const [providerID, providerConfig] of Object.entries(providers)) {
++      const models = providerConfig?.models;
++      if (!models) continue;
++
++      for (const [modelID, modelConfig] of Object.entries(models)) {
++        if (supportsImageInput(modelConfig)) {
++          visionCapableModelsCache.set(
++            `${providerID}/${modelID}`,
++            { providerID, modelID },
++          )
++        }
+ 
+-  for (const [providerID, providerConfig] of Object.entries(providers)) {
+-    const models = providerConfig?.models;
+-    if (!models) continue;
++        const contextLimit = modelConfig?.limit?.context;
++        if (!contextLimit) continue;
+ 
+-    for (const [modelID, modelConfig] of Object.entries(models)) {
+-      if (supportsImageInput(modelConfig)) {
+-        visionCapableModelsCache.set(
++        modelContextLimitsCache.set(
+           `${providerID}/${modelID}`,
+-          { providerID, modelID },
+-        )
++          contextLimit,
++        );
+       }
+-
+-      const contextLimit = modelConfig?.limit?.context;
+-      if (!contextLimit) continue;
+-
+-      modelContextLimitsCache.set(
+-        `${providerID}/${modelID}`,
+-        contextLimit,
+-      );
+     }
+   }
++
++  for (const trustedModelString of params.trustedVisionCapableModels ?? []) {
++    const trustedModel = parseTrustedModel(trustedModelString)
++    if (!trustedModel) continue
++    const key = `${trustedModel.providerID}/${trustedModel.modelID}`
++    if (visionCapableModelsCache.has(key)) continue
++    visionCapableModelsCache.set(key, trustedModel)
++  }
+ }
+-- 
+2.39.2
+

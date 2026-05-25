@@ -1,0 +1,351 @@
+From a9c73986d70e1a3d72382f9e0239dbd44c7f75b3 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 7 Apr 2026 15:24:20 +0900
+Subject: [PATCH 4007/5749] fix: detect token-limit errors in todo-continuation
+ to prevent infinite loop (#2462)
+
+handler.ts now catches ContextLengthError/prompt-too-long errors and
+stops continuation instead of retrying with an even larger context.
+
+91 tests pass, tsc clean.
+
+Closes #2462
+---
+ .../continuation-injection.ts                 |   9 +
+ .../todo-continuation-enforcer/handler.ts     |   7 +-
+ .../todo-continuation-enforcer/idle-event.ts  |   5 +
+ .../non-idle-events.ts                        |   1 +
+ .../todo-continuation-enforcer.test.ts        | 183 ++++++++++++++++++
+ .../token-limit-detection.ts                  |  27 +++
+ src/hooks/todo-continuation-enforcer/types.ts |   1 +
+ 7 files changed, 232 insertions(+), 1 deletion(-)
+ create mode 100644 src/hooks/todo-continuation-enforcer/token-limit-detection.ts
+
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index aa52fcc5..fdd12efc 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -26,6 +26,7 @@ import {
+ } from "./constants"
+ import { isCompactionGuardActive } from "./compaction-guard"
+ import { getMessageDir } from "./message-directory"
++import { isTokenLimitError } from "./token-limit-detection"
+ import { getIncompleteCount } from "./todo"
+ import type { ResolvedMessageInfo, Todo } from "./types"
+ import type { SessionStateStore } from "./session-state"
+@@ -204,6 +205,14 @@ ${todoList}`
+       injectionState.inFlight = false
+       injectionState.lastInjectedAt = Date.now()
+       injectionState.consecutiveFailures = (injectionState.consecutiveFailures ?? 0) + 1
++
++      const errorObj = error instanceof Error
++        ? { name: error.name, message: error.message }
++        : { message: String(error) }
++      if (isTokenLimitError(errorObj)) {
++        injectionState.tokenLimitDetected = true
++        log(`[${HOOK_NAME}] Token limit error detected during injection, stopping continuation`, { sessionID })
++      }
+     }
+   }
+ }
+diff --git a/src/hooks/todo-continuation-enforcer/handler.ts b/src/hooks/todo-continuation-enforcer/handler.ts
+index e9416750..3347ee66 100644
+--- a/src/hooks/todo-continuation-enforcer/handler.ts
++++ b/src/hooks/todo-continuation-enforcer/handler.ts
+@@ -11,6 +11,7 @@ import { armCompactionGuard } from "./compaction-guard"
+ import type { SessionStateStore } from "./session-state"
+ import { handleSessionIdle } from "./idle-event"
+ import { handleNonIdleEvent } from "./non-idle-events"
++import { isTokenLimitError } from "./token-limit-detection"
+ 
+ export function createTodoContinuationHandler(args: {
+   ctx: PluginInput
+@@ -34,7 +35,7 @@ export function createTodoContinuationHandler(args: {
+       const sessionID = props?.sessionID as string | undefined
+       if (!sessionID) return
+ 
+-      const error = props?.error as { name?: string } | undefined
++      const error = props?.error as { name?: string; message?: string } | undefined
+       if (error?.name === "MessageAbortedError" || error?.name === "AbortError") {
+         const state = sessionStateStore.getState(sessionID)
+         state.wasCancelled = true
+@@ -45,6 +46,10 @@ export function createTodoContinuationHandler(args: {
+         state.stagnationCount = 0
+         state.consecutiveFailures = 0
+         log(`[${HOOK_NAME}] Abort detected via session.error`, { sessionID, errorName: error.name })
++      } else if (isTokenLimitError(error)) {
++        const state = sessionStateStore.getState(sessionID)
++        state.tokenLimitDetected = true
++        log(`[${HOOK_NAME}] Token limit error detected via session.error`, { sessionID, errorName: error?.name, errorMessage: error?.message })
+       }
+ 
+       sessionStateStore.cancelCountdown(sessionID)
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 9c1f2533..87c67410 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -55,6 +55,11 @@ export async function handleSessionIdle(args: {
+     return
+   }
+ 
++  if (state.tokenLimitDetected) {
++    log(`[${HOOK_NAME}] Skipped: token limit error detected, retry would worsen context overflow`, { sessionID })
++    return
++  }
++
+   if (state.abortDetectedAt) {
+     const timeSinceAbort = Date.now() - state.abortDetectedAt
+     if (timeSinceAbort < ABORT_WINDOW_MS) {
+diff --git a/src/hooks/todo-continuation-enforcer/non-idle-events.ts b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+index b9f61f80..a88da877 100644
+--- a/src/hooks/todo-continuation-enforcer/non-idle-events.ts
++++ b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+@@ -28,6 +28,7 @@ export function handleNonIdleEvent(args: {
+       if (state) {
+         state.abortDetectedAt = undefined
+         state.wasCancelled = false
++        state.tokenLimitDetected = false
+         sessionStateStore.recordActivity(sessionID)
+       }
+       sessionStateStore.cancelCountdown(sessionID)
+diff --git a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+index e126bfd1..ecd95c88 100644
+--- a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
++++ b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+@@ -1962,5 +1962,188 @@ describe("todo-continuation-enforcer", () => {
+     expect(promptCalls).toHaveLength(1)
+   }, { timeout: 20000 })
+ 
++  // ============================================================
++  // TOKEN-LIMIT ERROR DETECTION TESTS (#2462)
++  // These tests verify that the enforcer does NOT retry continuation
++  // when the model returns a token-limit / context-length error.
++  // ============================================================
++
++  test("should stop continuation when session.error carries a ContextLengthError", async () => {
++    // given - session with incomplete todos
++    const sessionID = "main-token-limit-event"
++    setMainSession(sessionID)
++    mockMessages = [
++      { info: { id: "msg-1", role: "user" } },
++      { info: { id: "msg-2", role: "assistant" } },
++    ]
++
++    const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
++
++    // when - token limit error event fires
++    await hook.handler({
++      event: {
++        type: "session.error",
++        properties: {
++          sessionID,
++          error: { name: "ContextLengthError", message: "prompt is too long: 250000 tokens > 200000 maximum" },
++        },
++      },
++    })
++
++    // when - session goes idle
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++
++    await fakeTimers.advanceBy(3000)
++
++    // then - no continuation injected (token limit error blocks retry)
++    expect(promptCalls).toHaveLength(0)
++  })
++
++  test("should stop continuation when session.error message contains token limit keywords", async () => {
++    // given - session with incomplete todos
++    const sessionID = "main-token-limit-message"
++    setMainSession(sessionID)
++    mockMessages = [
++      { info: { id: "msg-1", role: "user" } },
++      { info: { id: "msg-2", role: "assistant" } },
++    ]
++
++    const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
++
++    // when - error with token limit message fires (no specific error name)
++    await hook.handler({
++      event: {
++        type: "session.error",
++        properties: {
++          sessionID,
++          error: { name: "APIError", message: "context_length_exceeded: the prompt is too long" },
++        },
++      },
++    })
++
++    // when - session goes idle
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++
++    await fakeTimers.advanceBy(3000)
++
++    // then - no continuation injected
++    expect(promptCalls).toHaveLength(0)
++  })
++
++  test("should stop continuation when promptAsync throws a token-limit error", async () => {
++    // given - session where promptAsync will throw a token limit error
++    const sessionID = "main-token-limit-injection"
++    setMainSession(sessionID)
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.promptAsync = async () => {
++      const error = new Error("prompt is too long: 150000 tokens > 100000 maximum")
++      ;(error as any).name = "ContextLengthError"
++      throw error
++    }
++
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    // when - first idle triggers injection that fails with token limit
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++
++    // when - wait past any cooldown, try again
++    await fakeTimers.advanceClockBy(CONTINUATION_COOLDOWN_MS * 100)
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(3000, true)
++
++    // then - no second injection attempt (token limit permanently stops continuation)
++    expect(promptCalls).toHaveLength(0)
++  })
++
++  test("should still allow retries for non-token-limit errors (existing behavior)", async () => {
++    // given - session where promptAsync throws a generic error
++    const sessionID = "main-generic-error-retry"
++    setMainSession(sessionID)
++    let callCount = 0
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.promptAsync = async (opts: any) => {
++      callCount++
++      if (callCount === 1) {
++        throw new Error("simulated network error")
++      }
++      promptCalls.push({
++        sessionID: opts.path.id,
++        agent: opts.body.agent,
++        model: opts.body.model,
++        text: opts.body.parts[0].text,
++      })
++      return {}
++    }
++
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    // when - first idle triggers injection that fails with generic error
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++
++    // when - wait past cooldown, try again
++    await fakeTimers.advanceClockBy(CONTINUATION_COOLDOWN_MS * 2)
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++
++    // then - second attempt succeeds (generic errors still allow retry)
++    expect(callCount).toBe(2)
++    expect(promptCalls).toHaveLength(1)
++  }, { timeout: 30000 })
++
++  test("should clear token limit flag when user sends new message after recovery", async () => {
++    fakeTimers.restore()
++    // given - session that hit token limit
++    const sessionID = "main-token-limit-recovery"
++    setMainSession(sessionID)
++    mockMessages = [
++      { info: { id: "msg-1", role: "user" } },
++      { info: { id: "msg-2", role: "assistant" } },
++    ]
++
++    const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
++
++    // when - token limit error fires
++    await hook.handler({
++      event: {
++        type: "session.error",
++        properties: {
++          sessionID,
++          error: { name: "ContextLengthError", message: "prompt is too long" },
++        },
++      },
++    })
++
++    // when - user sends new message (clears token limit flag via activity)
++    await hook.handler({
++      event: {
++        type: "message.updated",
++        properties: { info: { sessionID, role: "user" } },
++      },
++    })
++
++    // when - session goes idle
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++
++    await wait(2500)
++
++    // then - continuation injected (token limit flag cleared by user activity)
++    expect(promptCalls.length).toBe(1)
++  }, { timeout: 15000 })
+ 
+ })
+diff --git a/src/hooks/todo-continuation-enforcer/token-limit-detection.ts b/src/hooks/todo-continuation-enforcer/token-limit-detection.ts
+new file mode 100644
+index 00000000..25a2fad3
+--- /dev/null
++++ b/src/hooks/todo-continuation-enforcer/token-limit-detection.ts
+@@ -0,0 +1,27 @@
++const TOKEN_LIMIT_ERROR_NAMES = new Set([
++  "contextlengtherror",
++])
++
++const TOKEN_LIMIT_KEYWORDS = [
++  "prompt is too long",
++  "is too long",
++  "context_length_exceeded",
++  "token limit",
++  "context length",
++  "too many tokens",
++]
++
++export function isTokenLimitError(error: { name?: string; message?: string } | undefined): boolean {
++  if (!error) return false
++
++  if (error.name && TOKEN_LIMIT_ERROR_NAMES.has(error.name.toLowerCase())) {
++    return true
++  }
++
++  if (error.message) {
++    const lower = error.message.toLowerCase()
++    return TOKEN_LIMIT_KEYWORDS.some((keyword) => lower.includes(keyword))
++  }
++
++  return false
++}
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index aea9598f..d28874ed 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -27,6 +27,7 @@ export interface SessionState {
+   countdownInterval?: ReturnType<typeof setInterval>
+   isRecovering?: boolean
+   wasCancelled?: boolean
++  tokenLimitDetected?: boolean
+   countdownStartedAt?: number
+   abortDetectedAt?: number
+   lastIncompleteCount?: number
+-- 
+2.39.2
+

@@ -1,0 +1,453 @@
+From 04f2b513c6ed9dc9c4e6653eb65f18c40d43cd31 Mon Sep 17 00:00:00 2001
+From: justsisyphus <justsisyphus@users.noreply.github.com>
+Date: Mon, 26 Jan 2026 15:25:05 +0900
+Subject: [PATCH 1426/5749] feat(tmux-subagent): add replace action to prevent
+ mass eviction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add column-based splittable calculation (getColumnCount, getColumnWidth)
+- New decision tree: splittable → split, k=1 eviction → close+spawn, else → replace
+- Add 'replace' action type using tmux respawn-pane (preserves layout)
+- Replace oldest pane in-place instead of closing all panes when unsplittable
+- Prevents scenario where all agent panes get closed leaving only 1
+---
+ src/agents/utils.ts                           |   8 +-
+ src/features/tmux-subagent/action-executor.ts |  18 ++-
+ src/features/tmux-subagent/decision-engine.ts | 129 +++++++++++++-----
+ src/features/tmux-subagent/manager.test.ts    |  34 ++---
+ src/features/tmux-subagent/manager.ts         |  17 ++-
+ src/features/tmux-subagent/types.ts           |   1 +
+ src/shared/tmux/tmux-utils.ts                 |  47 +++++++
+ 7 files changed, 188 insertions(+), 66 deletions(-)
+
+diff --git a/src/agents/utils.ts b/src/agents/utils.ts
+index 6e86f348..4bcc62ba 100644
+--- a/src/agents/utils.ts
++++ b/src/agents/utils.ts
+@@ -10,7 +10,7 @@ import { createMetisAgent } from "./metis"
+ import { createAtlasAgent } from "./atlas"
+ import { createMomusAgent } from "./momus"
+ import type { AvailableAgent, AvailableCategory, AvailableSkill } from "./dynamic-agent-prompt-builder"
+-import { deepMerge, fetchAvailableModels, resolveModelWithFallback, AGENT_MODEL_REQUIREMENTS, findCaseInsensitive, includesCaseInsensitive } from "../shared"
++import { deepMerge, fetchAvailableModels, resolveModelWithFallback, AGENT_MODEL_REQUIREMENTS, findCaseInsensitive, includesCaseInsensitive, readConnectedProvidersCache } from "../shared"
+ import { DEFAULT_CATEGORIES, CATEGORY_DESCRIPTIONS } from "../tools/delegate-task/constants"
+ import { resolveMultipleSkills } from "../features/opencode-skill-loader/skill-content"
+ import { createBuiltinSkills } from "../features/builtin-skills"
+@@ -155,8 +155,10 @@ export async function createBuiltinAgents(
+     throw new Error("createBuiltinAgents requires systemDefaultModel")
+   }
+ 
+-  // Fetch available models at plugin init
+-  const availableModels = client ? await fetchAvailableModels(client) : new Set<string>()
++  const connectedProviders = readConnectedProvidersCache()
++  const availableModels = client 
++    ? await fetchAvailableModels(client, { connectedProviders: connectedProviders ?? undefined }) 
++    : new Set<string>()
+ 
+   const result: Record<string, AgentConfig> = {}
+   const availableAgents: AvailableAgent[] = []
+diff --git a/src/features/tmux-subagent/action-executor.ts b/src/features/tmux-subagent/action-executor.ts
+index d6001860..02233bb2 100644
+--- a/src/features/tmux-subagent/action-executor.ts
++++ b/src/features/tmux-subagent/action-executor.ts
+@@ -1,6 +1,6 @@
+ import type { TmuxConfig } from "../../config/schema"
+ import type { PaneAction, WindowState } from "./types"
+-import { spawnTmuxPane, closeTmuxPane, enforceMainPaneWidth } from "../../shared/tmux"
++import { spawnTmuxPane, closeTmuxPane, enforceMainPaneWidth, replaceTmuxPane } from "../../shared/tmux"
+ import { log } from "../../shared"
+ 
+ export interface ActionResult {
+@@ -38,6 +38,20 @@ export async function executeAction(
+     return { success }
+   }
+ 
++  if (action.type === "replace") {
++    const result = await replaceTmuxPane(
++      action.paneId,
++      action.newSessionId,
++      action.description,
++      ctx.config,
++      ctx.serverUrl
++    )
++    return {
++      success: result.success,
++      paneId: result.paneId,
++    }
++  }
++
+   const result = await spawnTmuxPane(
+     action.sessionId,
+     action.description,
+@@ -74,7 +88,7 @@ export async function executeActions(
+       return { success: false, results }
+     }
+ 
+-    if (action.type === "spawn" && result.paneId) {
++    if ((action.type === "spawn" || action.type === "replace") && result.paneId) {
+       spawnedPaneId = result.paneId
+     }
+   }
+diff --git a/src/features/tmux-subagent/decision-engine.ts b/src/features/tmux-subagent/decision-engine.ts
+index a81dd441..b6761bf6 100644
+--- a/src/features/tmux-subagent/decision-engine.ts
++++ b/src/features/tmux-subagent/decision-engine.ts
+@@ -31,11 +31,38 @@ export interface SpawnTarget {
+ }
+ 
+ const MAIN_PANE_RATIO = 0.5
++const MAX_COLS = 2
++const MAX_ROWS = 3
+ const MAX_GRID_SIZE = 4
+ const DIVIDER_SIZE = 1
+ const MIN_SPLIT_WIDTH = 2 * MIN_PANE_WIDTH + DIVIDER_SIZE
+ const MIN_SPLIT_HEIGHT = 2 * MIN_PANE_HEIGHT + DIVIDER_SIZE
+ 
++export function getColumnCount(paneCount: number): number {
++  if (paneCount <= 0) return 1
++  return Math.min(MAX_COLS, Math.max(1, Math.ceil(paneCount / MAX_ROWS)))
++}
++
++export function getColumnWidth(agentAreaWidth: number, paneCount: number): number {
++  const cols = getColumnCount(paneCount)
++  const dividersWidth = (cols - 1) * DIVIDER_SIZE
++  return Math.floor((agentAreaWidth - dividersWidth) / cols)
++}
++
++export function isSplittableAtCount(agentAreaWidth: number, paneCount: number): boolean {
++  const columnWidth = getColumnWidth(agentAreaWidth, paneCount)
++  return columnWidth >= MIN_SPLIT_WIDTH
++}
++
++export function findMinimalEvictions(agentAreaWidth: number, currentCount: number): number | null {
++  for (let k = 1; k <= currentCount; k++) {
++    if (isSplittableAtCount(agentAreaWidth, currentCount - k)) {
++      return k
++    }
++  }
++  return null
++}
++
+ export function canSplitPane(pane: TmuxPaneInfo, direction: SplitDirection): boolean {
+   if (direction === "-h") {
+     return pane.width >= MIN_SPLIT_WIDTH
+@@ -251,9 +278,10 @@ export function decideSpawnActions(
+     return { canSpawn: false, actions: [], reason: "no main pane found" }
+   }
+ 
+-  const capacity = calculateCapacity(state.windowWidth, state.windowHeight)
+-  
+-  if (capacity.total === 0) {
++  const agentAreaWidth = Math.floor(state.windowWidth * (1 - MAIN_PANE_RATIO))
++  const currentCount = state.agentPanes.length
++
++  if (agentAreaWidth < MIN_PANE_WIDTH) {
+     return {
+       canSpawn: false,
+       actions: [],
+@@ -261,52 +289,85 @@ export function decideSpawnActions(
+     }
+   }
+ 
+-  let currentState = state
+-  const closeActions: PaneAction[] = []
+-  const maxIterations = state.agentPanes.length + 1
++  const oldestPane = findOldestAgentPane(state.agentPanes, sessionMappings)
++  const oldestMapping = oldestPane 
++    ? sessionMappings.find(m => m.paneId === oldestPane.paneId)
++    : null
+ 
+-  for (let i = 0; i < maxIterations; i++) {
+-    const spawnTarget = findSplittableTarget(currentState)
+-    
+-    if (spawnTarget) {
++  if (currentCount === 0) {
++    const virtualMainPane: TmuxPaneInfo = { ...state.mainPane, width: state.windowWidth }
++    if (canSplitPane(virtualMainPane, "-h")) {
+       return {
+         canSpawn: true,
+-        actions: [
+-          ...closeActions,
+-          { 
+-            type: "spawn", 
+-            sessionId, 
+-            description, 
+-            targetPaneId: spawnTarget.targetPaneId,
+-            splitDirection: spawnTarget.splitDirection
+-          }
+-        ],
+-        reason: closeActions.length > 0 ? `closed ${closeActions.length} pane(s) to make room` : undefined,
++        actions: [{
++          type: "spawn",
++          sessionId,
++          description,
++          targetPaneId: state.mainPane.paneId,
++          splitDirection: "-h"
++        }]
+       }
+     }
++    return { canSpawn: false, actions: [], reason: "mainPane too small to split" }
++  }
+ 
+-    const oldestPane = findOldestAgentPane(currentState.agentPanes, sessionMappings)
+-    if (!oldestPane) {
+-      break
++  if (isSplittableAtCount(agentAreaWidth, currentCount)) {
++    const spawnTarget = findSplittableTarget(state)
++    if (spawnTarget) {
++      return {
++        canSpawn: true,
++        actions: [{
++          type: "spawn",
++          sessionId,
++          description,
++          targetPaneId: spawnTarget.targetPaneId,
++          splitDirection: spawnTarget.splitDirection
++        }]
++      }
+     }
++  }
+ 
+-    const mappingForPane = sessionMappings.find(m => m.paneId === oldestPane.paneId)
+-    closeActions.push({
+-      type: "close",
+-      paneId: oldestPane.paneId,
+-      sessionId: mappingForPane?.sessionId || ""
+-    })
++  const minEvictions = findMinimalEvictions(agentAreaWidth, currentCount)
+ 
+-    currentState = {
+-      ...currentState,
+-      agentPanes: currentState.agentPanes.filter(p => p.paneId !== oldestPane.paneId)
++  if (minEvictions === 1 && oldestPane) {
++    return {
++      canSpawn: true,
++      actions: [
++        {
++          type: "close",
++          paneId: oldestPane.paneId,
++          sessionId: oldestMapping?.sessionId || ""
++        },
++        {
++          type: "spawn",
++          sessionId,
++          description,
++          targetPaneId: state.mainPane.paneId,
++          splitDirection: "-h"
++        }
++      ],
++      reason: "closed 1 pane to make room for split"
++    }
++  }
++
++  if (oldestPane) {
++    return {
++      canSpawn: true,
++      actions: [{
++        type: "replace",
++        paneId: oldestPane.paneId,
++        oldSessionId: oldestMapping?.sessionId || "",
++        newSessionId: sessionId,
++        description
++      }],
++      reason: "replaced oldest pane (no split possible)"
+     }
+   }
+ 
+   return {
+     canSpawn: false,
+     actions: [],
+-    reason: "no splittable pane found even after closing all agent panes",
++    reason: "no pane available to replace"
+   }
+ }
+ 
+diff --git a/src/features/tmux-subagent/manager.test.ts b/src/features/tmux-subagent/manager.test.ts
+index 8f9e06cc..10ef9fa7 100644
+--- a/src/features/tmux-subagent/manager.test.ts
++++ b/src/features/tmux-subagent/manager.test.ts
+@@ -100,9 +100,9 @@ function createSessionCreatedEvent(
+ 
+ function createWindowState(overrides?: Partial<WindowState>): WindowState {
+   return {
+-    windowWidth: 200,
++    windowWidth: 220,
+     windowHeight: 44,
+-    mainPane: { paneId: '%0', width: 120, height: 44, left: 0, top: 0, title: 'main', isActive: true },
++    mainPane: { paneId: '%0', width: 110, height: 44, left: 0, top: 0, title: 'main', isActive: true },
+     agentPanes: [],
+     ...overrides,
+   }
+@@ -368,8 +368,8 @@ describe('TmuxSessionManager', () => {
+       expect(mockExecuteActions).toHaveBeenCalledTimes(0)
+     })
+ 
+-    test('closes oldest agent when at max capacity', async () => {
+-      //#given
++    test('replaces oldest agent when unsplittable (small window)', async () => {
++      //#given - small window where split is not possible
+       mockIsInsideTmux.mockReturnValue(true)
+       mockQueryWindowState.mockImplementation(async () =>
+         createWindowState({
+@@ -405,18 +405,13 @@ describe('TmuxSessionManager', () => {
+         createSessionCreatedEvent('ses_new', 'ses_parent', 'New Task')
+       )
+ 
+-      //#then
++      //#then - with small window, replace action is used instead of close+spawn
+       expect(mockExecuteActions).toHaveBeenCalledTimes(1)
+       const call = mockExecuteActions.mock.calls[0]
+       expect(call).toBeDefined()
+       const actionsArg = call![0]
+-      expect(actionsArg.length).toBeGreaterThanOrEqual(1)
+-
+-      const closeActions = actionsArg.filter((a) => a.type === 'close')
+-      const spawnActions = actionsArg.filter((a) => a.type === 'spawn')
+-
+-      expect(closeActions).toHaveLength(1)
+-      expect(spawnActions).toHaveLength(1)
++      expect(actionsArg).toHaveLength(1)
++      expect(actionsArg[0].type).toBe('replace')
+     })
+   })
+ 
+@@ -614,8 +609,8 @@ describe('DecisionEngine', () => {
+       }
+     })
+ 
+-    test('returns close + spawn when at capacity', async () => {
+-      //#given
++    test('returns replace when split not possible', async () => {
++      //#given - small window where split is never possible
+       const { decideSpawnActions } = await import('./decision-engine')
+       const state: WindowState = {
+         windowWidth: 160,
+@@ -654,15 +649,10 @@ describe('DecisionEngine', () => {
+         sessionMappings
+       )
+ 
+-      //#then
++      //#then - agent area (80) < MIN_SPLIT_WIDTH (105), so replace is used
+       expect(decision.canSpawn).toBe(true)
+-      expect(decision.actions).toHaveLength(2)
+-      expect(decision.actions[0]).toEqual({
+-        type: 'close',
+-        paneId: '%1',
+-        sessionId: 'ses_old',
+-      })
+-      expect(decision.actions[1].type).toBe('spawn')
++      expect(decision.actions).toHaveLength(1)
++      expect(decision.actions[0].type).toBe('replace')
+     })
+ 
+     test('returns canSpawn=false when window too small', async () => {
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index 7b3ac221..4bad83d1 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -166,11 +166,11 @@ export class TmuxSessionManager {
+         canSpawn: decision.canSpawn,
+         reason: decision.reason,
+         actionCount: decision.actions.length,
+-        actions: decision.actions.map((a) =>
+-          a.type === "close"
+-            ? { type: "close", paneId: a.paneId }
+-            : { type: "spawn", sessionId: a.sessionId }
+-        ),
++        actions: decision.actions.map((a) => {
++          if (a.type === "close") return { type: "close", paneId: a.paneId }
++          if (a.type === "replace") return { type: "replace", paneId: a.paneId, newSessionId: a.newSessionId }
++          return { type: "spawn", sessionId: a.sessionId }
++        }),
+       })
+ 
+       if (!decision.canSpawn) {
+@@ -190,6 +190,13 @@ export class TmuxSessionManager {
+             sessionId: action.sessionId,
+           })
+         }
++        if (action.type === "replace" && actionResult.success) {
++          this.sessions.delete(action.oldSessionId)
++          log("[tmux-session-manager] removed replaced session from cache", {
++            oldSessionId: action.oldSessionId,
++            newSessionId: action.newSessionId,
++          })
++        }
+       }
+ 
+       if (result.success && result.spawnedPaneId) {
+diff --git a/src/features/tmux-subagent/types.ts b/src/features/tmux-subagent/types.ts
+index 41c06091..ce57140b 100644
+--- a/src/features/tmux-subagent/types.ts
++++ b/src/features/tmux-subagent/types.ts
+@@ -31,6 +31,7 @@ export type SplitDirection = "-h" | "-v"
+ export type PaneAction =
+   | { type: "close"; paneId: string; sessionId: string }
+   | { type: "spawn"; sessionId: string; description: string; targetPaneId: string; splitDirection: SplitDirection }
++  | { type: "replace"; paneId: string; oldSessionId: string; newSessionId: string; description: string }
+ 
+ export interface SpawnDecision {
+   canSpawn: boolean
+diff --git a/src/shared/tmux/tmux-utils.ts b/src/shared/tmux/tmux-utils.ts
+index 11bfd7e4..540bcff2 100644
+--- a/src/shared/tmux/tmux-utils.ts
++++ b/src/shared/tmux/tmux-utils.ts
+@@ -179,6 +179,53 @@ export async function closeTmuxPane(paneId: string): Promise<boolean> {
+   return exitCode === 0
+ }
+ 
++export async function replaceTmuxPane(
++  paneId: string,
++  sessionId: string,
++  description: string,
++  config: TmuxConfig,
++  serverUrl: string
++): Promise<SpawnPaneResult> {
++  const { log } = await import("../logger")
++  
++  log("[replaceTmuxPane] called", { paneId, sessionId, description })
++  
++  if (!config.enabled) {
++    return { success: false }
++  }
++  if (!isInsideTmux()) {
++    return { success: false }
++  }
++
++  const tmux = await getTmuxPath()
++  if (!tmux) {
++    return { success: false }
++  }
++
++  const opencodeCmd = `opencode attach ${serverUrl} --session ${sessionId}`
++
++  const proc = spawn([tmux, "respawn-pane", "-k", "-t", paneId, opencodeCmd], {
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++  const exitCode = await proc.exited
++
++  if (exitCode !== 0) {
++    const stderr = await new Response(proc.stderr).text()
++    log("[replaceTmuxPane] FAILED", { paneId, exitCode, stderr: stderr.trim() })
++    return { success: false }
++  }
++
++  const title = `omo-subagent-${description.slice(0, 20)}`
++  spawn([tmux, "select-pane", "-t", paneId, "-T", title], {
++    stdout: "ignore",
++    stderr: "ignore",
++  })
++
++  log("[replaceTmuxPane] SUCCESS", { paneId, sessionId })
++  return { success: true, paneId }
++}
++
+ export async function applyLayout(
+   tmux: string,
+   layout: TmuxLayout,
+-- 
+2.39.2
+

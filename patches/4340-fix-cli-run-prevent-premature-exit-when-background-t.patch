@@ -1,0 +1,186 @@
+From aa90cff9cc71e3c3cdbe9dbd131955f717eb2bed Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9F=AF=E6=9D=A8?= <keyang.lk@oceanbase.com>
+Date: Thu, 16 Apr 2026 11:59:11 +0800
+Subject: [PATCH 4340/5749] fix(cli-run): prevent premature exit when
+ background tasks are active
+
+When using `opencode run`, the process exits prematurely if the main
+agent dispatches background subtasks. The CLI completion checker relies
+on `session.children()` + `session.status()` APIs which cannot see
+tasks in "pending" state (no session created yet) or tasks whose
+sessions are momentarily idle between operations.
+
+This fix bridges BackgroundManager state to the CLI completion checker
+using the existing run-continuation-state marker system:
+
+- Add "background-task" continuation marker source
+- BackgroundManager writes/clears markers on task lifecycle events
+  (launch, cancel, complete, crash)
+- CLI completion checker blocks exit when marker is active
+- Fix todo-continuation-enforcer to also check "pending" task status
+
+Closes #3452
+---
+ src/cli/run/completion.ts                     |  5 +++
+ src/cli/run/continuation-state.ts             |  2 ++
+ src/features/background-agent/manager.ts      | 34 +++++++++++++++++++
+ src/features/run-continuation-state/types.ts  |  2 +-
+ .../continuation-injection.ts                 |  2 +-
+ .../todo-continuation-enforcer/idle-event.ts  |  2 +-
+ 6 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/src/cli/run/completion.ts b/src/cli/run/completion.ts
+index f28927f1..bcc0cebb 100644
+--- a/src/cli/run/completion.ts
++++ b/src/cli/run/completion.ts
+@@ -20,6 +20,11 @@ export async function checkCompletionConditions(ctx: RunContext): Promise<boolea
+       return false
+     }
+ 
++    if (continuationState.hasActiveBackgroundTaskMarker) {
++      logWaiting(ctx, continuationState.activeHookMarkerReason ?? "background tasks are active")
++      return false
++    }
++
+     if (!await areAllChildrenIdle(ctx)) {
+       return false
+     }
+diff --git a/src/cli/run/continuation-state.ts b/src/cli/run/continuation-state.ts
+index 07b53081..7e7eb1a6 100644
+--- a/src/cli/run/continuation-state.ts
++++ b/src/cli/run/continuation-state.ts
+@@ -16,6 +16,7 @@ export interface ContinuationState {
+   hasActiveRalphLoop: boolean
+   hasHookMarker: boolean
+   hasTodoHookMarker: boolean
++  hasActiveBackgroundTaskMarker: boolean
+   hasActiveHookMarker: boolean
+   activeHookMarkerReason: string | null
+ }
+@@ -32,6 +33,7 @@ export async function getContinuationState(
+     hasActiveRalphLoop: hasActiveRalphLoopContinuation(directory, sessionID),
+     hasHookMarker: marker !== null,
+     hasTodoHookMarker: marker?.sources.todo !== undefined,
++    hasActiveBackgroundTaskMarker: marker?.sources["background-task"]?.state === "active",
+     hasActiveHookMarker: isContinuationMarkerActive(marker),
+     activeHookMarkerReason: getActiveContinuationMarkerReason(marker),
+   }
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index a59ea953..2350d0db 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -48,6 +48,7 @@ import {
+ } from "./error-classifier"
+ import { tryFallbackRetry } from "./fallback-retry-handler"
+ import { registerManagerForCleanup, unregisterManagerForCleanup } from "./process-cleanup"
++import { setContinuationMarkerSource } from "../../features/run-continuation-state"
+ import {
+   findNearestMessageExcludingCompaction,
+   resolvePromptContextFromSessionMessages,
+@@ -370,6 +371,9 @@ export class BackgroundManager {
+       spawnReservation.commit()
+       this.markPreStartDescendantReservation(task)
+ 
++      // Signal CLI run mode that background tasks are active
++      this.updateBackgroundTaskMarker(input.parentSessionID)
++
+       // Trigger processing (fire-and-forget)
+       void this.processKey(key)
+ 
+@@ -657,6 +661,21 @@ export class BackgroundManager {
+     return result
+   }
+ 
++  private updateBackgroundTaskMarker(parentSessionID: string): void {
++    const tasks = this.getTasksByParentSession(parentSessionID)
++    const activeTasks = tasks.filter(t => t.status === "running" || t.status === "pending")
++    if (activeTasks.length > 0) {
++      setContinuationMarkerSource(
++        this.directory, parentSessionID, "background-task", "active",
++        `${activeTasks.length} background task(s) active`,
++      )
++    } else {
++      setContinuationMarkerSource(
++        this.directory, parentSessionID, "background-task", "idle",
++      )
++    }
++  }
++
+   getAllDescendantTasks(sessionID: string): BackgroundTask[] {
+     const result: BackgroundTask[] = []
+     const directChildren = this.getTasksByParentSession(sessionID)
+@@ -1585,6 +1604,11 @@ export class BackgroundManager {
+ 
+     removeTaskToastTracking(task.id)
+ 
++    // Update continuation marker for CLI run mode
++    if (task.parentSessionID) {
++      this.updateBackgroundTaskMarker(task.parentSessionID)
++    }
++
+     if (options?.skipNotification) {
+       this.cleanupPendingByParent(task)
+       this.scheduleTaskRemoval(task.id)
+@@ -1700,6 +1724,11 @@ export class BackgroundManager {
+       SessionCategoryRegistry.remove(task.sessionID)
+     }
+ 
++    // Update continuation marker for CLI run mode
++    if (task.parentSessionID) {
++      this.updateBackgroundTaskMarker(task.parentSessionID)
++    }
++
+     try {
+       await this.enqueueNotificationForParent(task.parentSessionID, () => this.notifyParentSession(task))
+       log(`[background-agent] Task completed via ${source}:`, task.id)
+@@ -1993,6 +2022,11 @@ export class BackgroundManager {
+       SessionCategoryRegistry.remove(task.sessionID)
+     }
+ 
++    // Update continuation marker for CLI run mode
++    if (task.parentSessionID) {
++      this.updateBackgroundTaskMarker(task.parentSessionID)
++    }
++
+     this.markForNotification(task)
+     this.enqueueNotificationForParent(task.parentSessionID, () => this.notifyParentSession(task)).catch(err => {
+       log("[background-agent] Error in notifyParentSession for crashed task:", { taskId: task.id, error: err })
+diff --git a/src/features/run-continuation-state/types.ts b/src/features/run-continuation-state/types.ts
+index 856f3d9e..b851043d 100644
+--- a/src/features/run-continuation-state/types.ts
++++ b/src/features/run-continuation-state/types.ts
+@@ -1,4 +1,4 @@
+-export type ContinuationMarkerSource = "todo" | "stop"
++export type ContinuationMarkerSource = "todo" | "stop" | "background-task"
+ 
+ export type ContinuationMarkerState = "idle" | "active" | "stopped"
+ 
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index 5844bebd..d1ca73a1 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -79,7 +79,7 @@ export async function injectContinuation(args: {
+   }
+ 
+   const hasRunningBgTasks = backgroundManager
+-    ? backgroundManager.getTasksByParentSession(sessionID).some((task: { status: string }) => task.status === "running")
++    ? backgroundManager.getTasksByParentSession(sessionID).some((task: { status: string }) => task.status === "running" || task.status === "pending")
+     : false
+ 
+   if (hasRunningBgTasks) {
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 162b60f6..2c2c68d4 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -71,7 +71,7 @@ export async function handleSessionIdle(args: {
+   }
+ 
+   const hasRunningBgTasks = backgroundManager
+-    ? backgroundManager.getTasksByParentSession(sessionID).some((task: { status: string }) => task.status === "running")
++    ? backgroundManager.getTasksByParentSession(sessionID).some((task: { status: string }) => task.status === "running" || task.status === "pending")
+     : false
+ 
+   if (hasRunningBgTasks) {
+-- 
+2.39.2
+

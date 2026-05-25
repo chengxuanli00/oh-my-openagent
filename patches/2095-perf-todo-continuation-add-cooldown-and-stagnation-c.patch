@@ -1,0 +1,308 @@
+From 10a60854dc75645404b812e55be749f3376649b2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 13 Feb 2026 11:52:31 +0900
+Subject: [PATCH 2095/5749] perf(todo-continuation): add cooldown and
+ stagnation cap to prevent re-injection loops
+
+---
+ .../todo-continuation-enforcer/constants.ts   |   2 +
+ .../continuation-injection.ts                 |  12 ++
+ .../todo-continuation-enforcer/idle-event.ts  |  25 +++
+ .../session-state.ts                          |   1 +
+ .../todo-continuation-enforcer.test.ts        | 145 +++++++++++++++++-
+ src/hooks/todo-continuation-enforcer/types.ts |   4 +
+ 6 files changed, 186 insertions(+), 3 deletions(-)
+
+diff --git a/src/hooks/todo-continuation-enforcer/constants.ts b/src/hooks/todo-continuation-enforcer/constants.ts
+index 03e7d01f..f8b94fde 100644
+--- a/src/hooks/todo-continuation-enforcer/constants.ts
++++ b/src/hooks/todo-continuation-enforcer/constants.ts
+@@ -17,3 +17,5 @@ export const TOAST_DURATION_MS = 900
+ export const COUNTDOWN_GRACE_PERIOD_MS = 500
+ 
+ export const ABORT_WINDOW_MS = 3000
++export const CONTINUATION_COOLDOWN_MS = 30_000
++export const MAX_UNCHANGED_CYCLES = 3
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index 2e891132..2c67fa78 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -114,6 +114,11 @@ export async function injectContinuation(args: {
+ Remaining tasks:
+ ${todoList}`
+ 
++  const injectionState = sessionStateStore.getExistingState(sessionID)
++  if (injectionState) {
++    injectionState.inFlight = true
++  }
++
+   try {
+     log(`[${HOOK_NAME}] Injecting continuation`, {
+       sessionID,
+@@ -133,7 +138,14 @@ ${todoList}`
+     })
+ 
+     log(`[${HOOK_NAME}] Injection successful`, { sessionID })
++    if (injectionState) {
++      injectionState.inFlight = false
++      injectionState.lastInjectedAt = Date.now()
++    }
+   } catch (error) {
+     log(`[${HOOK_NAME}] Injection failed`, { sessionID, error: String(error) })
++    if (injectionState) {
++      injectionState.inFlight = false
++    }
+   }
+ }
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 86d3e504..c5181d48 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -8,8 +8,10 @@ import { log } from "../../shared/logger"
+ 
+ import {
+   ABORT_WINDOW_MS,
++  CONTINUATION_COOLDOWN_MS,
+   DEFAULT_SKIP_AGENTS,
+   HOOK_NAME,
++  MAX_UNCHANGED_CYCLES,
+ } from "./constants"
+ import { isLastAssistantMessageAborted } from "./abort-detection"
+ import { getIncompleteCount } from "./todo"
+@@ -105,6 +107,29 @@ export async function handleSessionIdle(args: {
+     return
+   }
+ 
++  if (state.inFlight) {
++    log(`[${HOOK_NAME}] Skipped: injection in flight`, { sessionID })
++    return
++  }
++
++  if (state.lastInjectedAt && Date.now() - state.lastInjectedAt < CONTINUATION_COOLDOWN_MS) {
++    log(`[${HOOK_NAME}] Skipped: cooldown active`, { sessionID })
++    return
++  }
++
++  const incompleteTodos = todos.filter((todo) => todo.status !== "completed" && todo.status !== "cancelled")
++  const todoHash = incompleteTodos.map((todo) => `${todo.id}:${todo.status}`).join("|")
++  if (state.lastTodoHash === todoHash) {
++    state.unchangedCycles = (state.unchangedCycles ?? 0) + 1
++    if (state.unchangedCycles >= MAX_UNCHANGED_CYCLES) {
++      log(`[${HOOK_NAME}] Skipped: stagnation cap reached`, { sessionID, cycles: state.unchangedCycles })
++      return
++    }
++  } else {
++    state.unchangedCycles = 0
++  }
++  state.lastTodoHash = todoHash
++
+   let resolvedInfo: ResolvedMessageInfo | undefined
+   let hasCompactionMessage = false
+   try {
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.ts b/src/hooks/todo-continuation-enforcer/session-state.ts
+index fc96437a..904e0a8f 100644
+--- a/src/hooks/todo-continuation-enforcer/session-state.ts
++++ b/src/hooks/todo-continuation-enforcer/session-state.ts
+@@ -38,6 +38,7 @@ export function createSessionStateStore(): SessionStateStore {
+       state.countdownInterval = undefined
+     }
+ 
++    state.inFlight = false
+     state.countdownStartedAt = undefined
+   }
+ 
+diff --git a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+index 760165dd..43c681ba 100644
+--- a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
++++ b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+ import type { BackgroundManager } from "../../features/background-agent"
+ import { setMainSession, subagentSessions, _resetForTesting } from "../../features/claude-code-session-state"
+ import { createTodoContinuationEnforcer } from "."
++import { CONTINUATION_COOLDOWN_MS } from "./constants"
+ 
+ type TimerCallback = (...args: any[]) => void
+ 
+@@ -507,6 +508,144 @@ describe("todo-continuation-enforcer", () => {
+     expect(promptCalls).toHaveLength(0)
+   })
+ 
++  test("should not inject again when cooldown is active", async () => {
++    //#given
++    const sessionID = "main-cooldown-active"
++    setupMainSessionWithBoulder(sessionID)
++    const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
++
++    //#when
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(1)
++  })
++
++  test("should inject again when cooldown expires", async () => {
++    //#given
++    const sessionID = "main-cooldown-expired"
++    setupMainSessionWithBoulder(sessionID)
++    const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
++
++    //#when
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceBy(CONTINUATION_COOLDOWN_MS, true)
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(2)
++  })
++
++  test("should stop after stagnation cap and reset when todo hash changes", async () => {
++    //#given
++    const sessionID = "main-stagnation-cap"
++    setupMainSessionWithBoulder(sessionID)
++    let mutableTodoStatus: "pending" | "in_progress" = "pending"
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.todo = async () => ({ data: [
++      { id: "1", content: "Task 1", status: mutableTodoStatus, priority: "high" },
++      { id: "2", content: "Task 2", status: "completed", priority: "medium" },
++    ]})
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    //#when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceBy(CONTINUATION_COOLDOWN_MS, true)
++
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceBy(CONTINUATION_COOLDOWN_MS, true)
++
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceBy(CONTINUATION_COOLDOWN_MS, true)
++
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++
++    mutableTodoStatus = "in_progress"
++    await fakeTimers.advanceBy(CONTINUATION_COOLDOWN_MS, true)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(4)
++  })
++
++  test("should skip idle handling while injection is in flight", async () => {
++    //#given
++    const sessionID = "main-in-flight"
++    setupMainSessionWithBoulder(sessionID)
++    let resolvePrompt: (() => void) | undefined
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.promptAsync = async (opts: any) => {
++      promptCalls.push({
++        sessionID: opts.path.id,
++        agent: opts.body.agent,
++        model: opts.body.model,
++        text: opts.body.parts[0].text,
++      })
++      await new Promise<void>((resolve) => {
++        resolvePrompt = resolve
++      })
++      return {}
++    }
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    //#when
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2100, true)
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(3000, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(1)
++
++    resolvePrompt?.()
++    await Promise.resolve()
++  })
++
++  test("should clear cooldown and stagnation state on session deleted", async () => {
++    //#given
++    const sessionID = "main-delete-state-reset"
++    setupMainSessionWithBoulder(sessionID)
++    const hook = createTodoContinuationEnforcer(createMockPluginInput(), {})
++
++    //#when
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++    await hook.handler({
++      event: { type: "session.deleted", properties: { info: { id: sessionID } } },
++    })
++    await hook.handler({
++      event: { type: "session.idle", properties: { sessionID } },
++    })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(2)
++  })
++
+   test("should accept skipAgents option without error", async () => {
+     // given - session with skipAgents configured for Prometheus
+     const sessionID = "main-prometheus-option"
+@@ -556,16 +695,16 @@ describe("todo-continuation-enforcer", () => {
+     await hook.handler({
+       event: { type: "session.idle", properties: { sessionID } },
+     })
+-    await fakeTimers.advanceBy(3500)
++    await fakeTimers.advanceBy(3500, true)
+ 
+     // then - first injection happened
+     expect(promptCalls.length).toBe(1)
+ 
+-    // when - immediately trigger second idle (no 10s wait needed)
++    await fakeTimers.advanceBy(CONTINUATION_COOLDOWN_MS, true)
+     await hook.handler({
+       event: { type: "session.idle", properties: { sessionID } },
+     })
+-    await fakeTimers.advanceBy(3500)
++    await fakeTimers.advanceBy(3500, true)
+ 
+     // then - second injection also happened (no throttle blocking)
+     expect(promptCalls.length).toBe(2)
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index 8ef8745f..c3384aa0 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -27,6 +27,10 @@ export interface SessionState {
+   isRecovering?: boolean
+   countdownStartedAt?: number
+   abortDetectedAt?: number
++  lastInjectedAt?: number
++  inFlight?: boolean
++  lastTodoHash?: string
++  unchangedCycles?: number
+ }
+ 
+ export interface MessageInfo {
+-- 
+2.39.2
+

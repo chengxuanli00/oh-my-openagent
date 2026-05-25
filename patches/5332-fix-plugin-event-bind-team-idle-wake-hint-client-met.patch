@@ -1,0 +1,203 @@
+From a43215f24e03722b7cd6ab4815e9d45d0417ab4d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 02:06:14 +0900
+Subject: [PATCH 5332/5749] fix(plugin/event): bind team-idle-wake-hint client
+ methods to SDK Session
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The team-mode wiring at `createEventHandler` extracted
+`pluginContext.client.session.promptAsync` and `.status` into a fresh
+wrapper object. The methods were copied by reference, so the prompt-async
+gate's `session.promptAsync.bind(session)` was binding to that plain
+wrapper rather than the underlying SDK `Session` instance. The opencode
+SDK's `promptAsync` reads `this._client.post(...)`, so production calls
+threw `TypeError: undefined is not an object (evaluating 'this._client')`
+on the very first dispatch — fingerprinted in /tmp/oh-my-opencode.log as
+688 `background-agent-parent-wake`, 47 `model-suggestion-retry`, and 4
+`team-idle-wake-hint` failures over the past three days.
+
+Move the wrapper construction into `buildTeamIdleWakeHintClient`, which
+preserves the narrow factory contract while binding both methods back to
+the SDK `Session` so `_client` survives the dispatch. Cover the contract
+with four BDD-style tests including the historical destructure-only
+failure mode so any future regression is caught at unit-test time.
+---
+ .../build-team-idle-wake-hint-client.test.ts  | 100 ++++++++++++++++++
+ .../build-team-idle-wake-hint-client.ts       |  25 +++++
+ src/plugin/event.ts                           |  10 +-
+ 3 files changed, 128 insertions(+), 7 deletions(-)
+ create mode 100644 src/plugin/build-team-idle-wake-hint-client.test.ts
+ create mode 100644 src/plugin/build-team-idle-wake-hint-client.ts
+
+diff --git a/src/plugin/build-team-idle-wake-hint-client.test.ts b/src/plugin/build-team-idle-wake-hint-client.test.ts
+new file mode 100644
+index 00000000..f845e35a
+--- /dev/null
++++ b/src/plugin/build-team-idle-wake-hint-client.test.ts
+@@ -0,0 +1,100 @@
++/// <reference path="../../bun-test.d.ts" />
++import { describe, test, expect } from "bun:test"
++
++import { buildTeamIdleWakeHintClient } from "./build-team-idle-wake-hint-client"
++
++type FakeSdkHttp = {
++  post: (args: { url: string; body?: unknown }) => Promise<{ url: string; body?: unknown }>
++}
++
++type SdkLikeSession = {
++  _client: FakeSdkHttp
++  promptAsync: (options: { path: { id: string }; body?: unknown }) => Promise<{ url: string; body?: unknown }>
++  status: () => Promise<{ url: string; _client: FakeSdkHttp }>
++}
++
++function createSdkLikeSession(http: FakeSdkHttp): SdkLikeSession {
++  return {
++    _client: http,
++    async promptAsync(options) {
++      return this._client.post({ url: `/session/${options.path.id}/prompt_async`, body: options.body })
++    },
++    async status() {
++      return { url: "/session", _client: this._client }
++    },
++  }
++}
++
++describe("buildTeamIdleWakeHintClient", () => {
++  test("#given a real-SDK-like session whose promptAsync reads this._client #when the wrapper dispatches the bound method #then the SDK receives the call with _client preserved", async () => {
++    // given
++    const calls: Array<{ url: string; body?: unknown }> = []
++    const http: FakeSdkHttp = {
++      post: async (args) => {
++        calls.push(args)
++        return args
++      },
++    }
++    const session = createSdkLikeSession(http)
++    const sdkClient = { session } as unknown as Parameters<typeof buildTeamIdleWakeHintClient>[0]
++
++    // when
++    const wrapped = buildTeamIdleWakeHintClient(sdkClient)
++    await wrapped.session.promptAsync?.({ path: { id: "ses_regression" }, body: { hello: "world" } } as never)
++
++    // then
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.url).toBe("/session/ses_regression/prompt_async")
++    expect(calls[0]?.body).toEqual({ hello: "world" })
++  })
++
++  test("#given a real-SDK-like session whose status reads this._client #when the wrapper dispatches the bound status #then _client is preserved", async () => {
++    // given
++    const http: FakeSdkHttp = {
++      post: async (args) => args,
++    }
++    const session = createSdkLikeSession(http)
++    const sdkClient = { session } as unknown as Parameters<typeof buildTeamIdleWakeHintClient>[0]
++
++    // when
++    const wrapped = buildTeamIdleWakeHintClient(sdkClient)
++    const result = (await wrapped.session.status?.()) as { _client?: FakeSdkHttp } | undefined
++
++    // then
++    expect(result?._client).toBe(http)
++  })
++
++  test("#given a session without optional methods #when the wrapper is built #then it gracefully exposes undefined entries", async () => {
++    // given
++    const partial = { session: {} } as unknown as Parameters<typeof buildTeamIdleWakeHintClient>[0]
++
++    // when
++    const wrapped = buildTeamIdleWakeHintClient(partial)
++
++    // then
++    expect(wrapped.session.promptAsync).toBeUndefined()
++    expect(wrapped.session.status).toBeUndefined()
++  })
++
++  test("#given a destructure-without-bind pattern #when promptAsync is invoked via a plain wrapper #then this._client is undefined (historical bug)", async () => {
++    // given
++    const http: FakeSdkHttp = { post: async (args) => args }
++    const session = createSdkLikeSession(http)
++    const brokenWrapper = {
++      session: {
++        promptAsync: session.promptAsync,
++      },
++    }
++
++    // when
++    let caughtMessage = ""
++    try {
++      await brokenWrapper.session.promptAsync({ path: { id: "ses_x" } } as never)
++    } catch (error) {
++      caughtMessage = error instanceof Error ? error.message : String(error)
++    }
++
++    // then
++    expect(caughtMessage).toContain("_client")
++  })
++})
+diff --git a/src/plugin/build-team-idle-wake-hint-client.ts b/src/plugin/build-team-idle-wake-hint-client.ts
+new file mode 100644
+index 00000000..53250e90
+--- /dev/null
++++ b/src/plugin/build-team-idle-wake-hint-client.ts
+@@ -0,0 +1,25 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++
++type SdkSession = PluginInput["client"]["session"]
++type SdkPromptAsync = SdkSession["promptAsync"]
++type SdkStatus = SdkSession["status"]
++
++export type TeamIdleWakeHintNarrowClient = {
++  session: {
++    promptAsync?: SdkPromptAsync
++    status?: SdkStatus
++  }
++}
++
++export function buildTeamIdleWakeHintClient(client: PluginInput["client"]): TeamIdleWakeHintNarrowClient {
++  const session = client.session
++  const promptAsync = typeof session.promptAsync === "function"
++    ? session.promptAsync.bind(session) as SdkPromptAsync
++    : undefined
++  const status = typeof session.status === "function"
++    ? session.status.bind(session) as SdkStatus
++    : undefined
++  return {
++    session: { promptAsync, status },
++  }
++}
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 62a0f877..89f6fb66 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -39,6 +39,7 @@ import { deleteSessionTools } from "../shared/session-tools-store";
+ import { lspManager } from "../tools";
+ import { dispatchOpenClawEvent } from "../openclaw/runtime-dispatch";
+ import { createTeamIdleWakeHint } from "../hooks/team-session-events/team-idle-wake-hint";
++import { buildTeamIdleWakeHintClient } from "./build-team-idle-wake-hint-client";
+ import { createTeamLeadOrphanHandler } from "../hooks/team-session-events/team-lead-orphan-handler";
+ import { createTeamMemberErrorHandler } from "../hooks/team-session-events/team-member-error-handler";
+ import { createTeamMemberStatusHandler } from "../hooks/team-session-events/team-member-status-handler";
+@@ -343,15 +344,10 @@ export function createEventHandler(args: {
+   const teamMemberStatusHandler = teamModeConfig
+     ? createTeamMemberStatusHandler(teamModeConfig)
+     : undefined;
+-  const teamIdleWakeHint = teamModeConfig && pluginContext.client.session?.promptAsync
++  const teamIdleWakeHint = teamModeConfig && typeof pluginContext.client.session?.promptAsync === "function"
+     ? createTeamIdleWakeHint({
+         directory: pluginContext.directory,
+-        client: {
+-          session: {
+-            promptAsync: pluginContext.client.session.promptAsync,
+-            status: pluginContext.client.session.status,
+-          },
+-        },
++        client: buildTeamIdleWakeHintClient(pluginContext.client),
+       }, teamModeConfig)
+     : undefined;
+   const TMUX_ACTIVITY_EVENT_TYPES = new Set([
+-- 
+2.39.2
+

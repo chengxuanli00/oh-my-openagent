@@ -1,0 +1,478 @@
+From dff3a551d82d4fc1b871e32340261e6a132b7cce Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 15 Feb 2026 15:53:18 +0900
+Subject: [PATCH 2208/5749] feat: wire session-recovery callers to async
+ SDK/HTTP variants on SQLite
+
+- recover-thinking-disabled-violation: isSqliteBackend() branch using
+  stripThinkingPartsAsync() with SDK message enumeration
+- recover-thinking-block-order: isSqliteBackend() branch using
+  prependThinkingPartAsync() with SDK orphan thinking detection
+- recover-empty-content-message: isSqliteBackend() branch delegating to
+  extracted recover-empty-content-message-sdk.ts (200 LOC limit)
+- storage.ts barrel: add async variant exports for all SDK functions
+---
+ .../recover-empty-content-message-sdk.ts      | 195 ++++++++++++++++++
+ .../recover-empty-content-message.ts          |  15 +-
+ .../recover-thinking-block-order.ts           |  92 ++++++++-
+ .../recover-thinking-disabled-violation.ts    |  42 +++-
+ src/hooks/session-recovery/storage.ts         |   6 +
+ 5 files changed, 347 insertions(+), 3 deletions(-)
+ create mode 100644 src/hooks/session-recovery/recover-empty-content-message-sdk.ts
+
+diff --git a/src/hooks/session-recovery/recover-empty-content-message-sdk.ts b/src/hooks/session-recovery/recover-empty-content-message-sdk.ts
+new file mode 100644
+index 00000000..e40b1b8f
+--- /dev/null
++++ b/src/hooks/session-recovery/recover-empty-content-message-sdk.ts
+@@ -0,0 +1,195 @@
++import type { createOpencodeClient } from "@opencode-ai/sdk"
++import type { MessageData } from "./types"
++import { extractMessageIndex } from "./detect-error-type"
++import { META_TYPES, THINKING_TYPES } from "./constants"
++
++type Client = ReturnType<typeof createOpencodeClient>
++
++type ReplaceEmptyTextPartsAsync = (
++  client: Client,
++  sessionID: string,
++  messageID: string,
++  replacementText: string
++) => Promise<boolean>
++
++type InjectTextPartAsync = (
++  client: Client,
++  sessionID: string,
++  messageID: string,
++  text: string
++) => Promise<boolean>
++
++type FindMessagesWithEmptyTextPartsFromSDK = (
++  client: Client,
++  sessionID: string
++) => Promise<string[]>
++
++export async function recoverEmptyContentMessageFromSDK(
++  client: Client,
++  sessionID: string,
++  failedAssistantMsg: MessageData,
++  error: unknown,
++  dependencies: {
++    placeholderText: string
++    replaceEmptyTextPartsAsync: ReplaceEmptyTextPartsAsync
++    injectTextPartAsync: InjectTextPartAsync
++    findMessagesWithEmptyTextPartsFromSDK: FindMessagesWithEmptyTextPartsFromSDK
++  }
++): Promise<boolean> {
++  const targetIndex = extractMessageIndex(error)
++  const failedID = failedAssistantMsg.info?.id
++  let anySuccess = false
++
++  const messagesWithEmptyText = await dependencies.findMessagesWithEmptyTextPartsFromSDK(client, sessionID)
++  for (const messageID of messagesWithEmptyText) {
++    if (
++      await dependencies.replaceEmptyTextPartsAsync(
++        client,
++        sessionID,
++        messageID,
++        dependencies.placeholderText
++      )
++    ) {
++      anySuccess = true
++    }
++  }
++
++  const messages = await readMessagesFromSDK(client, sessionID)
++
++  const thinkingOnlyIDs = findMessagesWithThinkingOnlyFromSDK(messages)
++  for (const messageID of thinkingOnlyIDs) {
++    if (await dependencies.injectTextPartAsync(client, sessionID, messageID, dependencies.placeholderText)) {
++      anySuccess = true
++    }
++  }
++
++  if (targetIndex !== null) {
++    const targetMessageID = findEmptyMessageByIndexFromSDK(messages, targetIndex)
++    if (targetMessageID) {
++      if (
++        await dependencies.replaceEmptyTextPartsAsync(
++          client,
++          sessionID,
++          targetMessageID,
++          dependencies.placeholderText
++        )
++      ) {
++        return true
++      }
++      if (await dependencies.injectTextPartAsync(client, sessionID, targetMessageID, dependencies.placeholderText)) {
++        return true
++      }
++    }
++  }
++
++  if (failedID) {
++    if (await dependencies.replaceEmptyTextPartsAsync(client, sessionID, failedID, dependencies.placeholderText)) {
++      return true
++    }
++    if (await dependencies.injectTextPartAsync(client, sessionID, failedID, dependencies.placeholderText)) {
++      return true
++    }
++  }
++
++  const emptyMessageIDs = findEmptyMessagesFromSDK(messages)
++  for (const messageID of emptyMessageIDs) {
++    if (
++      await dependencies.replaceEmptyTextPartsAsync(
++        client,
++        sessionID,
++        messageID,
++        dependencies.placeholderText
++      )
++    ) {
++      anySuccess = true
++    }
++    if (await dependencies.injectTextPartAsync(client, sessionID, messageID, dependencies.placeholderText)) {
++      anySuccess = true
++    }
++  }
++
++  return anySuccess
++}
++
++type SdkPart = NonNullable<MessageData["parts"]>[number]
++
++function sdkPartHasContent(part: SdkPart): boolean {
++  if (THINKING_TYPES.has(part.type)) return false
++  if (META_TYPES.has(part.type)) return false
++
++  if (part.type === "text") {
++    return !!part.text?.trim()
++  }
++
++  if (part.type === "tool" || part.type === "tool_use" || part.type === "tool_result") {
++    return true
++  }
++
++  return false
++}
++
++function sdkMessageHasContent(message: MessageData): boolean {
++  return (message.parts ?? []).some(sdkPartHasContent)
++}
++
++async function readMessagesFromSDK(client: Client, sessionID: string): Promise<MessageData[]> {
++  const response = await client.session.messages({ path: { id: sessionID } })
++  return (response.data ?? []) as MessageData[]
++}
++
++function findMessagesWithThinkingOnlyFromSDK(messages: MessageData[]): string[] {
++  const result: string[] = []
++
++  for (const msg of messages) {
++    if (msg.info?.role !== "assistant") continue
++    if (!msg.info?.id) continue
++    if (!msg.parts || msg.parts.length === 0) continue
++
++    const hasThinking = msg.parts.some((part) => THINKING_TYPES.has(part.type))
++    const hasContent = msg.parts.some(sdkPartHasContent)
++
++    if (hasThinking && !hasContent) {
++      result.push(msg.info.id)
++    }
++  }
++
++  return result
++}
++
++function findEmptyMessagesFromSDK(messages: MessageData[]): string[] {
++  const emptyIds: string[] = []
++
++  for (const msg of messages) {
++    if (!msg.info?.id) continue
++    if (!sdkMessageHasContent(msg)) {
++      emptyIds.push(msg.info.id)
++    }
++  }
++
++  return emptyIds
++}
++
++function findEmptyMessageByIndexFromSDK(messages: MessageData[], targetIndex: number): string | null {
++  const indicesToTry = [
++    targetIndex,
++    targetIndex - 1,
++    targetIndex + 1,
++    targetIndex - 2,
++    targetIndex + 2,
++    targetIndex - 3,
++    targetIndex - 4,
++    targetIndex - 5,
++  ]
++
++  for (const index of indicesToTry) {
++    if (index < 0 || index >= messages.length) continue
++    const targetMessage = messages[index]
++    if (!targetMessage.info?.id) continue
++
++    if (!sdkMessageHasContent(targetMessage)) {
++      return targetMessage.info.id
++    }
++  }
++
++  return null
++}
+diff --git a/src/hooks/session-recovery/recover-empty-content-message.ts b/src/hooks/session-recovery/recover-empty-content-message.ts
+index f095eb2e..7b73f34f 100644
+--- a/src/hooks/session-recovery/recover-empty-content-message.ts
++++ b/src/hooks/session-recovery/recover-empty-content-message.ts
+@@ -1,6 +1,7 @@
+ import type { createOpencodeClient } from "@opencode-ai/sdk"
+ import type { MessageData } from "./types"
+ import { extractMessageIndex } from "./detect-error-type"
++import { recoverEmptyContentMessageFromSDK } from "./recover-empty-content-message-sdk"
+ import {
+   findEmptyMessageByIndex,
+   findEmptyMessages,
+@@ -9,18 +10,30 @@ import {
+   injectTextPart,
+   replaceEmptyTextParts,
+ } from "./storage"
++import { isSqliteBackend } from "../../shared/opencode-storage-detection"
++import { replaceEmptyTextPartsAsync, findMessagesWithEmptyTextPartsFromSDK } from "./storage/empty-text"
++import { injectTextPartAsync } from "./storage/text-part-injector"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+ 
+ const PLACEHOLDER_TEXT = "[user interrupted]"
+ 
+ export async function recoverEmptyContentMessage(
+-  _client: Client,
++  client: Client,
+   sessionID: string,
+   failedAssistantMsg: MessageData,
+   _directory: string,
+   error: unknown
+ ): Promise<boolean> {
++  if (isSqliteBackend()) {
++    return recoverEmptyContentMessageFromSDK(client, sessionID, failedAssistantMsg, error, {
++      placeholderText: PLACEHOLDER_TEXT,
++      replaceEmptyTextPartsAsync,
++      injectTextPartAsync,
++      findMessagesWithEmptyTextPartsFromSDK,
++    })
++  }
++
+   const targetIndex = extractMessageIndex(error)
+   const failedID = failedAssistantMsg.info?.id
+   let anySuccess = false
+diff --git a/src/hooks/session-recovery/recover-thinking-block-order.ts b/src/hooks/session-recovery/recover-thinking-block-order.ts
+index f26bf4f1..b07d1e9a 100644
+--- a/src/hooks/session-recovery/recover-thinking-block-order.ts
++++ b/src/hooks/session-recovery/recover-thinking-block-order.ts
+@@ -2,16 +2,23 @@ import type { createOpencodeClient } from "@opencode-ai/sdk"
+ import type { MessageData } from "./types"
+ import { extractMessageIndex } from "./detect-error-type"
+ import { findMessageByIndexNeedingThinking, findMessagesWithOrphanThinking, prependThinkingPart } from "./storage"
++import { isSqliteBackend } from "../../shared/opencode-storage-detection"
++import { prependThinkingPartAsync } from "./storage/thinking-prepend"
++import { THINKING_TYPES } from "./constants"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+ 
+ export async function recoverThinkingBlockOrder(
+-  _client: Client,
++  client: Client,
+   sessionID: string,
+   _failedAssistantMsg: MessageData,
+   _directory: string,
+   error: unknown
+ ): Promise<boolean> {
++  if (isSqliteBackend()) {
++    return recoverThinkingBlockOrderFromSDK(client, sessionID, error)
++  }
++
+   const targetIndex = extractMessageIndex(error)
+   if (targetIndex !== null) {
+     const targetMessageID = findMessageByIndexNeedingThinking(sessionID, targetIndex)
+@@ -34,3 +41,86 @@ export async function recoverThinkingBlockOrder(
+ 
+   return anySuccess
+ }
++
++async function recoverThinkingBlockOrderFromSDK(
++  client: Client,
++  sessionID: string,
++  error: unknown
++): Promise<boolean> {
++  const targetIndex = extractMessageIndex(error)
++  if (targetIndex !== null) {
++    const targetMessageID = await findMessageByIndexNeedingThinkingFromSDK(client, sessionID, targetIndex)
++    if (targetMessageID) {
++      return prependThinkingPartAsync(client, sessionID, targetMessageID)
++    }
++  }
++
++  const orphanMessages = await findMessagesWithOrphanThinkingFromSDK(client, sessionID)
++  if (orphanMessages.length === 0) {
++    return false
++  }
++
++  let anySuccess = false
++  for (const messageID of orphanMessages) {
++    if (await prependThinkingPartAsync(client, sessionID, messageID)) {
++      anySuccess = true
++    }
++  }
++
++  return anySuccess
++}
++
++async function findMessagesWithOrphanThinkingFromSDK(
++  client: Client,
++  sessionID: string
++): Promise<string[]> {
++  const response = await client.session.messages({ path: { id: sessionID } })
++  const messages = (response.data ?? []) as MessageData[]
++
++  const result: string[] = []
++  for (const msg of messages) {
++    if (msg.info?.role !== "assistant") continue
++    if (!msg.info?.id) continue
++    if (!msg.parts || msg.parts.length === 0) continue
++
++    const partsWithIds = msg.parts.filter(
++      (part): part is { id: string; type: string } => typeof part.id === "string"
++    )
++    if (partsWithIds.length === 0) continue
++
++    const sortedParts = [...partsWithIds].sort((a, b) => a.id.localeCompare(b.id))
++    const firstPart = sortedParts[0]
++    if (!THINKING_TYPES.has(firstPart.type)) {
++      result.push(msg.info.id)
++    }
++  }
++
++  return result
++}
++
++async function findMessageByIndexNeedingThinkingFromSDK(
++  client: Client,
++  sessionID: string,
++  targetIndex: number
++): Promise<string | null> {
++  const response = await client.session.messages({ path: { id: sessionID } })
++  const messages = (response.data ?? []) as MessageData[]
++
++  if (targetIndex < 0 || targetIndex >= messages.length) return null
++
++  const targetMessage = messages[targetIndex]
++  if (targetMessage.info?.role !== "assistant") return null
++  if (!targetMessage.info?.id) return null
++  if (!targetMessage.parts || targetMessage.parts.length === 0) return null
++
++  const partsWithIds = targetMessage.parts.filter(
++    (part): part is { id: string; type: string } => typeof part.id === "string"
++  )
++  if (partsWithIds.length === 0) return null
++
++  const sortedParts = [...partsWithIds].sort((a, b) => a.id.localeCompare(b.id))
++  const firstPart = sortedParts[0]
++  const firstIsThinking = THINKING_TYPES.has(firstPart.type)
++
++  return firstIsThinking ? null : targetMessage.info.id
++}
+diff --git a/src/hooks/session-recovery/recover-thinking-disabled-violation.ts b/src/hooks/session-recovery/recover-thinking-disabled-violation.ts
+index 6eeded93..44e7a3f5 100644
+--- a/src/hooks/session-recovery/recover-thinking-disabled-violation.ts
++++ b/src/hooks/session-recovery/recover-thinking-disabled-violation.ts
+@@ -1,14 +1,21 @@
+ import type { createOpencodeClient } from "@opencode-ai/sdk"
+ import type { MessageData } from "./types"
+ import { findMessagesWithThinkingBlocks, stripThinkingParts } from "./storage"
++import { isSqliteBackend } from "../../shared/opencode-storage-detection"
++import { stripThinkingPartsAsync } from "./storage/thinking-strip"
++import { THINKING_TYPES } from "./constants"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+ 
+ export async function recoverThinkingDisabledViolation(
+-  _client: Client,
++  client: Client,
+   sessionID: string,
+   _failedAssistantMsg: MessageData
+ ): Promise<boolean> {
++  if (isSqliteBackend()) {
++    return recoverThinkingDisabledViolationFromSDK(client, sessionID)
++  }
++
+   const messagesWithThinking = findMessagesWithThinkingBlocks(sessionID)
+   if (messagesWithThinking.length === 0) {
+     return false
+@@ -23,3 +30,36 @@ export async function recoverThinkingDisabledViolation(
+ 
+   return anySuccess
+ }
++
++async function recoverThinkingDisabledViolationFromSDK(
++  client: Client,
++  sessionID: string
++): Promise<boolean> {
++  const response = await client.session.messages({ path: { id: sessionID } })
++  const messages = (response.data ?? []) as MessageData[]
++
++  const messageIDsWithThinking: string[] = []
++  for (const msg of messages) {
++    if (msg.info?.role !== "assistant") continue
++    if (!msg.info?.id) continue
++    if (!msg.parts) continue
++
++    const hasThinking = msg.parts.some((part) => THINKING_TYPES.has(part.type))
++    if (hasThinking) {
++      messageIDsWithThinking.push(msg.info.id)
++    }
++  }
++
++  if (messageIDsWithThinking.length === 0) {
++    return false
++  }
++
++  let anySuccess = false
++  for (const messageID of messageIDsWithThinking) {
++    if (await stripThinkingPartsAsync(client, sessionID, messageID)) {
++      anySuccess = true
++    }
++  }
++
++  return anySuccess
++}
+diff --git a/src/hooks/session-recovery/storage.ts b/src/hooks/session-recovery/storage.ts
+index f83dadd4..741569bb 100644
+--- a/src/hooks/session-recovery/storage.ts
++++ b/src/hooks/session-recovery/storage.ts
+@@ -6,6 +6,7 @@ export { readParts } from "./storage/parts-reader"
+ export { readPartsFromSDK } from "./storage/parts-reader"
+ export { hasContent, messageHasContent } from "./storage/part-content"
+ export { injectTextPart } from "./storage/text-part-injector"
++export { injectTextPartAsync } from "./storage/text-part-injector"
+ 
+ export {
+   findEmptyMessages,
+@@ -13,6 +14,7 @@ export {
+   findFirstEmptyMessage,
+ } from "./storage/empty-messages"
+ export { findMessagesWithEmptyTextParts } from "./storage/empty-text"
++export { findMessagesWithEmptyTextPartsFromSDK } from "./storage/empty-text"
+ 
+ export {
+   findMessagesWithThinkingBlocks,
+@@ -26,3 +28,7 @@ export {
+ export { prependThinkingPart } from "./storage/thinking-prepend"
+ export { stripThinkingParts } from "./storage/thinking-strip"
+ export { replaceEmptyTextParts } from "./storage/empty-text"
++
++export { prependThinkingPartAsync } from "./storage/thinking-prepend"
++export { stripThinkingPartsAsync } from "./storage/thinking-strip"
++export { replaceEmptyTextPartsAsync } from "./storage/empty-text"
+-- 
+2.39.2
+

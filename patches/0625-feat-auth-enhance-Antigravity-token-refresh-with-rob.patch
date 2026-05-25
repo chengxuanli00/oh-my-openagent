@@ -1,0 +1,414 @@
+From 87e229fb626beb14946985a4dd32a23419c1478c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 28 Dec 2025 13:21:07 +0900
+Subject: [PATCH 0625/5749] feat(auth): enhance Antigravity token refresh with
+ robust error handling and retry logic
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add AntigravityTokenRefreshError custom error class with code, description, and status fields
+- Implement parseOAuthErrorPayload() for parsing Google's various OAuth error response formats
+- Add retry logic with exponential backoff (3 retries, 1s→2s→4s delay) for transient failures
+- Add special handling for invalid_grant error - immediately throws without retry and clears caches
+- Add invalidateProjectContextByRefreshToken() for selective cache invalidation
+- Update fetch.ts error handling to work with new error class and cache invalidation
+
+🤖 Generated with assistance of OhMyOpenCode (https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/auth/antigravity/fetch.ts              |  44 ++++-
+ src/auth/antigravity/project.ts            |   5 +
+ src/auth/antigravity/token.ts              | 194 +++++++++++++++------
+ src/auth/antigravity/types.ts              |  17 ++
+ src/hooks/anthropic-auto-compact/parser.ts |   8 +-
+ 5 files changed, 207 insertions(+), 61 deletions(-)
+
+diff --git a/src/auth/antigravity/fetch.ts b/src/auth/antigravity/fetch.ts
+index 4822f072..b003b5b3 100644
+--- a/src/auth/antigravity/fetch.ts
++++ b/src/auth/antigravity/fetch.ts
+@@ -17,16 +17,15 @@
+  * Debug logging available via ANTIGRAVITY_DEBUG=1 environment variable.
+  */
+ 
+-import { ANTIGRAVITY_ENDPOINT_FALLBACKS, ANTIGRAVITY_DEFAULT_PROJECT_ID } from "./constants"
+-import { fetchProjectContext, clearProjectContextCache } from "./project"
+-import { isTokenExpired, refreshAccessToken, parseStoredToken, formatTokenForStorage } from "./token"
++import { ANTIGRAVITY_ENDPOINT_FALLBACKS } from "./constants"
++import { fetchProjectContext, clearProjectContextCache, invalidateProjectContextByRefreshToken } from "./project"
++import { isTokenExpired, refreshAccessToken, parseStoredToken, formatTokenForStorage, AntigravityTokenRefreshError } from "./token"
+ import { transformRequest } from "./request"
+ import { convertRequestBody, hasOpenAIMessages } from "./message-converter"
+ import {
+   transformResponse,
+   transformStreamingResponse,
+   isStreamingResponse,
+-  extractSignatureFromSsePayload,
+ } from "./response"
+ import { normalizeToolsForGemini, type OpenAITool } from "./tools"
+ import { extractThinkingBlocks, shouldIncludeThinking, transformResponseThinking } from "./thinking"
+@@ -391,7 +390,6 @@ export function createAntigravityFetch(
+       try {
+         const newTokens = await refreshAccessToken(refreshParts.refreshToken, clientId, clientSecret)
+ 
+-        // Update cached tokens
+         cachedTokens = {
+           type: "antigravity",
+           access_token: newTokens.access_token,
+@@ -400,10 +398,8 @@ export function createAntigravityFetch(
+           timestamp: Date.now(),
+         }
+ 
+-        // Clear project context cache on token refresh
+         clearProjectContextCache()
+ 
+-        // Format and save new tokens
+         const formattedRefresh = formatTokenForStorage(
+           newTokens.refresh_token,
+           refreshParts.projectId || "",
+@@ -418,6 +414,16 @@ export function createAntigravityFetch(
+ 
+         debugLog("Token refreshed successfully")
+       } catch (error) {
++        if (error instanceof AntigravityTokenRefreshError) {
++          if (error.isInvalidGrant) {
++            debugLog(`[REFRESH] Token revoked (invalid_grant), clearing caches`)
++            invalidateProjectContextByRefreshToken(refreshParts.refreshToken)
++            clearProjectContextCache()
++          }
++          throw new Error(
++            `Antigravity: Token refresh failed: ${error.description || error.message}${error.code ? ` (${error.code})` : ""}`
++          )
++        }
+         throw new Error(
+           `Antigravity: Token refresh failed: ${error instanceof Error ? error.message : "Unknown error"}`
+         )
+@@ -535,11 +541,33 @@ export function createAntigravityFetch(
+             debugLog("[401] Token refreshed, retrying request...")
+             return executeWithEndpoints()
+           } catch (refreshError) {
++            if (refreshError instanceof AntigravityTokenRefreshError) {
++              if (refreshError.isInvalidGrant) {
++                debugLog(`[401] Token revoked (invalid_grant), clearing caches`)
++                invalidateProjectContextByRefreshToken(refreshParts.refreshToken)
++                clearProjectContextCache()
++              }
++              debugLog(`[401] Token refresh failed: ${refreshError.description || refreshError.message}`)
++              return new Response(
++                JSON.stringify({
++                  error: {
++                    message: refreshError.description || refreshError.message,
++                    type: refreshError.isInvalidGrant ? "token_revoked" : "unauthorized",
++                    code: refreshError.code || "token_refresh_failed",
++                  },
++                }),
++                {
++                  status: 401,
++                  statusText: "Unauthorized",
++                  headers: { "Content-Type": "application/json" },
++                }
++              )
++            }
+             debugLog(`[401] Token refresh failed: ${refreshError instanceof Error ? refreshError.message : "Unknown error"}`)
+             return new Response(
+               JSON.stringify({
+                 error: {
+-                  message: `Token refresh failed: ${refreshError instanceof Error ? refreshError.message : "Unknown error"}`,
++                  message: refreshError instanceof Error ? refreshError.message : "Unknown error",
+                   type: "unauthorized",
+                   code: "token_refresh_failed",
+                 },
+diff --git a/src/auth/antigravity/project.ts b/src/auth/antigravity/project.ts
+index 150a02ca..1490a667 100644
+--- a/src/auth/antigravity/project.ts
++++ b/src/auth/antigravity/project.ts
+@@ -267,3 +267,8 @@ export function clearProjectContextCache(accessToken?: string): void {
+     projectContextCache.clear()
+   }
+ }
++
++export function invalidateProjectContextByRefreshToken(_refreshToken: string): void {
++  projectContextCache.clear()
++  debugLog(`[invalidateProjectContextByRefreshToken] Cleared all project context cache due to refresh token invalidation`)
++}
+diff --git a/src/auth/antigravity/token.ts b/src/auth/antigravity/token.ts
+index 8a4f8847..f34ed007 100644
+--- a/src/auth/antigravity/token.ts
++++ b/src/auth/antigravity/token.ts
+@@ -1,8 +1,3 @@
+-/**
+- * Antigravity token management utilities.
+- * Handles token expiration checking, refresh, and storage format parsing.
+- */
+-
+ import {
+   ANTIGRAVITY_CLIENT_ID,
+   ANTIGRAVITY_CLIENT_SECRET,
+@@ -13,33 +8,86 @@ import type {
+   AntigravityRefreshParts,
+   AntigravityTokenExchangeResult,
+   AntigravityTokens,
++  OAuthErrorPayload,
++  ParsedOAuthError,
+ } from "./types"
+ 
+-/**
+- * Check if the access token is expired.
+- * Includes a 60-second safety buffer to refresh before actual expiration.
+- *
+- * @param tokens - The Antigravity tokens to check
+- * @returns true if the token is expired or will expire within the buffer period
+- */
++export class AntigravityTokenRefreshError extends Error {
++  code?: string
++  description?: string
++  status: number
++  statusText: string
++  responseBody?: string
++
++  constructor(options: {
++    message: string
++    code?: string
++    description?: string
++    status: number
++    statusText: string
++    responseBody?: string
++  }) {
++    super(options.message)
++    this.name = "AntigravityTokenRefreshError"
++    this.code = options.code
++    this.description = options.description
++    this.status = options.status
++    this.statusText = options.statusText
++    this.responseBody = options.responseBody
++  }
++
++  get isInvalidGrant(): boolean {
++    return this.code === "invalid_grant"
++  }
++
++  get isNetworkError(): boolean {
++    return this.status === 0
++  }
++}
++
++function parseOAuthErrorPayload(text: string | undefined): ParsedOAuthError {
++  if (!text) {
++    return {}
++  }
++
++  try {
++    const payload = JSON.parse(text) as OAuthErrorPayload
++    let code: string | undefined
++
++    if (typeof payload.error === "string") {
++      code = payload.error
++    } else if (payload.error && typeof payload.error === "object") {
++      code = payload.error.status ?? payload.error.code
++    }
++
++    return {
++      code,
++      description: payload.error_description,
++    }
++  } catch {
++    return { description: text }
++  }
++}
++
+ export function isTokenExpired(tokens: AntigravityTokens): boolean {
+-  // Calculate when the token expires (timestamp + expires_in in ms)
+-  // timestamp is in milliseconds, expires_in is in seconds
+   const expirationTime = tokens.timestamp + tokens.expires_in * 1000
+-
+-  // Check if current time is past (expiration - buffer)
+   return Date.now() >= expirationTime - ANTIGRAVITY_TOKEN_REFRESH_BUFFER_MS
+ }
+ 
+-/**
+- * Refresh an access token using a refresh token.
+- * Exchanges the refresh token for a new access token via Google's OAuth endpoint.
+- *
+- * @param refreshToken - The refresh token to use
+- * @param clientId - Optional custom client ID (defaults to ANTIGRAVITY_CLIENT_ID)
+- * @param clientSecret - Optional custom client secret (defaults to ANTIGRAVITY_CLIENT_SECRET)
+- * @returns Token exchange result with new access token, or throws on error
+- */
++const MAX_REFRESH_RETRIES = 3
++const INITIAL_RETRY_DELAY_MS = 1000
++
++function calculateRetryDelay(attempt: number): number {
++  return Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt), 10000)
++}
++
++function isRetryableError(status: number): boolean {
++  if (status === 0) return true
++  if (status === 429) return true
++  if (status >= 500 && status < 600) return true
++  return false
++}
++
+ export async function refreshAccessToken(
+   refreshToken: string,
+   clientId: string = ANTIGRAVITY_CLIENT_ID,
+@@ -52,35 +100,81 @@ export async function refreshAccessToken(
+     client_secret: clientSecret,
+   })
+ 
+-  const response = await fetch(GOOGLE_TOKEN_URL, {
+-    method: "POST",
+-    headers: {
+-      "Content-Type": "application/x-www-form-urlencoded",
+-    },
+-    body: params,
+-  })
++  let lastError: AntigravityTokenRefreshError | undefined
+ 
+-  if (!response.ok) {
+-    const errorText = await response.text().catch(() => "Unknown error")
+-    throw new Error(
+-      `Token refresh failed: ${response.status} ${response.statusText} - ${errorText}`
+-    )
+-  }
++  for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
++    try {
++      const response = await fetch(GOOGLE_TOKEN_URL, {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/x-www-form-urlencoded",
++        },
++        body: params,
++      })
+ 
+-  const data = (await response.json()) as {
+-    access_token: string
+-    refresh_token?: string
+-    expires_in: number
+-    token_type: string
+-  }
++      if (response.ok) {
++        const data = (await response.json()) as {
++          access_token: string
++          refresh_token?: string
++          expires_in: number
++          token_type: string
++        }
+ 
+-  return {
+-    access_token: data.access_token,
+-    // Google may return a new refresh token, fall back to the original
+-    refresh_token: data.refresh_token || refreshToken,
+-    expires_in: data.expires_in,
+-    token_type: data.token_type,
++        return {
++          access_token: data.access_token,
++          refresh_token: data.refresh_token || refreshToken,
++          expires_in: data.expires_in,
++          token_type: data.token_type,
++        }
++      }
++
++      const responseBody = await response.text().catch(() => undefined)
++      const parsed = parseOAuthErrorPayload(responseBody)
++
++      lastError = new AntigravityTokenRefreshError({
++        message: parsed.description || `Token refresh failed: ${response.status} ${response.statusText}`,
++        code: parsed.code,
++        description: parsed.description,
++        status: response.status,
++        statusText: response.statusText,
++        responseBody,
++      })
++
++      if (parsed.code === "invalid_grant") {
++        throw lastError
++      }
++
++      if (!isRetryableError(response.status)) {
++        throw lastError
++      }
++
++      if (attempt < MAX_REFRESH_RETRIES) {
++        const delay = calculateRetryDelay(attempt)
++        await new Promise((resolve) => setTimeout(resolve, delay))
++      }
++    } catch (error) {
++      if (error instanceof AntigravityTokenRefreshError) {
++        throw error
++      }
++
++      lastError = new AntigravityTokenRefreshError({
++        message: error instanceof Error ? error.message : "Network error during token refresh",
++        status: 0,
++        statusText: "Network Error",
++      })
++
++      if (attempt < MAX_REFRESH_RETRIES) {
++        const delay = calculateRetryDelay(attempt)
++        await new Promise((resolve) => setTimeout(resolve, delay))
++      }
++    }
+   }
++
++  throw lastError || new AntigravityTokenRefreshError({
++    message: "Token refresh failed after all retries",
++    status: 0,
++    statusText: "Max Retries Exceeded",
++  })
+ }
+ 
+ /**
+diff --git a/src/auth/antigravity/types.ts b/src/auth/antigravity/types.ts
+index aec456aa..c53e768c 100644
+--- a/src/auth/antigravity/types.ts
++++ b/src/auth/antigravity/types.ts
+@@ -194,3 +194,20 @@ export interface AntigravityRefreshParts {
+   projectId?: string
+   managedProjectId?: string
+ }
++
++/**
++ * OAuth error payload from Google
++ * Google returns errors in multiple formats, this handles all of them
++ */
++export interface OAuthErrorPayload {
++  error?: string | { status?: string; code?: string; message?: string }
++  error_description?: string
++}
++
++/**
++ * Parsed OAuth error with normalized fields
++ */
++export interface ParsedOAuthError {
++  code?: string
++  description?: string
++}
+diff --git a/src/hooks/anthropic-auto-compact/parser.ts b/src/hooks/anthropic-auto-compact/parser.ts
+index 8d1170f2..6d36789a 100644
+--- a/src/hooks/anthropic-auto-compact/parser.ts
++++ b/src/hooks/anthropic-auto-compact/parser.ts
+@@ -26,6 +26,7 @@ const TOKEN_LIMIT_KEYWORDS = [
+   "context length",
+   "too many tokens",
+   "non-empty content",
++  "invalid_request_error",
+ ]
+ 
+ const MESSAGE_INDEX_PATTERN = /messages\.(\d+)/
+@@ -114,9 +115,10 @@ export function parseAnthropicTokenLimitError(err: unknown): ParsedTokenLimitErr
+   if (typeof responseBody === "string") {
+     try {
+       const jsonPatterns = [
+-        /data:\s*(\{[\s\S]*?\})\s*$/m,
+-        /(\{"type"\s*:\s*"error"[\s\S]*?\})/,
+-        /(\{[\s\S]*?"error"[\s\S]*?\})/,
++        // Greedy match to last } for nested JSON
++        /data:\s*(\{[\s\S]*\})\s*$/m,
++        /(\{"type"\s*:\s*"error"[\s\S]*\})/,
++        /(\{[\s\S]*"error"[\s\S]*\})/,
+       ]
+ 
+       for (const pattern of jsonPatterns) {
+-- 
+2.39.2
+

@@ -1,0 +1,221 @@
+From 685b8023dd6dad408f0daf16e614355a5838c5bb Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 26 Feb 2026 20:55:11 +0900
+Subject: [PATCH 2770/5749] fix(background-task): make background_output
+ block=true actually wait for task completion
+
+Closes #2115
+---
+ .../create-background-output.blocking.test.ts | 112 ++++++++++++++++++
+ .../create-background-output.ts               |  38 ++++--
+ 2 files changed, 141 insertions(+), 9 deletions(-)
+ create mode 100644 src/tools/background-task/create-background-output.blocking.test.ts
+
+diff --git a/src/tools/background-task/create-background-output.blocking.test.ts b/src/tools/background-task/create-background-output.blocking.test.ts
+new file mode 100644
+index 00000000..82de143e
+--- /dev/null
++++ b/src/tools/background-task/create-background-output.blocking.test.ts
+@@ -0,0 +1,112 @@
++/// <reference types="bun-types" />
++
++import { describe, expect, test } from "bun:test"
++import type { ToolContext } from "@opencode-ai/plugin/tool"
++import type { BackgroundTask } from "../../features/background-agent"
++import type { BackgroundOutputClient, BackgroundOutputManager } from "./clients"
++import { createBackgroundOutput } from "./create-background-output"
++
++const projectDir = "/Users/yeongyu/local-workspaces/oh-my-opencode"
++
++const mockContext = {
++  sessionID: "test-session",
++  messageID: "test-message",
++  agent: "test-agent",
++  directory: projectDir,
++  worktree: projectDir,
++  abort: new AbortController().signal,
++  metadata: () => {},
++  ask: async () => {},
++} as unknown as ToolContext
++
++function createTask(overrides: Partial<BackgroundTask> = {}): BackgroundTask {
++  return {
++    id: "task-1",
++    sessionID: "ses-1",
++    parentSessionID: "main-1",
++    parentMessageID: "msg-1",
++    description: "background task",
++    prompt: "do work",
++    agent: "test-agent",
++    status: "running",
++    ...overrides,
++  }
++}
++
++function createMockClient(): BackgroundOutputClient {
++  return {
++    session: {
++      messages: async () => ({ data: [] }),
++    },
++  }
++}
++
++describe("createBackgroundOutput block=true polling", () => {
++  test("returns terminal error output when task fails during blocking wait", async () => {
++    // #given
++    let pollCount = 0
++    const task = createTask({ status: "running" })
++    const manager: BackgroundOutputManager = {
++      getTask: (id: string) => {
++        if (id !== task.id) return undefined
++
++        pollCount += 1
++        if (pollCount >= 2) {
++          task.status = "error"
++          task.error = "task failed"
++        }
++
++        return task
++      },
++    }
++
++    const tool = createBackgroundOutput(manager, createMockClient())
++
++    // #when
++    const output = await tool.execute(
++      {
++        task_id: task.id,
++        block: true,
++        timeout: 3000,
++        full_session: false,
++      },
++      mockContext
++    )
++
++    // #then
++    expect(pollCount).toBeGreaterThanOrEqual(2)
++    expect(output).toContain("Status | **error**")
++    expect(output).not.toContain("Timed out waiting")
++  })
++
++  test("returns latest output with timeout note when task stays running", async () => {
++    // #given
++    let pollCount = 0
++    const task = createTask({ status: "running" })
++    const manager: BackgroundOutputManager = {
++      getTask: (id: string) => {
++        if (id !== task.id) return undefined
++        pollCount += 1
++        return task
++      },
++    }
++
++    const tool = createBackgroundOutput(manager, createMockClient())
++
++    // #when
++    const output = await tool.execute(
++      {
++        task_id: task.id,
++        block: true,
++        timeout: 10,
++      },
++      mockContext
++    )
++
++    // #then
++    expect(pollCount).toBeGreaterThanOrEqual(2)
++    expect(output).toContain("# Full Session Output")
++    expect(output).toContain("Timed out waiting")
++    expect(output).toContain("still running")
++  })
++})
+diff --git a/src/tools/background-task/create-background-output.ts b/src/tools/background-task/create-background-output.ts
+index 78593a88..e12cfa9a 100644
+--- a/src/tools/background-task/create-background-output.ts
++++ b/src/tools/background-task/create-background-output.ts
+@@ -33,6 +33,14 @@ function formatResolvedTitle(task: BackgroundTask): string {
+   return `${label} - ${task.description}`
+ }
+ 
++function isTaskActiveStatus(status: BackgroundTask["status"]): boolean {
++  return status === "pending" || status === "running"
++}
++
++function appendTimeoutNote(output: string, timeoutMs: number): string {
++  return `${output}\n\n> **Timed out waiting** after ${timeoutMs}ms. Task is still running; showing latest available output.`
++}
++
+ export function createBackgroundOutput(manager: BackgroundOutputManager, client: BackgroundOutputClient): ToolDefinition {
+   return tool({
+     description: BACKGROUND_OUTPUT_DESCRIPTION,
+@@ -83,7 +91,9 @@ export function createBackgroundOutput(manager: BackgroundOutputManager, client:
+ 
+         let resolvedTask = task
+ 
+-        if (shouldBlock && (task.status === "pending" || task.status === "running")) {
++        let didTimeoutWhileActive = false
++
++        if (shouldBlock && isTaskActiveStatus(task.status)) {
+           const startTime = Date.now()
+           while (Date.now() - startTime < timeoutMs) {
+             await delay(1000)
+@@ -93,30 +103,39 @@ export function createBackgroundOutput(manager: BackgroundOutputManager, client:
+               return `Task was deleted: ${args.task_id}`
+             }
+ 
+-            if (currentTask.status !== "pending" && currentTask.status !== "running") {
+-              resolvedTask = currentTask
++            resolvedTask = currentTask
++
++            if (!isTaskActiveStatus(currentTask.status)) {
+               break
+             }
+           }
+ 
+-          const finalCheck = manager.getTask(args.task_id)
+-          if (finalCheck) {
+-            resolvedTask = finalCheck
++          if (isTaskActiveStatus(resolvedTask.status)) {
++            const finalCheck = manager.getTask(args.task_id)
++            if (finalCheck) {
++              resolvedTask = finalCheck
++            }
++          }
++
++          if (isTaskActiveStatus(resolvedTask.status)) {
++            didTimeoutWhileActive = true
+           }
+         }
+ 
+-        const isActive = resolvedTask.status === "pending" || resolvedTask.status === "running"
++        const isActive = isTaskActiveStatus(resolvedTask.status)
+         const includeThinking = isActive || (args.include_thinking ?? false)
+         const includeToolResults = isActive || (args.include_tool_results ?? false)
+ 
+         if (fullSession) {
+-          return await formatFullSession(resolvedTask, client, {
++          const output = await formatFullSession(resolvedTask, client, {
+             includeThinking,
+             messageLimit: args.message_limit,
+             sinceMessageId: args.since_message_id,
+             includeToolResults,
+             thinkingMaxChars: args.thinking_max_chars,
+           })
++
++          return didTimeoutWhileActive ? appendTimeoutNote(output, timeoutMs) : output
+         }
+ 
+         if (resolvedTask.status === "completed") {
+@@ -127,7 +146,8 @@ export function createBackgroundOutput(manager: BackgroundOutputManager, client:
+           return formatTaskStatus(resolvedTask)
+         }
+ 
+-        return formatTaskStatus(resolvedTask)
++        const statusOutput = formatTaskStatus(resolvedTask)
++        return didTimeoutWhileActive ? appendTimeoutNote(statusOutput, timeoutMs) : statusOutput
+       } catch (error) {
+         return `Error getting output: ${error instanceof Error ? error.message : String(error)}`
+       }
+-- 
+2.39.2
+

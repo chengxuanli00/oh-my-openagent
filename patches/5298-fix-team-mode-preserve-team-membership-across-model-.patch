@@ -1,0 +1,121 @@
+From b516d5d41ef55c219a0dba1816cb0958a3acd70c Mon Sep 17 00:00:00 2001
+From: ZeyuFu <fuzeyu09@gmail.com>
+Date: Sat, 16 May 2026 01:47:29 -0400
+Subject: [PATCH 5298/5749] fix(team-mode): preserve team membership across
+ model fallback (#3898)
+
+When a team-mode subagent hit a fallback model (rate limit / quota
+exhaustion on the primary), the fallback continuation started a
+fresh subagent session that was not registered in the team's
+member registry under the original role. Subsequent
+team_send_message / team_status calls from the fallback agent
+threw "not in team" because the membership lookup missed.
+
+Capture teamRunId + member identity at fallback initiation and
+carry them onto the fallback session so the fallback agent
+remains a first-class team participant. If preservation is not
+possible, surface a bounded structured error instead of letting
+the runtime fail mid-flight with a confusing membership message.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../fallback-retry-handler.test.ts            | 39 ++++++++++++++++++-
+ .../fallback-retry-handler.ts                 | 22 +++++++++++
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/src/features/background-agent/fallback-retry-handler.test.ts b/src/features/background-agent/fallback-retry-handler.test.ts
+index 53b7b7ef..e208a707 100644
+--- a/src/features/background-agent/fallback-retry-handler.test.ts
++++ b/src/features/background-agent/fallback-retry-handler.test.ts
+@@ -1,5 +1,5 @@
+ import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test"
+-import { tryFallbackRetry, type FallbackRetryHandlerDeps } from "./fallback-retry-handler"
++import { tryFallbackRetry, TeamModeFallbackError, type FallbackRetryHandlerDeps } from "./fallback-retry-handler"
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ 
+ const sharedLogMock = mock(() => {})
+@@ -433,4 +433,41 @@ describe("tryFallbackRetry", () => {
+       expect(args.task.model?.modelID).toBe("fallback-model-1")
+     })
+   })
++
++  describe("#team-mode fallback", () => {
++    test("throws TeamModeFallbackError when teamRunId is set but onSessionCreated is absent", async () => {
++      // given: a team-mode task that somehow lost its onSessionCreated callback —
++      // without it the fallback session would not be registered in the team-session
++      // registry and every team tool call would silently fail with "not in team"
++      const args = createDefaultArgs({
++        teamRunId: "team-run-abc",
++        onSessionCreated: undefined,
++      })
++
++      // when / then: a bounded structured error must surface instead
++      await expect(tryFallbackRetry(args)).rejects.toThrow(TeamModeFallbackError)
++      await expect(tryFallbackRetry(createDefaultArgs({ teamRunId: "team-run-abc", onSessionCreated: undefined }))).rejects.toThrow(
++        "team-mode fallback denied: cannot preserve team context",
++      )
++    })
++
++    test("proceeds normally when teamRunId and onSessionCreated are both present", async () => {
++      // given: a properly-formed team-mode task with its session registration callback
++      const onSessionCreated = mock(async () => {})
++      const args = createDefaultArgs({
++        teamRunId: "team-run-abc",
++        onSessionCreated,
++      })
++
++      // when
++      const result = await tryFallbackRetry(args)
++
++      // then: fallback is queued and the retry input preserves both team fields
++      expect(result).toBe(true)
++      const key = `${args.task.model!.providerID}/${args.task.model!.modelID}`
++      const retryInput = args.queuesByKey.get(key)?.[0]?.input
++      expect(retryInput?.teamRunId).toBe("team-run-abc")
++      expect(retryInput?.onSessionCreated).toBe(onSessionCreated)
++    })
++  })
+ })
+diff --git a/src/features/background-agent/fallback-retry-handler.ts b/src/features/background-agent/fallback-retry-handler.ts
+index 3cf1453e..a52c1354 100644
+--- a/src/features/background-agent/fallback-retry-handler.ts
++++ b/src/features/background-agent/fallback-retry-handler.ts
+@@ -13,6 +13,13 @@ import { transformModelForProvider } from "../../shared/provider-model-id-transf
+ import { abortWithTimeout } from "./abort-with-timeout"
+ import { ensureCurrentAttempt, scheduleRetryAttempt } from "./attempt-lifecycle"
+ 
++export class TeamModeFallbackError extends Error {
++  constructor(message: string) {
++    super(message)
++    this.name = "TeamModeFallbackError"
++  }
++}
++
+ function canonicalizeModelID(modelID: string): string {
+   return modelID.toLowerCase().replace(/\./g, "-")
+ }
+@@ -183,6 +190,21 @@ export async function tryFallbackRetry(args: {
+     nextModel: `${providerID}/${transformedModelId}`,
+   })
+ 
++  // Guard: a team-mode task (teamRunId set) MUST carry an onSessionCreated callback so
++  // the fallback session gets registered in the team-session registry under the original
++  // member slot. Without it the new session would not appear as a team participant and
++  // every subsequent team tool call would throw "not in team". Fail with a bounded
++  // structured error instead of silently entering that confusing runtime state.
++  if (task.teamRunId && !task.onSessionCreated) {
++    deps.log("[background-agent] team-mode fallback denied: task has teamRunId but no onSessionCreated; cannot preserve team membership", {
++      taskId: task.id,
++      teamRunId: task.teamRunId,
++    })
++    throw new TeamModeFallbackError(
++      `team-mode fallback denied: cannot preserve team context for task ${task.id} (teamRunId=${task.teamRunId})`,
++    )
++  }
++
+   const key = task.model ? `${task.model.providerID}/${task.model.modelID}` : task.agent
+   const queue = queuesByKey.get(key) ?? []
+   const retryInput: LaunchInput = {
+-- 
+2.39.2
+

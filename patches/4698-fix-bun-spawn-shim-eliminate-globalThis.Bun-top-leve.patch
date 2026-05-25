@@ -1,0 +1,695 @@
+From 3ddc757b152219c9dd2193cbe2da86ab4f41bf59 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 5 May 2026 22:41:45 +0900
+Subject: [PATCH 4698/5749] fix(bun-spawn-shim): eliminate globalThis.Bun
+ top-level destructures for Electron/Node compat
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause: bun build --target bun inlines top-level
+  var { spawn } = globalThis.Bun;
+for every file that contains 'import { spawn } from "bun"'. On Node/Electron
+where globalThis.Bun is undefined, this crashes with
+  Cannot destructure property 'spawn' of 'globalThis.Bun' as it is undefined.
+26 source files had this import; the bundled output had 25 top-level destructures.
+
+Fix:
+- Add src/shared/bun-spawn-shim.ts: a thin wrapper that
+  - delegates to Bun.spawn/spawnSync when globalThis.Bun is present (real Bun)
+  - falls back to static ESM imports of node:child_process otherwise
+  - uses static 'import { spawn } from "node:child_process"' so Bun bundler
+    does NOT emit any globalThis.Bun destructures for this module
+- Replace all 26 'from "bun"' spawn/spawnSync imports with relative paths to shim
+- Replace 4 direct Bun.spawn() call sites with shim's spawn()
+- Remove src/electron-compat.ts and script/prepend-electron-shim.ts (no longer needed)
+- Update src/electron-compat.test.ts to assert 0 top-level globalThis.Bun destructures
+
+Verification: grep -c '} = globalThis.Bun;' dist/index.js → 0 (was 25)
+All 5921 tests pass (1 pre-existing timeout failure unrelated to this change).
+
+Fixes #3797
+---
+ package.json                                  |  3 +-
+ script/prepend-electron-shim.ts               | 65 ----------------
+ src/electron-compat.test.ts                   | 34 ++++-----
+ src/electron-compat.ts                        | 74 -------------------
+ .../team-mode/team-worktree/cleanup.ts        |  5 +-
+ .../team-mode/team-worktree/manager.ts        |  3 +-
+ .../tmux-subagent/pane-state-querier.ts       |  2 +-
+ src/hooks/comment-checker/cli.ts              |  2 +-
+ src/index.ts                                  |  1 -
+ src/openclaw/dispatcher.ts                    |  2 +-
+ src/openclaw/reply-listener-process.ts        |  2 +-
+ src/openclaw/reply-listener-spawn.ts          |  2 +-
+ src/openclaw/tmux.ts                          |  2 +-
+ src/shared/binary-downloader.ts               |  2 +-
+ src/shared/bun-spawn-shim.ts                  | 68 +++++++++++++++++
+ src/shared/spawn-with-windows-hide.ts         |  2 +-
+ src/shared/tmux/tmux-utils/layout.ts          |  2 +-
+ src/shared/tmux/tmux-utils/pane-dimensions.ts |  2 +-
+ src/shared/tmux/tmux-utils/pane-replace.ts    |  2 +-
+ src/shared/tmux/tmux-utils/pane-spawn.ts      |  2 +-
+ src/shared/tmux/tmux-utils/session-spawn.ts   |  2 +-
+ src/shared/tmux/tmux-utils/spawn-process.ts   |  2 +-
+ src/shared/tmux/tmux-utils/window-spawn.ts    |  2 +-
+ .../powershell-zip-entry-listing.ts           |  2 +-
+ .../python-zip-entry-listing.ts               |  2 +-
+ .../read-zip-symlink-target.ts                |  2 +-
+ .../tar-zip-entry-listing.ts                  |  2 +-
+ .../zipinfo-zip-entry-listing.ts              |  2 +-
+ src/shared/zip-extractor.ts                   |  2 +-
+ src/tools/ast-grep/cli.ts                     |  2 +-
+ src/tools/glob/cli.ts                         |  2 +-
+ src/tools/grep/cli.ts                         |  2 +-
+ src/tools/hashline-edit/formatter-trigger.ts  |  3 +-
+ .../interactive-bash/tmux-path-resolver.ts    |  2 +-
+ src/tools/lsp/lsp-process.ts                  |  2 +-
+ 35 files changed, 117 insertions(+), 191 deletions(-)
+ delete mode 100644 script/prepend-electron-shim.ts
+ delete mode 100644 src/electron-compat.ts
+ create mode 100644 src/shared/bun-spawn-shim.ts
+
+diff --git a/package.json b/package.json
+index c72accc3..ffd57237 100644
+--- a/package.json
++++ b/package.json
+@@ -22,8 +22,7 @@
+     "./schema.json": "./dist/oh-my-opencode.schema.json"
+   },
+   "scripts": {
+-    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @ast-grep/napi --external zod && bun run build:prepend-shim && tsc --emitDeclarationOnly && bun build src/cli/index.ts --outdir dist/cli --target bun --format esm --external @ast-grep/napi && bun run build:schema",
+-    "build:prepend-shim": "bun run script/prepend-electron-shim.ts",
++    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @ast-grep/napi --external zod && tsc --emitDeclarationOnly && bun build src/cli/index.ts --outdir dist/cli --target bun --format esm --external @ast-grep/napi && bun run build:schema",
+     "build:all": "bun run build && bun run build:binaries",
+     "build:binaries": "bun run script/build-binaries.ts",
+     "build:schema": "bun run script/build-schema.ts",
+diff --git a/script/prepend-electron-shim.ts b/script/prepend-electron-shim.ts
+deleted file mode 100644
+index 8b4f5f58..00000000
+--- a/script/prepend-electron-shim.ts
++++ /dev/null
+@@ -1,65 +0,0 @@
+-#!/usr/bin/env bun
+-/**
+- * Prepend the Electron/Node compat shim to dist/index.js.
+- *
+- * When bundled with --target bun, Bun inlines top-level
+- *   var { spawn } = globalThis.Bun;
+- * statements from its own internal modules. These crash on Node/Electron
+- * because globalThis.Bun is undefined there.
+- *
+- * Since Bun's bundler does not guarantee that a side-effect import at the
+- * top of src/index.ts will appear before all other module top-level code,
+- * we post-process the bundle and manually prepend the shim.
+- */
+-
+-import { readFileSync, writeFileSync } from "node:fs"
+-import { join } from "node:path"
+-
+-const DIST_PATH = join(import.meta.dir, "..", "dist", "index.js")
+-
+-const SHIM = `// [omo] Electron/Node compat shim — prepended by script/prepend-electron-shim.ts
+-// Populates globalThis.Bun before any top-level destructure fires.
+-if (!globalThis.Bun) {
+-  const _cp = await import("node:child_process");
+-  const _Readable = (await import("node:stream")).Readable;
+-  function _mkproc(p) {
+-    let c = null;
+-    const exited = new Promise(r => {
+-      p.on("exit", code => { c = code ?? 1; r(c); });
+-      p.on("error", () => { if (c === null) { c = 1; r(1); } });
+-    });
+-    return { get exitCode() { return c; }, exited,
+-      stdout: p.stdout ? _Readable.toWeb(p.stdout) : undefined,
+-      stderr: p.stderr ? _Readable.toWeb(p.stderr) : undefined,
+-      stdin: p.stdin, kill(s) { try { p.kill(s); } catch {} }, pid: p.pid };
+-  }
+-  function _spawn(cmdOrOpts, opts) {
+-    const isObj = !Array.isArray(cmdOrOpts);
+-    const cmd = isObj ? cmdOrOpts.cmd : cmdOrOpts;
+-    const o = isObj ? cmdOrOpts : (opts || {});
+-    const [bin, ...args] = cmd;
+-    return _mkproc(_cp.spawn(bin, args, { cwd: o.cwd, env: o.env,
+-      stdio: [o.stdin||"pipe", o.stdout||"pipe", o.stderr||"pipe"] }));
+-  }
+-  function _spawnSync(cmdOrOpts) {
+-    const isObj = !Array.isArray(cmdOrOpts);
+-    const cmd = isObj ? cmdOrOpts.cmd : cmdOrOpts;
+-    const o = isObj ? cmdOrOpts : {};
+-    const [bin, ...args] = cmd;
+-    const r = _cp.spawnSync(bin, args, { cwd: o.cwd, env: o.env, stdio: ["pipe","pipe","pipe"] });
+-    return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
+-  }
+-  globalThis.Bun = { spawn: _spawn, spawnSync: _spawnSync, env: process.env, version: "0.0.0-node-shim" };
+-}
+-`
+-
+-const original = readFileSync(DIST_PATH, "utf-8")
+-
+-// Avoid double-prepend
+-if (original.includes("[omo] Electron/Node compat shim")) {
+-  console.log("Shim already present in dist/index.js, skipping.")
+-  process.exit(0)
+-}
+-
+-writeFileSync(DIST_PATH, SHIM + original, "utf-8")
+-console.log(`✓ Prepended Electron/Node compat shim to dist/index.js`)
+diff --git a/src/electron-compat.test.ts b/src/electron-compat.test.ts
+index 7da00cbc..1f91f453 100644
+--- a/src/electron-compat.test.ts
++++ b/src/electron-compat.test.ts
+@@ -1,27 +1,23 @@
+ import { describe, test, expect } from "bun:test"
+ 
+-describe("electron-compat shim", () => {
+-  test("#given shim module #when inspected #then it exports no values (side-effect only)", async () => {
+-    // The shim is a side-effect module — no named exports
+-    const mod = await import("./electron-compat")
+-    expect(Object.keys(mod)).toHaveLength(0)
++describe("electron-compat: dist/index.js globalThis.Bun safety", () => {
++  test("#given dist/index.js #then no top-level globalThis.Bun destructures exist", async () => {
++    // This guards the fix for https://github.com/code-yeongyu/oh-my-openagent/issues/3797.
++    // Previously 'bun build --target bun' emitted 25 top-level
++    //   var { spawn } = globalThis.Bun;
++    // statements that crashed on Node/Electron where globalThis.Bun is undefined.
++    // The fix replaces all 'from "bun"' spawn imports with a node:child_process
++    // shim so the bundler no longer emits these destructures.
++    const dist = await Bun.file("dist/index.js").text()
++    const destructures = (dist.match(/\} = globalThis\.Bun;/g) ?? []).length
++    expect(destructures).toBe(0)
+   })
+ 
+-  test("#given Bun runtime #when shim is loaded #then globalThis.Bun remains the real Bun", () => {
+-    // In Bun (our test environment), globalThis.Bun is already defined.
+-    // The shim must not overwrite it.
++  test("#given Bun runtime #when shim module is loaded #then globalThis.Bun remains real Bun", () => {
++    // On real Bun runtime, globalThis.Bun must not be overwritten by any shim
+     expect(globalThis.Bun).toBeDefined()
+-    // Real Bun version looks like "1.x.x", not our shim string
++    expect(typeof globalThis.Bun.spawn).toBe("function")
++    // The shim version string is only set when globalThis.Bun was absent
+     expect(globalThis.Bun.version).not.toBe("0.0.0-node-shim")
+   })
+-
+-  test("#given dist/index.js #when inspected #then compat shim appears before first globalThis.Bun destructure", async () => {
+-    // This test guards that build/prepend-electron-shim ran.
+-    // If the shim is missing, the plugin crashes on Electron at line 2876.
+-    const dist = await Bun.file("dist/index.js").text()
+-    const shimPos = dist.indexOf("[omo] Electron/Node compat shim")
+-    const firstDestructure = dist.indexOf("} = globalThis.Bun;")
+-    expect(shimPos).toBeGreaterThanOrEqual(0) // shim present
+-    expect(shimPos).toBeLessThan(firstDestructure) // shim before destructures
+-  })
+ })
+diff --git a/src/electron-compat.ts b/src/electron-compat.ts
+deleted file mode 100644
+index b60ab0be..00000000
+--- a/src/electron-compat.ts
++++ /dev/null
+@@ -1,74 +0,0 @@
+-/**
+- * Electron/Node runtime compatibility shim.
+- *
+- * OpenCode Desktop runs the plugin in an Electron renderer/main process
+- * whose ESM loader is Node — not Bun. When bundled with `--target bun`,
+- * every chunk that calls `Bun.spawn` / `Bun.spawnSync` emits a top-level
+- * `var { spawn } = globalThis.Bun` destructure. On Node/Electron,
+- * `globalThis.Bun` is `undefined`, so module evaluation crashes before any
+- * plugin hook is ever reached.
+- *
+- * We patch globalThis.Bun at module-evaluation time so the destructures
+- * resolve to real functions backed by node:child_process.
+- */
+-
+-// eslint-disable-next-line @typescript-eslint/no-require-imports
+-const _cp = require("node:child_process") as typeof import("node:child_process")
+-// eslint-disable-next-line @typescript-eslint/no-require-imports
+-const _stream = require("node:stream") as typeof import("node:stream")
+-
+-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+-type AnyRecord = Record<string, any>
+-
+-function _makeProc(proc: ReturnType<typeof _cp.spawn>) {
+-  let _exitCode: number | null = null
+-  const exited = new Promise<number>((resolve) => {
+-    proc.on("exit", (code) => { _exitCode = code ?? 1; resolve(_exitCode) })
+-    proc.on("error", () => { if (_exitCode === null) { _exitCode = 1; resolve(1) } })
+-  })
+-  return {
+-    get exitCode() { return _exitCode },
+-    exited,
+-    stdout: proc.stdout ? (_stream.Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array>) : undefined,
+-    stderr: proc.stderr ? (_stream.Readable.toWeb(proc.stderr) as ReadableStream<Uint8Array>) : undefined,
+-    stdin: proc.stdin,
+-    kill(sig?: NodeJS.Signals) { try { proc.kill(sig) } catch {} },
+-    pid: proc.pid,
+-  }
+-}
+-
+-function _spawnShim(cmdOrOpts: string[] | AnyRecord, optsArg?: AnyRecord) {
+-  const isObj = !Array.isArray(cmdOrOpts)
+-  const cmd: string[] = isObj ? (cmdOrOpts as AnyRecord)["cmd"] as string[] : (cmdOrOpts as string[])
+-  const o: AnyRecord = isObj ? (cmdOrOpts as AnyRecord) : (optsArg ?? {})
+-  const [bin, ...args] = cmd
+-  const proc = _cp.spawn(bin, args, {
+-    cwd: o["cwd"] as string | undefined,
+-    env: o["env"] as NodeJS.ProcessEnv | undefined,
+-    stdio: [(o["stdin"] ?? "pipe") as "pipe", (o["stdout"] ?? "pipe") as "pipe", (o["stderr"] ?? "pipe") as "pipe"],
+-  })
+-  return _makeProc(proc)
+-}
+-
+-function _spawnSyncShim(cmdOrOpts: string[] | AnyRecord) {
+-  const isObj = !Array.isArray(cmdOrOpts)
+-  const cmd: string[] = isObj ? (cmdOrOpts as AnyRecord)["cmd"] as string[] : (cmdOrOpts as string[])
+-  const o: AnyRecord = isObj ? (cmdOrOpts as AnyRecord) : {}
+-  const [bin, ...args] = cmd
+-  const r = _cp.spawnSync(bin, args, {
+-    cwd: o["cwd"] as string | undefined,
+-    env: o["env"] as NodeJS.ProcessEnv | undefined,
+-    stdio: ["pipe", "pipe", "pipe"],
+-  })
+-  return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr }
+-}
+-
+-if (!globalThis.Bun) {
+-  // @ts-expect-error – intentional globalThis shim for Electron/Node compat
+-  globalThis.Bun = {
+-    spawn: _spawnShim as unknown as typeof globalThis.Bun.spawn,
+-    spawnSync: _spawnSyncShim as unknown as typeof globalThis.Bun.spawnSync,
+-    env: process.env,
+-    version: "0.0.0-node-shim",
+-  }
+-}
+diff --git a/src/features/team-mode/team-worktree/cleanup.ts b/src/features/team-mode/team-worktree/cleanup.ts
+index 673ecebc..72649cc3 100644
+--- a/src/features/team-mode/team-worktree/cleanup.ts
++++ b/src/features/team-mode/team-worktree/cleanup.ts
+@@ -2,9 +2,10 @@ import fs from "node:fs/promises"
+ import path from "node:path"
+ 
+ import type { TeamModeConfig } from "./manager"
++import { spawn as bunSpawn } from "../../../shared/bun-spawn-shim"
+ 
+ async function runGit(args: string[]): Promise<{ code: number; stderr: string }> {
+-  const process = Bun.spawn({ cmd: ["git", ...args], stdout: "pipe", stderr: "pipe" })
++  const process = bunSpawn({ cmd: ["git", ...args], stdout: "pipe", stderr: "pipe" })
+   const [exitCode, stderrText] = await Promise.all([process.exited, new Response(process.stderr).text()])
+   return { code: exitCode, stderr: stderrText }
+ }
+@@ -12,7 +13,7 @@ async function runGit(args: string[]): Promise<{ code: number; stderr: string }>
+ export async function removeWorktree(worktreePath: string): Promise<void> {
+   await fs.rm(worktreePath, { recursive: true, force: true })
+ 
+-  const rootLookup = await Bun.spawn({
++  const rootLookup = bunSpawn({
+     cmd: ["git", "-C", worktreePath, "rev-parse", "--show-superproject-working-tree"],
+     stdout: "pipe",
+     stderr: "pipe",
+diff --git a/src/features/team-mode/team-worktree/manager.ts b/src/features/team-mode/team-worktree/manager.ts
+index 359df4cd..0f01bed7 100644
+--- a/src/features/team-mode/team-worktree/manager.ts
++++ b/src/features/team-mode/team-worktree/manager.ts
+@@ -1,4 +1,5 @@
+ import path from "node:path"
++import { spawn as bunSpawn } from "../../../shared/bun-spawn-shim"
+ 
+ export type TeamModeConfig = {
+   worktreeBaseDir?: string
+@@ -16,7 +17,7 @@ function countParentSegments(spec: string): number {
+ }
+ 
+ async function runGit(args: string[], cwd?: string): Promise<{ code: number; stderr: string }> {
+-  const process = Bun.spawn({ cmd: ["git", ...args], cwd, stdout: "pipe", stderr: "pipe" })
++  const process = bunSpawn({ cmd: ["git", ...args], cwd, stdout: "pipe", stderr: "pipe" })
+   const [exitCode, stderrBytes] = await Promise.all([process.exited, new Response(process.stderr).text()])
+   return { code: exitCode, stderr: stderrBytes }
+ }
+diff --git a/src/features/tmux-subagent/pane-state-querier.ts b/src/features/tmux-subagent/pane-state-querier.ts
+index e2ac9bfd..0d01b03c 100644
+--- a/src/features/tmux-subagent/pane-state-querier.ts
++++ b/src/features/tmux-subagent/pane-state-querier.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../shared/bun-spawn-shim"
+ import type { WindowState, TmuxPaneInfo } from "./types"
+ import { parsePaneStateOutput } from "./pane-state-parser"
+ import { getTmuxPath } from "../../tools/interactive-bash/tmux-path-resolver"
+diff --git a/src/hooks/comment-checker/cli.ts b/src/hooks/comment-checker/cli.ts
+index e0ca2147..14a128d4 100644
+--- a/src/hooks/comment-checker/cli.ts
++++ b/src/hooks/comment-checker/cli.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../shared/bun-spawn-shim"
+ import { createRequire } from "module"
+ import { dirname, join } from "path"
+ import { existsSync } from "fs"
+diff --git a/src/index.ts b/src/index.ts
+index 6ac93ece..a5f549d3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,4 +1,3 @@
+-import "./electron-compat"
+ import { initConfigContext } from "./cli/config-manager/config-context"
+ import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin"
+ 
+diff --git a/src/openclaw/dispatcher.ts b/src/openclaw/dispatcher.ts
+index 5971f371..97643958 100644
+--- a/src/openclaw/dispatcher.ts
++++ b/src/openclaw/dispatcher.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../shared/bun-spawn-shim"
+ import { validateGatewayUrl } from "./gateway-url-validation"
+ import type { OpenClawGateway, WakeResult } from "./types"
+ 
+diff --git a/src/openclaw/reply-listener-process.ts b/src/openclaw/reply-listener-process.ts
+index f6309f16..305601ed 100644
+--- a/src/openclaw/reply-listener-process.ts
++++ b/src/openclaw/reply-listener-process.ts
+@@ -1,5 +1,5 @@
+ import { readFileSync } from "fs"
+-import { spawn } from "bun"
++import { spawn } from "../shared/bun-spawn-shim"
+ 
+ export const REPLY_LISTENER_DAEMON_IDENTITY_MARKER = "--openclaw-reply-listener-daemon"
+ 
+diff --git a/src/openclaw/reply-listener-spawn.ts b/src/openclaw/reply-listener-spawn.ts
+index 1cd0a181..9d6b6cfb 100644
+--- a/src/openclaw/reply-listener-spawn.ts
++++ b/src/openclaw/reply-listener-spawn.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../shared/bun-spawn-shim"
+ import {
+   createReplyListenerDaemonEnv,
+   REPLY_LISTENER_DAEMON_IDENTITY_MARKER,
+diff --git a/src/openclaw/tmux.ts b/src/openclaw/tmux.ts
+index 9bdb6212..47b04c45 100644
+--- a/src/openclaw/tmux.ts
++++ b/src/openclaw/tmux.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../shared/bun-spawn-shim"
+ 
+ export function getCurrentTmuxSession(): string | null {
+   const env = process.env.TMUX
+diff --git a/src/shared/binary-downloader.ts b/src/shared/binary-downloader.ts
+index bb6918c3..16a8ff60 100644
+--- a/src/shared/binary-downloader.ts
++++ b/src/shared/binary-downloader.ts
+@@ -1,6 +1,6 @@
+ import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+ import * as path from "node:path";
+-import { spawn } from "bun";
++import { spawn } from "./bun-spawn-shim";
+ import { validateArchiveEntries, type ArchiveEntry } from "./archive-entry-validator";
+ import { extractZip } from "./zip-extractor";
+ 
+diff --git a/src/shared/bun-spawn-shim.ts b/src/shared/bun-spawn-shim.ts
+new file mode 100644
+index 00000000..bab4ac94
+--- /dev/null
++++ b/src/shared/bun-spawn-shim.ts
+@@ -0,0 +1,68 @@
++/**
++ * Node/Electron-compatible spawn shim.
++ *
++ * Replaces direct `import { spawn } from "bun"` throughout the codebase so
++ * that `bun build --target bun` no longer emits top-level
++ *   var { spawn } = globalThis.Bun;
++ * destructures that crash on Node/Electron (where globalThis.Bun is undefined).
++ *
++ * On real Bun runtime:  delegates straight to Bun.spawn / Bun.spawnSync.
++ * On Node/Electron:     backed by node:child_process (via static ESM imports
++ *                       which are safe in both runtimes).
++ */
++
++/* eslint-disable @typescript-eslint/no-explicit-any */
++
++import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from "node:child_process"
++import { Readable } from "node:stream"
++
++const IS_BUN = typeof globalThis.Bun !== "undefined"
++
++function _resolveCmd(cmdOrOpts: any, optsArg?: any): { cmd: string[]; opts: any } {
++  const isObj = !Array.isArray(cmdOrOpts)
++  return {
++    cmd: isObj ? (cmdOrOpts as any).cmd : (cmdOrOpts as string[]),
++    opts: isObj ? cmdOrOpts : (optsArg ?? {}),
++  }
++}
++
++function _wrapNodeProc(proc: ReturnType<typeof nodeSpawn>): any {
++  let code: number | null = null
++  const exited = new Promise<number>((resolve) => {
++    proc.on("exit", (c) => { code = c ?? 1; resolve(code) })
++    proc.on("error", () => { if (code === null) { code = 1; resolve(1) } })
++  })
++  return {
++    get exitCode() { return code },
++    exited,
++    stdout: proc.stdout ? Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array> : undefined,
++    stderr: proc.stderr ? Readable.toWeb(proc.stderr) as ReadableStream<Uint8Array> : undefined,
++    stdin: proc.stdin,
++    kill(s?: NodeJS.Signals) { try { proc.kill(s) } catch {} },
++    pid: proc.pid,
++  }
++}
++
++export function spawn(cmdOrOpts: any, opts?: any): any {
++  if (IS_BUN) return (globalThis.Bun as any).spawn(cmdOrOpts, opts)
++  const { cmd, opts: o } = _resolveCmd(cmdOrOpts, opts)
++  const [bin, ...args] = cmd
++  const proc = nodeSpawn(bin, args, {
++    cwd: o.cwd as string | undefined,
++    env: o.env as NodeJS.ProcessEnv | undefined,
++    stdio: [(o.stdin ?? "pipe") as any, (o.stdout ?? "pipe") as any, (o.stderr ?? "pipe") as any],
++  })
++  return _wrapNodeProc(proc)
++}
++
++export function spawnSync(cmdOrOpts: any, _opts?: any): any {
++  if (IS_BUN) return (globalThis.Bun as any).spawnSync(cmdOrOpts)
++  const { cmd, opts: o } = _resolveCmd(cmdOrOpts)
++  const [bin, ...args] = cmd
++  const r = nodeSpawnSync(bin, args, {
++    cwd: o.cwd as string | undefined,
++    env: o.env as NodeJS.ProcessEnv | undefined,
++    stdio: ["pipe", "pipe", "pipe"],
++  })
++  return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr, success: (r.status ?? 1) === 0, pid: -1 }
++}
+diff --git a/src/shared/spawn-with-windows-hide.ts b/src/shared/spawn-with-windows-hide.ts
+index 7da9ed08..872c8dee 100644
+--- a/src/shared/spawn-with-windows-hide.ts
++++ b/src/shared/spawn-with-windows-hide.ts
+@@ -1,4 +1,4 @@
+-import { spawn as bunSpawn } from "bun"
++import { spawn as bunSpawn } from "./bun-spawn-shim"
+ import { spawn as nodeSpawn, type ChildProcess } from "node:child_process"
+ import { Readable } from "node:stream"
+ 
+diff --git a/src/shared/tmux/tmux-utils/layout.ts b/src/shared/tmux/tmux-utils/layout.ts
+index 5ac82ee5..25949889 100644
+--- a/src/shared/tmux/tmux-utils/layout.ts
++++ b/src/shared/tmux/tmux-utils/layout.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../bun-spawn-shim"
+ import type { TmuxLayout } from "../../../config/schema"
+ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ 
+diff --git a/src/shared/tmux/tmux-utils/pane-dimensions.ts b/src/shared/tmux/tmux-utils/pane-dimensions.ts
+index a11ad260..d16238e8 100644
+--- a/src/shared/tmux/tmux-utils/pane-dimensions.ts
++++ b/src/shared/tmux/tmux-utils/pane-dimensions.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../bun-spawn-shim"
+ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ 
+ export interface PaneDimensions {
+diff --git a/src/shared/tmux/tmux-utils/pane-replace.ts b/src/shared/tmux/tmux-utils/pane-replace.ts
+index 271ad79e..12ee3311 100644
+--- a/src/shared/tmux/tmux-utils/pane-replace.ts
++++ b/src/shared/tmux/tmux-utils/pane-replace.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../bun-spawn-shim"
+ import type { TmuxConfig } from "../../../config/schema"
+ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ import type { SpawnPaneResult } from "../types"
+diff --git a/src/shared/tmux/tmux-utils/pane-spawn.ts b/src/shared/tmux/tmux-utils/pane-spawn.ts
+index 2713eafb..779da303 100644
+--- a/src/shared/tmux/tmux-utils/pane-spawn.ts
++++ b/src/shared/tmux/tmux-utils/pane-spawn.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../bun-spawn-shim"
+ import type { TmuxConfig } from "../../../config/schema"
+ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ import type { SpawnPaneResult } from "../types"
+diff --git a/src/shared/tmux/tmux-utils/session-spawn.ts b/src/shared/tmux/tmux-utils/session-spawn.ts
+index a6fd15d2..f5f3bbf7 100644
+--- a/src/shared/tmux/tmux-utils/session-spawn.ts
++++ b/src/shared/tmux/tmux-utils/session-spawn.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../bun-spawn-shim"
+ import type { TmuxConfig } from "../../../config/schema"
+ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ import type { SpawnPaneResult } from "../types"
+diff --git a/src/shared/tmux/tmux-utils/spawn-process.ts b/src/shared/tmux/tmux-utils/spawn-process.ts
+index c75826ca..f1bb66d3 100644
+--- a/src/shared/tmux/tmux-utils/spawn-process.ts
++++ b/src/shared/tmux/tmux-utils/spawn-process.ts
+@@ -1 +1 @@
+-export { spawn } from "bun"
++export { spawn } from "../../bun-spawn-shim"
+diff --git a/src/shared/tmux/tmux-utils/window-spawn.ts b/src/shared/tmux/tmux-utils/window-spawn.ts
+index 45c0ee31..222dd2de 100644
+--- a/src/shared/tmux/tmux-utils/window-spawn.ts
++++ b/src/shared/tmux/tmux-utils/window-spawn.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../bun-spawn-shim"
+ import type { TmuxConfig } from "../../../config/schema"
+ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ import type { SpawnPaneResult } from "../types"
+diff --git a/src/shared/zip-entry-listing/powershell-zip-entry-listing.ts b/src/shared/zip-entry-listing/powershell-zip-entry-listing.ts
+index 9169f510..a7721389 100644
+--- a/src/shared/zip-entry-listing/powershell-zip-entry-listing.ts
++++ b/src/shared/zip-entry-listing/powershell-zip-entry-listing.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../bun-spawn-shim"
+ 
+ import type { ArchiveEntry } from "../archive-entry-validator"
+ 
+diff --git a/src/shared/zip-entry-listing/python-zip-entry-listing.ts b/src/shared/zip-entry-listing/python-zip-entry-listing.ts
+index 8c94442a..4cdd7161 100644
+--- a/src/shared/zip-entry-listing/python-zip-entry-listing.ts
++++ b/src/shared/zip-entry-listing/python-zip-entry-listing.ts
+@@ -1,4 +1,4 @@
+-import { spawn, spawnSync } from "bun"
++import { spawn, spawnSync } from "../bun-spawn-shim"
+ 
+ import type { ArchiveEntry } from "../archive-entry-validator"
+ 
+diff --git a/src/shared/zip-entry-listing/read-zip-symlink-target.ts b/src/shared/zip-entry-listing/read-zip-symlink-target.ts
+index 59eb6098..2b6b9ab8 100644
+--- a/src/shared/zip-entry-listing/read-zip-symlink-target.ts
++++ b/src/shared/zip-entry-listing/read-zip-symlink-target.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../bun-spawn-shim"
+ 
+ export async function readZipSymlinkTarget(
+ 	archivePath: string,
+diff --git a/src/shared/zip-entry-listing/tar-zip-entry-listing.ts b/src/shared/zip-entry-listing/tar-zip-entry-listing.ts
+index 10b23190..f346b655 100644
+--- a/src/shared/zip-entry-listing/tar-zip-entry-listing.ts
++++ b/src/shared/zip-entry-listing/tar-zip-entry-listing.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../bun-spawn-shim"
+ 
+ import type { ArchiveEntry } from "../archive-entry-validator"
+ import { log } from "../logger"
+diff --git a/src/shared/zip-entry-listing/zipinfo-zip-entry-listing.ts b/src/shared/zip-entry-listing/zipinfo-zip-entry-listing.ts
+index 2fd63852..926e8b5d 100644
+--- a/src/shared/zip-entry-listing/zipinfo-zip-entry-listing.ts
++++ b/src/shared/zip-entry-listing/zipinfo-zip-entry-listing.ts
+@@ -1,4 +1,4 @@
+-import { spawn, spawnSync } from "bun"
++import { spawn, spawnSync } from "../bun-spawn-shim"
+ 
+ import type { ArchiveEntry } from "../archive-entry-validator"
+ import { readZipSymlinkTarget } from "./read-zip-symlink-target"
+diff --git a/src/shared/zip-extractor.ts b/src/shared/zip-extractor.ts
+index 77ac26b3..cdc61fec 100644
+--- a/src/shared/zip-extractor.ts
++++ b/src/shared/zip-extractor.ts
+@@ -1,4 +1,4 @@
+-import { spawn, spawnSync } from "bun"
++import { spawn, spawnSync } from "./bun-spawn-shim"
+ import { release } from "os"
+ 
+ import { validateArchiveEntries } from "./archive-entry-validator"
+diff --git a/src/tools/ast-grep/cli.ts b/src/tools/ast-grep/cli.ts
+index 86dc211e..2d76975f 100644
+--- a/src/tools/ast-grep/cli.ts
++++ b/src/tools/ast-grep/cli.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../shared/bun-spawn-shim"
+ import { existsSync } from "fs"
+ import {
+ 	getSgCliPath,
+diff --git a/src/tools/glob/cli.ts b/src/tools/glob/cli.ts
+index 99613338..9ba34c32 100644
+--- a/src/tools/glob/cli.ts
++++ b/src/tools/glob/cli.ts
+@@ -1,5 +1,5 @@
+ import { resolve } from "node:path"
+-import { spawn } from "bun"
++import { spawn } from "../../shared/bun-spawn-shim"
+ import {
+   resolveGrepCli,
+   type GrepBackend,
+diff --git a/src/tools/grep/cli.ts b/src/tools/grep/cli.ts
+index 9f55b1d2..4b9684c6 100644
+--- a/src/tools/grep/cli.ts
++++ b/src/tools/grep/cli.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../shared/bun-spawn-shim"
+ import {
+   resolveGrepCli,
+   type ResolvedCli,
+diff --git a/src/tools/hashline-edit/formatter-trigger.ts b/src/tools/hashline-edit/formatter-trigger.ts
+index 37001584..72a755e6 100644
+--- a/src/tools/hashline-edit/formatter-trigger.ts
++++ b/src/tools/hashline-edit/formatter-trigger.ts
+@@ -1,5 +1,6 @@
+ import path from "path"
+ import { log } from "../../shared"
++import { spawn as bunSpawn } from "../../shared/bun-spawn-shim"
+ 
+ interface FormatterConfig {
+   disabled?: boolean
+@@ -106,7 +107,7 @@ export async function runFormattersForFile(
+     const cmd = buildFormatterCommand(formatter.command, filePath)
+     try {
+       log("[formatter-trigger] Running formatter", { command: cmd, file: filePath })
+-      const proc = Bun.spawn(cmd, {
++      const proc = bunSpawn(cmd, {
+         cwd: directory,
+         env: { ...process.env, ...formatter.environment },
+         stdout: "ignore",
+diff --git a/src/tools/interactive-bash/tmux-path-resolver.ts b/src/tools/interactive-bash/tmux-path-resolver.ts
+index 1aa34623..1187fdef 100644
+--- a/src/tools/interactive-bash/tmux-path-resolver.ts
++++ b/src/tools/interactive-bash/tmux-path-resolver.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "bun"
++import { spawn } from "../../shared/bun-spawn-shim"
+ 
+ let tmuxPath: string | null = null
+ let initPromise: Promise<string | null> | null = null
+diff --git a/src/tools/lsp/lsp-process.ts b/src/tools/lsp/lsp-process.ts
+index 3f7b769a..91d940b9 100644
+--- a/src/tools/lsp/lsp-process.ts
++++ b/src/tools/lsp/lsp-process.ts
+@@ -1,4 +1,4 @@
+-import { spawn as bunSpawn } from "bun"
++import { spawn as bunSpawn } from "../../shared/bun-spawn-shim"
+ import { spawn as nodeSpawn, type ChildProcess } from "node:child_process"
+ import { existsSync, statSync } from "fs"
+ import { log } from "../../shared/logger"
+-- 
+2.39.2
+

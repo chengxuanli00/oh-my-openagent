@@ -1,0 +1,1227 @@
+From 2246d1c5ef2022f758bc4660eb8035eb8449a682 Mon Sep 17 00:00:00 2001
+From: Lukin <mylukin@gmail.com>
+Date: Sat, 27 Dec 2025 17:56:40 +0800
+Subject: [PATCH 0608/5749] feat: add Claude Code plugin support (#240)
+
+---
+ assets/oh-my-opencode.schema.json             |  12 +
+ src/config/schema.ts                          |   2 +
+ .../claude-code-plugin-loader/index.ts        |   3 +
+ .../claude-code-plugin-loader/loader.ts       | 471 ++++++++++++++++++
+ .../claude-code-plugin-loader/types.ts        | 195 ++++++++
+ src/index.ts                                  |  33 +-
+ src/tools/ast-grep/index.ts                   |   3 +-
+ src/tools/ast-grep/tools.ts                   |   6 +-
+ src/tools/background-task/tools.ts            |   8 +-
+ src/tools/call-omo-agent/tools.ts             |   4 +-
+ src/tools/glob/tools.ts                       |   4 +-
+ src/tools/grep/tools.ts                       |   4 +-
+ src/tools/index.ts                            |   6 +-
+ src/tools/interactive-bash/tools.ts           |   4 +-
+ src/tools/look-at/tools.ts                    |   4 +-
+ src/tools/lsp/tools.ts                        |  24 +-
+ src/tools/session-manager/tools.ts            |  10 +-
+ src/tools/slashcommand/tools.ts               |   4 +-
+ 18 files changed, 748 insertions(+), 49 deletions(-)
+ create mode 100644 src/features/claude-code-plugin-loader/index.ts
+ create mode 100644 src/features/claude-code-plugin-loader/loader.ts
+ create mode 100644 src/features/claude-code-plugin-loader/types.ts
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index dd3870e1..84010f1a 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -1340,6 +1340,18 @@
+         },
+         "hooks": {
+           "type": "boolean"
++        },
++        "plugins": {
++          "type": "boolean"
++        },
++        "plugins_override": {
++          "type": "object",
++          "propertyNames": {
++            "type": "string"
++          },
++          "additionalProperties": {
++            "type": "boolean"
++          }
+         }
+       }
+     },
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index 08bed6c8..db95fb28 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -104,6 +104,8 @@ export const ClaudeCodeConfigSchema = z.object({
+   skills: z.boolean().optional(),
+   agents: z.boolean().optional(),
+   hooks: z.boolean().optional(),
++  plugins: z.boolean().optional(),
++  plugins_override: z.record(z.string(), z.boolean()).optional(),
+ })
+ 
+ export const SisyphusAgentConfigSchema = z.object({
+diff --git a/src/features/claude-code-plugin-loader/index.ts b/src/features/claude-code-plugin-loader/index.ts
+new file mode 100644
+index 00000000..e95b6a4e
+--- /dev/null
++++ b/src/features/claude-code-plugin-loader/index.ts
+@@ -0,0 +1,3 @@
++export * from "./types"
++export * from "./loader"
++export type { PluginLoaderOptions, ClaudeSettings } from "./types"
+diff --git a/src/features/claude-code-plugin-loader/loader.ts b/src/features/claude-code-plugin-loader/loader.ts
+new file mode 100644
+index 00000000..b21a8396
+--- /dev/null
++++ b/src/features/claude-code-plugin-loader/loader.ts
+@@ -0,0 +1,471 @@
++import { existsSync, readdirSync, readFileSync } from "fs"
++import { homedir } from "os"
++import { join, basename } from "path"
++import type { AgentConfig } from "@opencode-ai/sdk"
++import { parseFrontmatter } from "../../shared/frontmatter"
++import { sanitizeModelField } from "../../shared/model-sanitizer"
++import { isMarkdownFile, resolveSymlink } from "../../shared/file-utils"
++import { log } from "../../shared/logger"
++import { expandEnvVarsInObject } from "../claude-code-mcp-loader/env-expander"
++import { transformMcpServer } from "../claude-code-mcp-loader/transformer"
++import type { CommandDefinition, CommandFrontmatter } from "../claude-code-command-loader/types"
++import type { SkillMetadata } from "../claude-code-skill-loader/types"
++import type { AgentFrontmatter } from "../claude-code-agent-loader/types"
++import type { ClaudeCodeMcpConfig, McpServerConfig } from "../claude-code-mcp-loader/types"
++import type {
++  InstalledPluginsDatabase,
++  PluginManifest,
++  LoadedPlugin,
++  PluginLoadResult,
++  PluginLoadError,
++  PluginScope,
++  HooksConfig,
++  ClaudeSettings,
++  PluginLoaderOptions,
++} from "./types"
++
++const CLAUDE_PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
++
++function getPluginsBaseDir(): string {
++  // Allow override for testing
++  if (process.env.CLAUDE_PLUGINS_HOME) {
++    return process.env.CLAUDE_PLUGINS_HOME
++  }
++  return join(homedir(), ".claude", "plugins")
++}
++
++function getInstalledPluginsPath(): string {
++  return join(getPluginsBaseDir(), "installed_plugins.json")
++}
++
++function resolvePluginPath(path: string, pluginRoot: string): string {
++  return path.replace(CLAUDE_PLUGIN_ROOT_VAR, pluginRoot)
++}
++
++function resolvePluginPaths<T>(obj: T, pluginRoot: string): T {
++  if (obj === null || obj === undefined) return obj
++  if (typeof obj === "string") {
++    return resolvePluginPath(obj, pluginRoot) as T
++  }
++  if (Array.isArray(obj)) {
++    return obj.map((item) => resolvePluginPaths(item, pluginRoot)) as T
++  }
++  if (typeof obj === "object") {
++    const result: Record<string, unknown> = {}
++    for (const [key, value] of Object.entries(obj)) {
++      result[key] = resolvePluginPaths(value, pluginRoot)
++    }
++    return result as T
++  }
++  return obj
++}
++
++function loadInstalledPlugins(): InstalledPluginsDatabase | null {
++  const dbPath = getInstalledPluginsPath()
++  if (!existsSync(dbPath)) {
++    return null
++  }
++
++  try {
++    const content = readFileSync(dbPath, "utf-8")
++    return JSON.parse(content) as InstalledPluginsDatabase
++  } catch (error) {
++    log("Failed to load installed plugins database", error)
++    return null
++  }
++}
++
++function getClaudeSettingsPath(): string {
++  if (process.env.CLAUDE_SETTINGS_PATH) {
++    return process.env.CLAUDE_SETTINGS_PATH
++  }
++  return join(homedir(), ".claude", "settings.json")
++}
++
++function loadClaudeSettings(): ClaudeSettings | null {
++  const settingsPath = getClaudeSettingsPath()
++  if (!existsSync(settingsPath)) {
++    return null
++  }
++
++  try {
++    const content = readFileSync(settingsPath, "utf-8")
++    return JSON.parse(content) as ClaudeSettings
++  } catch (error) {
++    log("Failed to load Claude settings", error)
++    return null
++  }
++}
++
++function loadPluginManifest(installPath: string): PluginManifest | null {
++  const manifestPath = join(installPath, ".claude-plugin", "plugin.json")
++  if (!existsSync(manifestPath)) {
++    return null
++  }
++
++  try {
++    const content = readFileSync(manifestPath, "utf-8")
++    return JSON.parse(content) as PluginManifest
++  } catch (error) {
++    log(`Failed to load plugin manifest from ${manifestPath}`, error)
++    return null
++  }
++}
++
++function derivePluginNameFromKey(pluginKey: string): string {
++  const atIndex = pluginKey.indexOf("@")
++  if (atIndex > 0) {
++    return pluginKey.substring(0, atIndex)
++  }
++  return pluginKey
++}
++
++function isPluginEnabled(
++  pluginKey: string,
++  settingsEnabledPlugins: Record<string, boolean> | undefined,
++  overrideEnabledPlugins: Record<string, boolean> | undefined
++): boolean {
++  if (overrideEnabledPlugins && pluginKey in overrideEnabledPlugins) {
++    return overrideEnabledPlugins[pluginKey]
++  }
++  if (settingsEnabledPlugins && pluginKey in settingsEnabledPlugins) {
++    return settingsEnabledPlugins[pluginKey]
++  }
++  return true
++}
++
++export function discoverInstalledPlugins(options?: PluginLoaderOptions): PluginLoadResult {
++  const db = loadInstalledPlugins()
++  const settings = loadClaudeSettings()
++  const plugins: LoadedPlugin[] = []
++  const errors: PluginLoadError[] = []
++
++  if (!db || !db.plugins) {
++    return { plugins, errors }
++  }
++
++  const settingsEnabledPlugins = settings?.enabledPlugins
++  const overrideEnabledPlugins = options?.enabledPluginsOverride
++
++  for (const [pluginKey, installations] of Object.entries(db.plugins)) {
++    if (!installations || installations.length === 0) continue
++
++    if (!isPluginEnabled(pluginKey, settingsEnabledPlugins, overrideEnabledPlugins)) {
++      log(`Plugin disabled: ${pluginKey}`)
++      continue
++    }
++
++    const installation = installations[0]
++    const { installPath, scope, version } = installation
++
++    if (!existsSync(installPath)) {
++      errors.push({
++        pluginKey,
++        installPath,
++        error: "Plugin installation path does not exist",
++      })
++      continue
++    }
++
++    const manifest = loadPluginManifest(installPath)
++    const pluginName = manifest?.name || derivePluginNameFromKey(pluginKey)
++
++    const loadedPlugin: LoadedPlugin = {
++      name: pluginName,
++      version: version || manifest?.version || "unknown",
++      scope: scope as PluginScope,
++      installPath,
++      pluginKey,
++      manifest: manifest ?? undefined,
++    }
++
++    if (existsSync(join(installPath, "commands"))) {
++      loadedPlugin.commandsDir = join(installPath, "commands")
++    }
++    if (existsSync(join(installPath, "agents"))) {
++      loadedPlugin.agentsDir = join(installPath, "agents")
++    }
++    if (existsSync(join(installPath, "skills"))) {
++      loadedPlugin.skillsDir = join(installPath, "skills")
++    }
++
++    const hooksPath = join(installPath, "hooks", "hooks.json")
++    if (existsSync(hooksPath)) {
++      loadedPlugin.hooksPath = hooksPath
++    }
++
++    const mcpPath = join(installPath, ".mcp.json")
++    if (existsSync(mcpPath)) {
++      loadedPlugin.mcpPath = mcpPath
++    }
++
++    plugins.push(loadedPlugin)
++    log(`Discovered plugin: ${pluginName}@${version} (${scope})`, { installPath, hasManifest: !!manifest })
++  }
++
++  return { plugins, errors }
++}
++
++export function loadPluginCommands(
++  plugins: LoadedPlugin[]
++): Record<string, CommandDefinition> {
++  const commands: Record<string, CommandDefinition> = {}
++
++  for (const plugin of plugins) {
++    if (!plugin.commandsDir || !existsSync(plugin.commandsDir)) continue
++
++    const entries = readdirSync(plugin.commandsDir, { withFileTypes: true })
++
++    for (const entry of entries) {
++      if (!isMarkdownFile(entry)) continue
++
++      const commandPath = join(plugin.commandsDir, entry.name)
++      const commandName = basename(entry.name, ".md")
++      const namespacedName = `${plugin.name}:${commandName}`
++
++      try {
++        const content = readFileSync(commandPath, "utf-8")
++        const { data, body } = parseFrontmatter<CommandFrontmatter>(content)
++
++        const wrappedTemplate = `<command-instruction>
++${body.trim()}
++</command-instruction>
++
++<user-request>
++$ARGUMENTS
++</user-request>`
++
++        const formattedDescription = `(plugin: ${plugin.name}) ${data.description || ""}`
++
++        commands[namespacedName] = {
++          name: namespacedName,
++          description: formattedDescription,
++          template: wrappedTemplate,
++          agent: data.agent,
++          model: sanitizeModelField(data.model, "claude-code"),
++          subtask: data.subtask,
++          argumentHint: data["argument-hint"],
++        }
++
++        log(`Loaded plugin command: ${namespacedName}`, { path: commandPath })
++      } catch (error) {
++        log(`Failed to load plugin command: ${commandPath}`, error)
++      }
++    }
++  }
++
++  return commands
++}
++
++export function loadPluginSkillsAsCommands(
++  plugins: LoadedPlugin[]
++): Record<string, CommandDefinition> {
++  const skills: Record<string, CommandDefinition> = {}
++
++  for (const plugin of plugins) {
++    if (!plugin.skillsDir || !existsSync(plugin.skillsDir)) continue
++
++    const entries = readdirSync(plugin.skillsDir, { withFileTypes: true })
++
++    for (const entry of entries) {
++      if (entry.name.startsWith(".")) continue
++
++      const skillPath = join(plugin.skillsDir, entry.name)
++      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
++
++      const resolvedPath = resolveSymlink(skillPath)
++      const skillMdPath = join(resolvedPath, "SKILL.md")
++      if (!existsSync(skillMdPath)) continue
++
++      try {
++        const content = readFileSync(skillMdPath, "utf-8")
++        const { data, body } = parseFrontmatter<SkillMetadata>(content)
++
++        const skillName = data.name || entry.name
++        const namespacedName = `${plugin.name}:${skillName}`
++        const originalDescription = data.description || ""
++        const formattedDescription = `(plugin: ${plugin.name} - Skill) ${originalDescription}`
++
++        const wrappedTemplate = `<skill-instruction>
++Base directory for this skill: ${resolvedPath}/
++File references (@path) in this skill are relative to this directory.
++
++${body.trim()}
++</skill-instruction>
++
++<user-request>
++$ARGUMENTS
++</user-request>`
++
++        skills[namespacedName] = {
++          name: namespacedName,
++          description: formattedDescription,
++          template: wrappedTemplate,
++          model: sanitizeModelField(data.model),
++        }
++
++        log(`Loaded plugin skill: ${namespacedName}`, { path: resolvedPath })
++      } catch (error) {
++        log(`Failed to load plugin skill: ${skillPath}`, error)
++      }
++    }
++  }
++
++  return skills
++}
++
++function parseToolsConfig(toolsStr?: string): Record<string, boolean> | undefined {
++  if (!toolsStr) return undefined
++
++  const tools = toolsStr.split(",").map((t) => t.trim()).filter(Boolean)
++  if (tools.length === 0) return undefined
++
++  const result: Record<string, boolean> = {}
++  for (const tool of tools) {
++    result[tool.toLowerCase()] = true
++  }
++  return result
++}
++
++export function loadPluginAgents(
++  plugins: LoadedPlugin[]
++): Record<string, AgentConfig> {
++  const agents: Record<string, AgentConfig> = {}
++
++  for (const plugin of plugins) {
++    if (!plugin.agentsDir || !existsSync(plugin.agentsDir)) continue
++
++    const entries = readdirSync(plugin.agentsDir, { withFileTypes: true })
++
++    for (const entry of entries) {
++      if (!isMarkdownFile(entry)) continue
++
++      const agentPath = join(plugin.agentsDir, entry.name)
++      const agentName = basename(entry.name, ".md")
++      const namespacedName = `${plugin.name}:${agentName}`
++
++      try {
++        const content = readFileSync(agentPath, "utf-8")
++        const { data, body } = parseFrontmatter<AgentFrontmatter>(content)
++
++        const name = data.name || agentName
++        const originalDescription = data.description || ""
++        const formattedDescription = `(plugin: ${plugin.name}) ${originalDescription}`
++
++        const config: AgentConfig = {
++          description: formattedDescription,
++          mode: "subagent",
++          prompt: body.trim(),
++        }
++
++        const toolsConfig = parseToolsConfig(data.tools)
++        if (toolsConfig) {
++          config.tools = toolsConfig
++        }
++
++        agents[namespacedName] = config
++        log(`Loaded plugin agent: ${namespacedName}`, { path: agentPath })
++      } catch (error) {
++        log(`Failed to load plugin agent: ${agentPath}`, error)
++      }
++    }
++  }
++
++  return agents
++}
++
++export async function loadPluginMcpServers(
++  plugins: LoadedPlugin[]
++): Promise<Record<string, McpServerConfig>> {
++  const servers: Record<string, McpServerConfig> = {}
++
++  for (const plugin of plugins) {
++    if (!plugin.mcpPath || !existsSync(plugin.mcpPath)) continue
++
++    try {
++      const content = await Bun.file(plugin.mcpPath).text()
++      let config = JSON.parse(content) as ClaudeCodeMcpConfig
++
++      config = resolvePluginPaths(config, plugin.installPath)
++      config = expandEnvVarsInObject(config)
++
++      if (!config.mcpServers) continue
++
++      for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
++        if (serverConfig.disabled) {
++          log(`Skipping disabled MCP server "${name}" from plugin ${plugin.name}`)
++          continue
++        }
++
++        try {
++          const transformed = transformMcpServer(name, serverConfig)
++          const namespacedName = `${plugin.name}:${name}`
++          servers[namespacedName] = transformed
++          log(`Loaded plugin MCP server: ${namespacedName}`, { path: plugin.mcpPath })
++        } catch (error) {
++          log(`Failed to transform plugin MCP server "${name}"`, error)
++        }
++      }
++    } catch (error) {
++      log(`Failed to load plugin MCP config: ${plugin.mcpPath}`, error)
++    }
++  }
++
++  return servers
++}
++
++export function loadPluginHooksConfigs(
++  plugins: LoadedPlugin[]
++): HooksConfig[] {
++  const configs: HooksConfig[] = []
++
++  for (const plugin of plugins) {
++    if (!plugin.hooksPath || !existsSync(plugin.hooksPath)) continue
++
++    try {
++      const content = readFileSync(plugin.hooksPath, "utf-8")
++      let config = JSON.parse(content) as HooksConfig
++
++      config = resolvePluginPaths(config, plugin.installPath)
++
++      configs.push(config)
++      log(`Loaded plugin hooks config from ${plugin.name}`, { path: plugin.hooksPath })
++    } catch (error) {
++      log(`Failed to load plugin hooks config: ${plugin.hooksPath}`, error)
++    }
++  }
++
++  return configs
++}
++
++export interface PluginComponentsResult {
++  commands: Record<string, CommandDefinition>
++  skills: Record<string, CommandDefinition>
++  agents: Record<string, AgentConfig>
++  mcpServers: Record<string, McpServerConfig>
++  hooksConfigs: HooksConfig[]
++  plugins: LoadedPlugin[]
++  errors: PluginLoadError[]
++}
++
++export async function loadAllPluginComponents(options?: PluginLoaderOptions): Promise<PluginComponentsResult> {
++  const { plugins, errors } = discoverInstalledPlugins(options)
++
++  const commands = loadPluginCommands(plugins)
++  const skills = loadPluginSkillsAsCommands(plugins)
++  const agents = loadPluginAgents(plugins)
++  const mcpServers = await loadPluginMcpServers(plugins)
++  const hooksConfigs = loadPluginHooksConfigs(plugins)
++
++  log(`Loaded ${plugins.length} plugins with ${Object.keys(commands).length} commands, ${Object.keys(skills).length} skills, ${Object.keys(agents).length} agents, ${Object.keys(mcpServers).length} MCP servers`)
++
++  return {
++    commands,
++    skills,
++    agents,
++    mcpServers,
++    hooksConfigs,
++    plugins,
++    errors,
++  }
++}
+diff --git a/src/features/claude-code-plugin-loader/types.ts b/src/features/claude-code-plugin-loader/types.ts
+new file mode 100644
+index 00000000..522f2a7e
+--- /dev/null
++++ b/src/features/claude-code-plugin-loader/types.ts
+@@ -0,0 +1,195 @@
++/**
++ * Claude Code Plugin Types
++ * 
++ * Type definitions for Claude Code plugin system compatibility.
++ * Based on https://code.claude.com/docs/en/plugins-reference
++ */
++
++export type PluginScope = "user" | "project" | "local" | "managed"
++
++/**
++ * Plugin installation entry in installed_plugins.json
++ */
++export interface PluginInstallation {
++  scope: PluginScope
++  installPath: string
++  version: string
++  installedAt: string
++  lastUpdated: string
++  gitCommitSha?: string
++  isLocal?: boolean
++}
++
++/**
++ * Installed plugins database structure
++ * Located at ~/.claude/plugins/installed_plugins.json
++ */
++export interface InstalledPluginsDatabase {
++  version: number
++  plugins: Record<string, PluginInstallation[]>
++}
++
++/**
++ * Plugin author information
++ */
++export interface PluginAuthor {
++  name?: string
++  email?: string
++  url?: string
++}
++
++/**
++ * Plugin manifest (plugin.json)
++ * Located at <plugin_root>/.claude-plugin/plugin.json
++ */
++export interface PluginManifest {
++  name: string
++  version?: string
++  description?: string
++  author?: PluginAuthor
++  homepage?: string
++  repository?: string
++  license?: string
++  keywords?: string[]
++  
++  // Component paths (can be string or array)
++  commands?: string | string[]
++  agents?: string | string[]
++  skills?: string | string[]
++  hooks?: string | HooksConfig
++  mcpServers?: string | McpServersConfig
++  lspServers?: string | LspServersConfig
++  outputStyles?: string | string[]
++}
++
++/**
++ * Hooks configuration
++ */
++export interface HookEntry {
++  type: "command" | "prompt" | "agent"
++  command?: string
++  prompt?: string
++  agent?: string
++}
++
++export interface HookMatcher {
++  matcher?: string
++  hooks: HookEntry[]
++}
++
++export interface HooksConfig {
++  hooks?: {
++    PreToolUse?: HookMatcher[]
++    PostToolUse?: HookMatcher[]
++    PostToolUseFailure?: HookMatcher[]
++    PermissionRequest?: HookMatcher[]
++    UserPromptSubmit?: HookMatcher[]
++    Notification?: HookMatcher[]
++    Stop?: HookMatcher[]
++    SubagentStart?: HookMatcher[]
++    SubagentStop?: HookMatcher[]
++    SessionStart?: HookMatcher[]
++    SessionEnd?: HookMatcher[]
++    PreCompact?: HookMatcher[]
++  }
++}
++
++/**
++ * MCP servers configuration in plugin
++ */
++export interface PluginMcpServer {
++  command?: string
++  args?: string[]
++  env?: Record<string, string>
++  cwd?: string
++  url?: string
++  type?: "stdio" | "http" | "sse"
++  disabled?: boolean
++}
++
++export interface McpServersConfig {
++  mcpServers?: Record<string, PluginMcpServer>
++}
++
++/**
++ * LSP server configuration
++ */
++export interface LspServerConfig {
++  command: string
++  args?: string[]
++  extensionToLanguage: Record<string, string>
++  transport?: "stdio" | "socket"
++  env?: Record<string, string>
++  initializationOptions?: Record<string, unknown>
++  settings?: Record<string, unknown>
++  workspaceFolder?: string
++  startupTimeout?: number
++  shutdownTimeout?: number
++  restartOnCrash?: boolean
++  maxRestarts?: number
++  loggingConfig?: {
++    args?: string[]
++    env?: Record<string, string>
++  }
++}
++
++export interface LspServersConfig {
++  [language: string]: LspServerConfig
++}
++
++/**
++ * Loaded plugin with all resolved components
++ */
++export interface LoadedPlugin {
++  name: string
++  version: string
++  scope: PluginScope
++  installPath: string
++  manifest?: PluginManifest
++  pluginKey: string
++  
++  // Resolved paths for components
++  commandsDir?: string
++  agentsDir?: string
++  skillsDir?: string
++  hooksPath?: string
++  mcpPath?: string
++  lspPath?: string
++}
++
++/**
++ * Plugin load result with all components
++ */
++export interface PluginLoadResult {
++  plugins: LoadedPlugin[]
++  errors: PluginLoadError[]
++}
++
++export interface PluginLoadError {
++  pluginKey: string
++  installPath: string
++  error: string
++}
++
++/**
++ * Claude settings from ~/.claude/settings.json
++ */
++export interface ClaudeSettings {
++  enabledPlugins?: Record<string, boolean>
++  // Other settings we don't use
++  [key: string]: unknown
++}
++
++/**
++ * Plugin loader options
++ */
++export interface PluginLoaderOptions {
++  /**
++   * Override enabled plugins from oh-my-opencode config.
++   * Key format: "pluginName@marketplace" (e.g., "shell-scripting@claude-code-workflows")
++   * Value: true = enabled, false = disabled
++   * 
++   * This takes precedence over ~/.claude/settings.json enabledPlugins
++   */
++  enabledPluginsOverride?: Record<string, boolean>
++}
+diff --git a/src/index.ts b/src/index.ts
+index 655eb954..30e85006 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -32,15 +32,13 @@ import {
+   loadOpencodeGlobalCommands,
+   loadOpencodeProjectCommands,
+ } from "./features/claude-code-command-loader";
+-import {
+-  loadUserSkillsAsCommands,
+-  loadProjectSkillsAsCommands,
+-} from "./features/claude-code-skill-loader";
++
+ import {
+   loadUserAgents,
+   loadProjectAgents,
+ } from "./features/claude-code-agent-loader";
+ import { loadMcpConfigs } from "./features/claude-code-mcp-loader";
++import { loadAllPluginComponents } from "./features/claude-code-plugin-loader";
+ import {
+   setMainSession,
+   getMainSessionID,
+@@ -401,6 +399,22 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+         }
+       }
+ 
++      const pluginComponents = (pluginConfig.claude_code?.plugins ?? true)
++        ? await loadAllPluginComponents({
++            enabledPluginsOverride: pluginConfig.claude_code?.plugins_override,
++          })
++        : { commands: {}, skills: {}, agents: {}, mcpServers: {}, hooksConfigs: [], plugins: [], errors: [] };
++
++      if (pluginComponents.plugins.length > 0) {
++        log(`Loaded ${pluginComponents.plugins.length} Claude Code plugins`, {
++          plugins: pluginComponents.plugins.map(p => `${p.name}@${p.version}`),
++        });
++      }
++
++      if (pluginComponents.errors.length > 0) {
++        log(`Plugin load errors`, { errors: pluginComponents.errors });
++      }
++
+       const builtinAgents = createBuiltinAgents(
+         pluginConfig.disabled_agents,
+         pluginConfig.agents,
+@@ -410,6 +424,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+ 
+       const userAgents = (pluginConfig.claude_code?.agents ?? true) ? loadUserAgents() : {};
+       const projectAgents = (pluginConfig.claude_code?.agents ?? true) ? loadProjectAgents() : {};
++      const pluginAgents = pluginComponents.agents;
+ 
+       const isSisyphusEnabled = pluginConfig.sisyphus_agent?.disabled !== true;
+       const builderEnabled = pluginConfig.sisyphus_agent?.default_builder_enabled ?? false;
+@@ -469,6 +484,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+           ...Object.fromEntries(Object.entries(builtinAgents).filter(([k]) => k !== "Sisyphus")),
+           ...userAgents,
+           ...projectAgents,
++          ...pluginAgents,
+           ...filteredConfigAgents,  // Filtered config agents (excludes build/plan if replaced)
+           // Demote build/plan to subagent mode when replaced
+           build: { ...config.agent?.build, mode: "subagent" },
+@@ -479,6 +495,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+           ...builtinAgents,
+           ...userAgents,
+           ...projectAgents,
++          ...pluginAgents,
+           ...config.agent,
+         };
+       }
+@@ -517,10 +534,12 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       const mcpResult = (pluginConfig.claude_code?.mcp ?? true)
+         ? await loadMcpConfigs()
+         : { servers: {} };
++
+       config.mcp = {
+         ...config.mcp,
+         ...createBuiltinMcps(pluginConfig.disabled_mcps),
+         ...mcpResult.servers,
++        ...pluginComponents.mcpServers,
+       };
+ 
+       const userCommands = (pluginConfig.claude_code?.commands ?? true) ? loadUserCommands() : {};
+@@ -528,17 +547,13 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       const systemCommands = config.command ?? {};
+       const projectCommands = (pluginConfig.claude_code?.commands ?? true) ? loadProjectCommands() : {};
+       const opencodeProjectCommands = loadOpencodeProjectCommands();
+-      const userSkills = (pluginConfig.claude_code?.skills ?? true) ? loadUserSkillsAsCommands() : {};
+-      const projectSkills = (pluginConfig.claude_code?.skills ?? true) ? loadProjectSkillsAsCommands() : {};
+-
+       config.command = {
+         ...userCommands,
+-        ...userSkills,
+         ...opencodeGlobalCommands,
+         ...systemCommands,
+         ...projectCommands,
+-        ...projectSkills,
+         ...opencodeProjectCommands,
++        ...pluginComponents.commands,
+       };
+     },
+ 
+diff --git a/src/tools/ast-grep/index.ts b/src/tools/ast-grep/index.ts
+index 109b4aa5..8a02587d 100644
+--- a/src/tools/ast-grep/index.ts
++++ b/src/tools/ast-grep/index.ts
+@@ -1,6 +1,7 @@
++import type { ToolDefinition } from "@opencode-ai/plugin"
+ import { ast_grep_search, ast_grep_replace } from "./tools"
+ 
+-export const builtinTools = {
++export const builtinTools: Record<string, ToolDefinition> = {
+   ast_grep_search,
+   ast_grep_replace,
+ }
+diff --git a/src/tools/ast-grep/tools.ts b/src/tools/ast-grep/tools.ts
+index f4fc89a2..415838a2 100644
+--- a/src/tools/ast-grep/tools.ts
++++ b/src/tools/ast-grep/tools.ts
+@@ -1,4 +1,4 @@
+-import { tool } from "@opencode-ai/plugin/tool"
++import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+ import { CLI_LANGUAGES } from "./constants"
+ import { runSg } from "./cli"
+ import { formatSearchResult, formatReplaceResult } from "./utils"
+@@ -32,7 +32,7 @@ function getEmptyResultHint(pattern: string, lang: CliLanguage): string | null {
+   return null
+ }
+ 
+-export const ast_grep_search = tool({
++export const ast_grep_search: ToolDefinition = tool({
+   description:
+     "Search code patterns across filesystem using AST-aware matching. Supports 25 languages. " +
+     "Use meta-variables: $VAR (single node), $$$ (multiple nodes). " +
+@@ -75,7 +75,7 @@ export const ast_grep_search = tool({
+   },
+ })
+ 
+-export const ast_grep_replace = tool({
++export const ast_grep_replace: ToolDefinition = tool({
+   description:
+     "Replace code patterns across filesystem with AST-aware rewriting. " +
+     "Dry-run by default. Use meta-variables in rewrite to preserve matched content. " +
+diff --git a/src/tools/background-task/tools.ts b/src/tools/background-task/tools.ts
+index 802caff0..2b740135 100644
+--- a/src/tools/background-task/tools.ts
++++ b/src/tools/background-task/tools.ts
+@@ -1,4 +1,4 @@
+-import { tool, type PluginInput } from "@opencode-ai/plugin"
++import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin"
+ import { existsSync, readdirSync } from "node:fs"
+ import { join } from "node:path"
+ import type { BackgroundManager, BackgroundTask } from "../../features/background-agent"
+@@ -37,7 +37,7 @@ function formatDuration(start: Date, end?: Date): string {
+   }
+ }
+ 
+-export function createBackgroundTask(manager: BackgroundManager) {
++export function createBackgroundTask(manager: BackgroundManager): ToolDefinition {
+   return tool({
+     description: BACKGROUND_TASK_DESCRIPTION,
+     args: {
+@@ -217,7 +217,7 @@ Session ID: ${task.sessionID}
+ ${textContent || "(No text output)"}`
+ }
+ 
+-export function createBackgroundOutput(manager: BackgroundManager, client: OpencodeClient) {
++export function createBackgroundOutput(manager: BackgroundManager, client: OpencodeClient): ToolDefinition {
+   return tool({
+     description: BACKGROUND_OUTPUT_DESCRIPTION,
+     args: {
+@@ -283,7 +283,7 @@ export function createBackgroundOutput(manager: BackgroundManager, client: Openc
+   })
+ }
+ 
+-export function createBackgroundCancel(manager: BackgroundManager, client: OpencodeClient) {
++export function createBackgroundCancel(manager: BackgroundManager, client: OpencodeClient): ToolDefinition {
+   return tool({
+     description: BACKGROUND_CANCEL_DESCRIPTION,
+     args: {
+diff --git a/src/tools/call-omo-agent/tools.ts b/src/tools/call-omo-agent/tools.ts
+index 2886e364..5f204fdb 100644
+--- a/src/tools/call-omo-agent/tools.ts
++++ b/src/tools/call-omo-agent/tools.ts
+@@ -1,4 +1,4 @@
+-import { tool, type PluginInput } from "@opencode-ai/plugin"
++import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin"
+ import { ALLOWED_AGENTS, CALL_OMO_AGENT_DESCRIPTION } from "./constants"
+ import type { CallOmoAgentArgs } from "./types"
+ import type { BackgroundManager } from "../../features/background-agent"
+@@ -7,7 +7,7 @@ import { log } from "../../shared/logger"
+ export function createCallOmoAgent(
+   ctx: PluginInput,
+   backgroundManager: BackgroundManager
+-) {
++): ToolDefinition {
+   const agentDescriptions = ALLOWED_AGENTS.map(
+     (name) => `- ${name}: Specialized agent for ${name} tasks`
+   ).join("\n")
+diff --git a/src/tools/glob/tools.ts b/src/tools/glob/tools.ts
+index 73a44989..e9536767 100644
+--- a/src/tools/glob/tools.ts
++++ b/src/tools/glob/tools.ts
+@@ -1,8 +1,8 @@
+-import { tool } from "@opencode-ai/plugin/tool"
++import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+ import { runRgFiles } from "./cli"
+ import { formatGlobResult } from "./utils"
+ 
+-export const glob = tool({
++export const glob: ToolDefinition = tool({
+   description:
+     "Fast file pattern matching tool with safety limits (60s timeout, 100 file limit). " +
+     "Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\". " +
+diff --git a/src/tools/grep/tools.ts b/src/tools/grep/tools.ts
+index 78bea5d4..b809cc80 100644
+--- a/src/tools/grep/tools.ts
++++ b/src/tools/grep/tools.ts
+@@ -1,8 +1,8 @@
+-import { tool } from "@opencode-ai/plugin/tool"
++import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+ import { runRg } from "./cli"
+ import { formatGrepResult } from "./utils"
+ 
+-export const grep = tool({
++export const grep: ToolDefinition = tool({
+   description:
+     "Fast content search tool with safety limits (60s timeout, 10MB output). " +
+     "Searches file contents using regular expressions. " +
+diff --git a/src/tools/index.ts b/src/tools/index.ts
+index ead0b79a..283447bc 100644
+--- a/src/tools/index.ts
++++ b/src/tools/index.ts
+@@ -37,7 +37,7 @@ import {
+   createBackgroundCancel,
+ } from "./background-task"
+ 
+-import type { PluginInput } from "@opencode-ai/plugin"
++import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin"
+ import type { BackgroundManager } from "../features/background-agent"
+ 
+ type OpencodeClient = PluginInput["client"]
+@@ -45,7 +45,7 @@ type OpencodeClient = PluginInput["client"]
+ export { createCallOmoAgent } from "./call-omo-agent"
+ export { createLookAt } from "./look-at"
+ 
+-export function createBackgroundTools(manager: BackgroundManager, client: OpencodeClient) {
++export function createBackgroundTools(manager: BackgroundManager, client: OpencodeClient): Record<string, ToolDefinition> {
+   return {
+     background_task: createBackgroundTask(manager),
+     background_output: createBackgroundOutput(manager, client),
+@@ -53,7 +53,7 @@ export function createBackgroundTools(manager: BackgroundManager, client: Openco
+   }
+ }
+ 
+-export const builtinTools = {
++export const builtinTools: Record<string, ToolDefinition> = {
+   lsp_hover,
+   lsp_goto_definition,
+   lsp_find_references,
+diff --git a/src/tools/interactive-bash/tools.ts b/src/tools/interactive-bash/tools.ts
+index d9be4535..1628d6d1 100644
+--- a/src/tools/interactive-bash/tools.ts
++++ b/src/tools/interactive-bash/tools.ts
+@@ -1,4 +1,4 @@
+-import { tool } from "@opencode-ai/plugin/tool"
++import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+ import { BLOCKED_TMUX_SUBCOMMANDS, DEFAULT_TIMEOUT_MS, INTERACTIVE_BASH_DESCRIPTION } from "./constants"
+ import { getCachedTmuxPath } from "./utils"
+ 
+@@ -47,7 +47,7 @@ export function tokenizeCommand(cmd: string): string[] {
+   return tokens
+ }
+ 
+-export const interactive_bash = tool({
++export const interactive_bash: ToolDefinition = tool({
+   description: INTERACTIVE_BASH_DESCRIPTION,
+   args: {
+     tmux_command: tool.schema.string().describe("The tmux command to execute (without 'tmux' prefix)"),
+diff --git a/src/tools/look-at/tools.ts b/src/tools/look-at/tools.ts
+index 755e7511..b384bdd1 100644
+--- a/src/tools/look-at/tools.ts
++++ b/src/tools/look-at/tools.ts
+@@ -1,5 +1,5 @@
+ import { extname, basename } from "node:path"
+-import { tool, type PluginInput } from "@opencode-ai/plugin"
++import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin"
+ import { LOOK_AT_DESCRIPTION, MULTIMODAL_LOOKER_AGENT } from "./constants"
+ import type { LookAtArgs } from "./types"
+ import { log } from "../../shared/logger"
+@@ -28,7 +28,7 @@ function inferMimeType(filePath: string): string {
+   return mimeTypes[ext] || "application/octet-stream"
+ }
+ 
+-export function createLookAt(ctx: PluginInput) {
++export function createLookAt(ctx: PluginInput): ToolDefinition {
+   return tool({
+     description: LOOK_AT_DESCRIPTION,
+     args: {
+diff --git a/src/tools/lsp/tools.ts b/src/tools/lsp/tools.ts
+index c0dfb2cb..c2f17095 100644
+--- a/src/tools/lsp/tools.ts
++++ b/src/tools/lsp/tools.ts
+@@ -1,4 +1,4 @@
+-import { tool } from "@opencode-ai/plugin/tool"
++import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+ import { getAllServers } from "./config"
+ import {
+   DEFAULT_MAX_REFERENCES,
+@@ -34,7 +34,7 @@ import type {
+ 
+ 
+ 
+-export const lsp_hover = tool({
++export const lsp_hover: ToolDefinition = tool({
+   description: "Get type info, docs, and signature for a symbol at position.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -55,7 +55,7 @@ export const lsp_hover = tool({
+   },
+ })
+ 
+-export const lsp_goto_definition = tool({
++export const lsp_goto_definition: ToolDefinition = tool({
+   description: "Jump to symbol definition. Find WHERE something is defined.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -92,7 +92,7 @@ export const lsp_goto_definition = tool({
+   },
+ })
+ 
+-export const lsp_find_references = tool({
++export const lsp_find_references: ToolDefinition = tool({
+   description: "Find ALL usages/references of a symbol across the entire workspace.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -129,7 +129,7 @@ export const lsp_find_references = tool({
+   },
+ })
+ 
+-export const lsp_document_symbols = tool({
++export const lsp_document_symbols: ToolDefinition = tool({
+   description: "Get hierarchical outline of all symbols in a file.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -167,7 +167,7 @@ export const lsp_document_symbols = tool({
+   },
+ })
+ 
+-export const lsp_workspace_symbols = tool({
++export const lsp_workspace_symbols: ToolDefinition = tool({
+   description: "Search symbols by name across ENTIRE workspace.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -202,7 +202,7 @@ export const lsp_workspace_symbols = tool({
+   },
+ })
+ 
+-export const lsp_diagnostics = tool({
++export const lsp_diagnostics: ToolDefinition = tool({
+   description: "Get errors, warnings, hints from language server BEFORE running build.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -249,7 +249,7 @@ export const lsp_diagnostics = tool({
+   },
+ })
+ 
+-export const lsp_servers = tool({
++export const lsp_servers: ToolDefinition = tool({
+   description: "List available LSP servers and installation status.",
+   args: {},
+   execute: async (_args, context) => {
+@@ -271,7 +271,7 @@ export const lsp_servers = tool({
+   },
+ })
+ 
+-export const lsp_prepare_rename = tool({
++export const lsp_prepare_rename: ToolDefinition = tool({
+   description: "Check if rename is valid. Use BEFORE lsp_rename.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -295,7 +295,7 @@ export const lsp_prepare_rename = tool({
+   },
+ })
+ 
+-export const lsp_rename = tool({
++export const lsp_rename: ToolDefinition = tool({
+   description: "Rename symbol across entire workspace. APPLIES changes to all files.",
+   args: {
+     filePath: tool.schema.string(),
+@@ -318,7 +318,7 @@ export const lsp_rename = tool({
+   },
+ })
+ 
+-export const lsp_code_actions = tool({
++export const lsp_code_actions: ToolDefinition = tool({
+   description: "Get available quick fixes, refactorings, and source actions (organize imports, fix all).",
+   args: {
+     filePath: tool.schema.string(),
+@@ -362,7 +362,7 @@ export const lsp_code_actions = tool({
+   },
+ })
+ 
+-export const lsp_code_action_resolve = tool({
++export const lsp_code_action_resolve: ToolDefinition = tool({
+   description: "Resolve and APPLY a code action from lsp_code_actions.",
+   args: {
+     filePath: tool.schema.string(),
+diff --git a/src/tools/session-manager/tools.ts b/src/tools/session-manager/tools.ts
+index 7acffcca..c0fb04cd 100644
+--- a/src/tools/session-manager/tools.ts
++++ b/src/tools/session-manager/tools.ts
+@@ -1,4 +1,4 @@
+-import { tool } from "@opencode-ai/plugin/tool"
++import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+ import {
+   SESSION_LIST_DESCRIPTION,
+   SESSION_READ_DESCRIPTION,
+@@ -9,7 +9,7 @@ import { getAllSessions, getSessionInfo, readSessionMessages, readSessionTodos,
+ import { filterSessionsByDate, formatSessionInfo, formatSessionList, formatSessionMessages, formatSearchResults, searchInSession } from "./utils"
+ import type { SessionListArgs, SessionReadArgs, SessionSearchArgs, SessionInfoArgs } from "./types"
+ 
+-export const session_list = tool({
++export const session_list: ToolDefinition = tool({
+   description: SESSION_LIST_DESCRIPTION,
+   args: {
+     limit: tool.schema.number().optional().describe("Maximum number of sessions to return"),
+@@ -35,7 +35,7 @@ export const session_list = tool({
+   },
+ })
+ 
+-export const session_read = tool({
++export const session_read: ToolDefinition = tool({
+   description: SESSION_READ_DESCRIPTION,
+   args: {
+     session_id: tool.schema.string().describe("Session ID to read"),
+@@ -64,7 +64,7 @@ export const session_read = tool({
+   },
+ })
+ 
+-export const session_search = tool({
++export const session_search: ToolDefinition = tool({
+   description: SESSION_SEARCH_DESCRIPTION,
+   args: {
+     query: tool.schema.string().describe("Search query string"),
+@@ -87,7 +87,7 @@ export const session_search = tool({
+   },
+ })
+ 
+-export const session_info = tool({
++export const session_info: ToolDefinition = tool({
+   description: SESSION_INFO_DESCRIPTION,
+   args: {
+     session_id: tool.schema.string().describe("Session ID to inspect"),
+diff --git a/src/tools/slashcommand/tools.ts b/src/tools/slashcommand/tools.ts
+index 066f1f1f..3328ce8b 100644
+--- a/src/tools/slashcommand/tools.ts
++++ b/src/tools/slashcommand/tools.ts
+@@ -1,4 +1,4 @@
+-import { tool } from "@opencode-ai/plugin"
++import { tool, type ToolDefinition } from "@opencode-ai/plugin"
+ import { existsSync, readdirSync, readFileSync } from "fs"
+ import { join, basename, dirname } from "path"
+ import { parseFrontmatter, resolveCommandsInText, resolveFileReferencesInText, sanitizeModelField } from "../../shared"
+@@ -127,7 +127,7 @@ function formatCommandList(commands: CommandInfo[]): string {
+   return lines.join("\n")
+ }
+ 
+-export const slashcommand = tool({
++export const slashcommand: ToolDefinition = tool({
+   description: `Execute a slash command within the main conversation.
+ 
+ When you use this tool, the slash command gets expanded to a full prompt that provides detailed instructions on how to complete the task.
+-- 
+2.39.2
+

@@ -1,0 +1,489 @@
+From 98659783c0def8ecf60c4f6108c119a5f6435f73 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 2 Apr 2026 14:55:35 +0900
+Subject: [PATCH 3699/5749] fix(security): confine file resolution to project
+ roots
+
+Block traversal, out-of-root absolute path, and symlink escapes for @file references, file:// URIs, and config skill file loading while logging rejected attempts.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../builtin-agents/resolve-file-uri.test.ts   | 52 +++++++++--
+ src/agents/builtin-agents/resolve-file-uri.ts | 12 +++
+ .../merger/config-skill-entry-loader.test.ts  | 88 +++++++++++++++++++
+ .../merger/config-skill-entry-loader.ts       | 24 +++--
+ src/shared/contains-path.ts                   | 33 +++++++
+ src/shared/file-reference-resolver.test.ts    | 72 +++++++++++++++
+ src/shared/file-reference-resolver.ts         | 20 ++++-
+ src/shared/index.ts                           |  1 +
+ 8 files changed, 287 insertions(+), 15 deletions(-)
+ create mode 100644 src/features/opencode-skill-loader/merger/config-skill-entry-loader.test.ts
+ create mode 100644 src/shared/contains-path.ts
+ create mode 100644 src/shared/file-reference-resolver.test.ts
+
+diff --git a/src/agents/builtin-agents/resolve-file-uri.test.ts b/src/agents/builtin-agents/resolve-file-uri.test.ts
+index 22e4bd88..25da9d76 100644
+--- a/src/agents/builtin-agents/resolve-file-uri.test.ts
++++ b/src/agents/builtin-agents/resolve-file-uri.test.ts
+@@ -1,5 +1,5 @@
+ import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test"
+-import { mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+ import * as os from "node:os"
+ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+@@ -24,6 +24,8 @@ describe("resolvePromptAppend", () => {
+   const relativeFilePath = join(configDir, "relative.txt")
+   const spacedFilePath = join(fixtureRoot, "with space.txt")
+   const homeFilePath = join(homeFixtureDir, "home.txt")
++  const escapedFilePath = join(fixtureRoot, "escaped.txt")
++  const linkedAbsolutePath = join(configDir, "linked-absolute.txt")
+ 
+   beforeAll(async () => {
+     mockedHomeDir = homeFixtureRoot
+@@ -35,6 +37,8 @@ describe("resolvePromptAppend", () => {
+     writeFileSync(relativeFilePath, "relative-content", "utf8")
+     writeFileSync(spacedFilePath, "encoded-content", "utf8")
+     writeFileSync(homeFilePath, "home-content", "utf8")
++    writeFileSync(escapedFilePath, "escaped-content", "utf8")
++    symlinkSync(absoluteFilePath, linkedAbsolutePath)
+ 
+     moduleImportCounter += 1
+     ;({ resolvePromptAppend } = await import(`./resolve-file-uri?test=${moduleImportCounter}`))
+@@ -61,7 +65,7 @@ describe("resolvePromptAppend", () => {
+     const input = `file://${absoluteFilePath}`
+ 
+     //#when
+-    const resolved = resolvePromptAppend(input)
++    const resolved = resolvePromptAppend(input, fixtureRoot)
+ 
+     //#then
+     expect(resolved).toBe("absolute-content")
+@@ -83,7 +87,7 @@ describe("resolvePromptAppend", () => {
+     const input = "file://~/fixture-home/home.txt"
+ 
+     //#when
+-    const resolved = resolvePromptAppend(input)
++    const resolved = resolvePromptAppend(input, homeFixtureRoot)
+ 
+     //#then
+     expect(resolved).toBe("home-content")
+@@ -94,7 +98,7 @@ describe("resolvePromptAppend", () => {
+     const input = `file://${encodeURIComponent(spacedFilePath)}`
+ 
+     //#when
+-    const resolved = resolvePromptAppend(input)
++    const resolved = resolvePromptAppend(input, fixtureRoot)
+ 
+     //#then
+     expect(resolved).toBe("encoded-content")
+@@ -113,12 +117,48 @@ describe("resolvePromptAppend", () => {
+ 
+   test("returns warning when file does not exist", () => {
+     //#given
+-    const input = "file:///path/does/not/exist.txt"
++    const input = "file://./missing.txt"
+ 
+     //#when
+-    const resolved = resolvePromptAppend(input)
++    const resolved = resolvePromptAppend(input, configDir)
+ 
+     //#then
+     expect(resolved).toContain("[WARNING: Could not resolve file URI")
+   })
++
++  test("rejects absolute file URI outside configDir", () => {
++    //#given
++    const input = `file://${absoluteFilePath}`
++
++    //#when
++    const resolved = resolvePromptAppend(input, configDir)
++
++    //#then
++    expect(resolved).toContain("[WARNING: Path rejected:")
++    expect(resolved).not.toContain("absolute-content")
++  })
++
++  test("rejects traversal file URI that escapes configDir", () => {
++    //#given
++    const input = "file://../escaped.txt"
++
++    //#when
++    const resolved = resolvePromptAppend(input, configDir)
++
++    //#then
++    expect(resolved).toContain("[WARNING: Path rejected:")
++    expect(resolved).not.toContain("escaped-content")
++  })
++
++  test("rejects symlink file URI that escapes configDir", () => {
++    //#given
++    const input = "file://./linked-absolute.txt"
++
++    //#when
++    const resolved = resolvePromptAppend(input, configDir)
++
++    //#then
++    expect(resolved).toContain("[WARNING: Path rejected:")
++    expect(resolved).not.toContain("absolute-content")
++  })
+ })
+diff --git a/src/agents/builtin-agents/resolve-file-uri.ts b/src/agents/builtin-agents/resolve-file-uri.ts
+index 56c3ace5..46e7f154 100644
+--- a/src/agents/builtin-agents/resolve-file-uri.ts
++++ b/src/agents/builtin-agents/resolve-file-uri.ts
+@@ -1,6 +1,8 @@
+ import { existsSync, readFileSync } from "node:fs"
+ import { homedir } from "node:os"
+ import { isAbsolute, resolve } from "node:path"
++import { isWithinProject } from "../../shared/contains-path"
++import { log } from "../../shared/logger"
+ 
+ export function resolvePromptAppend(promptAppend: string, configDir?: string): string {
+   if (!promptAppend.startsWith("file://")) return promptAppend
+@@ -18,6 +20,16 @@ export function resolvePromptAppend(promptAppend: string, configDir?: string): s
+     return `[WARNING: Malformed file URI (invalid percent-encoding): ${promptAppend}]`
+   }
+ 
++  const projectRoot = configDir ?? process.cwd()
++  if (!isWithinProject(filePath, projectRoot)) {
++    log("[resolve-file-uri] Rejected file URI outside project root", {
++      promptAppend,
++      filePath,
++      projectRoot,
++    })
++    return `[WARNING: Path rejected: ${promptAppend}]`
++  }
++
+   if (!existsSync(filePath)) {
+     return `[WARNING: Could not resolve file URI: ${promptAppend}]`
+   }
+diff --git a/src/features/opencode-skill-loader/merger/config-skill-entry-loader.test.ts b/src/features/opencode-skill-loader/merger/config-skill-entry-loader.test.ts
+new file mode 100644
+index 00000000..791b79d0
+--- /dev/null
++++ b/src/features/opencode-skill-loader/merger/config-skill-entry-loader.test.ts
+@@ -0,0 +1,88 @@
++import { afterAll, beforeAll, describe, expect, test } from "bun:test"
++import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import type { SkillDefinition } from "../../../config/schema"
++import { configEntryToLoadedSkill } from "./config-skill-entry-loader"
++
++describe("configEntryToLoadedSkill", () => {
++  const fixtureRoot = join(tmpdir(), `config-skill-entry-loader-${Date.now()}`)
++  const configDir = join(fixtureRoot, "config")
++  const allowedSkillPath = join(configDir, "allowed-skill.md")
++  const linkedSecretSkillPath = join(configDir, "linked-secret-skill.md")
++  const outsideSkillPath = join(fixtureRoot, "secret-skill.md")
++
++  beforeAll(() => {
++    mkdirSync(configDir, { recursive: true })
++    writeFileSync(
++      allowedSkillPath,
++      [
++        "---",
++        "description: Allowed skill",
++        "---",
++        "Use ./allowed.txt for context.",
++      ].join("\n"),
++      "utf8"
++    )
++    writeFileSync(
++      outsideSkillPath,
++      [
++        "---",
++        "description: Secret skill",
++        "---",
++        "Do not leak this.",
++      ].join("\n"),
++      "utf8"
++    )
++    symlinkSync(outsideSkillPath, linkedSecretSkillPath)
++  })
++
++  afterAll(() => {
++    rmSync(fixtureRoot, { recursive: true, force: true })
++  })
++
++  test("loads skills from files within configDir", () => {
++    //#given
++    const entry: SkillDefinition = { from: "./allowed-skill.md" }
++
++    //#when
++    const loaded = configEntryToLoadedSkill("allowed-skill", entry, configDir)
++
++    //#then
++    expect(loaded).not.toBeNull()
++    expect(loaded?.definition.template).toContain("Use ./allowed.txt for context.")
++  })
++
++  test("rejects absolute skill files outside configDir", () => {
++    //#given
++    const entry: SkillDefinition = { from: outsideSkillPath }
++
++    //#when
++    const loaded = configEntryToLoadedSkill("secret-skill", entry, configDir)
++
++    //#then
++    expect(loaded).toBeNull()
++  })
++
++  test("rejects traversal skill files that escape configDir", () => {
++    //#given
++    const entry: SkillDefinition = { from: "../secret-skill.md" }
++
++    //#when
++    const loaded = configEntryToLoadedSkill("secret-skill", entry, configDir)
++
++    //#then
++    expect(loaded).toBeNull()
++  })
++
++  test("rejects symlink skill files that escape configDir", () => {
++    //#given
++    const entry: SkillDefinition = { from: "./linked-secret-skill.md" }
++
++    //#when
++    const loaded = configEntryToLoadedSkill("secret-skill", entry, configDir)
++
++    //#then
++    expect(loaded).toBeNull()
++  })
++})
+diff --git a/src/features/opencode-skill-loader/merger/config-skill-entry-loader.ts b/src/features/opencode-skill-loader/merger/config-skill-entry-loader.ts
+index b55bd9e3..d3f7d806 100644
+--- a/src/features/opencode-skill-loader/merger/config-skill-entry-loader.ts
++++ b/src/features/opencode-skill-loader/merger/config-skill-entry-loader.ts
+@@ -5,6 +5,8 @@ import { existsSync, readFileSync } from "fs"
+ import { dirname, isAbsolute, resolve } from "path"
+ import { homedir } from "os"
+ import { parseFrontmatter } from "../../../shared/frontmatter"
++import { isWithinProject } from "../../../shared/contains-path"
++import { log } from "../../../shared/logger"
+ import { sanitizeModelField } from "../../../shared/model-sanitizer"
+ import { resolveSkillPathReferences } from "../../../shared/skill-path-resolver"
+ import { parseAllowedTools } from "../allowed-tools-parser"
+@@ -46,10 +48,22 @@ export function configEntryToLoadedSkill(
+ ): LoadedSkill | null {
+   let template = entry.template || ""
+   let fileMetadata: SkillMetadata = {}
++  let sourcePath: string | undefined
+ 
+   if (entry.from) {
+-    const filePath = resolveFilePath(entry.from, configDir)
+-    const loaded = loadSkillFromFile(filePath)
++    sourcePath = resolveFilePath(entry.from, configDir)
++    const projectRoot = configDir || process.cwd()
++
++    if (!isWithinProject(sourcePath, projectRoot)) {
++      log("[config-skill-entry-loader] Rejected skill entry file outside project root", {
++        from: entry.from,
++        filePath: sourcePath,
++        projectRoot,
++      })
++      return null
++    }
++
++    const loaded = loadSkillFromFile(sourcePath)
+     if (loaded) {
+       template = loaded.template
+       fileMetadata = loaded.metadata
+@@ -63,9 +77,7 @@ export function configEntryToLoadedSkill(
+   }
+ 
+   const description = entry.description || fileMetadata.description || ""
+-  const resolvedPath = entry.from
+-    ? dirname(resolveFilePath(entry.from, configDir))
+-    : configDir || process.cwd()
++  const resolvedPath = sourcePath ? dirname(sourcePath) : configDir || process.cwd()
+ 
+   const resolvedTemplate = resolveSkillPathReferences(template.trim(), resolvedPath)
+   const wrappedTemplate = `<skill-instruction>
+@@ -93,7 +105,7 @@ $ARGUMENTS
+ 
+   return {
+     name,
+-    path: entry.from ? resolveFilePath(entry.from, configDir) : undefined,
++    path: sourcePath,
+     resolvedPath,
+     definition,
+     scope: "config",
+diff --git a/src/shared/contains-path.ts b/src/shared/contains-path.ts
+new file mode 100644
+index 00000000..bd37a5bb
+--- /dev/null
++++ b/src/shared/contains-path.ts
+@@ -0,0 +1,33 @@
++import { existsSync, realpathSync } from "fs"
++import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from "path"
++
++function toCanonicalPath(pathToNormalize: string): string {
++  const resolvedPath = resolve(pathToNormalize)
++
++  if (existsSync(resolvedPath)) {
++    try {
++      return normalize(realpathSync.native(resolvedPath))
++    } catch {
++      return normalize(resolvedPath)
++    }
++  }
++
++  const parentDirectory = dirname(resolvedPath)
++  const canonicalParentDirectory = existsSync(parentDirectory)
++    ? realpathSync.native(parentDirectory)
++    : parentDirectory
++
++  return normalize(join(canonicalParentDirectory, basename(resolvedPath)))
++}
++
++export function containsPath(rootPath: string, candidatePath: string): boolean {
++  const canonicalRootPath = toCanonicalPath(rootPath)
++  const canonicalCandidatePath = toCanonicalPath(candidatePath)
++  const relativePath = relative(canonicalRootPath, canonicalCandidatePath)
++
++  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath))
++}
++
++export function isWithinProject(candidatePath: string, projectRoot: string): boolean {
++  return containsPath(projectRoot, candidatePath)
++}
+diff --git a/src/shared/file-reference-resolver.test.ts b/src/shared/file-reference-resolver.test.ts
+new file mode 100644
+index 00000000..3684b340
+--- /dev/null
++++ b/src/shared/file-reference-resolver.test.ts
+@@ -0,0 +1,72 @@
++import { afterAll, beforeAll, describe, expect, test } from "bun:test"
++import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { resolveFileReferencesInText } from "./file-reference-resolver"
++
++describe("resolveFileReferencesInText", () => {
++  const fixtureRoot = join(tmpdir(), `file-reference-resolver-${Date.now()}`)
++  const workspaceDir = join(fixtureRoot, "workspace")
++  const notesDir = join(workspaceDir, "notes")
++  const allowedFilePath = join(notesDir, "allowed.txt")
++  const linkedSecretPath = join(notesDir, "linked-secret.txt")
++  const outsideFilePath = join(fixtureRoot, "secret.txt")
++
++  beforeAll(() => {
++    mkdirSync(notesDir, { recursive: true })
++    writeFileSync(allowedFilePath, "allowed-content", "utf8")
++    writeFileSync(outsideFilePath, "secret-content", "utf8")
++    symlinkSync(outsideFilePath, linkedSecretPath)
++  })
++
++  afterAll(() => {
++    rmSync(fixtureRoot, { recursive: true, force: true })
++  })
++
++  test("resolves file references within cwd", async () => {
++    //#given
++    const input = "Read @notes/allowed.txt before continuing"
++
++    //#when
++    const resolved = await resolveFileReferencesInText(input, workspaceDir)
++
++    //#then
++    expect(resolved).toContain("allowed-content")
++  })
++
++  test("rejects traversal references that escape cwd", async () => {
++    //#given
++    const input = "Read @../secret.txt before continuing"
++
++    //#when
++    const resolved = await resolveFileReferencesInText(input, workspaceDir)
++
++    //#then
++    expect(resolved).toContain("[path rejected:")
++    expect(resolved).not.toContain("secret-content")
++  })
++
++  test("rejects absolute references outside cwd", async () => {
++    //#given
++    const input = `Read @${outsideFilePath} before continuing`
++
++    //#when
++    const resolved = await resolveFileReferencesInText(input, workspaceDir)
++
++    //#then
++    expect(resolved).toContain("[path rejected:")
++    expect(resolved).not.toContain("secret-content")
++  })
++
++  test("rejects symlink references that escape cwd", async () => {
++    //#given
++    const input = "Read @notes/linked-secret.txt before continuing"
++
++    //#when
++    const resolved = await resolveFileReferencesInText(input, workspaceDir)
++
++    //#then
++    expect(resolved).toContain("[path rejected:")
++    expect(resolved).not.toContain("secret-content")
++  })
++})
+diff --git a/src/shared/file-reference-resolver.ts b/src/shared/file-reference-resolver.ts
+index b1dbae07..d5f0eafb 100644
+--- a/src/shared/file-reference-resolver.ts
++++ b/src/shared/file-reference-resolver.ts
+@@ -1,5 +1,7 @@
+ import { existsSync, readFileSync, statSync } from "fs"
+-import { join, isAbsolute } from "path"
++import { isAbsolute, resolve } from "path"
++import { isWithinProject } from "./contains-path"
++import { log } from "./logger"
+ 
+ interface FileMatch {
+   fullMatch: string
+@@ -30,9 +32,10 @@ function findFileReferences(text: string): FileMatch[] {
+ 
+ function resolveFilePath(filePath: string, cwd: string): string {
+   if (isAbsolute(filePath)) {
+-    return filePath
++    return resolve(filePath)
+   }
+-  return join(cwd, filePath)
++
++  return resolve(cwd, filePath)
+ }
+ 
+ function readFileContent(resolvedPath: string): string {
+@@ -68,6 +71,17 @@ export async function resolveFileReferencesInText(
+ 
+   for (const match of matches) {
+     const resolvedPath = resolveFilePath(match.filePath, cwd)
++
++    if (!isWithinProject(resolvedPath, cwd)) {
++      log("[file-reference-resolver] Rejected file reference outside project root", {
++        filePath: match.filePath,
++        resolvedPath,
++        projectRoot: cwd,
++      })
++      replacements.set(match.fullMatch, `[path rejected: ${match.filePath}]`)
++      continue
++    }
++
+     const content = readFileContent(resolvedPath)
+     replacements.set(match.fullMatch, content)
+   }
+diff --git a/src/shared/index.ts b/src/shared/index.ts
+index e178952b..da70aee2 100644
+--- a/src/shared/index.ts
++++ b/src/shared/index.ts
+@@ -1,5 +1,6 @@
+ export * from "./frontmatter"
+ export * from "./command-executor"
++export * from "./contains-path"
+ export * from "./file-reference-resolver"
+ export * from "./model-sanitizer"
+ export * from "./logger"
+-- 
+2.39.2
+

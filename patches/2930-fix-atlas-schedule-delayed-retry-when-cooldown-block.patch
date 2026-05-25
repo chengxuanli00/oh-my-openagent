@@ -1,0 +1,298 @@
+From cecb78e944466caa83ee33886e1a40729f460b3b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 6 Mar 2026 16:14:24 +0900
+Subject: [PATCH 2930/5749] fix(atlas): schedule delayed retry when cooldown
+ blocks boulder continuation
+
+When atlas injects a boulder continuation via promptAsync() and the
+model's response is immediately aborted (MessageAbortedError), OpenCode
+fires a burst of session.idle events within milliseconds. Atlas blocks
+all of them due to the 5-second cooldown. After the burst, OpenCode
+stops generating session.idle events (it's state-change based, not
+periodic), leaving the session stuck forever.
+
+Fix: When cooldown blocks an idle event for a boulder session with an
+incomplete plan, schedule a one-shot setTimeout (cooldown + 1s) to
+re-attempt injection. The timer callback re-checks boulder state, plan
+progress, and continuation-stopped flag before injecting. Only one timer
+per session is allowed (deduped via pendingRetryTimer field). Timers are
+cleaned up on session.deleted and session.compacted events.
+---
+ src/hooks/atlas/event-handler.ts |  42 ++++++++
+ src/hooks/atlas/index.test.ts    | 173 +++++++++++++++++++++++++++++++
+ src/hooks/atlas/types.ts         |   1 +
+ 3 files changed, 216 insertions(+)
+
+diff --git a/src/hooks/atlas/event-handler.ts b/src/hooks/atlas/event-handler.ts
+index 3930b40b..21c18613 100644
+--- a/src/hooks/atlas/event-handler.ts
++++ b/src/hooks/atlas/event-handler.ts
+@@ -11,6 +11,7 @@ import type { AtlasHookOptions, SessionState } from "./types"
+ 
+ const CONTINUATION_COOLDOWN_MS = 5000
+ const FAILURE_BACKOFF_MS = 5 * 60 * 1000
++const RETRY_DELAY_MS = CONTINUATION_COOLDOWN_MS + 1000
+ 
+ export function createAtlasEventHandler(input: {
+   ctx: PluginInput
+@@ -123,9 +124,42 @@ export function createAtlasEventHandler(input: {
+       }
+ 
+       if (state.lastContinuationInjectedAt && now - state.lastContinuationInjectedAt < CONTINUATION_COOLDOWN_MS) {
++        if (!state.pendingRetryTimer) {
++          state.pendingRetryTimer = setTimeout(async () => {
++            state.pendingRetryTimer = undefined
++
++            const currentBoulder = readBoulderState(ctx.directory)
++            if (!currentBoulder) return
++
++            const currentProgress = getPlanProgress(currentBoulder.active_plan)
++            if (currentProgress.isComplete) return
++
++            if (options?.isContinuationStopped?.(sessionID)) return
++
++            state.lastContinuationInjectedAt = Date.now()
++            const currentRemaining = currentProgress.total - currentProgress.completed
++            try {
++              await injectBoulderContinuation({
++                ctx,
++                sessionID,
++                planName: currentBoulder.plan_name,
++                remaining: currentRemaining,
++                total: currentProgress.total,
++                agent: currentBoulder.agent,
++                worktreePath: currentBoulder.worktree_path,
++                backgroundManager,
++                sessionState: state,
++              })
++            } catch (err) {
++              log(`[${HOOK_NAME}] Delayed retry failed`, { sessionID, error: err })
++              state.promptFailureCount++
++            }
++          }, RETRY_DELAY_MS)
++        }
+         log(`[${HOOK_NAME}] Skipped: continuation cooldown active`, {
+           sessionID,
+           cooldownRemaining: CONTINUATION_COOLDOWN_MS - (now - state.lastContinuationInjectedAt),
++          pendingRetry: !!state.pendingRetryTimer,
+         })
+         return
+       }
+@@ -191,6 +225,10 @@ export function createAtlasEventHandler(input: {
+     if (event.type === "session.deleted") {
+       const sessionInfo = props?.info as { id?: string } | undefined
+       if (sessionInfo?.id) {
++        const deletedState = sessions.get(sessionInfo.id)
++        if (deletedState?.pendingRetryTimer) {
++          clearTimeout(deletedState.pendingRetryTimer)
++        }
+         sessions.delete(sessionInfo.id)
+         log(`[${HOOK_NAME}] Session deleted: cleaned up`, { sessionID: sessionInfo.id })
+       }
+@@ -200,6 +238,10 @@ export function createAtlasEventHandler(input: {
+     if (event.type === "session.compacted") {
+       const sessionID = (props?.sessionID ?? (props?.info as { id?: string } | undefined)?.id) as string | undefined
+       if (sessionID) {
++        const compactedState = sessions.get(sessionID)
++        if (compactedState?.pendingRetryTimer) {
++          clearTimeout(compactedState.pendingRetryTimer)
++        }
+         sessions.delete(sessionID)
+         log(`[${HOOK_NAME}] Session compacted: cleaned up`, { sessionID })
+       }
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index e7027750..e0a46557 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -1419,5 +1419,178 @@ describe("atlas hook", () => {
+       // then - should continue because start-work updated session agent to atlas
+       expect(mockInput._promptMock).toHaveBeenCalled()
+     })
++
++    describe("delayed retry timer (abort-stuck fix)", () => {
++      test("should schedule delayed retry when cooldown blocks idle for incomplete boulder", async () => {
++        // given - boulder with incomplete plan
++        const planPath = join(TEST_DIR, "test-plan.md")
++        writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [x] Task 2")
++
++        const state: BoulderState = {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [MAIN_SESSION_ID],
++          plan_name: "test-plan",
++        }
++        writeBoulderState(TEST_DIR, state)
++
++        const mockInput = createMockPluginInput()
++        const hook = createAtlasHook(mockInput)
++
++        // when - first idle injects, second idle within cooldown schedules retry timer
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++
++        // then - wait for retry timer to fire (RETRY_DELAY_MS = 6000ms)
++        await new Promise(resolve => setTimeout(resolve, 7000))
++        await flushMicrotasks()
++
++        expect(mockInput._promptMock).toHaveBeenCalledTimes(2)
++      }, 15000)
++
++      test("should not schedule duplicate retry timers for rapid idle events", async () => {
++        // given - boulder with incomplete plan
++        const planPath = join(TEST_DIR, "test-plan.md")
++        writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++        const state: BoulderState = {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [MAIN_SESSION_ID],
++          plan_name: "test-plan",
++        }
++        writeBoulderState(TEST_DIR, state)
++
++        const mockInput = createMockPluginInput()
++        const hook = createAtlasHook(mockInput)
++
++        // when - first idle injects, then 3 rapid idles within cooldown
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++
++        // then - wait for retry timer, only one retry should fire
++        await new Promise(resolve => setTimeout(resolve, 7000))
++        await flushMicrotasks()
++
++        expect(mockInput._promptMock).toHaveBeenCalledTimes(2)
++      }, 15000)
++
++      test("should not retry if plan completes before timer fires", async () => {
++        // given - boulder with incomplete plan
++        const planPath = join(TEST_DIR, "test-plan.md")
++        writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [x] Task 2")
++
++        const state: BoulderState = {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [MAIN_SESSION_ID],
++          plan_name: "test-plan",
++        }
++        writeBoulderState(TEST_DIR, state)
++
++        const mockInput = createMockPluginInput()
++        const hook = createAtlasHook(mockInput)
++
++        // when - first idle injects, second schedules retry, then plan completes before timer fires
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++
++        writeFileSync(planPath, "# Plan\n- [x] Task 1\n- [x] Task 2")
++
++        // then - wait for retry timer, it should bail out seeing complete plan
++        await new Promise(resolve => setTimeout(resolve, 7000))
++        await flushMicrotasks()
++
++        expect(mockInput._promptMock).toHaveBeenCalledTimes(1)
++      }, 15000)
++
++      test("should cleanup pending retry timer on session.deleted", async () => {
++        // given - boulder with incomplete plan, schedule retry timer
++        const planPath = join(TEST_DIR, "test-plan.md")
++        writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [x] Task 2")
++
++        const state: BoulderState = {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [MAIN_SESSION_ID],
++          plan_name: "test-plan",
++        }
++        writeBoulderState(TEST_DIR, state)
++
++        const mockInput = createMockPluginInput()
++        const hook = createAtlasHook(mockInput)
++
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++
++        // when - delete session before timer fires
++        await hook.handler({
++          event: { type: "session.deleted", properties: { info: { id: MAIN_SESSION_ID } } },
++        })
++
++        // then - wait for timer period, prompt should only have been called once
++        await new Promise(resolve => setTimeout(resolve, 7000))
++        await flushMicrotasks()
++
++        expect(mockInput._promptMock).toHaveBeenCalledTimes(1)
++      }, 15000)
++
++      test("should cleanup pending retry timer on session.compacted", async () => {
++        // given - boulder with incomplete plan, schedule retry timer
++        const planPath = join(TEST_DIR, "test-plan.md")
++        writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [x] Task 2")
++
++        const state: BoulderState = {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [MAIN_SESSION_ID],
++          plan_name: "test-plan",
++        }
++        writeBoulderState(TEST_DIR, state)
++
++        const mockInput = createMockPluginInput()
++        const hook = createAtlasHook(mockInput)
++
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++        await hook.handler({
++          event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++
++        // when - compact session before timer fires
++        await hook.handler({
++          event: { type: "session.compacted", properties: { sessionID: MAIN_SESSION_ID } },
++        })
++
++        // then - wait for timer period, prompt should only have been called once
++        await new Promise(resolve => setTimeout(resolve, 7000))
++        await flushMicrotasks()
++
++        expect(mockInput._promptMock).toHaveBeenCalledTimes(1)
++      }, 15000)
++    })
+   })
+ })
+diff --git a/src/hooks/atlas/types.ts b/src/hooks/atlas/types.ts
+index 73436a01..b96021ce 100644
+--- a/src/hooks/atlas/types.ts
++++ b/src/hooks/atlas/types.ts
+@@ -29,4 +29,5 @@ export interface SessionState {
+   lastContinuationInjectedAt?: number
+   promptFailureCount: number
+   lastFailureAt?: number
++  pendingRetryTimer?: ReturnType<typeof setTimeout>
+ }
+-- 
+2.39.2
+

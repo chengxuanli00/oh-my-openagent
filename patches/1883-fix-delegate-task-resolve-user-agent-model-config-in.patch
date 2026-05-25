@@ -1,0 +1,371 @@
+From a06364081b33417621538265359e8038bb3ab047 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 8 Feb 2026 13:14:11 +0900
+Subject: [PATCH 1883/5749] fix(delegate-task): resolve user agent model config
+ in subagent_type path (#1357)
+
+---
+ src/index.ts                          |   1 +
+ src/tools/delegate-task/executor.ts   |  47 +++++-
+ src/tools/delegate-task/tools.test.ts | 207 +++++++++++++++++++++++++-
+ src/tools/delegate-task/types.ts      |   3 +-
+ 4 files changed, 246 insertions(+), 12 deletions(-)
+
+diff --git a/src/index.ts b/src/index.ts
+index db49858c..41168e3c 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -488,6 +488,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     disabledSkills,
+     availableCategories,
+     availableSkills,
++    agentOverrides: pluginConfig.agents,
+     onSyncSessionCreated: async (event) => {
+       log("[index] onSyncSessionCreated callback", {
+         sessionID: event.sessionID,
+diff --git a/src/tools/delegate-task/executor.ts b/src/tools/delegate-task/executor.ts
+index 2a3be2b2..886364f0 100644
+--- a/src/tools/delegate-task/executor.ts
++++ b/src/tools/delegate-task/executor.ts
+@@ -1,5 +1,5 @@
+ import type { BackgroundManager } from "../../features/background-agent"
+-import type { CategoriesConfig, GitMasterConfig, BrowserAutomationProvider } from "../../config/schema"
++import type { CategoriesConfig, GitMasterConfig, BrowserAutomationProvider, AgentOverrides } from "../../config/schema"
+ import type { ModelFallbackInfo } from "../../features/task-toast-manager/types"
+ import type { DelegateTaskArgs, ToolContextWithMetadata, OpencodeClient } from "./types"
+ import { DEFAULT_CATEGORIES, CATEGORY_DESCRIPTIONS, isPlanAgent } from "./constants"
+@@ -15,7 +15,7 @@ import { subagentSessions, getSessionAgent } from "../../features/claude-code-se
+ import { log, getAgentToolRestrictions, resolveModelPipeline, promptWithModelSuggestionRetry } from "../../shared"
+ import { fetchAvailableModels, isModelAvailable } from "../../shared/model-availability"
+ import { readConnectedProvidersCache } from "../../shared/connected-providers-cache"
+-import { CATEGORY_MODEL_REQUIREMENTS } from "../../shared/model-requirements"
++import { AGENT_MODEL_REQUIREMENTS, CATEGORY_MODEL_REQUIREMENTS } from "../../shared/model-requirements"
+ import { storeToolMetadata } from "../../features/tool-metadata-store"
+ 
+ const SISYPHUS_JUNIOR_AGENT = "sisyphus-junior"
+@@ -28,6 +28,7 @@ export interface ExecutorContext {
+   gitMasterConfig?: GitMasterConfig
+   sisyphusJuniorModel?: string
+   browserProvider?: BrowserAutomationProvider
++  agentOverrides?: AgentOverrides
+   onSyncSessionCreated?: (event: { sessionID: string; parentID: string; title: string }) => Promise<void>
+ }
+ 
+@@ -940,8 +941,8 @@ export async function resolveSubagentExecution(
+   executorCtx: ExecutorContext,
+   parentAgent: string | undefined,
+   categoryExamples: string
+-): Promise<{ agentToUse: string; categoryModel: { providerID: string; modelID: string } | undefined; error?: string }> {
+-  const { client } = executorCtx
++): Promise<{ agentToUse: string; categoryModel: { providerID: string; modelID: string; variant?: string } | undefined; error?: string }> {
++  const { client, agentOverrides } = executorCtx
+ 
+   if (!args.subagent_type?.trim()) {
+     return { agentToUse: "", categoryModel: undefined, error: `Agent name cannot be empty.` }
+@@ -970,7 +971,7 @@ Create the work plan directly - that's your job as the planning agent.`,
+   }
+ 
+   let agentToUse = agentName
+-  let categoryModel: { providerID: string; modelID: string } | undefined
++  let categoryModel: { providerID: string; modelID: string; variant?: string } | undefined
+ 
+   try {
+     const agentsResult = await client.app.agents()
+@@ -1007,7 +1008,41 @@ Create the work plan directly - that's your job as the planning agent.`,
+ 
+     agentToUse = matchedAgent.name
+ 
+-    if (matchedAgent.model) {
++    const agentNameLower = agentToUse.toLowerCase()
++    const agentOverride = agentOverrides?.[agentNameLower as keyof typeof agentOverrides]
++      ?? (agentOverrides ? Object.entries(agentOverrides).find(([key]) => key.toLowerCase() === agentNameLower)?.[1] : undefined)
++    const agentRequirement = AGENT_MODEL_REQUIREMENTS[agentNameLower]
++
++    if (agentOverride?.model || agentRequirement) {
++      const connectedProviders = readConnectedProvidersCache()
++      const availableModels = await fetchAvailableModels(client, {
++        connectedProviders: connectedProviders ?? undefined,
++      })
++
++      const matchedAgentModelStr = matchedAgent.model
++        ? `${matchedAgent.model.providerID}/${matchedAgent.model.modelID}`
++        : undefined
++
++      const resolution = resolveModelPipeline({
++        intent: {
++          userModel: agentOverride?.model,
++          categoryDefaultModel: matchedAgentModelStr,
++        },
++        constraints: { availableModels },
++        policy: {
++          fallbackChain: agentRequirement?.fallbackChain,
++          systemDefaultModel: undefined,
++        },
++      })
++
++      if (resolution) {
++        const parsed = parseModelString(resolution.model)
++        if (parsed) {
++          const variantToUse = agentOverride?.variant ?? resolution.variant
++          categoryModel = variantToUse ? { ...parsed, variant: variantToUse } : parsed
++        }
++      }
++    } else if (matchedAgent.model) {
+       categoryModel = matchedAgent.model
+     }
+   } catch {
+diff --git a/src/tools/delegate-task/tools.test.ts b/src/tools/delegate-task/tools.test.ts
+index 63a42297..25609dc0 100644
+--- a/src/tools/delegate-task/tools.test.ts
++++ b/src/tools/delegate-task/tools.test.ts
+@@ -2841,8 +2841,8 @@ describe("sisyphus-task", () => {
+       })
+     }, { timeout: 20000 })
+ 
+-    test("agent without model does not override categoryModel", async () => {
+-      // given - agent registered without model field
++    test("agent without model resolves via fallback chain", async () => {
++      // given - agent registered without model field, fallback chain should resolve
+       const { createDelegateTask } = require("./tools")
+       let promptBody: any
+ 
+@@ -2857,7 +2857,7 @@ describe("sisyphus-task", () => {
+          app: {
+            agents: async () => ({
+              data: [
+-               { name: "explore", mode: "subagent" }, // no model field
++               { name: "explore", mode: "subagent" },
+              ],
+            }),
+          },
+@@ -2898,8 +2898,205 @@ describe("sisyphus-task", () => {
+         toolContext
+       )
+ 
+-      // then - no model should be passed to session.prompt
+-      expect(promptBody.model).toBeUndefined()
++      // then - model should be resolved via AGENT_MODEL_REQUIREMENTS fallback chain
++      expect(promptBody.model).toBeDefined()
++    }, { timeout: 20000 })
++
++    test("agentOverrides model takes priority over matchedAgent.model (#1357)", async () => {
++      // given - user configured oracle to use a specific model in oh-my-opencode.json
++      const { createDelegateTask } = require("./tools")
++      let promptBody: any
++
++      const mockManager = { launch: async () => ({}) }
++
++       const promptMock = async (input: any) => {
++         promptBody = input.body
++         return { data: {} }
++       }
++
++       const mockClient = {
++         app: {
++           agents: async () => ({
++             data: [
++               { name: "oracle", mode: "subagent", model: { providerID: "openai", modelID: "gpt-5.2" } },
++             ],
++           }),
++         },
++         config: { get: async () => ({ data: { model: SYSTEM_DEFAULT_MODEL } }) },
++         session: {
++           get: async () => ({ data: { directory: "/project" } }),
++           create: async () => ({ data: { id: "ses_override_model" } }),
++           prompt: promptMock,
++           promptAsync: promptMock,
++           messages: async () => ({
++             data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "Done" }] }],
++           }),
++           status: async () => ({ data: { "ses_override_model": { type: "idle" } } }),
++         },
++       }
++
++       const tool = createDelegateTask({
++         manager: mockManager,
++         client: mockClient,
++         agentOverrides: {
++           oracle: { model: "anthropic/claude-opus-4-6" },
++         },
++       })
++
++      const toolContext = {
++        sessionID: "parent-session",
++        messageID: "parent-message",
++        agent: "sisyphus",
++        abort: new AbortController().signal,
++      }
++
++      // when - delegating to oracle via subagent_type with user override
++      await tool.execute(
++        {
++          description: "Consult oracle with override",
++          prompt: "Review architecture",
++          subagent_type: "oracle",
++          run_in_background: false,
++          load_skills: [],
++        },
++        toolContext
++      )
++
++      // then - user-configured model should take priority over matchedAgent.model
++      expect(promptBody.model).toEqual({
++        providerID: "anthropic",
++        modelID: "claude-opus-4-6",
++      })
++    }, { timeout: 20000 })
++
++    test("agentOverrides variant is applied when model is overridden (#1357)", async () => {
++      // given - user configured oracle with model and variant
++      const { createDelegateTask } = require("./tools")
++      let promptBody: any
++
++      const mockManager = { launch: async () => ({}) }
++
++       const promptMock = async (input: any) => {
++         promptBody = input.body
++         return { data: {} }
++       }
++
++       const mockClient = {
++         app: {
++           agents: async () => ({
++             data: [
++               { name: "oracle", mode: "subagent", model: { providerID: "openai", modelID: "gpt-5.2" } },
++             ],
++           }),
++         },
++         config: { get: async () => ({ data: { model: SYSTEM_DEFAULT_MODEL } }) },
++         session: {
++           get: async () => ({ data: { directory: "/project" } }),
++           create: async () => ({ data: { id: "ses_variant_test" } }),
++           prompt: promptMock,
++           promptAsync: promptMock,
++           messages: async () => ({
++             data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "Done" }] }],
++           }),
++           status: async () => ({ data: { "ses_variant_test": { type: "idle" } } }),
++         },
++       }
++
++       const tool = createDelegateTask({
++         manager: mockManager,
++         client: mockClient,
++         agentOverrides: {
++           oracle: { model: "anthropic/claude-opus-4-6", variant: "max" },
++         },
++       })
++
++      const toolContext = {
++        sessionID: "parent-session",
++        messageID: "parent-message",
++        agent: "sisyphus",
++        abort: new AbortController().signal,
++      }
++
++      // when - delegating to oracle via subagent_type with variant override
++      await tool.execute(
++        {
++          description: "Consult oracle with variant",
++          prompt: "Review architecture",
++          subagent_type: "oracle",
++          run_in_background: false,
++          load_skills: [],
++        },
++        toolContext
++      )
++
++      // then - user-configured variant should be applied
++      expect(promptBody.variant).toBe("max")
++    }, { timeout: 20000 })
++
++    test("fallback chain resolves model when no override and no matchedAgent.model (#1357)", async () => {
++      // given - agent registered without model, no override, but AGENT_MODEL_REQUIREMENTS has fallback
++      const { createDelegateTask } = require("./tools")
++      let promptBody: any
++
++      const mockManager = { launch: async () => ({}) }
++
++       const promptMock = async (input: any) => {
++         promptBody = input.body
++         return { data: {} }
++       }
++
++       const mockClient = {
++         app: {
++           agents: async () => ({
++             data: [
++               { name: "oracle", mode: "subagent" }, // no model field
++             ],
++           }),
++         },
++         config: { get: async () => ({ data: { model: SYSTEM_DEFAULT_MODEL } }) },
++         session: {
++           get: async () => ({ data: { directory: "/project" } }),
++           create: async () => ({ data: { id: "ses_fallback_test" } }),
++           prompt: promptMock,
++           promptAsync: promptMock,
++           messages: async () => ({
++             data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "Done" }] }],
++           }),
++           status: async () => ({ data: { "ses_fallback_test": { type: "idle" } } }),
++         },
++       }
++
++       const tool = createDelegateTask({
++         manager: mockManager,
++         client: mockClient,
++         // no agentOverrides
++       })
++
++      const toolContext = {
++        sessionID: "parent-session",
++        messageID: "parent-message",
++        agent: "sisyphus",
++        abort: new AbortController().signal,
++      }
++
++      // when - delegating to oracle with no override and no matchedAgent model
++      await tool.execute(
++        {
++          description: "Consult oracle with fallback",
++          prompt: "Review architecture",
++          subagent_type: "oracle",
++          run_in_background: false,
++          load_skills: [],
++        },
++        toolContext
++      )
++
++      // then - should resolve via AGENT_MODEL_REQUIREMENTS fallback chain for oracle
++      // oracle fallback chain: gpt-5.2 (openai) > gemini-3-pro (google) > claude-opus-4-6 (anthropic)
++      // Since openai is in connectedProviders, should resolve to openai/gpt-5.2
++      expect(promptBody.model).toBeDefined()
++      expect(promptBody.model.providerID).toBe("openai")
++      expect(promptBody.model.modelID).toContain("gpt-5.2")
+     }, { timeout: 20000 })
+   })
+ 
+diff --git a/src/tools/delegate-task/types.ts b/src/tools/delegate-task/types.ts
+index 1fb4b4a6..1646b1fe 100644
+--- a/src/tools/delegate-task/types.ts
++++ b/src/tools/delegate-task/types.ts
+@@ -1,6 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { BackgroundManager } from "../../features/background-agent"
+-import type { CategoriesConfig, GitMasterConfig, BrowserAutomationProvider } from "../../config/schema"
++import type { CategoriesConfig, GitMasterConfig, BrowserAutomationProvider, AgentOverrides } from "../../config/schema"
+ import type {
+   AvailableCategory,
+   AvailableSkill,
+@@ -53,6 +53,7 @@ export interface DelegateTaskToolOptions {
+   disabledSkills?: Set<string>
+   availableCategories?: AvailableCategory[]
+   availableSkills?: AvailableSkill[]
++  agentOverrides?: AgentOverrides
+   onSyncSessionCreated?: (event: SyncSessionCreatedEvent) => Promise<void>
+ }
+ 
+-- 
+2.39.2
+

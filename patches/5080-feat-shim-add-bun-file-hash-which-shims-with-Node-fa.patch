@@ -1,0 +1,914 @@
+From 4394f34225bfc128a264702c547921a1ed2efe92 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 12 May 2026 12:46:31 +0900
+Subject: [PATCH 5080/5749] feat(shim): add bun-file/hash/which shims with Node
+ fallbacks
+
+The plugin builds with `bun build --target bun` and runs under OpenCode
+CLI (Bun SEA) but also under OpenCode Desktop (Electron / Node V8) where
+`globalThis.Bun` does not exist. Mirror the existing `bun-spawn-shim.ts`
+pattern for three more Bun runtime APIs:
+
+- bun-file-shim: bunFile()/bunWrite() backed by node:fs/promises with
+  ArrayBuffer slicing to avoid Node Buffer pool exposure
+- bun-hash-shim: pure-JS XXH32, bit-exact with Bun.hash.xxHash32 verified
+  by 1200-pair fuzz comparison so existing hashline LINE#ID tags remain
+  stable across runtimes
+- bun-which-shim: synchronous PATH walker with Windows .exe/.cmd/.bat/.com
+  extensions plus isUnsafeCommandName guard that rejects path separators,
+  parent traversal, drive letters and null bytes before any probe
+
+Each shim uses the canonical `runtime.Bun !== undefined` detection and
+delegates to native Bun under IS_BUN, otherwise uses Node primitives.
+Each ships with a co-located test that exercises both branches via the
+`node:vm.runInNewContext` pattern from bun-hash-shim.test.ts.
+---
+ src/shared/bun-file-shim.test.ts  | 300 ++++++++++++++++++++++++++++++
+ src/shared/bun-file-shim.ts       |  65 +++++++
+ src/shared/bun-hash-shim.test.ts  | 175 +++++++++++++++++
+ src/shared/bun-hash-shim.ts       |  89 +++++++++
+ src/shared/bun-which-shim.test.ts | 149 +++++++++++++++
+ src/shared/bun-which-shim.ts      |  58 ++++++
+ 6 files changed, 836 insertions(+)
+ create mode 100644 src/shared/bun-file-shim.test.ts
+ create mode 100644 src/shared/bun-file-shim.ts
+ create mode 100644 src/shared/bun-hash-shim.test.ts
+ create mode 100644 src/shared/bun-hash-shim.ts
+ create mode 100644 src/shared/bun-which-shim.test.ts
+ create mode 100644 src/shared/bun-which-shim.ts
+
+diff --git a/src/shared/bun-file-shim.test.ts b/src/shared/bun-file-shim.test.ts
+new file mode 100644
+index 00000000..7be9fa4d
+--- /dev/null
++++ b/src/shared/bun-file-shim.test.ts
+@@ -0,0 +1,300 @@
++/// <reference path="../../bun-test.d.ts" />
++
++import { Buffer as NodeBuffer } from "node:buffer"
++import { readFileSync } from "node:fs"
++import { access, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { dirname, join } from "node:path"
++import { fileURLToPath } from "node:url"
++import { runInNewContext } from "node:vm"
++import { afterAll, beforeAll, describe, expect, it } from "bun:test"
++
++import { bunFile, bunWrite } from "./bun-file-shim"
++
++type NodeFallbackBunFileLike = {
++  text(): Promise<string>
++  arrayBuffer(): Promise<ArrayBuffer>
++  exists(): Promise<boolean>
++  delete(): Promise<void>
++}
++
++type NodeFallbackBunFile = (path: string) => NodeFallbackBunFileLike
++type NodeFallbackBunWrite = (path: string, data: string | ArrayBuffer | Uint8Array) => Promise<number>
++
++type NodeFallbackExports = {
++  bunFile: NodeFallbackBunFile
++  bunWrite: NodeFallbackBunWrite
++}
++
++type BunFileTestRuntime = {
++  Transpiler: new (options: { loader: "ts" }) => { transformSync(source: string): string }
++}
++
++type BunFileSandbox = {
++  access: typeof access
++  Buffer: typeof NodeBuffer
++  console: Console
++  Promise: PromiseConstructor
++  readFile: typeof readFile
++  TextEncoder: typeof TextEncoder
++  Uint8Array: Uint8ArrayConstructor
++  unlink: typeof unlink
++  writeFile: typeof writeFile
++  __exports?: NodeFallbackExports
++}
++
++const runtime = globalThis as typeof globalThis & { Bun: BunFileTestRuntime }
++const NODE_FALLBACK = loadNodeFallbackBunFileShim()
++
++let temporaryDirectory = ""
++let nodeFallbackTemporaryDirectory = ""
++
++function temporaryPath(fileName: string): string {
++  return join(temporaryDirectory, fileName)
++}
++
++function nodeFallbackPath(fileName: string): string {
++  return join(nodeFallbackTemporaryDirectory, fileName)
++}
++
++function loadNodeFallbackBunFileShim(): NodeFallbackExports {
++  const sourcePath = join(dirname(fileURLToPath(import.meta.url)), "bun-file-shim.ts")
++  const source = readFileSync(sourcePath, "utf8")
++  const importStatement = 'import { access, readFile, unlink, writeFile } from "node:fs/promises"\n\n'
++  const interfaceSignature = "export interface BunFileLike {"
++  const bunFileSignature = "export function bunFile(path: string): BunFileLike {"
++  const bunWriteSignature =
++    "export async function bunWrite(path: string, data: string | ArrayBuffer | Uint8Array): Promise<number> {"
++
++  if (!source.startsWith(importStatement)) {
++    throw new Error("bun-file-shim import statement changed")
++  }
++
++  for (const signature of [interfaceSignature, bunFileSignature, bunWriteSignature]) {
++    if (!source.includes(signature)) {
++      throw new Error(`bun-file-shim signature changed: ${signature}`)
++    }
++  }
++
++  const transformedSource = source
++    .slice(importStatement.length)
++    .replace(interfaceSignature, "interface BunFileLike {")
++    .replace(bunFileSignature, "function bunFile(path: string): BunFileLike {")
++    .replace(
++      bunWriteSignature,
++      "async function bunWrite(path: string, data: string | ArrayBuffer | Uint8Array): Promise<number> {",
++    )
++  const scriptSource = `${transformedSource}\nglobalThis.__exports = { bunFile, bunWrite }\n`
++  const transpiler = new runtime.Bun.Transpiler({ loader: "ts" })
++  const script = transpiler.transformSync(scriptSource)
++  const sandbox: BunFileSandbox = {
++    access,
++    Buffer: NodeBuffer,
++    console,
++    Promise,
++    readFile,
++    TextEncoder,
++    Uint8Array,
++    unlink,
++    writeFile,
++  }
++
++  runInNewContext(script, sandbox, { filename: sourcePath })
++
++  if (!sandbox.__exports) {
++    throw new Error("Node fallback bun-file-shim loader failed")
++  }
++
++  return sandbox.__exports
++}
++
++function arrayBufferFromBytes(bytes: number[]): ArrayBuffer {
++  const arrayBuffer = new ArrayBuffer(bytes.length)
++  const view = new Uint8Array(arrayBuffer)
++
++  view.set(bytes)
++
++  return arrayBuffer
++}
++
++describe("bun-file-shim", () => {
++  beforeAll(async () => {
++    temporaryDirectory = await mkdtemp(join(tmpdir(), "bun-file-shim-"))
++  })
++
++  afterAll(async () => {
++    if (temporaryDirectory.length === 0) return
++
++    await rm(temporaryDirectory, { recursive: true, force: true })
++  })
++
++  describe("#given bunFile", () => {
++    it("#when text is called then it reads file contents", async () => {
++      const filePath = temporaryPath("text.txt")
++      const content = "hello from file"
++
++      await writeFile(filePath, content)
++
++      expect(await bunFile(filePath).text()).toBe(content)
++    })
++
++    it("#when arrayBuffer is called then it returns exact file bytes", async () => {
++      const filePath = temporaryPath("bytes.bin")
++      const bytes = new Uint8Array([0, 1, 2, 255])
++
++      await writeFile(filePath, bytes)
++
++      const arrayBuffer = await bunFile(filePath).arrayBuffer()
++
++      expect(arrayBuffer.byteLength).toBe(bytes.byteLength)
++      expect(Array.from(new Uint8Array(arrayBuffer))).toEqual(Array.from(bytes))
++    })
++
++    it("#when exists is called then it reflects file presence", async () => {
++      const existingPath = temporaryPath("existing.txt")
++      const missingPath = temporaryPath("missing.txt")
++
++      await writeFile(existingPath, "present")
++
++      expect(await bunFile(existingPath).exists()).toBe(true)
++      expect(await bunFile(missingPath).exists()).toBe(false)
++    })
++
++    it("#when delete is called then it removes the file", async () => {
++      const filePath = temporaryPath("delete-me.txt")
++
++      await writeFile(filePath, "remove")
++      await bunFile(filePath).delete()
++
++      expect(await bunFile(filePath).exists()).toBe(false)
++    })
++  })
++
++  describe("#given bunWrite", () => {
++    it("#when writing string data then it writes contents and returns byte count", async () => {
++      const filePath = temporaryPath("write-string.txt")
++      const content = "write me"
++      const bytesWritten = await bunWrite(filePath, content)
++
++      expect(bytesWritten).toBe(new TextEncoder().encode(content).byteLength)
++      expect(await readFile(filePath, "utf8")).toBe(content)
++    })
++
++    it("#when writing array buffer data then it writes exact bytes", async () => {
++      const filePath = temporaryPath("write-array-buffer.bin")
++      const arrayBuffer = arrayBufferFromBytes([65, 66, 67, 68])
++      const bytesWritten = await bunWrite(filePath, arrayBuffer)
++      const written = await readFile(filePath)
++
++      expect(bytesWritten).toBe(arrayBuffer.byteLength)
++      expect(Array.from(written)).toEqual([65, 66, 67, 68])
++    })
++
++    it("#when writing then reading text then it round trips content", async () => {
++      const filePath = temporaryPath("round-trip.txt")
++      const content = "round trip content"
++
++      await bunWrite(filePath, content)
++
++      expect(await bunFile(filePath).text()).toBe(content)
++    })
++
++    it("#when writing unicode text then it round trips content", async () => {
++      const filePath = temporaryPath("unicode-round-trip.txt")
++      const content = "Hello 世界 🌍"
++
++      await bunWrite(filePath, content)
++
++      expect(await bunFile(filePath).text()).toBe(content)
++    })
++  })
++
++  describe("#given Node fallback without Bun global", () => {
++    beforeAll(async () => {
++      nodeFallbackTemporaryDirectory = await mkdtemp(join(tmpdir(), "bun-file-shim-node-"))
++    })
++
++    afterAll(async () => {
++      if (nodeFallbackTemporaryDirectory.length === 0) return
++
++      await rm(nodeFallbackTemporaryDirectory, { recursive: true, force: true })
++    })
++
++    it("#when text is called then it reads file contents", async () => {
++      const filePath = nodeFallbackPath("text.txt")
++      const content = "hello from Node fallback"
++
++      await writeFile(filePath, content)
++
++      expect(await NODE_FALLBACK.bunFile(filePath).text()).toBe(content)
++    })
++
++    it("#when arrayBuffer is called then it returns exact file bytes", async () => {
++      const filePath = nodeFallbackPath("bytes.bin")
++      const bytes = new Uint8Array([0, 1, 2, 255, 128])
++
++      await writeFile(filePath, bytes)
++
++      const arrayBuffer = await NODE_FALLBACK.bunFile(filePath).arrayBuffer()
++
++      expect(arrayBuffer.byteLength).toBe(bytes.byteLength)
++      expect(Array.from(new Uint8Array(arrayBuffer))).toEqual(Array.from(bytes))
++    })
++
++    it("#when exists is called then it reflects file presence", async () => {
++      const existingPath = nodeFallbackPath("existing.txt")
++      const missingPath = nodeFallbackPath("missing.txt")
++
++      await writeFile(existingPath, "present")
++
++      expect(await NODE_FALLBACK.bunFile(existingPath).exists()).toBe(true)
++      expect(await NODE_FALLBACK.bunFile(missingPath).exists()).toBe(false)
++    })
++
++    it("#when delete is called then it removes the file", async () => {
++      const filePath = nodeFallbackPath("delete-me.txt")
++
++      await writeFile(filePath, "remove")
++      await NODE_FALLBACK.bunFile(filePath).delete()
++
++      expect(await NODE_FALLBACK.bunFile(filePath).exists()).toBe(false)
++    })
++
++    it("#when writing string data then it writes contents and returns byte count", async () => {
++      const filePath = nodeFallbackPath("write-string.txt")
++      const content = "write me from Node fallback"
++      const bytesWritten = await NODE_FALLBACK.bunWrite(filePath, content)
++
++      expect(bytesWritten).toBe(new TextEncoder().encode(content).byteLength)
++      expect(await readFile(filePath, "utf8")).toBe(content)
++    })
++
++    it("#when writing array buffer data then it writes exact bytes", async () => {
++      const filePath = nodeFallbackPath("write-array-buffer.bin")
++      const arrayBuffer = arrayBufferFromBytes([65, 66, 67, 68, 69])
++      const bytesWritten = await NODE_FALLBACK.bunWrite(filePath, arrayBuffer)
++      const written = await readFile(filePath)
++
++      expect(bytesWritten).toBe(arrayBuffer.byteLength)
++      expect(Array.from(written)).toEqual([65, 66, 67, 68, 69])
++    })
++
++    it("#when writing then reading text then it round trips content", async () => {
++      const filePath = nodeFallbackPath("round-trip.txt")
++      const content = "round trip through Node fallback"
++
++      await NODE_FALLBACK.bunWrite(filePath, content)
++
++      expect(await NODE_FALLBACK.bunFile(filePath).text()).toBe(content)
++    })
++
++    it("#when writing unicode text then it round trips content", async () => {
++      const filePath = nodeFallbackPath("unicode-round-trip.txt")
++      const content = "Hello 世界 🌍 from Node fallback"
++
++      await NODE_FALLBACK.bunWrite(filePath, content)
++
++      expect(await NODE_FALLBACK.bunFile(filePath).text()).toBe(content)
++    })
++  })
++})
+diff --git a/src/shared/bun-file-shim.ts b/src/shared/bun-file-shim.ts
+new file mode 100644
+index 00000000..97085318
+--- /dev/null
++++ b/src/shared/bun-file-shim.ts
+@@ -0,0 +1,65 @@
++import { access, readFile, unlink, writeFile } from "node:fs/promises"
++
++export interface BunFileLike {
++  text(): Promise<string>
++  arrayBuffer(): Promise<ArrayBuffer>
++  exists(): Promise<boolean>
++  delete(): Promise<void>
++}
++
++type BunFileRuntime = {
++  file(path: string): BunFileLike
++  write(path: string, data: string | ArrayBuffer | Uint8Array): Promise<number>
++}
++
++const runtime = globalThis as typeof globalThis & { Bun?: BunFileRuntime }
++const IS_BUN = typeof runtime.Bun !== "undefined"
++
++function byteLength(data: string | ArrayBuffer | Uint8Array): number {
++  if (typeof data === "string") return Buffer.byteLength(data, "utf8")
++
++  return data.byteLength
++}
++
++function toWritableData(data: string | ArrayBuffer | Uint8Array): string | Uint8Array {
++  if (typeof data === "string") return data
++  if (data instanceof Uint8Array) return data
++
++  return new Uint8Array(data)
++}
++
++function createNodeFile(path: string): BunFileLike {
++  return {
++    text() {
++      return readFile(path, "utf8")
++    },
++    async arrayBuffer() {
++      const buffer = await readFile(path)
++
++      return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
++    },
++    exists() {
++      return access(path).then(
++        () => true,
++        () => false,
++      )
++    },
++    delete() {
++      return unlink(path)
++    },
++  }
++}
++
++export function bunFile(path: string): BunFileLike {
++  if (IS_BUN) return runtime.Bun!.file(path)
++
++  return createNodeFile(path)
++}
++
++export async function bunWrite(path: string, data: string | ArrayBuffer | Uint8Array): Promise<number> {
++  if (IS_BUN) return runtime.Bun!.write(path, data)
++
++  await writeFile(path, toWritableData(data))
++
++  return byteLength(data)
++}
+diff --git a/src/shared/bun-hash-shim.test.ts b/src/shared/bun-hash-shim.test.ts
+new file mode 100644
+index 00000000..41755390
+--- /dev/null
++++ b/src/shared/bun-hash-shim.test.ts
+@@ -0,0 +1,175 @@
++import { readFileSync } from "node:fs"
++import { dirname, join } from "node:path"
++import { fileURLToPath } from "node:url"
++import { runInNewContext } from "node:vm"
++import { describe, expect, test } from "bun:test"
++import { bunHashXxh32 as runtimeBunHashXxh32 } from "./bun-hash-shim"
++
++type HashFunction = (input: string, seed: number) => number
++type HashPair = { input: string; seed: number }
++type BunHashTestRuntime = {
++  hash: { xxHash32(data: string | Uint8Array, seed: number): number }
++  Transpiler: new (options: { loader: "ts" }) => { transformSync(source: string): string }
++}
++type HashSandbox = {
++  Math: Math
++  TextEncoder: typeof TextEncoder
++  Uint8Array: Uint8ArrayConstructor
++  __bunHashShim?: { bunHashXxh32: HashFunction }
++}
++
++const runtime = globalThis as typeof globalThis & { Bun: BunHashTestRuntime }
++const FUZZ_PAIR_COUNT = 1_200
++const FIXED_LENGTHS = [0, 1, 2, 3, 4, 15, 16, 17, 31, 32, 33, 64, 100, 255, 500]
++const FIXED_SEEDS = [0, 1, 42, 12345, 0xdeadbeef, 0xffffffff]
++const CONTENT_FRAGMENTS = ["你好世界", "\u{1f389}", "\u{1f525}", "\n", "\r\n", "\t", " "]
++const SPECIAL_INPUTS = [
++  "",
++  " ",
++  "\t\n\r\n",
++  "hello world",
++  "你好世界",
++  "\u{1f389}\u{1f525}",
++  "mixed 你好 \u{1f389} ascii",
++  "line one\nline two\r\n\tindented",
++]
++const PURE_JS_HASH = loadPureJsBunHashXxh32()
++const FUZZ_PAIRS = createFuzzPairs()
++
++function loadPureJsBunHashXxh32(): HashFunction {
++  const sourcePath = join(dirname(fileURLToPath(import.meta.url)), "bun-hash-shim.ts")
++  const source = readFileSync(sourcePath, "utf8")
++  const exportSignature = "export function bunHashXxh32(input: string, seed: number): number {"
++
++  if (!source.includes(exportSignature)) {
++    throw new Error("bunHashXxh32 export signature changed")
++  }
++
++  const scriptSource = `${source.replace(
++    exportSignature,
++    "function bunHashXxh32(input: string, seed: number): number {",
++  )}\nglobalThis.__bunHashShim = { bunHashXxh32 }\n`
++  const transpiler = new runtime.Bun.Transpiler({ loader: "ts" })
++  const script = transpiler.transformSync(scriptSource)
++  const sandbox: HashSandbox = { Math, TextEncoder, Uint8Array }
++
++  runInNewContext(script, sandbox, { filename: sourcePath })
++
++  const pureJsHash = sandbox.__bunHashShim?.bunHashXxh32
++  if (!pureJsHash) {
++    throw new Error("pure-JS bunHashXxh32 loader failed")
++  }
++
++  return pureJsHash
++}
++
++function createUint32Generator(seed: number): () => number {
++  let state = seed >>> 0
++
++  return () => {
++    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
++
++    return state
++  }
++}
++
++function createSeed(pairIndex: number, nextUint32: () => number): number {
++  if (pairIndex % (FIXED_SEEDS.length + 1) === FIXED_SEEDS.length) return nextUint32()
++
++  return FIXED_SEEDS[pairIndex % FIXED_SEEDS.length] ?? 0
++}
++
++function createRandomString(length: number, nextUint32: () => number): string {
++  let value = ""
++
++  while (value.length < length) {
++    if (nextUint32() % 10 < 6) {
++      value += String.fromCharCode(32 + (nextUint32() % 95))
++      continue
++    }
++
++    const fragment = CONTENT_FRAGMENTS[nextUint32() % CONTENT_FRAGMENTS.length] ?? " "
++    if (value.length + fragment.length <= length) {
++      value += fragment
++      continue
++    }
++
++    value += String.fromCharCode(32 + (nextUint32() % 95))
++  }
++
++  return value
++}
++
++function createFuzzPairs(): HashPair[] {
++  const nextUint32 = createUint32Generator(0x5eed1234)
++  const pairs: HashPair[] = []
++
++  for (const input of SPECIAL_INPUTS) {
++    pairs.push({ input, seed: createSeed(pairs.length, nextUint32) })
++  }
++
++  for (const length of FIXED_LENGTHS) {
++    pairs.push({ input: createRandomString(length, nextUint32), seed: createSeed(pairs.length, nextUint32) })
++  }
++
++  while (pairs.length < FUZZ_PAIR_COUNT) {
++    const randomLength = nextUint32() % 501
++    const length = pairs.length % 13 === 0 ? (FIXED_LENGTHS[pairs.length % FIXED_LENGTHS.length] ?? randomLength) : randomLength
++    pairs.push({ input: createRandomString(length, nextUint32), seed: createSeed(pairs.length, nextUint32) })
++  }
++
++  return pairs
++}
++
++function nativeXxh32(input: string, seed: number): number {
++  return runtime.Bun.hash.xxHash32(input, seed)
++}
++
++function createMismatchMessage(label: string, input: string, seed: number, expected: number, actual: number): string {
++  return `${label} mismatch for input=${JSON.stringify(input)} seed=${seed} expected=${expected} actual=${actual}`
++}
++
++function expectPureJsHashToMatchBun(label: string, input: string, seed: number): void {
++  const expected = nativeXxh32(input, seed)
++  const actual = PURE_JS_HASH(input, seed)
++
++  if (actual !== expected) {
++    throw new Error(createMismatchMessage(label, input, seed, expected, actual))
++  }
++}
++
++describe("#given known XXH32 test vectors", () => {
++  test("#when pure-JS hash is called #then returns canonical values", () => {
++    expect(PURE_JS_HASH("", 0)).toBe(0x02cc5d05)
++    expect(PURE_JS_HASH("a", 0)).toBe(0x550d7456)
++    expect(PURE_JS_HASH("abc", 0)).toBe(0x32d153ff)
++  })
++
++  test("#when a non-zero seed is used #then matches Bun hash", () => {
++    expectPureJsHashToMatchBun("seeded vector", "test", 42)
++    expect(runtimeBunHashXxh32("test", 42)).toBe(nativeXxh32("test", 42))
++  })
++})
++
++describe("#given random inputs #when hashed with pure-JS and Bun.hash", () => {
++  test("#then all fuzz pairs are bit-exact", () => {
++    expect(FUZZ_PAIRS).toHaveLength(FUZZ_PAIR_COUNT)
++
++    for (const [pairIndex, pair] of FUZZ_PAIRS.entries()) {
++      expectPureJsHashToMatchBun(`fuzz pair ${pairIndex}`, pair.input, pair.seed)
++    }
++  })
++})
++
++describe("#given production-like inputs", () => {
++  test("#when hashed with line-number seeds #then pure-JS matches Bun hash", () => {
++    const inputs = ["  const x = 42;", "import { foo } from 'bar'", "// comment", ""]
++    const seeds = [0, 1, 50, 100, 999]
++
++    for (const input of inputs) {
++      for (const seed of seeds) {
++        expectPureJsHashToMatchBun("production-like input", input, seed)
++      }
++    }
++  })
++})
+diff --git a/src/shared/bun-hash-shim.ts b/src/shared/bun-hash-shim.ts
+new file mode 100644
+index 00000000..d77bbda1
+--- /dev/null
++++ b/src/shared/bun-hash-shim.ts
+@@ -0,0 +1,89 @@
++type BunHashRuntime = { hash: { xxHash32(data: string | Uint8Array, seed: number): number } }
++
++const runtime = globalThis as typeof globalThis & { Bun?: BunHashRuntime }
++const IS_BUN = typeof runtime.Bun !== "undefined"
++const encoder = new TextEncoder()
++
++const PRIME32_1 = 0x9e3779b1
++const PRIME32_2 = 0x85ebca77
++const PRIME32_3 = 0xc2b2ae3d
++const PRIME32_4 = 0x27d4eb2f
++const PRIME32_5 = 0x165667b1
++
++function rotateLeft32(value: number, bits: number): number {
++  return ((value << bits) | (value >>> (32 - bits))) >>> 0
++}
++
++function readUint32LittleEndian(input: Uint8Array, offset: number): number {
++  return (
++    ((input[offset] ?? 0) |
++      ((input[offset + 1] ?? 0) << 8) |
++      ((input[offset + 2] ?? 0) << 16) |
++      ((input[offset + 3] ?? 0) << 24)) >>>
++    0
++  )
++}
++
++function round32(accumulator: number, value: number): number {
++  const added = (accumulator + Math.imul(value, PRIME32_2)) >>> 0
++
++  return Math.imul(rotateLeft32(added, 13), PRIME32_1) >>> 0
++}
++
++function xxHash32Js(input: Uint8Array, seed: number): number {
++  let offset = 0
++  const length = input.length
++  let hash: number
++
++  if (length >= 16) {
++    const limit = length - 16
++    let value1 = (seed + PRIME32_1 + PRIME32_2) >>> 0
++    let value2 = (seed + PRIME32_2) >>> 0
++    let value3 = seed >>> 0
++    let value4 = (seed - PRIME32_1) >>> 0
++
++    while (offset <= limit) {
++      value1 = round32(value1, readUint32LittleEndian(input, offset))
++      offset += 4
++      value2 = round32(value2, readUint32LittleEndian(input, offset))
++      offset += 4
++      value3 = round32(value3, readUint32LittleEndian(input, offset))
++      offset += 4
++      value4 = round32(value4, readUint32LittleEndian(input, offset))
++      offset += 4
++    }
++
++    hash = (rotateLeft32(value1, 1) + rotateLeft32(value2, 7)) >>> 0
++    hash = (hash + rotateLeft32(value3, 12)) >>> 0
++    hash = (hash + rotateLeft32(value4, 18)) >>> 0
++  } else {
++    hash = (seed + PRIME32_5) >>> 0
++  }
++
++  hash = (hash + length) >>> 0
++
++  while (offset + 4 <= length) {
++    hash = (hash + Math.imul(readUint32LittleEndian(input, offset), PRIME32_3)) >>> 0
++    hash = Math.imul(rotateLeft32(hash, 17), PRIME32_4) >>> 0
++    offset += 4
++  }
++
++  while (offset < length) {
++    hash = (hash + Math.imul(input[offset] ?? 0, PRIME32_5)) >>> 0
++    hash = Math.imul(rotateLeft32(hash, 11), PRIME32_1) >>> 0
++    offset += 1
++  }
++
++  hash = (hash ^ (hash >>> 15)) >>> 0
++  hash = Math.imul(hash, PRIME32_2) >>> 0
++  hash = (hash ^ (hash >>> 13)) >>> 0
++  hash = Math.imul(hash, PRIME32_3) >>> 0
++
++  return (hash ^ (hash >>> 16)) >>> 0
++}
++
++export function bunHashXxh32(input: string, seed: number): number {
++  if (IS_BUN) return runtime.Bun!.hash.xxHash32(input, seed)
++
++  return xxHash32Js(encoder.encode(input), seed >>> 0)
++}
+diff --git a/src/shared/bun-which-shim.test.ts b/src/shared/bun-which-shim.test.ts
+new file mode 100644
+index 00000000..9b55fec8
+--- /dev/null
++++ b/src/shared/bun-which-shim.test.ts
+@@ -0,0 +1,149 @@
++import { accessSync, constants, readFileSync } from "node:fs"
++import { delimiter, dirname, join } from "node:path"
++import { fileURLToPath } from "node:url"
++import { runInNewContext } from "node:vm"
++import { describe, expect, test } from "bun:test"
++
++import { bunWhich } from "./bun-which-shim"
++
++type BunWhichFunction = (commandName: string) => string | null
++type BunWhichRuntime = {
++  Transpiler?: new (options: { loader: "ts" }) => { transformSync(source: string): string }
++  which(commandName: string): string | null
++}
++type SandboxProcess = {
++  env: { PATH?: string; Path?: string }
++  platform: typeof process.platform
++}
++type BunWhichSandbox = {
++  accessSync: typeof accessSync
++  constants: typeof constants
++  console: Console
++  delimiter: typeof delimiter
++  join: typeof join
++  process: SandboxProcess
++  __bunWhichShim?: { bunWhich: BunWhichFunction }
++}
++
++const runtime = globalThis as typeof globalThis & { Bun?: BunWhichRuntime }
++const PATH_TRAVERSAL_COMMAND_NAMES = [
++  "../etc/passwd",
++  "/etc/passwd",
++  "./tool",
++  "sub/dir/tool",
++  "C:\\Windows\\evil",
++  "C:tool",
++  ".",
++  "..",
++  "node..evil",
++]
++const NULL_BYTE_COMMAND_NAME = "node\0evil"
++const NODE_FALLBACK_BUN_WHICH = loadNodeFallbackBunWhich()
++
++function loadNodeFallbackBunWhich(): BunWhichFunction {
++  const sourcePath = join(dirname(fileURLToPath(import.meta.url)), "bun-which-shim.ts")
++  const source = readFileSync(sourcePath, "utf8")
++  const fsImport = 'import { accessSync, constants } from "node:fs"\n'
++  const pathImport = 'import { delimiter, join } from "node:path"\n'
++  const exportSignature = "export function bunWhich(commandName: string): string | null {"
++
++  if (!source.includes(fsImport) || !source.includes(pathImport) || !source.includes(exportSignature)) {
++    throw new Error("bunWhich source shape changed")
++  }
++
++  const scriptSource = `${source
++    .replace(fsImport, "")
++    .replace(pathImport, "")
++    .replace(exportSignature, "function bunWhich(commandName: string): string | null {")}\nglobalThis.__bunWhichShim = { bunWhich }\n`
++  const transpilerConstructor = runtime.Bun?.Transpiler
++  if (!transpilerConstructor) {
++    throw new Error("Bun Transpiler unavailable")
++  }
++
++  const transpiler = new transpilerConstructor({ loader: "ts" })
++  const script = transpiler.transformSync(scriptSource)
++  const sandboxProcess: SandboxProcess = {
++    env: { PATH: process.env.PATH, Path: process.env.Path },
++    platform: process.platform,
++  }
++  const sandbox: BunWhichSandbox = { accessSync, constants, console, delimiter, join, process: sandboxProcess }
++
++  runInNewContext(script, sandbox, { filename: sourcePath })
++
++  const nodeFallbackBunWhich = sandbox.__bunWhichShim?.bunWhich
++  if (!nodeFallbackBunWhich) {
++    throw new Error("Node fallback bunWhich loader failed")
++  }
++
++  return nodeFallbackBunWhich
++}
++
++describe("bunWhich", () => {
++  test("#given 'node' command #when resolved #then returns a non-null path ending in 'node'", () => {
++    const resolvedPath = bunWhich("node")
++
++    expect(resolvedPath).not.toBeNull()
++    expect(resolvedPath?.toLowerCase()).toMatch(/node(?:\.exe)?$/)
++  })
++
++  test("#given a non-existent command #when resolved #then returns null", () => {
++    const resolvedPath = bunWhich("this-command-definitely-does-not-exist-abc123xyz")
++
++    expect(resolvedPath).toBeNull()
++  })
++
++  test("#given an empty string #when resolved #then returns null", () => {
++    const resolvedPath = bunWhich("")
++
++    expect(resolvedPath).toBeNull()
++  })
++
++  test("#given the result for 'node' #when resolved #then the returned path matches Bun.which('node')", () => {
++    const nativePath = runtime.Bun?.which("node")
++    const shimPath = bunWhich("node")
++
++    expect(nativePath).not.toBeNull()
++    expect(shimPath).toBe(nativePath)
++  })
++
++  test("#given path-traversal command names #when resolved through Bun runtime #then returns null", () => {
++    for (const commandName of PATH_TRAVERSAL_COMMAND_NAMES) {
++      expect(bunWhich(commandName)).toBeNull()
++    }
++  })
++
++  test("#given a null-byte command name #when resolved through Bun runtime #then returns null", () => {
++    expect(bunWhich(NULL_BYTE_COMMAND_NAME)).toBeNull()
++  })
++})
++
++describe("#given Node fallback bunWhich loaded without Bun global", () => {
++  test("#when 'node' command is resolved #then returns a non-null path ending in 'node'", () => {
++    const resolvedPath = NODE_FALLBACK_BUN_WHICH("node")
++
++    expect(resolvedPath).not.toBeNull()
++    expect(resolvedPath?.toLowerCase()).toMatch(/node(?:\.exe)?$/)
++  })
++
++  test("#when a non-existent command is resolved #then returns null", () => {
++    const resolvedPath = NODE_FALLBACK_BUN_WHICH("this-does-not-exist-abc123xyz")
++
++    expect(resolvedPath).toBeNull()
++  })
++
++  test("#when an empty string is resolved #then returns null", () => {
++    const resolvedPath = NODE_FALLBACK_BUN_WHICH("")
++
++    expect(resolvedPath).toBeNull()
++  })
++
++  test("#when path-traversal command names are resolved #then returns null", () => {
++    for (const commandName of PATH_TRAVERSAL_COMMAND_NAMES) {
++      expect(NODE_FALLBACK_BUN_WHICH(commandName)).toBeNull()
++    }
++  })
++
++  test("#when a null-byte command name is resolved #then returns null", () => {
++    expect(NODE_FALLBACK_BUN_WHICH(NULL_BYTE_COMMAND_NAME)).toBeNull()
++  })
++})
+diff --git a/src/shared/bun-which-shim.ts b/src/shared/bun-which-shim.ts
+new file mode 100644
+index 00000000..47d97491
+--- /dev/null
++++ b/src/shared/bun-which-shim.ts
+@@ -0,0 +1,58 @@
++import { accessSync, constants } from "node:fs"
++import { delimiter, join } from "node:path"
++
++type BunWhichRuntime = { which(commandName: string): string | null }
++const runtime = globalThis as typeof globalThis & { Bun?: BunWhichRuntime }
++const IS_BUN = typeof runtime.Bun !== "undefined"
++
++function isUnsafeCommandName(commandName: string): boolean {
++  if (commandName.includes("/") || commandName.includes("\\")) return true
++  if (commandName === "." || commandName === ".." || commandName.includes("..")) return true
++  if (/^[a-zA-Z]:/.test(commandName)) return true
++  if (commandName.includes("\0")) return true
++
++  return false
++}
++
++function isExecutable(filePath: string): boolean {
++  try {
++    accessSync(filePath, constants.X_OK)
++    return true
++  } catch {
++    return false
++  }
++}
++
++function resolvePathValue(): string | undefined {
++  if (process.platform === "win32") return process.env.Path ?? process.env.PATH
++
++  return process.env.PATH
++}
++
++function getWindowsCandidates(commandName: string): string[] {
++  if (process.platform !== "win32") return [commandName]
++
++  return [commandName, `${commandName}.exe`, `${commandName}.cmd`, `${commandName}.bat`, `${commandName}.com`]
++}
++
++export function bunWhich(commandName: string): string | null {
++  if (!commandName) return null
++  if (isUnsafeCommandName(commandName)) return null
++  if (IS_BUN) return runtime.Bun?.which(commandName) ?? null
++
++  const pathValue = resolvePathValue()
++  if (!pathValue) return null
++
++  const pathEntries = pathValue.split(delimiter).filter((pathEntry) => pathEntry.length > 0)
++  if (pathEntries.length === 0) return null
++
++  const candidateNames = getWindowsCandidates(commandName)
++  for (const pathEntry of pathEntries) {
++    for (const candidateName of candidateNames) {
++      const candidatePath = join(pathEntry, candidateName)
++      if (isExecutable(candidatePath)) return candidatePath
++    }
++  }
++
++  return null
++}
+-- 
+2.39.2
+

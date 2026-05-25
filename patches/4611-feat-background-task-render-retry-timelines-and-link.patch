@@ -1,0 +1,1071 @@
+From 79054ea3e533ccf4cb447103276b19c410bf66da Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Choi=20Kijin=20/=20=EC=B5=9C=20=EA=B8=B0=EC=A7=84=20/=20?=
+ =?UTF-8?q?=E3=83=81=E3=83=A7=E3=82=A4=20=E3=82=AD=E3=82=B8=E3=83=B3?=
+ <kichoi@lycorp.co.jp>
+Date: Tue, 28 Apr 2026 15:29:49 +0900
+Subject: [PATCH 4611/5749] feat(background-task): render retry timelines and
+ links
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ ...26-04-27-background-task-retry-timeline.md | 442 ++++++++++++++++++
+ ...7-background-task-retry-timeline-design.md | 320 +++++++++++++
+ ...kground-task-notification-template.test.ts |  70 +++
+ .../background-task-notification-template.ts  |  57 ++-
+ src/tools/background-task/clients.ts          |   2 +-
+ .../task-result-format.test.ts                |  48 ++
+ .../background-task/task-result-format.ts     |  18 +
+ 7 files changed, 952 insertions(+), 5 deletions(-)
+ create mode 100644 docs/superpowers/plans/2026-04-27-background-task-retry-timeline.md
+ create mode 100644 docs/superpowers/specs/2026-04-27-background-task-retry-timeline-design.md
+ create mode 100644 src/tools/background-task/task-result-format.test.ts
+
+diff --git a/docs/superpowers/plans/2026-04-27-background-task-retry-timeline.md b/docs/superpowers/plans/2026-04-27-background-task-retry-timeline.md
+new file mode 100644
+index 00000000..4c8b5e25
+--- /dev/null
++++ b/docs/superpowers/plans/2026-04-27-background-task-retry-timeline.md
+@@ -0,0 +1,442 @@
++# Background Task Retry Timeline Implementation Plan
++
++> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
++
++**Goal:** Add structured retry-attempt history to background tasks and surface a compact attempt timeline in parent chat while preserving separate retry child sessions.
++
++**Architecture:** Extend `BackgroundTask` with explicit `attempts[]` state and `currentAttemptID`, add small helper functions to keep task-level fields as a projection of the current attempt, and wire those helpers into background retry, session creation, and completion/error paths. Parent notifications remain the UI surface, but they are generated from structured attempt state instead of ad hoc retry text.
++
++**Tech Stack:** TypeScript, Bun test, OpenCode background task engine, parent chat notification flow
++
++---
++
++## File Structure
++
++### Files to modify
++
++- `src/features/background-agent/types.ts`
++  - Extend `BackgroundTask` with `attempts[]` and `currentAttemptID`
++  - Add attempt type definition and any retry-observability support fields needed
++
++- `src/features/background-agent/manager.ts`
++  - Add/consume helper functions for attempt lifecycle
++  - Bind retry child session ids to exact attempts in `startTask()`
++  - Resolve lifecycle events through `sessionID -> attemptID`
++  - Generate final parent summary from `attempts[]`
++
++- `src/features/background-agent/fallback-retry-handler.ts`
++  - Create next attempt entry during retry scheduling
++  - Finalize failed attempt before queueing retry
++  - Preserve retry notification metadata without mutating historical attempts
++
++- `src/features/background-agent/background-task-notification-template.ts`
++  - Add compact attempt timeline rendering for parent-facing notifications
++
++- `src/tools/background-task/task-result-format.ts`
++  - Optional first-pass alignment if task results need to reference attempt-derived terminal state consistently
++
++### Files to test
++
++- `src/features/background-agent/manager.test.ts`
++- `src/features/background-agent/fallback-retry-handler.test.ts`
++- `src/tools/background-task/task-result-format.test.ts`
++
++### Files to inspect for patterns/reference only
++
++- `src/features/background-agent/session-idle-event-handler.ts`
++- `src/features/background-agent/task-history.ts`
++- `src/features/background-agent/session-status-classifier.ts`
++- `docs/superpowers/specs/2026-04-27-background-task-retry-timeline-design.md`
++
++---
++
++### Task 1: Define structured attempt state
++
++**Files:**
++- Modify: `src/features/background-agent/types.ts`
++- Test: `src/features/background-agent/manager.test.ts`
++
++- [ ] **Step 1: Add a focused failing test that expects attempt state on a new background task**
++
++Add a test in `src/features/background-agent/manager.test.ts` that launches a background task and expects:
++- `attempts` to exist
++- first attempt to have `attemptNumber: 1`
++- `currentAttemptID` to point at that first attempt
++- top-level task fields to still exist for compatibility
++
++- [ ] **Step 2: Run the new test to verify it fails for the expected reason**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: the new assertion fails because `attempts[]` and `currentAttemptID` do not exist yet.
++
++- [ ] **Step 3: Add the attempt state types to `BackgroundTask`**
++
++Update `src/features/background-agent/types.ts` to add:
++- `BackgroundTaskAttempt` type/interface with:
++  - `attemptID`
++  - `attemptNumber`
++  - `sessionID?`
++  - `providerID?`
++  - `modelID?`
++  - `variant?`
++  - `status`
++  - `error?`
++  - `startedAt?`
++  - `completedAt?`
++- `attempts?: BackgroundTaskAttempt[]`
++- `currentAttemptID?: string`
++
++- [ ] **Step 4: Initialize first attempt state when tasks are created**
++
++In `src/features/background-agent/manager.ts`, when `launch()` creates the initial `BackgroundTask`, initialize:
++- one attempt entry in `pending`
++- `currentAttemptID` referencing that entry
++- top-level `model` copied into attempt model fields
++
++- [ ] **Step 5: Re-run the test to verify the new task has attempt state**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: the new launch/creation test passes.
++
++---
++
++### Task 2: Add attempt lifecycle helper functions
++
++**Files:**
++- Modify: `src/features/background-agent/manager.ts`
++- Test: `src/features/background-agent/manager.test.ts`
++
++- [ ] **Step 1: Add a failing test for exact attempt binding in `startTask()`**
++
++Add a test that simulates:
++- a task with a pending retry attempt
++- `startTask()` creating a child session
++- the session being bound to the exact scheduled attempt, not merely "the latest pending attempt"
++
++The test should assert:
++- `sessionID` lands on the correct attempt
++- `currentAttemptID` remains correct
++- top-level task `sessionID` mirrors that active attempt
++
++- [ ] **Step 2: Run the test to verify it fails before helpers exist**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: binding assertions fail or require manual task mutation not yet implemented.
++
++- [ ] **Step 3: Implement helper functions inside `manager.ts`**
++
++Add small focused helpers, either in `manager.ts` or a dedicated sibling helper file if needed:
++- `startAttempt(task, initialModel)`
++- `bindAttemptSession(task, attemptID, sessionID, model)`
++- `scheduleRetryAttempt(task, failedAttemptID, nextModel, error)`
++- `finalizeAttempt(task, attemptID, terminalStatus, error?)`
++
++These helpers must enforce:
++- only `currentAttemptID` is mutable
++- finalized attempts are immutable
++- binding by explicit `attemptID`
++
++- [ ] **Step 4: Add a `sessionID -> attemptID` mapping strategy**
++
++Implement one of:
++- a map stored on the task
++- or a lookup derived from attempts by session id
++
++The first implementation can be simple, but every lifecycle event must resolve the attempt through this mapping before mutating state.
++
++- [ ] **Step 5: Define an explicit queued work contract that carries `attemptID` into `startTask()`**
++
++Update the implementation plan so queued background work carries the scheduled `attemptID` explicitly.
++
++Concretely:
++- extend the queue item / queued work shape to include `attemptID`
++- ensure retry scheduling writes that `attemptID` at queue time
++- ensure `startTask()` receives the exact `attemptID` and never infers “latest pending attempt”
++
++This is required to satisfy the approved spec’s exact-binding rule.
++
++- [ ] **Step 6: Re-run the manager tests**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: new binding and helper tests pass.
++
++---
++
++### Task 3: Record retries as new attempts instead of overwriting task state
++
++**Files:**
++- Modify: `src/features/background-agent/fallback-retry-handler.ts`
++- Test: `src/features/background-agent/fallback-retry-handler.test.ts`
++
++- [ ] **Step 1: Add a failing test for retry scheduling creating Attempt 2**
++
++Add a test that starts with a task already representing Attempt 1 and then runs `tryFallbackRetry()`.
++
++Expected behavior:
++- Attempt 1 becomes terminal `error`
++- Attempt 2 is created as `pending`
++- `currentAttemptID` moves to Attempt 2
++- top-level `task.model` mirrors Attempt 2 model
++
++- [ ] **Step 2: Run the retry-handler test to verify it fails**
++
++Run:
++```bash
++bun test src/features/background-agent/fallback-retry-handler.test.ts
++```
++
++Expected: no structured attempt chain exists yet, so assertions fail.
++
++- [ ] **Step 3: Update retry scheduling to use attempt helpers**
++
++In `src/features/background-agent/fallback-retry-handler.ts`:
++- finalize the current attempt before retry queueing
++- create the next pending attempt
++- preserve retry notification metadata on the task
++- keep top-level compatibility fields aligned with the new active attempt
++
++- [ ] **Step 4: Re-run the retry-handler tests**
++
++Run:
++```bash
++bun test src/features/background-agent/fallback-retry-handler.test.ts
++```
++
++Expected: retry now produces a correct attempt chain.
++
++---
++
++### Task 4: Route all session lifecycle mutations through attempt identity
++
++**Files:**
++- Modify: `src/features/background-agent/manager.ts`
++- Reference: `src/features/background-agent/session-idle-event-handler.ts`
++- Test: `src/features/background-agent/manager.test.ts`
++
++- [ ] **Step 1: Add a failing stale-event regression test**
++
++Create a test that simulates:
++- Attempt 1 fails and Attempt 2 becomes current
++- a late event from Attempt 1’s old `sessionID` arrives
++
++Expected:
++- Attempt 2 and top-level task projection do not change
++- stale event is ignored for state mutation
++
++- [ ] **Step 2: Run the test to verify the stale-event case fails first**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: stale-event mutation is not yet blocked.
++
++- [ ] **Step 3: Update lifecycle handlers to resolve `sessionID -> attemptID` first**
++
++Apply this rule in relevant background manager paths:
++- `message.updated`
++- `session.error`
++- `session.status`
++- completion/idle handling if they mutate attempt/task state
++
++Before mutating state:
++1. resolve the `attemptID` from the incoming `sessionID`
++2. verify it still matches `currentAttemptID`
++3. otherwise ignore/log as stale
++
++- [ ] **Step 4: Re-run the manager tests**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: stale-event regression passes.
++
++---
++
++### Task 5: Render the attempt timeline in parent chat summaries
++
++**Files:**
++- Modify: `src/features/background-agent/background-task-notification-template.ts`
++- Test: `src/features/background-agent/manager.test.ts`
++
++- [ ] **Step 1: Add a failing notification-format test for multi-attempt tasks**
++
++Create a test that builds a completed/failed task with three attempts and expects parent-facing summary text containing:
++- attempt number
++- status
++- model
++- session id
++
++- [ ] **Step 2: Run the test to verify it fails first**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: current notifications do not include a structured attempt timeline.
++
++- [ ] **Step 3: Update notification template to render compact attempt timeline**
++
++In `background-task-notification-template.ts`:
++- keep the summary compact
++- render one line per attempt
++- include error text only for failed attempts where useful
++- do not replace separate retry reminders; final summary is additive
++
++- [ ] **Step 4: Update manager-side aggregation so final summaries carry attempt history**
++
++`notifyParentSession()` currently batches through `completedTaskSummaries` in `manager.ts`, which only stores task-level summary data.
++
++Modify that aggregation path so the final per-task notification has access to the task’s structured `attempts[]` data at summary time.
++
++Allowed implementation directions:
++- extend `BackgroundTaskNotificationTask` to include attempt timeline data
++- or bypass the reduced aggregation shape for final parent summaries and pass the original task objects (or a richer projection)
++
++The key requirement is that the final parent summary must render the authoritative attempt timeline from structured state, not from task-level status alone.
++
++- [ ] **Step 5: Re-run notification tests**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: parent-summary timeline is now shown from `attempts[]` state.
++
++---
++
++### Task 6: Preserve retry observability messages from state
++
++**Files:**
++- Modify: `src/features/background-agent/manager.ts`
++- Test: `src/features/background-agent/manager.test.ts`
++
++- [ ] **Step 1: Add a failing test that retry-scheduled and retry-session-ready notifications are derived from attempt state**
++
++The test should verify:
++- retry scheduled reminder still includes failed session id, failed model, error, next model
++- retry session ready reminder includes new retry session id and attempt number
++
++- [ ] **Step 2: Run the test to verify current behavior is incomplete**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: notifications are not yet driven by structured attempt state.
++
++- [ ] **Step 3: Refactor retry notifications to read from attempts**
++
++Make the existing retry observability path use `attempts[]` + `currentAttemptID` instead of ad hoc fields where practical.
++
++- [ ] **Step 4: Re-run manager tests**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts
++```
++
++Expected: retry observability remains correct after the attempt-state refactor.
++
++---
++
++### Task 7: End-to-end regression sweep for background retry history
++
++**Files:**
++- Test: `src/features/background-agent/manager.test.ts`
++- Test: `src/features/background-agent/fallback-retry-handler.test.ts`
++- Test: `src/tools/background-task/task-result-format.test.ts`
++
++- [ ] **Step 1: Add an end-to-end regression covering multiple retries followed by success**
++
++Test expectations:
++- 3 attempts recorded
++- first two failed with distinct models/session ids
++- third completed successfully
++- parent summary contains all three attempts in order
++
++- [ ] **Step 2: Run the focused regression suite**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts src/features/background-agent/fallback-retry-handler.test.ts src/tools/background-task/task-result-format.test.ts
++```
++
++Expected: all focused tests pass.
++
++- [ ] **Step 3: Run the broader fallback regression suite**
++
++Run:
++```bash
++bun test src/features/background-agent/manager.test.ts src/features/background-agent/fallback-retry-handler.test.ts src/features/background-agent/error-classifier.test.ts src/tools/background-task/task-result-format.test.ts src/tools/delegate-task/sync-session-poller.test.ts src/tools/delegate-task/sync-task.test.ts src/plugin/event.test.ts src/shared/model-error-classifier.test.ts
++```
++
++Expected: all tests pass.
++
++- [ ] **Step 4: Run typecheck and build**
++
++Run:
++```bash
++bun run typecheck
++bun run build
++```
++
++Expected: both commands succeed with no errors.
++
++---
++
++### Task 8: Final verification and handoff
++
++**Files:**
++- Review: all modified files above
++
++- [ ] **Step 1: Manually verify task-level projection consistency**
++
++Check in code review that:
++- active attempt and top-level fields always agree
++- finalized attempts are not mutated later
++- stale events are ignored
++
++- [ ] **Step 2: Confirm parent chat UX remains compact**
++
++Check that final attempt timeline is readable and not overly verbose.
++
++- [ ] **Step 3: Prepare implementation summary**
++
++Document:
++- files changed
++- new attempt-state invariants
++- tests added/updated
++
++- [ ] **Step 4: Commit**
++
++```bash
++git add src/features/background-agent/types.ts src/features/background-agent/manager.ts src/features/background-agent/fallback-retry-handler.ts src/features/background-agent/background-task-notification-template.ts src/features/background-agent/manager.test.ts src/features/background-agent/fallback-retry-handler.test.ts src/tools/background-task/task-result-format.test.ts docs/superpowers/specs/2026-04-27-background-task-retry-timeline-design.md docs/superpowers/plans/2026-04-27-background-task-retry-timeline.md
++git commit -m "feat(background-task): add retry attempt timeline"
++```
++
++---
++
++Plan complete and saved to `docs/superpowers/plans/2026-04-27-background-task-retry-timeline.md`. Ready to execute?
+diff --git a/docs/superpowers/specs/2026-04-27-background-task-retry-timeline-design.md b/docs/superpowers/specs/2026-04-27-background-task-retry-timeline-design.md
+new file mode 100644
+index 00000000..e449801f
+--- /dev/null
++++ b/docs/superpowers/specs/2026-04-27-background-task-retry-timeline-design.md
+@@ -0,0 +1,320 @@
++# Background Task Retry Timeline Design
++
++Date: 2026-04-27
++Status: Draft approved for spec review
++
++## Goal
++
++Make background task retries understandable from the parent chat UI.
++
++Today, retry attempts create separate child sessions, but the user mainly sees the first failed child session and has to infer whether a retry happened. The goal is to preserve separate retry child sessions while presenting an attempt timeline in the parent chat.
++
++## User Outcome
++
++For a background task that retries across models, the parent chat should show a compact attempt timeline such as:
++
++- Attempt 1 — failed — `openai/gpt-5.4-mini` — session `ses_aaa`
++- Attempt 2 — failed — `anthropic/claude-haiku-4.5` — session `ses_bbb`
++- Attempt 3 — completed — `google/gemini-2.5-flash-lite` — session `ses_ccc`
++
++The retry child sessions remain real, separate subagent sessions. The parent chat becomes the authoritative summary surface.
++
++## Scope
++
++### In scope
++
++- Add structured retry-attempt history to `BackgroundTask`
++- Update background retry lifecycle to record one attempt per child session
++- Surface the attempt timeline in parent chat notifications
++- Include session ids and model ids for each attempt
++
++### Out of scope
++
++- Redesigning the full session list UI
++- Building a timeline into `background_output` in the first iteration
++- Migrating historical tasks created before this feature
++- Merging retry child sessions into one synthetic session
++
++## Design Summary
++
++### 1. Background task state model
++
++Extend `BackgroundTask` with an `attempts` array.
++
++Also add:
++
++- `currentAttemptID?: string`
++
++Each attempt must have its own immutable identity so async events from superseded child sessions cannot mutate the wrong attempt.
++
++Each attempt should track:
++
++- `attemptID: string`
++- `attemptNumber: number`
++- `sessionID?: string`
++- `providerID?: string`
++- `modelID?: string`
++- `variant?: string`
++- `status: "pending" | "running" | "completed" | "error" | "cancelled" | "interrupt"`
++- `error?: string`
++- `startedAt?: Date`
++- `completedAt?: Date`
++
++### Task-level invariants
++
++`BackgroundTask` keeps existing top-level fields (`status`, `sessionID`, `model`, `startedAt`, `completedAt`, `error`) for compatibility, but they must be treated as a **projection of the current/latest attempt**.
++
++Rules:
++
++- `currentAttemptID` points at the only attempt allowed to receive active lifecycle updates
++- task-level `sessionID`, `model`, `status`, `startedAt`, `completedAt`, and `error` must mirror the current/latest attempt state
++- historical attempts are read-only once terminalized
++
++This avoids two competing sources of truth.
++
++This turns retry history into structured task state instead of a series of inferred notifications.
++
++### 2. Attempt lifecycle
++
++#### Initial launch
++
++When a background task is first launched:
++
++- create Attempt 1 in `pending`
++- populate model information from the initial task model
++- once `startTask()` creates the first child session, fill in `sessionID`, `startedAt`, and mark `running`
++- set `currentAttemptID` to Attempt 1
++
++#### Retry scheduled
++
++When fallback retry is chosen:
++
++- finalize the current attempt as failed using the latest error and completion time
++- create the next attempt as `pending`
++- populate its next fallback model metadata before queueing
++- update `currentAttemptID` to the new attempt
++
++The scheduler must pass the new `attemptID` forward to the later session-creation step. Binding must never target “the latest pending attempt” by inference.
++
++The previously active attempt becomes immutable at this point.
++
++#### Retry session ready
++
++When `startTask()` creates the retry child session:
++
++- bind the created child session to the exact scheduled `attemptID`
++- assign the new `sessionID`
++- set `startedAt`
++- mark the attempt `running`
++
++Binding rule:
++
++- session creation must call something equivalent to `bindAttemptSession(attemptID, sessionID, ...)`
++- binding succeeds only if that exact attempt is still the active pending/running attempt
++- if the attempt is already superseded or terminal, the new session is aborted or ignored rather than rebound to another attempt
++
++#### Final completion or failure
++
++When the task finishes:
++
++- mark the current attempt `completed`, `error`, `cancelled`, or `interrupt`
++- record `completedAt`
++
++### Pending sub-states
++
++Internally, a `pending` attempt can represent different operational conditions:
++
++1. queued behind concurrency
++2. retry selected, new child session not yet created
++3. session creation failed before a child session exists
++
++The first iteration may still render all three as `pending` in the parent chat timeline, but the implementation should distinguish them in state transitions and notification text so debugging remains clear.
++
++## Parent Chat Presentation
++
++### Balanced default
++
++The parent chat should show a balanced timeline by default:
++
++- one line per attempt
++- model id
++- outcome
++- session id
++
++Example:
++
++```text
++Background task attempts:
++- Attempt 1 — ERROR — openai/gpt-5.4-mini — ses_aaa
++  Error: Forbidden: Selected provider is forbidden
++- Attempt 2 — ERROR — anthropic/claude-haiku-4.5 — ses_bbb
++  Error: Too Many Requests
++- Attempt 3 — COMPLETED — google/gemini-2.5-flash-lite — ses_ccc
++```
++
++### Parent notification rules
++
++The parent should receive three kinds of retry-related updates:
++
++1. **Retry scheduled**
++   - failed session id
++   - failed model
++   - failed error
++   - next model
++
++2. **Retry session ready**
++   - retry session id
++   - attempt number
++   - model
++
++3. **Final summary**
++   - compact attempt timeline for all attempts
++
++The final summary should be emitted for any terminal task outcome:
++
++- completed
++- error
++- cancelled
++- interrupt
++
++The final summary is the user-facing source of truth.
++
++## Data Ownership
++
++`BackgroundTask` is the right owner for this state because:
++
++- retries mutate and requeue the same background task id
++- child sessions are implementation details of that task lifecycle
++- parent notifications already derive from background task state
++
++This avoids reconstructing attempt history from session logs or reminder text.
++
++## Mutation contract
++
++All attempt writes should go through a small set of helper functions owned by the background-task lifecycle.
++
++Suggested helpers:
++
++- `startAttempt(...)`
++- `bindAttemptSession(...)`
++- `scheduleRetry(...)`
++- `finalizeAttempt(...)`
++
++Also maintain a lightweight `sessionID -> attemptID` lookup for active and historical child sessions associated with the task lifecycle.
++
++Rules:
++
++- only the attempt referenced by `currentAttemptID` may receive active updates
++- once an attempt is finalized, later events from its child session are ignored
++- retry scheduling must finalize the old attempt before creating the next one
++- every lifecycle handler must first resolve an immutable attempt identity, either directly by `attemptID` or through `sessionID -> attemptID`, before mutating attempt or task-level state
++
++This is the key race-safety mechanism for async background retries.
++
++## Key Integration Points
++
++### Background retry path
++
++- `src/features/background-agent/fallback-retry-handler.ts`
++  - create the next attempt entry when retry is selected
++  - finalize the failed attempt before queueing
++  - record retry scheduling metadata without mutating historical attempts later
++
++### Session creation path
++
++- `src/features/background-agent/manager.ts`
++  - in `startTask()`, attach the created child session id to the exact scheduled `attemptID`
++  - emit the "retry session ready" reminder from attempt state
++
++### Completion and failure path
++
++- `src/features/background-agent/manager.ts`
++  - update the active attempt status when task completes or errors
++  - generate final parent summary from `attempts[]`
++  - ignore stale events that target older attempt session ids
++  - resolve every session lifecycle event through `sessionID -> attemptID` before applying updates
++
++### Background output
++
++Out of scope for the first iteration, but the same `attempts[]` state should make later extension straightforward.
++
++## Error Handling
++
++### Missing attempt session id
++
++If session creation fails before a retry session exists:
++
++- keep the attempt as `pending` until terminalized
++- if the task fails permanently, mark that attempt `error` with no `sessionID`
++
++### Late events from superseded sessions
++
++If the old child session emits `session.error`, `message.updated`, `interrupt`, or other lifecycle events after a retry is already scheduled:
++
++- those events must not mutate the newly active attempt
++- they may be logged for debugging
++- they must be ignored for task state purposes unless they resolve to the currently active `attemptID`
++
++This means event handling must not rely on task-level `sessionID` alone. It must first map the incoming `sessionID` to the originating `attemptID`, then reject the mutation if that attempt is no longer current.
++
++### Retry with no visible child session yet
++
++This is expected between:
++
++- old failed child abort
++- new child session creation
++
++The `Retry scheduled` notification should explain that the next attempt has been queued. The `Retry session ready` notification closes that observability gap.
++
++## Testing Strategy
++
++### Unit tests
++
++- attempt created for first launch
++- attempt finalized on retry scheduling
++- retry attempt receives the newly created child `sessionID`
++- final summary renders all attempts in order
++- final summary preserves separate statuses for failed and successful attempts
++
++### Regression tests
++
++- forbidden initial provider followed by successful fallback should produce two attempts
++- multiple failed retries followed by success should show full attempt chain
++- background task failure with no fallback available should still produce one terminal attempt
++
++## Risks
++
++### Risk: status drift between task and attempts
++
++Mitigation:
++
++- centralize attempt updates in helper functions
++- avoid manual field-by-field writes scattered across retry and completion code
++- keep task-level fields as a projection, not an independent state machine
++
++### Risk: duplicate retry attempt creation
++
++Mitigation:
++
++- create attempt entries only in the retry scheduling path
++- use one active pending/running attempt at a time
++
++### Risk: stale child-session events corrupt the latest attempt
++
++Mitigation:
++
++- require `attemptID`/`currentAttemptID`
++- require `sessionID -> attemptID` lookup for all child-session lifecycle events
++- finalize attempts immutably
++- ignore late events from superseded session ids
++
++### Risk: noisy parent chat
++
++Mitigation:
++
++- keep the final timeline compact
++- use reminders only at retry boundaries and final completion
++
++## Recommendation
++
++Implement the attempt timeline as structured `BackgroundTask` state first, and derive parent chat summaries from that. This gives the cleanest UX while preserving separate retry child sessions and sets up future UI improvements without relying on fragile text parsing.
+diff --git a/src/features/background-agent/background-task-notification-template.test.ts b/src/features/background-agent/background-task-notification-template.test.ts
+index 37b41657..18397508 100644
+--- a/src/features/background-agent/background-task-notification-template.test.ts
++++ b/src/features/background-agent/background-task-notification-template.test.ts
+@@ -154,6 +154,76 @@ Use \`background_output(task_id="<id>")\` to retrieve each result.
+     })
+   })
+ 
++  describe("#given a completed task with retry attempt history", () => {
++    test("#when building the final notification #then it renders the spec-aligned balanced attempt timeline", () => {
++      // given
++      const notification = buildBackgroundTaskNotificationText({
++        task: {
++          id: "task-3",
++          description: "Fallback task",
++          status: "completed",
++          attempts: [
++            {
++              attemptID: "att-1",
++              attemptNumber: 1,
++              sessionID: "ses-primary",
++              providerID: "genai-proxy-openai",
++              modelID: "gpt-5.4-mini",
++              status: "error",
++              error: "Forbidden: Selected provider is forbidden",
++            },
++            {
++              attemptID: "att-2",
++              attemptNumber: 2,
++              sessionID: "ses-fallback",
++              providerID: "anthropic",
++              modelID: "claude-haiku-4.5",
++              status: "completed",
++            },
++          ],
++        },
++        duration: "10s",
++        statusText: "COMPLETED",
++        allComplete: true,
++        remainingCount: 0,
++        completedTasks: [
++          {
++            id: "task-3",
++            description: "Fallback task",
++            status: "completed",
++            attempts: [
++              {
++                attemptID: "att-1",
++                attemptNumber: 1,
++                sessionID: "ses-primary",
++                providerID: "genai-proxy-openai",
++                modelID: "gpt-5.4-mini",
++                status: "error",
++                error: "Forbidden: Selected provider is forbidden",
++              },
++              {
++                attemptID: "att-2",
++                attemptNumber: 2,
++                sessionID: "ses-fallback",
++                providerID: "anthropic",
++                modelID: "claude-haiku-4.5",
++                status: "completed",
++              },
++            ],
++          },
++        ],
++      })
++
++      // then
++      expect(notification).toContain("[ALL BACKGROUND TASKS COMPLETE]")
++      expect(notification).toContain("- `task-3`: Fallback task")
++      expect(notification).toContain("Background task attempts:")
++      expect(notification).toContain("  - Attempt 1 — ERROR — genai-proxy-openai/gpt-5.4-mini — ses-primary")
++      expect(notification).toContain("    Error: Forbidden: Selected provider is forbidden")
++      expect(notification).toContain("  - Attempt 2 — COMPLETED — anthropic/claude-haiku-4.5 — ses-fallback")
++    })
++  })
++
+   describe("#given a single task notification with undefined description", () => {
+     test("#when building the partial notification #then it uses task ID as fallback", () => {
+       // given
+diff --git a/src/features/background-agent/background-task-notification-template.ts b/src/features/background-agent/background-task-notification-template.ts
+index ad6769fa..c3472c4a 100644
+--- a/src/features/background-agent/background-task-notification-template.ts
++++ b/src/features/background-agent/background-task-notification-template.ts
+@@ -1,4 +1,4 @@
+-import type { BackgroundTaskStatus } from "./types"
++import type { BackgroundTaskAttempt, BackgroundTaskStatus } from "./types"
+ 
+ export type BackgroundTaskNotificationStatus = "COMPLETED" | "CANCELLED" | "INTERRUPTED" | "ERROR"
+ 
+@@ -7,6 +7,55 @@ export interface BackgroundTaskNotificationTask {
+   description: string
+   status: BackgroundTaskStatus
+   error?: string
++  attempts?: BackgroundTaskAttempt[]
++}
++
++function formatAttemptModel(attempt: BackgroundTaskAttempt): string {
++  if (attempt.providerID && attempt.modelID) {
++    return `${attempt.providerID}/${attempt.modelID}`
++  }
++
++  if (attempt.modelID) {
++    return attempt.modelID
++  }
++
++  if (attempt.providerID) {
++    return attempt.providerID
++  }
++
++  return "unknown-model"
++}
++
++function formatAttemptTimeline(task: BackgroundTaskNotificationTask): string {
++  if (!task.attempts || task.attempts.length <= 1) {
++    return ""
++  }
++
++  const lines = task.attempts
++    .map((attempt) => {
++      const attemptLines = [
++        `  - Attempt ${attempt.attemptNumber} — ${attempt.status.toUpperCase()} — ${formatAttemptModel(attempt)} — ${attempt.sessionID ?? "unknown"}`,
++      ]
++
++      if (attempt.status !== "completed" && attempt.error) {
++        attemptLines.push(`    Error: ${attempt.error}`)
++      }
++
++      return attemptLines.join("\n")
++    })
++    .join("\n")
++
++  return `Background task attempts:\n${lines}`
++}
++
++function formatTaskSummaryLine(task: BackgroundTaskNotificationTask): string {
++  const baseLine = `- \`${task.id}\`: ${task.description || task.id}`
++  const statusSuffix = task.status === "completed"
++    ? ""
++    : ` [${task.status.toUpperCase()}]${task.error ? ` - ${task.error}` : ""}`
++  const timeline = formatAttemptTimeline(task)
++
++  return `${baseLine}${statusSuffix}${timeline ? `\n${timeline}` : ""}`
+ }
+ 
+ export function buildBackgroundTaskNotificationText(input: {
+@@ -27,10 +76,10 @@ export function buildBackgroundTaskNotificationText(input: {
+     const failedTasks = completedTasks.filter((t) => t.status !== "completed")
+ 
+     const succeededText = succeededTasks.length > 0
+-      ? succeededTasks.map((t) => `- \`${t.id}\`: ${safeDescription(t)}`).join("\n")
++      ? succeededTasks.map((t) => formatTaskSummaryLine(t)).join("\n")
+       : ""
+     const failedText = failedTasks.length > 0
+-      ? failedTasks.map((t) => `- \`${t.id}\`: ${safeDescription(t)} [${t.status.toUpperCase()}]${t.error ? ` - ${t.error}` : ""}`).join("\n")
++      ? failedTasks.map((t) => formatTaskSummaryLine(t)).join("\n")
+       : ""
+ 
+     const hasFailures = failedTasks.length > 0
+@@ -46,7 +95,7 @@ export function buildBackgroundTaskNotificationText(input: {
+       body += `\n**Failed:**\n${failedText}\n`
+     }
+     if (!body) {
+-      body = `- \`${task.id}\`: ${safeDescription(task)} [${task.status.toUpperCase()}]${task.error ? ` - ${task.error}` : ""}\n`
++      body = `${formatTaskSummaryLine(task)}\n`
+     }
+ 
+     return `<system-reminder>
+diff --git a/src/tools/background-task/clients.ts b/src/tools/background-task/clients.ts
+index b94977c3..b334cbf1 100644
+--- a/src/tools/background-task/clients.ts
++++ b/src/tools/background-task/clients.ts
+@@ -2,7 +2,7 @@ import type { BackgroundManager } from "../../features/background-agent"
+ 
+ export type BackgroundOutputMessage = {
+   id?: string
+-  info?: { role?: string; time?: string | { created?: number }; agent?: string }
++  info?: { role?: string; time?: string | { created?: number }; agent?: string; error?: unknown }
+   parts?: Array<{
+     type?: string
+     text?: string
+diff --git a/src/tools/background-task/task-result-format.test.ts b/src/tools/background-task/task-result-format.test.ts
+new file mode 100644
+index 00000000..aa34b94e
+--- /dev/null
++++ b/src/tools/background-task/task-result-format.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, test } from "bun:test"
++
++import type { BackgroundTask } from "../../features/background-agent"
++import type { BackgroundOutputClient } from "./clients"
++import { formatTaskResult } from "./task-result-format"
++
++function createTask(overrides: Partial<BackgroundTask> = {}): BackgroundTask {
++  return {
++    id: "task-1",
++    sessionID: "ses-1",
++    parentSessionID: "main-1",
++    parentMessageID: "msg-1",
++    description: "background task",
++    prompt: "do work",
++    agent: "test-agent",
++    status: "completed",
++    startedAt: new Date("2026-01-01T00:00:00.000Z"),
++    completedAt: new Date("2026-01-01T00:00:05.000Z"),
++    ...overrides,
++  }
++}
++
++describe("formatTaskResult", () => {
++  test("returns assistant session errors instead of masking them as success text", async () => {
++    const task = createTask()
++    const client: BackgroundOutputClient = {
++      session: {
++        messages: async () => ({
++          data: [
++            {
++              info: {
++                role: "assistant",
++                time: { created: 1 },
++                error: { data: { message: "Forbidden: Selected provider is forbidden" } },
++              },
++              parts: [],
++            },
++          ],
++        }),
++      },
++    }
++
++    const output = await formatTaskResult(task, client)
++
++    expect(output).toContain("Session error")
++    expect(output).toContain("Forbidden: Selected provider is forbidden")
++  })
++})
+diff --git a/src/tools/background-task/task-result-format.ts b/src/tools/background-task/task-result-format.ts
+index 564eb31f..c7146970 100644
+--- a/src/tools/background-task/task-result-format.ts
++++ b/src/tools/background-task/task-result-format.ts
+@@ -1,4 +1,5 @@
+ import type { BackgroundTask } from "../../features/background-agent"
++import { extractErrorMessage } from "../../features/background-agent/error-classifier"
+ import { consumeNewMessages } from "../../shared/session-cursor"
+ import type { BackgroundOutputClient, BackgroundOutputMessagesResult } from "./clients"
+ import { extractMessages, getErrorMessage } from "./session-messages"
+@@ -56,6 +57,23 @@ Session ID: ${task.sessionID}
+     return timeA.localeCompare(timeB)
+   })
+ 
++  const sessionError = sortedMessages
++    .filter((message) => message.info?.role === "assistant" && message.info?.error)
++    .map((message) => extractErrorMessage(message.info?.error))
++    .find((message): message is string => typeof message === "string" && message.length > 0)
++  if (sessionError) {
++    return `Task Result
++
++Task ID: ${task.id}
++Description: ${task.description}
++Duration: ${formatDuration(task.startedAt ?? new Date(), task.completedAt)}
++Session ID: ${task.sessionID}
++
++---
++
++Session error: ${sessionError}`
++  }
++
+   const newMessages = consumeNewMessages(task.sessionID, sortedMessages)
+   if (newMessages.length === 0) {
+     const duration = formatDuration(task.startedAt ?? new Date(), task.completedAt)
+-- 
+2.39.2
+

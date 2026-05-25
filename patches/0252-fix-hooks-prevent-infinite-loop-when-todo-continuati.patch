@@ -1,0 +1,204 @@
+From 2cab36f06da17ec1739827c4942d32c8bd8cf7a6 Mon Sep 17 00:00:00 2001
+From: Junho Yeo <i@junho.io>
+Date: Sat, 13 Dec 2025 11:48:22 +0900
+Subject: [PATCH 0252/5749] fix(hooks): prevent infinite loop when
+ todo-continuation-enforcer runs during session recovery (#29)
+
+---
+ src/hooks/index.ts                      |  4 +--
+ src/hooks/session-recovery/index.ts     | 26 ++++++++++++++++---
+ src/hooks/todo-continuation-enforcer.ts | 33 ++++++++++++++++++++++---
+ src/index.ts                            |  8 +++++-
+ 4 files changed, 61 insertions(+), 10 deletions(-)
+
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 64d1c6e7..be1fceff 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -1,7 +1,7 @@
+-export { createTodoContinuationEnforcer } from "./todo-continuation-enforcer";
++export { createTodoContinuationEnforcer, type TodoContinuationEnforcer } from "./todo-continuation-enforcer";
+ export { createContextWindowMonitorHook } from "./context-window-monitor";
+ export { createSessionNotification } from "./session-notification";
+-export { createSessionRecoveryHook } from "./session-recovery";
++export { createSessionRecoveryHook, type SessionRecoveryHook } from "./session-recovery";
+ export { createCommentCheckerHooks } from "./comment-checker";
+ export { createGrepOutputTruncatorHook } from "./grep-output-truncator";
+ export { createDirectoryAgentsInjectorHook } from "./directory-agents-injector";
+diff --git a/src/hooks/session-recovery/index.ts b/src/hooks/session-recovery/index.ts
+index 38f2779d..3e426bd4 100644
+--- a/src/hooks/session-recovery/index.ts
++++ b/src/hooks/session-recovery/index.ts
+@@ -216,14 +216,26 @@ async function recoverEmptyContentMessage(
+ // All error types have dedicated recovery functions (recoverToolResultMissing,
+ // recoverThinkingBlockOrder, recoverThinkingDisabledViolation, recoverEmptyContentMessage).
+ 
+-export function createSessionRecoveryHook(ctx: PluginInput) {
++export interface SessionRecoveryHook {
++  handleSessionRecovery: (info: MessageInfo) => Promise<boolean>
++  isRecoverableError: (error: unknown) => boolean
++  setOnAbortCallback: (callback: (sessionID: string) => void) => void
++  setOnRecoveryCompleteCallback: (callback: (sessionID: string) => void) => void
++}
++
++export function createSessionRecoveryHook(ctx: PluginInput): SessionRecoveryHook {
+   const processingErrors = new Set<string>()
+   let onAbortCallback: ((sessionID: string) => void) | null = null
++  let onRecoveryCompleteCallback: ((sessionID: string) => void) | null = null
+ 
+   const setOnAbortCallback = (callback: (sessionID: string) => void): void => {
+     onAbortCallback = callback
+   }
+ 
++  const setOnRecoveryCompleteCallback = (callback: (sessionID: string) => void): void => {
++    onRecoveryCompleteCallback = callback
++  }
++
+   const isRecoverableError = (error: unknown): boolean => {
+     return detectErrorType(error) !== null
+   }
+@@ -242,12 +254,12 @@ export function createSessionRecoveryHook(ctx: PluginInput) {
+     processingErrors.add(assistantMsgID)
+ 
+     try {
+-      await ctx.client.session.abort({ path: { id: sessionID } }).catch(() => {})
+-
+       if (onAbortCallback) {
+-        onAbortCallback(sessionID)
++        onAbortCallback(sessionID)  // Mark recovering BEFORE abort
+       }
+ 
++      await ctx.client.session.abort({ path: { id: sessionID } }).catch(() => {})
++
+       const messagesResp = await ctx.client.session.messages({
+         path: { id: sessionID },
+         query: { directory: ctx.directory },
+@@ -301,6 +313,11 @@ export function createSessionRecoveryHook(ctx: PluginInput) {
+     return false
+   } finally {
+     processingErrors.delete(assistantMsgID)
++
++    // Always notify recovery complete, regardless of success or failure
++    if (sessionID && onRecoveryCompleteCallback) {
++      onRecoveryCompleteCallback(sessionID)
++    }
+   }
+   }
+ 
+@@ -308,5 +325,6 @@ export function createSessionRecoveryHook(ctx: PluginInput) {
+     handleSessionRecovery,
+     isRecoverableError,
+     setOnAbortCallback,
++    setOnRecoveryCompleteCallback,
+   }
+ }
+diff --git a/src/hooks/todo-continuation-enforcer.ts b/src/hooks/todo-continuation-enforcer.ts
+index 7efeba8c..86d6c6e2 100644
+--- a/src/hooks/todo-continuation-enforcer.ts
++++ b/src/hooks/todo-continuation-enforcer.ts
+@@ -1,5 +1,11 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ 
++export interface TodoContinuationEnforcer {
++  handler: (input: { event: { type: string; properties?: unknown } }) => Promise<void>
++  markRecovering: (sessionID: string) => void
++  markRecoveryComplete: (sessionID: string) => void
++}
++
+ interface Todo {
+   content: string
+   status: string
+@@ -32,13 +38,22 @@ function detectInterrupt(error: unknown): boolean {
+   return false
+ }
+ 
+-export function createTodoContinuationEnforcer(ctx: PluginInput) {
++export function createTodoContinuationEnforcer(ctx: PluginInput): TodoContinuationEnforcer {
+   const remindedSessions = new Set<string>()
+   const interruptedSessions = new Set<string>()
+   const errorSessions = new Set<string>()
++  const recoveringSessions = new Set<string>()
+   const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>()
+ 
+-  return async ({ event }: { event: { type: string; properties?: unknown } }) => {
++  const markRecovering = (sessionID: string): void => {
++    recoveringSessions.add(sessionID)
++  }
++
++  const markRecoveryComplete = (sessionID: string): void => {
++    recoveringSessions.delete(sessionID)
++  }
++
++  const handler = async ({ event }: { event: { type: string; properties?: unknown } }): Promise<void> => {
+     const props = event.properties as Record<string, unknown> | undefined
+ 
+     if (event.type === "session.error") {
+@@ -73,6 +88,11 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+       const timer = setTimeout(async () => {
+         pendingTimers.delete(sessionID)
+ 
++        // Check if session is in recovery mode - if so, skip entirely without clearing state
++        if (recoveringSessions.has(sessionID)) {
++          return
++        }
++
+         const shouldBypass = interruptedSessions.has(sessionID) || errorSessions.has(sessionID)
+         
+         interruptedSessions.delete(sessionID)
+@@ -111,7 +131,7 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+         remindedSessions.add(sessionID)
+ 
+         // Re-check if abort occurred during the delay/fetch
+-        if (interruptedSessions.has(sessionID) || errorSessions.has(sessionID)) {
++        if (interruptedSessions.has(sessionID) || errorSessions.has(sessionID) || recoveringSessions.has(sessionID)) {
+           remindedSessions.delete(sessionID)
+           return
+         }
+@@ -158,6 +178,7 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+         remindedSessions.delete(sessionInfo.id)
+         interruptedSessions.delete(sessionInfo.id)
+         errorSessions.delete(sessionInfo.id)
++        recoveringSessions.delete(sessionInfo.id)
+         
+         // Cancel pending continuation
+         const timer = pendingTimers.get(sessionInfo.id)
+@@ -168,4 +189,10 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+       }
+     }
+   }
++
++  return {
++    handler,
++    markRecovering,
++    markRecoveryComplete,
++  }
+ }
+diff --git a/src/index.ts b/src/index.ts
+index e3b46028..09a632e3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -151,6 +151,12 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const todoContinuationEnforcer = createTodoContinuationEnforcer(ctx);
+   const contextWindowMonitor = createContextWindowMonitorHook(ctx);
+   const sessionRecovery = createSessionRecoveryHook(ctx);
++
++  // Wire up recovery state tracking between session-recovery and todo-continuation-enforcer
++  // This prevents the continuation enforcer from injecting prompts during active recovery
++  sessionRecovery.setOnAbortCallback(todoContinuationEnforcer.markRecovering);
++  sessionRecovery.setOnRecoveryCompleteCallback(todoContinuationEnforcer.markRecoveryComplete);
++
+   const commentChecker = createCommentCheckerHooks();
+   const grepOutputTruncator = createGrepOutputTruncatorHook(ctx);
+   const directoryAgentsInjector = createDirectoryAgentsInjectorHook(ctx);
+@@ -248,7 +254,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       await autoUpdateChecker.event(input);
+       await claudeCodeHooks.event(input);
+       await backgroundNotificationHook.event(input);
+-      await todoContinuationEnforcer(input);
++      await todoContinuationEnforcer.handler(input);
+       await contextWindowMonitor.event(input);
+       await directoryAgentsInjector.event(input);
+       await directoryReadmeInjector.event(input);
+-- 
+2.39.2
+

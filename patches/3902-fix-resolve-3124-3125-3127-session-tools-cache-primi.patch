@@ -1,0 +1,1525 @@
+From 130f4ac080acaf4658461b9af27e4646c2ed1040 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 5 Apr 2026 09:30:19 +0900
+Subject: [PATCH 3902/5749] fix: resolve #3124 #3125 #3127 session tools, cache
+ priming, and compaction loop
+
+- #3124: Session tools now merge SDK and file-backed sessions for SQLite backend
+- #3125: Cache priming fixed for OpenCode >=1.3.14 empty workspace
+- #3127: Activity-based progress detection prevents infinite compaction on Kimi/Minimax
+
+All 29 new tests pass, 4885 total tests passing.
+---
+ src/cli/config-manager/bun-install.test.ts    |  8 +-
+ src/cli/config-manager/bun-install.ts         |  7 +-
+ .../checker/pinned-version-updater.test.ts    | 45 ++++-----
+ .../checker/plugin-entry.test.ts              |  9 +-
+ .../checker/sync-package-json.ts              | 55 +++++++----
+ .../auto-update-checker/constants.test.ts     |  4 +-
+ src/hooks/auto-update-checker/constants.ts    |  5 +-
+ .../hook/background-update-check.ts           | 32 ++++++-
+ .../todo-continuation-enforcer/idle-event.ts  | 15 ++-
+ .../non-idle-events.ts                        |  9 +-
+ .../session-state.test.ts                     | 52 +++++++++++
+ .../session-state.ts                          | 36 +++++++-
+ src/hooks/todo-continuation-enforcer/types.ts |  4 +
+ .../background-update-check.test.ts           | 33 ++++---
+ .../workspace-resolution.test.ts              | 82 ++++++++++++-----
+ .../zauc-sync-mocks/sync-package-json.test.ts | 18 ++--
+ src/shared/opencode-message-dir.test.ts       | 19 +++-
+ src/shared/opencode-message-dir.ts            |  4 +-
+ .../delegate-task/sync-session-poller.test.ts | 92 ++++++++++++++++++-
+ .../delegate-task/sync-session-poller.ts      |  2 +
+ .../session-manager/storage-fallback.test.ts  | 83 +++++++++++++++++
+ src/tools/session-manager/storage.ts          | 38 +++++++-
+ 22 files changed, 538 insertions(+), 114 deletions(-)
+
+diff --git a/src/cli/config-manager/bun-install.test.ts b/src/cli/config-manager/bun-install.test.ts
+index 4f739612..a6a1ba24 100644
+--- a/src/cli/config-manager/bun-install.test.ts
++++ b/src/cli/config-manager/bun-install.test.ts
+@@ -64,7 +64,7 @@ describe("runBunInstallWithDetails", () => {
+         expect(result).toEqual({ success: true })
+         expect(getOpenCodeCacheDirSpy).toHaveBeenCalledTimes(1)
+         expect(spawnWithWindowsHideSpy).toHaveBeenCalledWith(["bun", "install"], {
+-          cwd: "/tmp/opencode-cache",
++          cwd: "/tmp/opencode-cache/packages",
+           stdout: "pipe",
+           stderr: "pipe",
+         })
+@@ -81,7 +81,7 @@ describe("runBunInstallWithDetails", () => {
+         // then
+         expect(result).toEqual({ success: true })
+         expect(spawnWithWindowsHideSpy).toHaveBeenCalledWith(["bun", "install"], {
+-          cwd: "/tmp/opencode-cache",
++          cwd: "/tmp/opencode-cache/packages",
+           stdout: "pipe",
+           stderr: "pipe",
+         })
+@@ -98,7 +98,7 @@ describe("runBunInstallWithDetails", () => {
+         // then
+         expect(result).toEqual({ success: true })
+         expect(spawnWithWindowsHideSpy).toHaveBeenCalledWith(["bun", "install"], {
+-          cwd: "/tmp/opencode-cache",
++          cwd: "/tmp/opencode-cache/packages",
+           stdout: "inherit",
+           stderr: "inherit",
+         })
+@@ -174,7 +174,7 @@ describe("runBunInstallWithDetails", () => {
+           expect(outcome.result).toEqual({
+             success: false,
+             timedOut: true,
+-            error: 'bun install timed out after 60 seconds. Try running manually: cd "/tmp/opencode-cache" && bun i',
++            error: 'bun install timed out after 60 seconds. Try running manually: cd "/tmp/opencode-cache/packages" && bun i',
+           } satisfies BunInstallResult)
+           expect(killCallCount).toBe(1)
+         } finally {
+diff --git a/src/cli/config-manager/bun-install.ts b/src/cli/config-manager/bun-install.ts
+index 1ef20dc0..82f49c2e 100644
+--- a/src/cli/config-manager/bun-install.ts
++++ b/src/cli/config-manager/bun-install.ts
+@@ -1,4 +1,5 @@
+ import { existsSync } from "node:fs"
++import { join } from "node:path"
+ 
+ import { getOpenCodeCacheDir } from "../../shared/data-path"
+ import { log } from "../../shared/logger"
+@@ -40,6 +41,10 @@ export async function runBunInstall(): Promise<boolean> {
+   return result.success
+ }
+ 
++function getDefaultWorkspaceDir(): string {
++  return join(getOpenCodeCacheDir(), "packages")
++}
++
+ function readProcessOutput(stream: ProcessOutputStream): Promise<string> {
+   if (!stream) {
+     return Promise.resolve("")
+@@ -67,7 +72,7 @@ function logCapturedOutputOnFailure(outputMode: BunInstallOutputMode, output: Bu
+ 
+ export async function runBunInstallWithDetails(options?: RunBunInstallOptions): Promise<BunInstallResult> {
+   const outputMode = options?.outputMode ?? "pipe"
+-  const cacheDir = options?.workspaceDir ?? getOpenCodeCacheDir()
++  const cacheDir = options?.workspaceDir ?? getDefaultWorkspaceDir()
+   const packageJsonPath = `${cacheDir}/package.json`
+ 
+   if (!existsSync(packageJsonPath)) {
+diff --git a/src/hooks/auto-update-checker/checker/pinned-version-updater.test.ts b/src/hooks/auto-update-checker/checker/pinned-version-updater.test.ts
+index aa74a585..e150d6a1 100644
+--- a/src/hooks/auto-update-checker/checker/pinned-version-updater.test.ts
++++ b/src/hooks/auto-update-checker/checker/pinned-version-updater.test.ts
+@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+ import * as fs from "node:fs"
+ import * as path from "node:path"
+ import * as os from "node:os"
++import { PACKAGE_NAME } from "../constants"
+ import { updatePinnedVersion, revertPinnedVersion } from "./pinned-version-updater"
+ 
+ describe("pinned-version-updater", () => {
+@@ -21,18 +22,18 @@ describe("pinned-version-updater", () => {
+     test("updates pinned version in config", () => {
+       //#given
+       const config = JSON.stringify({
+-        plugin: ["oh-my-openagent@3.1.8"],
++        plugin: [`${PACKAGE_NAME}@3.1.8`],
+       })
+       fs.writeFileSync(configPath, config)
+ 
+       //#when
+-      const result = updatePinnedVersion(configPath, "oh-my-openagent@3.1.8", "3.4.0")
++      const result = updatePinnedVersion(configPath, `${PACKAGE_NAME}@3.1.8`, "3.4.0")
+ 
+       //#then
+       expect(result).toBe(true)
+       const updated = fs.readFileSync(configPath, "utf-8")
+-      expect(updated).toContain("oh-my-openagent@3.4.0")
+-      expect(updated).not.toContain("oh-my-openagent@3.1.8")
++      expect(updated).toContain(`${PACKAGE_NAME}@3.4.0`)
++      expect(updated).not.toContain(`${PACKAGE_NAME}@3.1.8`)
+     })
+ 
+     test("returns false when entry not found", () => {
+@@ -43,7 +44,7 @@ describe("pinned-version-updater", () => {
+       fs.writeFileSync(configPath, config)
+ 
+       //#when
+-      const result = updatePinnedVersion(configPath, "oh-my-openagent@3.1.8", "3.4.0")
++      const result = updatePinnedVersion(configPath, `${PACKAGE_NAME}@3.1.8`, "3.4.0")
+ 
+       //#then
+       expect(result).toBe(false)
+@@ -55,7 +56,7 @@ describe("pinned-version-updater", () => {
+       fs.writeFileSync(configPath, config)
+ 
+       //#when
+-      const result = updatePinnedVersion(configPath, "oh-my-openagent@3.1.8", "3.4.0")
++      const result = updatePinnedVersion(configPath, `${PACKAGE_NAME}@3.1.8`, "3.4.0")
+ 
+       //#then
+       expect(result).toBe(false)
+@@ -66,46 +67,46 @@ describe("pinned-version-updater", () => {
+     test("reverts from failed version back to original entry", () => {
+       //#given
+       const config = JSON.stringify({
+-        plugin: ["oh-my-openagent@3.4.0"],
++        plugin: [`${PACKAGE_NAME}@3.4.0`],
+       })
+       fs.writeFileSync(configPath, config)
+ 
+       //#when
+-      const result = revertPinnedVersion(configPath, "3.4.0", "oh-my-openagent@3.1.8")
++      const result = revertPinnedVersion(configPath, "3.4.0", `${PACKAGE_NAME}@3.1.8`)
+ 
+       //#then
+       expect(result).toBe(true)
+       const reverted = fs.readFileSync(configPath, "utf-8")
+-      expect(reverted).toContain("oh-my-openagent@3.1.8")
+-      expect(reverted).not.toContain("oh-my-openagent@3.4.0")
++      expect(reverted).toContain(`${PACKAGE_NAME}@3.1.8`)
++      expect(reverted).not.toContain(`${PACKAGE_NAME}@3.4.0`)
+     })
+ 
+     test("reverts to unpinned entry", () => {
+       //#given
+       const config = JSON.stringify({
+-        plugin: ["oh-my-openagent@3.4.0"],
++        plugin: [`${PACKAGE_NAME}@3.4.0`],
+       })
+       fs.writeFileSync(configPath, config)
+ 
+       //#when
+-      const result = revertPinnedVersion(configPath, "3.4.0", "oh-my-openagent")
++      const result = revertPinnedVersion(configPath, "3.4.0", PACKAGE_NAME)
+ 
+       //#then
+       expect(result).toBe(true)
+       const reverted = fs.readFileSync(configPath, "utf-8")
+-      expect(reverted).toContain('"oh-my-openagent"')
+-      expect(reverted).not.toContain("oh-my-openagent@3.4.0")
++      expect(reverted).toContain(`"${PACKAGE_NAME}"`)
++      expect(reverted).not.toContain(`${PACKAGE_NAME}@3.4.0`)
+     })
+ 
+     test("returns false when failed version not found", () => {
+       //#given
+       const config = JSON.stringify({
+-        plugin: ["oh-my-openagent@3.1.8"],
++        plugin: [`${PACKAGE_NAME}@3.1.8`],
+       })
+       fs.writeFileSync(configPath, config)
+ 
+       //#when
+-      const result = revertPinnedVersion(configPath, "3.4.0", "oh-my-openagent@3.1.8")
++      const result = revertPinnedVersion(configPath, "3.4.0", `${PACKAGE_NAME}@3.1.8`)
+ 
+       //#then
+       expect(result).toBe(false)
+@@ -116,18 +117,18 @@ describe("pinned-version-updater", () => {
+     test("config returns to original state after update + revert", () => {
+       //#given
+       const originalConfig = JSON.stringify({
+-        plugin: ["oh-my-openagent@3.1.8"],
++        plugin: [`${PACKAGE_NAME}@3.1.8`],
+       })
+       fs.writeFileSync(configPath, originalConfig)
+ 
+       //#when
+-      updatePinnedVersion(configPath, "oh-my-openagent@3.1.8", "3.4.0")
+-      revertPinnedVersion(configPath, "3.4.0", "oh-my-openagent@3.1.8")
++      updatePinnedVersion(configPath, `${PACKAGE_NAME}@3.1.8`, "3.4.0")
++      revertPinnedVersion(configPath, "3.4.0", `${PACKAGE_NAME}@3.1.8`)
+ 
+       //#then
+       const finalConfig = fs.readFileSync(configPath, "utf-8")
+-      expect(finalConfig).toContain("oh-my-openagent@3.1.8")
+-      expect(finalConfig).not.toContain("oh-my-openagent@3.4.0")
++      expect(finalConfig).toContain(`${PACKAGE_NAME}@3.1.8`)
++      expect(finalConfig).not.toContain(`${PACKAGE_NAME}@3.4.0`)
+     })
+   })
+-})
+\ No newline at end of file
++})
+diff --git a/src/hooks/auto-update-checker/checker/plugin-entry.test.ts b/src/hooks/auto-update-checker/checker/plugin-entry.test.ts
+index 60035c20..024ea396 100644
+--- a/src/hooks/auto-update-checker/checker/plugin-entry.test.ts
++++ b/src/hooks/auto-update-checker/checker/plugin-entry.test.ts
+@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+ import * as fs from "node:fs"
+ import * as os from "node:os"
+ import * as path from "node:path"
++import { PACKAGE_NAME } from "../constants"
+ import { findPluginEntry } from "./plugin-entry"
+ 
+ describe("findPluginEntry", () => {
+@@ -21,7 +22,7 @@ describe("findPluginEntry", () => {
+ 
+   test("returns unpinned for bare package name", () => {
+     // #given plugin is configured without a tag
+-    fs.writeFileSync(configPath, JSON.stringify({ plugin: ["oh-my-openagent"] }))
++    fs.writeFileSync(configPath, JSON.stringify({ plugin: [PACKAGE_NAME] }))
+ 
+     // #when plugin entry is detected
+     const pluginInfo = findPluginEntry(temporaryDirectory)
+@@ -34,7 +35,7 @@ describe("findPluginEntry", () => {
+ 
+   test("returns unpinned for latest dist-tag", () => {
+     // #given plugin is configured with latest dist-tag
+-    fs.writeFileSync(configPath, JSON.stringify({ plugin: ["oh-my-openagent@latest"] }))
++    fs.writeFileSync(configPath, JSON.stringify({ plugin: [`${PACKAGE_NAME}@latest`] }))
+ 
+     // #when plugin entry is detected
+     const pluginInfo = findPluginEntry(temporaryDirectory)
+@@ -47,7 +48,7 @@ describe("findPluginEntry", () => {
+ 
+   test("returns unpinned for beta dist-tag", () => {
+     // #given plugin is configured with beta dist-tag
+-    fs.writeFileSync(configPath, JSON.stringify({ plugin: ["oh-my-openagent@beta"] }))
++    fs.writeFileSync(configPath, JSON.stringify({ plugin: [`${PACKAGE_NAME}@beta`] }))
+ 
+     // #when plugin entry is detected
+     const pluginInfo = findPluginEntry(temporaryDirectory)
+@@ -60,7 +61,7 @@ describe("findPluginEntry", () => {
+ 
+   test("returns pinned for explicit semver", () => {
+     // #given plugin is configured with explicit version
+-    fs.writeFileSync(configPath, JSON.stringify({ plugin: ["oh-my-openagent@3.5.2"] }))
++    fs.writeFileSync(configPath, JSON.stringify({ plugin: [`${PACKAGE_NAME}@3.5.2`] }))
+ 
+     // #when plugin entry is detected
+     const pluginInfo = findPluginEntry(temporaryDirectory)
+diff --git a/src/hooks/auto-update-checker/checker/sync-package-json.ts b/src/hooks/auto-update-checker/checker/sync-package-json.ts
+index 443cbc97..93c84709 100644
+--- a/src/hooks/auto-update-checker/checker/sync-package-json.ts
++++ b/src/hooks/auto-update-checker/checker/sync-package-json.ts
+@@ -11,7 +11,7 @@ interface CachePackageJson {
+ 
+ export interface SyncResult {
+   synced: boolean
+-  error: "file_not_found" | "plugin_not_in_deps" | "parse_error" | "write_error" | null
++  error: "parse_error" | "write_error" | null
+   message?: string
+ }
+ 
+@@ -32,12 +32,33 @@ function getIntentVersion(pluginInfo: PluginEntryInfo): string {
+   return pluginInfo.pinnedVersion
+ }
+ 
++function writeCachePackageJson(
++  cachePackageJsonPath: string,
++  pkgJson: CachePackageJson,
++): SyncResult {
++  const tmpPath = `${cachePackageJsonPath}.${crypto.randomUUID()}`
++  try {
++    fs.mkdirSync(path.dirname(cachePackageJsonPath), { recursive: true })
++    fs.writeFileSync(tmpPath, JSON.stringify(pkgJson, null, 2))
++    fs.renameSync(tmpPath, cachePackageJsonPath)
++    return { synced: true, error: null }
++  } catch (err) {
++    log("[auto-update-checker] Failed to write cache package.json:", err)
++    safeUnlink(tmpPath)
++    return { synced: false, error: "write_error", message: "Failed to write cache package.json" }
++  }
++}
++
+ export function syncCachePackageJsonToIntent(pluginInfo: PluginEntryInfo): SyncResult {
+   const cachePackageJsonPath = path.join(CACHE_DIR, "package.json")
++  const intentVersion = getIntentVersion(pluginInfo)
+ 
+   if (!fs.existsSync(cachePackageJsonPath)) {
+-    log("[auto-update-checker] Cache package.json not found, nothing to sync")
+-    return { synced: false, error: "file_not_found", message: "Cache package.json not found" }
++    log("[auto-update-checker] Cache package.json missing, creating workspace package.json", { intentVersion })
++    return {
++      ...writeCachePackageJson(cachePackageJsonPath, { dependencies: { [PACKAGE_NAME]: intentVersion } }),
++      message: `Created cache package.json with: ${intentVersion}`,
++    }
+   }
+ 
+   let content: string
+@@ -58,12 +79,21 @@ export function syncCachePackageJsonToIntent(pluginInfo: PluginEntryInfo): SyncR
+   }
+ 
+   if (!pkgJson || !pkgJson.dependencies?.[PACKAGE_NAME]) {
+-    log("[auto-update-checker] Plugin not in cache package.json dependencies, nothing to sync")
+-    return { synced: false, error: "plugin_not_in_deps", message: "Plugin not in cache package.json dependencies" }
++    log("[auto-update-checker] Plugin missing from cache package.json dependencies, adding dependency", { intentVersion })
++    const nextPkgJson = {
++      ...(pkgJson ?? {}),
++      dependencies: {
++        ...(pkgJson?.dependencies ?? {}),
++        [PACKAGE_NAME]: intentVersion,
++      },
++    }
++    return {
++      ...writeCachePackageJson(cachePackageJsonPath, nextPkgJson),
++      message: `Added ${PACKAGE_NAME}: ${intentVersion}`,
++    }
+   }
+ 
+   const currentVersion = pkgJson.dependencies[PACKAGE_NAME]
+-  const intentVersion = getIntentVersion(pluginInfo)
+ 
+   if (currentVersion === intentVersion) {
+     log("[auto-update-checker] Cache package.json already matches intent:", intentVersion)
+@@ -84,15 +114,8 @@ export function syncCachePackageJsonToIntent(pluginInfo: PluginEntryInfo): SyncR
+   }
+ 
+   pkgJson.dependencies[PACKAGE_NAME] = intentVersion
+-
+-  const tmpPath = `${cachePackageJsonPath}.${crypto.randomUUID()}`
+-  try {
+-    fs.writeFileSync(tmpPath, JSON.stringify(pkgJson, null, 2))
+-    fs.renameSync(tmpPath, cachePackageJsonPath)
+-    return { synced: true, error: null, message: `Updated: "${currentVersion}" → "${intentVersion}"` }
+-  } catch (err) {
+-    log("[auto-update-checker] Failed to write cache package.json:", err)
+-    safeUnlink(tmpPath)
+-    return { synced: false, error: "write_error", message: "Failed to write cache package.json" }
++  return {
++    ...writeCachePackageJson(cachePackageJsonPath, pkgJson),
++    message: `Updated: "${currentVersion}" → "${intentVersion}"`,
+   }
+ }
+diff --git a/src/hooks/auto-update-checker/constants.test.ts b/src/hooks/auto-update-checker/constants.test.ts
+index 30ff1eab..31bd2efc 100644
+--- a/src/hooks/auto-update-checker/constants.test.ts
++++ b/src/hooks/auto-update-checker/constants.test.ts
+@@ -6,9 +6,9 @@ describe("auto-update-checker constants", () => {
+   it("uses the OpenCode cache directory for installed package metadata", async () => {
+     const { CACHE_DIR, INSTALLED_PACKAGE_JSON, PACKAGE_NAME } = await import(`./constants?test=${Date.now()}`)
+ 
+-    expect(CACHE_DIR).toBe(getOpenCodeCacheDir())
++    expect(CACHE_DIR).toBe(join(getOpenCodeCacheDir(), "packages"))
+     expect(INSTALLED_PACKAGE_JSON).toBe(
+-      join(getOpenCodeCacheDir(), "node_modules", PACKAGE_NAME, "package.json")
++      join(getOpenCodeCacheDir(), "packages", "node_modules", PACKAGE_NAME, "package.json")
+     )
+   })
+ })
+diff --git a/src/hooks/auto-update-checker/constants.ts b/src/hooks/auto-update-checker/constants.ts
+index e4cb7d73..18e6421a 100644
+--- a/src/hooks/auto-update-checker/constants.ts
++++ b/src/hooks/auto-update-checker/constants.ts
+@@ -7,8 +7,9 @@ export const PACKAGE_NAME = "oh-my-openagent"
+ export const NPM_REGISTRY_URL = `https://registry.npmjs.org/-/package/${PACKAGE_NAME}/dist-tags`
+ export const NPM_FETCH_TIMEOUT = 5000
+ 
+-export const CACHE_DIR = getOpenCodeCacheDir()
+-export const VERSION_FILE = path.join(CACHE_DIR, "version")
++export const CACHE_ROOT_DIR = getOpenCodeCacheDir()
++export const CACHE_DIR = path.join(CACHE_ROOT_DIR, "packages")
++export const VERSION_FILE = path.join(CACHE_ROOT_DIR, "version")
+ 
+ export function getWindowsAppdataDir(): string | null {
+   if (process.platform !== "win32") return null
+diff --git a/src/hooks/auto-update-checker/hook/background-update-check.ts b/src/hooks/auto-update-checker/hook/background-update-check.ts
+index ef999069..5b092cfd 100644
+--- a/src/hooks/auto-update-checker/hook/background-update-check.ts
++++ b/src/hooks/auto-update-checker/hook/background-update-check.ts
+@@ -33,6 +33,10 @@ type BackgroundUpdateCheckRunner = (
+   getToastMessage: (isUpdate: boolean, latestVersion?: string) => string,
+ ) => Promise<void>
+ 
++function getCacheWorkspaceDir(deps: BackgroundUpdateCheckDeps): string {
++  return deps.join(deps.getOpenCodeCacheDir(), "packages")
++}
++
+ const defaultDeps: BackgroundUpdateCheckDeps = {
+   existsSync,
+   join,
+@@ -60,7 +64,7 @@ function getPinnedVersionToastMessage(latestVersion: string): string {
+  */
+ function resolveActiveInstallWorkspace(deps: BackgroundUpdateCheckDeps): string {
+   const configPaths = deps.getOpenCodeConfigPaths({ binary: "opencode" })
+-  const cacheDir = deps.getOpenCodeCacheDir()
++  const cacheDir = getCacheWorkspaceDir(deps)
+ 
+   const configInstallPath = deps.join(configPaths.configDir, "node_modules", PACKAGE_NAME, "package.json")
+   const cacheInstallPath = deps.join(cacheDir, "node_modules", PACKAGE_NAME, "package.json")
+@@ -76,6 +80,12 @@ function resolveActiveInstallWorkspace(deps: BackgroundUpdateCheckDeps): string
+     return cacheDir
+   }
+ 
++  const cachePackageJsonPath = deps.join(cacheDir, "package.json")
++  if (deps.existsSync(cachePackageJsonPath)) {
++    deps.log(`[auto-update-checker] Active workspace: cache-dir (${cacheDir}, package.json present)`) 
++    return cacheDir
++  }
++
+   // Default to config-dir if neither exists (matches doctor behavior)
+   deps.log(`[auto-update-checker] Active workspace: config-dir (default, no install detected)`)
+   return configPaths.configDir
+@@ -95,6 +105,19 @@ async function runBunInstallSafe(workspaceDir: string, deps: BackgroundUpdateChe
+   }
+ }
+ 
++async function primeCacheWorkspace(
++  activeWorkspace: string,
++  deps: BackgroundUpdateCheckDeps,
++): Promise<boolean> {
++  const cacheWorkspace = getCacheWorkspaceDir(deps)
++  if (activeWorkspace === cacheWorkspace) {
++    return true
++  }
++
++  deps.log(`[auto-update-checker] Priming cache workspace after install: ${cacheWorkspace}`)
++  return runBunInstallSafe(cacheWorkspace, deps)
++}
++
+ export function createBackgroundUpdateCheckRunner(
+   overrides: Partial<BackgroundUpdateCheckDeps> = {},
+ ): BackgroundUpdateCheckRunner {
+@@ -156,6 +179,13 @@ export function createBackgroundUpdateCheckRunner(
+     const installSuccess = await runBunInstallSafe(activeWorkspace, deps)
+ 
+     if (installSuccess) {
++      const cachePrimed = await primeCacheWorkspace(activeWorkspace, deps)
++      if (!cachePrimed) {
++        await deps.showUpdateAvailableToast(ctx, latestVersion, getToastMessage)
++        deps.log("[auto-update-checker] cache workspace priming failed after install")
++        return
++      }
++
+       await deps.showAutoUpdatedToast(ctx, currentVersion, latestVersion)
+       deps.log(`[auto-update-checker] Update installed: ${currentVersion} → ${latestVersion}`)
+       return
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 4416ff3b..9c1f2533 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -16,6 +16,14 @@ import { acknowledgeCompactionGuard, isCompactionGuardActive } from "./compactio
+ import type { SessionStateStore } from "./session-state"
+ import { startCountdown } from "./countdown"
+ 
++function shouldAllowActivityProgress(modelID: string | undefined): boolean {
++  if (!modelID) {
++    return false
++  }
++
++  return !modelID.toLowerCase().includes("codex")
++}
++
+ export async function handleSessionIdle(args: {
+   ctx: PluginInput
+   sessionID: string
+@@ -182,7 +190,12 @@ export async function handleSessionIdle(args: {
+     return
+   }
+ 
+-  const progressUpdate = sessionStateStore.trackContinuationProgress(sessionID, incompleteCount, todos)
++  const progressUpdate = sessionStateStore.trackContinuationProgress(
++    sessionID,
++    incompleteCount,
++    todos,
++    { allowActivityProgress: shouldAllowActivityProgress(resolvedInfo?.model?.modelID) },
++  )
+   if (shouldStopForStagnation({ sessionID, incompleteCount, progressUpdate })) {
+     return
+   }
+diff --git a/src/hooks/todo-continuation-enforcer/non-idle-events.ts b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+index 8a6a0b3a..b9f61f80 100644
+--- a/src/hooks/todo-continuation-enforcer/non-idle-events.ts
++++ b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+@@ -28,6 +28,7 @@ export function handleNonIdleEvent(args: {
+       if (state) {
+         state.abortDetectedAt = undefined
+         state.wasCancelled = false
++        sessionStateStore.recordActivity(sessionID)
+       }
+       sessionStateStore.cancelCountdown(sessionID)
+       return
+@@ -38,6 +39,7 @@ export function handleNonIdleEvent(args: {
+       if (state) {
+         state.abortDetectedAt = undefined
+         state.wasCancelled = false
++        sessionStateStore.recordActivity(sessionID)
+       }
+       sessionStateStore.cancelCountdown(sessionID)
+       return
+@@ -56,7 +58,10 @@ export function handleNonIdleEvent(args: {
+ 
+     if (targetSessionID) {
+       const state = sessionStateStore.getExistingState(targetSessionID)
+-      if (state) state.abortDetectedAt = undefined
++      if (state) {
++        state.abortDetectedAt = undefined
++        sessionStateStore.recordActivity(targetSessionID)
++      }
+       sessionStateStore.cancelCountdown(targetSessionID)
+     }
+     return
+@@ -69,6 +74,7 @@ export function handleNonIdleEvent(args: {
+       if (state) {
+         state.abortDetectedAt = undefined
+         state.wasCancelled = false
++        sessionStateStore.recordActivity(sessionID)
+       }
+       sessionStateStore.cancelCountdown(sessionID)
+     }
+@@ -82,6 +88,7 @@ export function handleNonIdleEvent(args: {
+       if (state) {
+         state.abortDetectedAt = undefined
+         state.wasCancelled = false
++        sessionStateStore.recordActivity(sessionID)
+       }
+       sessionStateStore.cancelCountdown(sessionID)
+     }
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.test.ts b/src/hooks/todo-continuation-enforcer/session-state.test.ts
+index 8c7464c5..c2ec32f8 100644
+--- a/src/hooks/todo-continuation-enforcer/session-state.test.ts
++++ b/src/hooks/todo-continuation-enforcer/session-state.test.ts
+@@ -143,4 +143,56 @@ describe("createSessionStateStore", () => {
+     expect(stagnatedAgainUpdate.hasProgressed).toBe(false)
+     expect(stagnatedAgainUpdate.stagnationCount).toBe(1)
+   })
++
++  test("given non-codex activity happens after a successful continuation, treats it as progress", () => {
++    // given
++    const sessionID = "ses-non-codex-activity-progress"
++    const state = sessionStateStore.getState(sessionID)
++    const todos = [
++      { id: "1", content: "Task 1", status: "pending", priority: "high" },
++    ]
++
++    sessionStateStore.trackContinuationProgress(sessionID, 1, todos)
++    state.awaitingPostInjectionProgressCheck = true
++    sessionStateStore.recordActivity(sessionID)
++
++    // when
++    const progressUpdate = sessionStateStore.trackContinuationProgress(
++      sessionID,
++      1,
++      todos,
++      { allowActivityProgress: true },
++    )
++
++    // then
++    expect(progressUpdate.hasProgressed).toBe(true)
++    expect(progressUpdate.progressSource).toBe("activity")
++    expect(progressUpdate.stagnationCount).toBe(0)
++  })
++
++  test("given codex activity happens after a successful continuation, keeps counting stagnation", () => {
++    // given
++    const sessionID = "ses-codex-activity-stagnation"
++    const state = sessionStateStore.getState(sessionID)
++    const todos = [
++      { id: "1", content: "Task 1", status: "pending", priority: "high" },
++    ]
++
++    sessionStateStore.trackContinuationProgress(sessionID, 1, todos)
++    state.awaitingPostInjectionProgressCheck = true
++    sessionStateStore.recordActivity(sessionID)
++
++    // when
++    const progressUpdate = sessionStateStore.trackContinuationProgress(
++      sessionID,
++      1,
++      todos,
++      { allowActivityProgress: false },
++    )
++
++    // then
++    expect(progressUpdate.hasProgressed).toBe(false)
++    expect(progressUpdate.progressSource).toBe("none")
++    expect(progressUpdate.stagnationCount).toBe(1)
++  })
+ })
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.ts b/src/hooks/todo-continuation-enforcer/session-state.ts
+index 8a151958..a87472b7 100644
+--- a/src/hooks/todo-continuation-enforcer/session-state.ts
++++ b/src/hooks/todo-continuation-enforcer/session-state.ts
+@@ -1,4 +1,4 @@
+-import type { SessionState, Todo } from "./types"
++import type { ContinuationProgressOptions, SessionState, Todo } from "./types"
+ 
+ type TimerHandle = number | { unref?: () => void }
+ 
+@@ -16,6 +16,8 @@ interface TrackedSessionState {
+   lastAccessedAt: number
+   lastCompletedCount?: number
+   lastTodoSnapshot?: string
++  activitySignalCount: number
++  lastObservedActivitySignalCount?: number
+ }
+ 
+ export interface ContinuationProgressUpdate {
+@@ -23,13 +25,19 @@ export interface ContinuationProgressUpdate {
+   previousStagnationCount: number
+   stagnationCount: number
+   hasProgressed: boolean
+-  progressSource: "none" | "todo"
++  progressSource: "none" | "todo" | "activity"
+ }
+ 
+ export interface SessionStateStore {
+   getState: (sessionID: string) => SessionState
+   getExistingState: (sessionID: string) => SessionState | undefined
+-  trackContinuationProgress: (sessionID: string, incompleteCount: number, todos?: Todo[]) => ContinuationProgressUpdate
++  recordActivity: (sessionID: string) => void
++  trackContinuationProgress: (
++    sessionID: string,
++    incompleteCount: number,
++    todos?: Todo[],
++    options?: ContinuationProgressOptions,
++  ) => ContinuationProgressUpdate
+   resetContinuationProgress: (sessionID: string) => void
+   cancelCountdown: (sessionID: string) => void
+   cleanup: (sessionID: string) => void
+@@ -96,6 +104,7 @@ export function createSessionStateStore(): SessionStateStore {
+     const trackedSession: TrackedSessionState = {
+       state: rawState,
+       lastAccessedAt: Date.now(),
++      activitySignalCount: 0,
+     }
+     sessions.set(sessionID, trackedSession)
+     return trackedSession
+@@ -114,10 +123,16 @@ export function createSessionStateStore(): SessionStateStore {
+     return undefined
+   }
+ 
++  function recordActivity(sessionID: string): void {
++    const trackedSession = getTrackedSession(sessionID)
++    trackedSession.activitySignalCount += 1
++  }
++
+   function trackContinuationProgress(
+     sessionID: string,
+     incompleteCount: number,
+-    todos?: Todo[]
++    todos?: Todo[],
++    options: ContinuationProgressOptions = {},
+   ): ContinuationProgressUpdate {
+     const trackedSession = getTrackedSession(sessionID)
+     const state = trackedSession.state
+@@ -125,6 +140,7 @@ export function createSessionStateStore(): SessionStateStore {
+     const previousStagnationCount = state.stagnationCount
+     const currentCompletedCount = todos?.filter((todo) => todo.status === "completed").length
+     const currentTodoSnapshot = todos ? getTodoSnapshot(todos) : undefined
++    const currentActivitySignalCount = trackedSession.activitySignalCount
+     const hasCompletedMoreTodos =
+       currentCompletedCount !== undefined
+       && trackedSession.lastCompletedCount !== undefined
+@@ -133,6 +149,10 @@ export function createSessionStateStore(): SessionStateStore {
+       currentTodoSnapshot !== undefined
+       && trackedSession.lastTodoSnapshot !== undefined
+       && currentTodoSnapshot !== trackedSession.lastTodoSnapshot
++    const hasObservedExternalActivity =
++      options.allowActivityProgress === true
++      && trackedSession.lastObservedActivitySignalCount !== undefined
++      && currentActivitySignalCount > trackedSession.lastObservedActivitySignalCount
+     const hadSuccessfulInjectionAwaitingProgressCheck = state.awaitingPostInjectionProgressCheck === true
+ 
+     state.lastIncompleteCount = incompleteCount
+@@ -142,6 +162,7 @@ export function createSessionStateStore(): SessionStateStore {
+     if (currentTodoSnapshot !== undefined) {
+       trackedSession.lastTodoSnapshot = currentTodoSnapshot
+     }
++    trackedSession.lastObservedActivitySignalCount = currentActivitySignalCount
+ 
+     if (previousIncompleteCount === undefined) {
+       state.stagnationCount = 0
+@@ -156,7 +177,9 @@ export function createSessionStateStore(): SessionStateStore {
+ 
+     const progressSource = incompleteCount < previousIncompleteCount || hasCompletedMoreTodos || hasTodoSnapshotChanged
+       ? "todo"
+-      : "none"
++      : hasObservedExternalActivity
++        ? "activity"
++        : "none"
+ 
+     if (progressSource !== "none") {
+       state.stagnationCount = 0
+@@ -204,6 +227,8 @@ export function createSessionStateStore(): SessionStateStore {
+     state.awaitingPostInjectionProgressCheck = false
+     trackedSession.lastCompletedCount = undefined
+     trackedSession.lastTodoSnapshot = undefined
++    trackedSession.activitySignalCount = 0
++    trackedSession.lastObservedActivitySignalCount = undefined
+   }
+ 
+   function cancelCountdown(sessionID: string): void {
+@@ -247,6 +272,7 @@ export function createSessionStateStore(): SessionStateStore {
+   return {
+     getState,
+     getExistingState,
++    recordActivity,
+     trackContinuationProgress,
+     resetContinuationProgress,
+     cancelCountdown,
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index fc67b701..c773928c 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -65,3 +65,7 @@ export interface ResolveLatestMessageInfoResult {
+   resolvedInfo?: ResolvedMessageInfo
+   encounteredCompaction: boolean
+ }
++
++export interface ContinuationProgressOptions {
++  allowActivityProgress?: boolean
++}
+diff --git a/src/hooks/zauc-mocks-bg/background-update-check.test.ts b/src/hooks/zauc-mocks-bg/background-update-check.test.ts
+index 12501870..05d0bf09 100644
+--- a/src/hooks/zauc-mocks-bg/background-update-check.test.ts
++++ b/src/hooks/zauc-mocks-bg/background-update-check.test.ts
+@@ -1,11 +1,11 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { beforeEach, describe, expect, it, mock } from "bun:test"
+ 
+-import { createBackgroundUpdateCheckRunner } from "../auto-update-checker/hook/background-update-check"
+ import type { PluginEntryInfo } from "../auto-update-checker/checker"
+ import type { SyncResult } from "../auto-update-checker/checker/sync-package-json"
+ 
+ type ToastMessageGetter = (isUpdate: boolean, version?: string) => string
++let importCounter = 0
+ 
+ function createPluginEntry(overrides?: Partial<PluginEntryInfo>): PluginEntryInfo {
+   return {
+@@ -35,7 +35,9 @@ const mockSyncCachePackageJsonToIntent = mock((_pluginInfo: PluginEntryInfo): Sy
+   error: null,
+ }))
+ 
+-function createRunner() {
++async function createRunner() {
++  const { createBackgroundUpdateCheckRunner } = await import(`../auto-update-checker/hook/background-update-check?test=${importCounter++}`)
++
+   return createBackgroundUpdateCheckRunner({
+     existsSync: () => false,
+     join: (...parts) => parts.join("/"),
+@@ -66,6 +68,7 @@ describe("runBackgroundUpdateCheck", () => {
+     isUpdate ? `Update to ${version}` : "Up to date"
+ 
+   beforeEach(() => {
++    importCounter += 1
+     mockFindPluginEntry.mockReset()
+     mockGetCachedVersion.mockReset()
+     mockGetLatestVersion.mockReset()
+@@ -87,7 +90,7 @@ describe("runBackgroundUpdateCheck", () => {
+ 
+   it("#given no plugin entry #when checking in background #then it returns early", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+     mockFindPluginEntry.mockReturnValue(null)
+ 
+     // #when
+@@ -101,7 +104,7 @@ describe("runBackgroundUpdateCheck", () => {
+ 
+   it("#given no current version #when checking in background #then it returns early", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+     mockFindPluginEntry.mockReturnValue(createPluginEntry({ entry: "oh-my-opencode" }))
+     mockGetCachedVersion.mockReturnValue(null)
+ 
+@@ -115,7 +118,7 @@ describe("runBackgroundUpdateCheck", () => {
+ 
+   it("#given latest version fetch fails #when checking in background #then it returns early", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+     mockGetLatestVersion.mockResolvedValue(null)
+ 
+     // #when
+@@ -128,7 +131,7 @@ describe("runBackgroundUpdateCheck", () => {
+ 
+   it("#given current version is latest #when checking in background #then it does nothing", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+     mockGetLatestVersion.mockResolvedValue("3.4.0")
+ 
+     // #when
+@@ -141,7 +144,7 @@ describe("runBackgroundUpdateCheck", () => {
+ 
+   it("#given auto update is disabled #when checking in background #then it shows notification only", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+ 
+     // #when
+     await runBackgroundUpdateCheck(mockCtx, false, getToastMessage)
+@@ -153,7 +156,7 @@ describe("runBackgroundUpdateCheck", () => {
+ 
+   it("#given user pinned a version #when checking in background #then it skips auto update", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+     mockFindPluginEntry.mockReturnValue(createPluginEntry({ isPinned: true, pinnedVersion: "3.4.0" }))
+ 
+     // #when
+@@ -166,7 +169,7 @@ describe("runBackgroundUpdateCheck", () => {
+ 
+   it("#given unpinned update succeeds #when checking in background #then it syncs invalidates installs and toasts", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+ 
+     // #when
+     await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
+@@ -174,14 +177,14 @@ describe("runBackgroundUpdateCheck", () => {
+     // #then
+     expect(mockSyncCachePackageJsonToIntent).toHaveBeenCalledTimes(1)
+     expect(mockInvalidatePackage).toHaveBeenCalledTimes(1)
+-    expect(mockRunBunInstallWithDetails).toHaveBeenCalledTimes(1)
++    expect(mockRunBunInstallWithDetails).toHaveBeenCalledTimes(2)
+     expect(mockShowAutoUpdatedToast).toHaveBeenCalledWith(mockCtx, "3.4.0", "3.5.0")
+     expect(mockShowUpdateAvailableToast).not.toHaveBeenCalled()
+   })
+ 
+   it("#given update succeeds #when checking in background #then it syncs before invalidate and install", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+     const callOrder: string[] = []
+     mockSyncCachePackageJsonToIntent.mockImplementation((_pluginInfo) => {
+       callOrder.push("sync")
+@@ -199,12 +202,12 @@ describe("runBackgroundUpdateCheck", () => {
+     await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
+ 
+     // #then
+-    expect(callOrder).toEqual(["sync", "invalidate", "install"])
++    expect(callOrder).toEqual(["sync", "invalidate", "install", "install"])
+   })
+ 
+   it("#given install fails #when checking in background #then it falls back to notification only", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
++    const runBackgroundUpdateCheck = await createRunner()
+     mockRunBunInstallWithDetails.mockResolvedValue({ success: false })
+ 
+     // #when
+@@ -215,10 +218,10 @@ describe("runBackgroundUpdateCheck", () => {
+     expect(mockShowAutoUpdatedToast).not.toHaveBeenCalled()
+   })
+ 
+-  for (const syncError of ["file_not_found", "plugin_not_in_deps", "parse_error", "write_error"] as const) {
++  for (const syncError of ["parse_error", "write_error"] as const) {
+     it(`#given sync fails with ${syncError} #when checking in background #then it aborts and shows notification only`, async () => {
+       // #given
+-      const runBackgroundUpdateCheck = createRunner()
++      const runBackgroundUpdateCheck = await createRunner()
+       mockSyncCachePackageJsonToIntent.mockReturnValue({
+         synced: false,
+         error: syncError,
+diff --git a/src/hooks/zauc-mocks-ws/workspace-resolution.test.ts b/src/hooks/zauc-mocks-ws/workspace-resolution.test.ts
+index 3f157cf5..c9171289 100644
+--- a/src/hooks/zauc-mocks-ws/workspace-resolution.test.ts
++++ b/src/hooks/zauc-mocks-ws/workspace-resolution.test.ts
+@@ -3,15 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+ import { join } from "node:path"
+ 
+-import { createBackgroundUpdateCheckRunner } from "../auto-update-checker/hook/background-update-check"
+ import type { PluginEntryInfo } from "../auto-update-checker/checker"
+ import type { SyncResult } from "../auto-update-checker/checker/sync-package-json"
++import { PACKAGE_NAME } from "../auto-update-checker/constants"
+ 
+ type ToastMessageGetter = (isUpdate: boolean, version?: string) => string
++let importCounter = 0
+ 
+ function createPluginEntry(overrides?: Partial<PluginEntryInfo>): PluginEntryInfo {
+   return {
+-    entry: "oh-my-openagent@3.4.0",
++    entry: `${PACKAGE_NAME}@3.4.0`,
+     isPinned: false,
+     pinnedVersion: null,
+     configPath: "/test/opencode.json",
+@@ -21,6 +22,7 @@ function createPluginEntry(overrides?: Partial<PluginEntryInfo>): PluginEntryInf
+ 
+ const TEST_DIR = join(import.meta.dir, "__test-workspace-resolution__")
+ const TEST_CACHE_DIR = join(TEST_DIR, "cache")
++const TEST_CACHE_WORKSPACE_DIR = join(TEST_CACHE_DIR, "packages")
+ const TEST_CONFIG_DIR = join(TEST_DIR, "config")
+ 
+ const mockFindPluginEntry = mock((_directory: string): PluginEntryInfo | null => createPluginEntry())
+@@ -38,7 +40,9 @@ const mockSyncCachePackageJsonToIntent = mock((_pluginInfo: PluginEntryInfo): Sy
+ const mockRunBunInstallWithDetails = mock(async (_opts?: { outputMode?: string; workspaceDir?: string }) => ({ success: true }))
+ const mockLog = mock(() => {})
+ 
+-function createRunner() {
++async function createRunner() {
++  const { createBackgroundUpdateCheckRunner } = await import(`../auto-update-checker/hook/background-update-check?test=${importCounter++}`)
++
+   return createBackgroundUpdateCheckRunner({
+     existsSync,
+     join,
+@@ -69,6 +73,7 @@ describe("workspace resolution", () => {
+     isUpdate ? `Update to ${version}` : "Up to date"
+ 
+   beforeEach(() => {
++    importCounter += 1
+     if (existsSync(TEST_DIR)) {
+       rmSync(TEST_DIR, { recursive: true, force: true })
+     }
+@@ -101,12 +106,12 @@ describe("workspace resolution", () => {
+ 
+   it("#given config-dir install exists but cache-dir does not #when updating #then it installs to config-dir", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
+-    mkdirSync(join(TEST_CONFIG_DIR, "node_modules", "oh-my-openagent"), { recursive: true })
+-    writeFileSync(join(TEST_CONFIG_DIR, "package.json"), JSON.stringify({ dependencies: { "oh-my-openagent": "3.4.0" } }, null, 2))
++    const runBackgroundUpdateCheck = await createRunner()
++    mkdirSync(join(TEST_CONFIG_DIR, "node_modules", PACKAGE_NAME), { recursive: true })
++    writeFileSync(join(TEST_CONFIG_DIR, "package.json"), JSON.stringify({ dependencies: { [PACKAGE_NAME]: "3.4.0" } }, null, 2))
+     writeFileSync(
+-      join(TEST_CONFIG_DIR, "node_modules", "oh-my-openagent", "package.json"),
+-      JSON.stringify({ name: "oh-my-openagent", version: "3.4.0" }, null, 2),
++      join(TEST_CONFIG_DIR, "node_modules", PACKAGE_NAME, "package.json"),
++      JSON.stringify({ name: PACKAGE_NAME, version: "3.4.0" }, null, 2),
+     )
+ 
+     // #when
+@@ -118,18 +123,18 @@ describe("workspace resolution", () => {
+ 
+   it("#given both config-dir and cache-dir installs exist #when updating #then it prefers config-dir", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
+-    mkdirSync(join(TEST_CONFIG_DIR, "node_modules", "oh-my-openagent"), { recursive: true })
+-    writeFileSync(join(TEST_CONFIG_DIR, "package.json"), JSON.stringify({ dependencies: { "oh-my-openagent": "3.4.0" } }, null, 2))
++    const runBackgroundUpdateCheck = await createRunner()
++    mkdirSync(join(TEST_CONFIG_DIR, "node_modules", PACKAGE_NAME), { recursive: true })
++    writeFileSync(join(TEST_CONFIG_DIR, "package.json"), JSON.stringify({ dependencies: { [PACKAGE_NAME]: "3.4.0" } }, null, 2))
+     writeFileSync(
+-      join(TEST_CONFIG_DIR, "node_modules", "oh-my-openagent", "package.json"),
+-      JSON.stringify({ name: "oh-my-openagent", version: "3.4.0" }, null, 2),
++      join(TEST_CONFIG_DIR, "node_modules", PACKAGE_NAME, "package.json"),
++      JSON.stringify({ name: PACKAGE_NAME, version: "3.4.0" }, null, 2),
+     )
+-    mkdirSync(join(TEST_CACHE_DIR, "node_modules", "oh-my-openagent"), { recursive: true })
+-    writeFileSync(join(TEST_CACHE_DIR, "package.json"), JSON.stringify({ dependencies: { "oh-my-openagent": "3.4.0" } }, null, 2))
++    mkdirSync(join(TEST_CACHE_DIR, "node_modules", PACKAGE_NAME), { recursive: true })
++    writeFileSync(join(TEST_CACHE_DIR, "package.json"), JSON.stringify({ dependencies: { [PACKAGE_NAME]: "3.4.0" } }, null, 2))
+     writeFileSync(
+-      join(TEST_CACHE_DIR, "node_modules", "oh-my-openagent", "package.json"),
+-      JSON.stringify({ name: "oh-my-openagent", version: "3.4.0" }, null, 2),
++      join(TEST_CACHE_DIR, "node_modules", PACKAGE_NAME, "package.json"),
++      JSON.stringify({ name: PACKAGE_NAME, version: "3.4.0" }, null, 2),
+     )
+ 
+     // #when
+@@ -141,18 +146,49 @@ describe("workspace resolution", () => {
+ 
+   it("#given only cache-dir install exists #when updating #then it falls back to cache-dir", async () => {
+     // #given
+-    const runBackgroundUpdateCheck = createRunner()
+-    mkdirSync(join(TEST_CACHE_DIR, "node_modules", "oh-my-openagent"), { recursive: true })
+-    writeFileSync(join(TEST_CACHE_DIR, "package.json"), JSON.stringify({ dependencies: { "oh-my-openagent": "3.4.0" } }, null, 2))
++    const runBackgroundUpdateCheck = await createRunner()
++    mkdirSync(join(TEST_CACHE_WORKSPACE_DIR, "node_modules", PACKAGE_NAME), { recursive: true })
++    writeFileSync(join(TEST_CACHE_WORKSPACE_DIR, "package.json"), JSON.stringify({ dependencies: { [PACKAGE_NAME]: "3.4.0" } }, null, 2))
+     writeFileSync(
+-      join(TEST_CACHE_DIR, "node_modules", "oh-my-openagent", "package.json"),
+-      JSON.stringify({ name: "oh-my-openagent", version: "3.4.0" }, null, 2),
++      join(TEST_CACHE_WORKSPACE_DIR, "node_modules", PACKAGE_NAME, "package.json"),
++      JSON.stringify({ name: PACKAGE_NAME, version: "3.4.0" }, null, 2),
+     )
+ 
+     // #when
+     await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
+ 
+     // #then
+-    expect(mockRunBunInstallWithDetails.mock.calls[0]?.[0]?.workspaceDir).toBe(TEST_CACHE_DIR)
++    expect(mockRunBunInstallWithDetails.mock.calls[0]?.[0]?.workspaceDir).toBe(TEST_CACHE_WORKSPACE_DIR)
++  })
++
++  it("#given cache workspace package.json exists without installed module #when updating #then it installs to cache-dir", async () => {
++    // #given
++    const runner = await createRunner()
++    mkdirSync(TEST_CACHE_WORKSPACE_DIR, { recursive: true })
++    writeFileSync(join(TEST_CACHE_WORKSPACE_DIR, "package.json"), JSON.stringify({ dependencies: { [PACKAGE_NAME]: "3.4.0" } }, null, 2))
++
++    // #when
++    await runner(mockCtx, true, getToastMessage)
++
++    // #then
++    expect(mockRunBunInstallWithDetails.mock.calls[0]?.[0]?.workspaceDir).toBe(TEST_CACHE_WORKSPACE_DIR)
++  })
++
++  it("#given config-dir install exists #when updating #then it also primes the cache workspace", async () => {
++    // #given
++    const runBackgroundUpdateCheck = await createRunner()
++    mkdirSync(join(TEST_CONFIG_DIR, "node_modules", PACKAGE_NAME), { recursive: true })
++    writeFileSync(join(TEST_CONFIG_DIR, "package.json"), JSON.stringify({ dependencies: { [PACKAGE_NAME]: "3.4.0" } }, null, 2))
++    writeFileSync(
++      join(TEST_CONFIG_DIR, "node_modules", PACKAGE_NAME, "package.json"),
++      JSON.stringify({ name: PACKAGE_NAME, version: "3.4.0" }, null, 2),
++    )
++
++    // #when
++    await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++
++    // #then
++    expect(mockRunBunInstallWithDetails.mock.calls[0]?.[0]?.workspaceDir).toBe(TEST_CONFIG_DIR)
++    expect(mockRunBunInstallWithDetails.mock.calls[1]?.[0]?.workspaceDir).toBe(TEST_CACHE_WORKSPACE_DIR)
+   })
+ })
+diff --git a/src/hooks/zauc-sync-mocks/sync-package-json.test.ts b/src/hooks/zauc-sync-mocks/sync-package-json.test.ts
+index 67fc0872..2a9ba806 100644
+--- a/src/hooks/zauc-sync-mocks/sync-package-json.test.ts
++++ b/src/hooks/zauc-sync-mocks/sync-package-json.test.ts
+@@ -148,7 +148,7 @@ describe("syncCachePackageJsonToIntent", () => {
+   })
+ 
+   describe("#given cache package.json does not exist", () => {
+-    it("#then returns file_not_found error", async () => {
++    it("#then creates cache package.json with the plugin dependency", async () => {
+       cleanupTestCache()
+       const { syncCachePackageJsonToIntent } = await importFreshSyncPackageJsonModule()
+ 
+@@ -161,13 +161,14 @@ describe("syncCachePackageJsonToIntent", () => {
+ 
+       const result = syncCachePackageJsonToIntent(pluginInfo)
+ 
+-      expect(result.synced).toBe(false)
+-      expect(result.error).toBe("file_not_found")
++      expect(result.synced).toBe(true)
++      expect(result.error).toBeNull()
++      expect(readCachePackageJsonVersion()).toBe("latest")
+     })
+   })
+ 
+   describe("#given plugin not in cache package.json dependencies", () => {
+-    it("#then returns plugin_not_in_deps error", async () => {
++    it("#then adds the plugin dependency and preserves existing dependencies", async () => {
+       cleanupTestCache()
+       mkdirSync(TEST_CACHE_DIR, { recursive: true })
+       writeFileSync(
+@@ -186,8 +187,13 @@ describe("syncCachePackageJsonToIntent", () => {
+ 
+       const result = syncCachePackageJsonToIntent(pluginInfo)
+ 
+-      expect(result.synced).toBe(false)
+-      expect(result.error).toBe("plugin_not_in_deps")
++      expect(result.synced).toBe(true)
++      expect(result.error).toBeNull()
++
++      const content = readFileSync(join(TEST_CACHE_DIR, "package.json"), "utf-8")
++      const pkg = JSON.parse(content) as { dependencies?: Record<string, string> }
++      expect(pkg.dependencies?.["oh-my-opencode"]).toBe("latest")
++      expect(pkg.dependencies?.other).toBe("1.0.0")
+     })
+   })
+ 
+diff --git a/src/shared/opencode-message-dir.test.ts b/src/shared/opencode-message-dir.test.ts
+index 97b9cac0..3bcd93f6 100644
+--- a/src/shared/opencode-message-dir.test.ts
++++ b/src/shared/opencode-message-dir.test.ts
+@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto"
+ 
+ const TEST_STORAGE = join(tmpdir(), `omo-msgdir-test-${randomUUID()}`)
+ const TEST_MESSAGE_STORAGE = join(TEST_STORAGE, "message")
++let sqliteBackend = false
+ 
+ mock.module("./opencode-storage-paths", () => ({
+   OPENCODE_STORAGE: TEST_STORAGE,
+@@ -15,7 +16,7 @@ mock.module("./opencode-storage-paths", () => ({
+ }))
+ 
+ mock.module("./opencode-storage-detection", () => ({
+-  isSqliteBackend: () => false,
++  isSqliteBackend: () => sqliteBackend,
+   resetSqliteBackendCache: () => {},
+ }))
+ 
+@@ -25,6 +26,7 @@ const { getMessageDir } = await import("./opencode-message-dir")
+ 
+ describe("getMessageDir", () => {
+   beforeEach(() => {
++    sqliteBackend = false
+     mkdirSync(TEST_MESSAGE_STORAGE, { recursive: true })
+   })
+ 
+@@ -73,6 +75,19 @@ describe("getMessageDir", () => {
+     expect(result).toBe(sessionDir)
+   })
+ 
++  it("returns file fallback path even when SQLite backend is active", () => {
++    //#given
++    sqliteBackend = true
++    const sessionDir = join(TEST_MESSAGE_STORAGE, "subdir", "ses_123")
++    mkdirSync(sessionDir, { recursive: true })
++
++    //#when
++    const result = getMessageDir("ses_123")
++
++    //#then
++    expect(result).toBe(sessionDir)
++  })
++
+   it("returns null for path traversal attempts with ..", () => {
+     //#given - sessionID containing path traversal
+     //#when
+@@ -106,4 +121,4 @@ describe("getMessageDir", () => {
+     //#then
+     expect(result).toBe(null)
+   })
+-})
+\ No newline at end of file
++})
+diff --git a/src/shared/opencode-message-dir.ts b/src/shared/opencode-message-dir.ts
+index c8d8e3b3..13173776 100644
+--- a/src/shared/opencode-message-dir.ts
++++ b/src/shared/opencode-message-dir.ts
+@@ -1,13 +1,11 @@
+ import { existsSync, readdirSync } from "node:fs"
+ import { join } from "node:path"
+ import { MESSAGE_STORAGE } from "./opencode-storage-paths"
+-import { isSqliteBackend } from "./opencode-storage-detection"
+ import { log } from "./logger"
+ 
+ export function getMessageDir(sessionID: string): string | null {
+   if (!sessionID.startsWith("ses_")) return null
+   if (/[/\\]|\.\./.test(sessionID)) return null
+-  if (isSqliteBackend()) return null
+   if (!existsSync(MESSAGE_STORAGE)) return null
+ 
+   const directPath = join(MESSAGE_STORAGE, sessionID)
+@@ -28,4 +26,4 @@ export function getMessageDir(sessionID: string): string | null {
+   }
+ 
+   return null
+-}
+\ No newline at end of file
++}
+diff --git a/src/tools/delegate-task/sync-session-poller.test.ts b/src/tools/delegate-task/sync-session-poller.test.ts
+index 28407bde..7ef08e16 100644
+--- a/src/tools/delegate-task/sync-session-poller.test.ts
++++ b/src/tools/delegate-task/sync-session-poller.test.ts
+@@ -165,6 +165,58 @@ describe("pollSyncSession", () => {
+       expect(callCount).toBeGreaterThan(1)
+     })
+ 
++    test("keeps polling when finish is 'stop' but assistant still has tool-call parts", async () => {
++      //#given
++      const { pollSyncSession } = require("./sync-session-poller")
++
++      let callCount = 0
++      const mockClient = {
++        session: {
++          messages: async () => {
++            callCount++
++            if (callCount <= 1) {
++              return {
++                data: [
++                  { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                  {
++                    info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "stop" },
++                    parts: [{ type: "tool-call", text: "calling tool" }],
++                  },
++                ],
++              }
++            }
++            return {
++              data: [
++                { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++                {
++                  info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "stop" },
++                  parts: [{ type: "tool-call", text: "calling tool" }],
++                },
++                { info: { id: "msg_003", role: "user", time: { created: 3000 } } },
++                {
++                  info: { id: "msg_004", role: "assistant", time: { created: 4000 }, finish: "stop" },
++                  parts: [{ type: "text", text: "Done" }],
++                },
++              ],
++            }
++          },
++          status: async () => ({ data: { "ses_test": { type: "idle" } } }),
++        },
++      }
++
++      //#when
++      const result = await pollSyncSession(createMockCtx(), mockClient, {
++        sessionID: "ses_test",
++        agentToUse: "test-agent",
++        toastManager: null,
++        taskId: undefined,
++      })
++
++      //#then
++      expect(result).toBeNull()
++      expect(callCount).toBeGreaterThan(1)
++    })
++
+     test("does not complete when assistant id < user id (user sent after assistant)", async () => {
+       //#given - assistant finished but user message came after it (agent still processing)
+       const { pollSyncSession } = require("./sync-session-poller")
+@@ -421,6 +473,44 @@ describe("pollSyncSession", () => {
+       expect(result).toBe(false)
+     })
+ 
++    test("returns false when finish is stop but assistant has tool-call parts", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
++
++      //#given - provider marks stop even though tool execution is still pending
++      const messages = [
++        { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++        {
++          info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "stop" },
++          parts: [{ type: "tool-call", text: "calling tool" }],
++        },
++      ]
++
++      //#when
++      const result = isSessionComplete(messages)
++
++      //#then - should return false because tool execution is still pending
++      expect(result).toBe(false)
++    })
++
++    test("returns false when finish is end_turn but assistant has tool-call parts", () => {
++      const { isSessionComplete } = require("./sync-session-poller")
++
++      //#given - assistant emitted a terminal finish but still contains pending tool calls
++      const messages = [
++        { info: { id: "msg_001", role: "user", time: { created: 1000 } } },
++        {
++          info: { id: "msg_002", role: "assistant", time: { created: 2000 }, finish: "end_turn" },
++          parts: [{ type: "tool-call", text: "calling tool" }],
++        },
++      ]
++
++      //#when
++      const result = isSessionComplete(messages)
++
++      //#then - should return false because tool execution is still pending
++      expect(result).toBe(false)
++    })
++
+     test("returns false when user message has missing info.id field", () => {
+       const { isSessionComplete } = require("./sync-session-poller")
+ 
+@@ -438,7 +528,7 @@ describe("pollSyncSession", () => {
+ 
+       //#then - should return false (missing user id)
+       expect(result).toBe(false)
++    })
+   })
+-})
+ 
+ })
+diff --git a/src/tools/delegate-task/sync-session-poller.ts b/src/tools/delegate-task/sync-session-poller.ts
+index 516c8321..257c25ae 100644
+--- a/src/tools/delegate-task/sync-session-poller.ts
++++ b/src/tools/delegate-task/sync-session-poller.ts
+@@ -5,6 +5,7 @@ import { log } from "../../shared/logger"
+ import { normalizeSDKResponse } from "../../shared"
+ 
+ const NON_TERMINAL_FINISH_REASONS = new Set(["tool-calls", "unknown"])
++const PENDING_TOOL_PART_TYPES = new Set(["tool", "tool_use", "tool-call"])
+ 
+ function wait(milliseconds: number): Promise<void> {
+   const sharedBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
+@@ -35,6 +36,7 @@ export function isSessionComplete(messages: SessionMessage[]): boolean {
+ 
+   if (!lastAssistant?.info?.finish) return false
+   if (NON_TERMINAL_FINISH_REASONS.has(lastAssistant.info.finish)) return false
++  if (lastAssistant.parts?.some((part) => part.type && PENDING_TOOL_PART_TYPES.has(part.type))) return false
+   if (!lastUser?.info?.id || !lastAssistant?.info?.id) return false
+   return lastUser.info.id < lastAssistant.info.id
+ }
+diff --git a/src/tools/session-manager/storage-fallback.test.ts b/src/tools/session-manager/storage-fallback.test.ts
+index 87bf9798..de8e9961 100644
+--- a/src/tools/session-manager/storage-fallback.test.ts
++++ b/src/tools/session-manager/storage-fallback.test.ts
+@@ -128,6 +128,60 @@ describe("session-manager storage fallback", () => {
+     expect(sessions[0].id).toBe("ses_file")
+   })
+ 
++  test("#given empty SDK list response #when getMainSessions runs #then returns file-backed pre-migration sessions", async () => {
++    createSessionMetadata("proj_test", "ses_file", "/workspace/project", 2_000)
++    mockClient.session.list.mockImplementation(() => Promise.resolve({ data: [] }))
++
++    const sessions = await storage.getMainSessions({ directory: "/workspace/project" })
++
++    expect(sessions).toHaveLength(1)
++    expect(sessions[0].id).toBe("ses_file")
++  })
++
++  test("#given SDK and file sessions overlap #when getMainSessions runs #then dedupes by id and keeps SDK metadata", async () => {
++    createSessionMetadata("proj_test", "ses_file", "/workspace/project", 2_000)
++    createSessionMetadata("proj_test", "ses_sdk", "/workspace/project", 1_500)
++    mockClient.session.list.mockImplementation(() => Promise.resolve({
++      data: [
++        {
++          id: "ses_sdk",
++          projectID: "sdk_project",
++          directory: "/workspace/project",
++          time: { created: 3_000, updated: 4_000 },
++        },
++      ],
++    }))
++
++    const sessions = await storage.getMainSessions({ directory: "/workspace/project" })
++
++    expect(sessions).toHaveLength(2)
++    expect(sessions.map((session) => session.id)).toEqual(["ses_sdk", "ses_file"])
++    expect(sessions[0].projectID).toBe("sdk_project")
++  })
++
++  test("#given empty SDK session list #when getAllSessions runs #then returns file-backed session ids", async () => {
++    createSessionMessage("ses_file", "msg_001", 1_000)
++    mockClient.session.list.mockImplementation(() => Promise.resolve({ data: [] }))
++
++    const sessionIds = await storage.getAllSessions()
++
++    expect(sessionIds).toEqual(["ses_file"])
++  })
++
++  test("#given SDK and file session ids overlap #when getAllSessions runs #then returns deduped union", async () => {
++    createSessionMessage("ses_file", "msg_001", 1_000)
++    createSessionMessage("ses_sdk", "msg_002", 2_000)
++    mockClient.session.list.mockImplementation(() => Promise.resolve({
++      data: [
++        { id: "ses_sdk" },
++      ],
++    }))
++
++    const sessionIds = await storage.getAllSessions()
++
++    expect(sessionIds).toEqual(["ses_sdk", "ses_file"])
++  })
++
+   test("#given unreachable SDK messages error #when readSessionMessages runs #then falls back to file messages", async () => {
+     createSessionMessage("ses_file", "msg_001", 1_000)
+     mockClient.session.messages.mockImplementation(() => Promise.reject(createSdkUnavailableError("Unable to connect to http://localhost:4096")))
+@@ -138,6 +192,16 @@ describe("session-manager storage fallback", () => {
+     expect(messages[0].id).toBe("msg_001")
+   })
+ 
++  test("#given empty SDK messages response #when readSessionMessages runs #then falls back to file messages", async () => {
++    createSessionMessage("ses_file", "msg_001", 1_000)
++    mockClient.session.messages.mockImplementation(() => Promise.resolve({ data: [] }))
++
++    const messages = await storage.readSessionMessages("ses_file")
++
++    expect(messages).toHaveLength(1)
++    expect(messages[0].id).toBe("msg_001")
++  })
++
+   test("#given unreachable SDK todo response #when readSessionTodos runs #then falls back to file todos", async () => {
+     createSessionTodo("ses_file", [{ id: "todo_1", content: "Fallback todo", status: "pending" }])
+     mockClient.session.todo.mockImplementation(() => Promise.resolve({ error: createSdkUnavailableError("network error: server unreachable") }))
+@@ -148,6 +212,16 @@ describe("session-manager storage fallback", () => {
+     expect(todos[0].content).toBe("Fallback todo")
+   })
+ 
++  test("#given empty SDK todo response #when readSessionTodos runs #then falls back to file todos", async () => {
++    createSessionTodo("ses_file", [{ id: "todo_1", content: "Fallback todo", status: "pending" }])
++    mockClient.session.todo.mockImplementation(() => Promise.resolve({ data: [] }))
++
++    const todos = await storage.readSessionTodos("ses_file")
++
++    expect(todos).toHaveLength(1)
++    expect(todos[0].content).toBe("Fallback todo")
++  })
++
+   test("#given unreachable SDK list error #when sessionExists runs #then falls back to file existence", async () => {
+     createSessionMessage("ses_file", "msg_001", 1_000)
+     mockClient.session.list.mockImplementation(() => Promise.reject(createSdkUnavailableError("ETIMEDOUT while connecting")))
+@@ -157,6 +231,15 @@ describe("session-manager storage fallback", () => {
+     expect(exists).toBe(true)
+   })
+ 
++  test("#given empty SDK session list #when sessionExists runs #then falls back to file existence", async () => {
++    createSessionMessage("ses_file", "msg_001", 1_000)
++    mockClient.session.list.mockImplementation(() => Promise.resolve({ data: [] }))
++
++    const exists = await storage.sessionExists("ses_file")
++
++    expect(exists).toBe(true)
++  })
++
+   test("#given semantic SDK error #when readSessionMessages runs #then rethrows instead of hiding bug", async () => {
+     mockClient.session.messages.mockImplementation(() => Promise.resolve({ error: new Error("session not found") }))
+ 
+diff --git a/src/tools/session-manager/storage.ts b/src/tools/session-manager/storage.ts
+index 2862d155..46a00daa 100644
+--- a/src/tools/session-manager/storage.ts
++++ b/src/tools/session-manager/storage.ts
+@@ -9,6 +9,27 @@ export interface GetMainSessionsOptions {
+   directory?: string
+ }
+ 
++function mergeSessionMetadataLists(
++  sdkSessions: SessionMetadata[],
++  fileSessions: SessionMetadata[],
++): SessionMetadata[] {
++  const merged = new Map<string, SessionMetadata>()
++
++  for (const session of fileSessions) {
++    merged.set(session.id, session)
++  }
++
++  for (const session of sdkSessions) {
++    merged.set(session.id, session)
++  }
++
++  return [...merged.values()].sort((a, b) => b.time.updated - a.time.updated)
++}
++
++function mergeSessionIds(sdkSessionIds: string[], fileSessionIds: string[]): string[] {
++  return [...new Set([...sdkSessionIds, ...fileSessionIds])]
++}
++
+ // SDK client reference for beta mode
+ let sdkClient: PluginInput["client"] | null = null
+ 
+@@ -23,7 +44,9 @@ export function resetStorageClient(): void {
+ export async function getMainSessions(options: GetMainSessionsOptions): Promise<SessionMetadata[]> {
+   if (isSqliteBackend() && sdkClient) {
+     try {
+-      return await getSdkMainSessions(sdkClient, options.directory)
++      const sdkSessions = await getSdkMainSessions(sdkClient, options.directory)
++      const fileSessions = await getFileMainSessions(options.directory)
++      return mergeSessionMetadataLists(sdkSessions, fileSessions)
+     } catch (error) {
+       if (!shouldFallbackFromSdkError(error)) throw error
+       log("[session-manager] falling back to file session list after SDK unavailable error", { error: String(error) })
+@@ -36,7 +59,9 @@ export async function getMainSessions(options: GetMainSessionsOptions): Promise<
+ export async function getAllSessions(): Promise<string[]> {
+   if (isSqliteBackend() && sdkClient) {
+     try {
+-      return await getSdkAllSessions(sdkClient)
++      const sdkSessionIds = await getSdkAllSessions(sdkClient)
++      const fileSessionIds = await getFileAllSessions()
++      return mergeSessionIds(sdkSessionIds, fileSessionIds)
+     } catch (error) {
+       if (!shouldFallbackFromSdkError(error)) throw error
+       log("[session-manager] falling back to file session ids after SDK unavailable error", { error: String(error) })
+@@ -51,7 +76,8 @@ export { getMessageDir } from "../../shared/opencode-message-dir"
+ export async function sessionExists(sessionID: string): Promise<boolean> {
+   if (isSqliteBackend() && sdkClient) {
+     try {
+-      return await sdkSessionExists(sdkClient, sessionID)
++      const existsInSdk = await sdkSessionExists(sdkClient, sessionID)
++      if (existsInSdk) return true
+     } catch (error) {
+       if (!shouldFallbackFromSdkError(error)) throw error
+       log("[session-manager] falling back to file sessionExists after SDK unavailable error", { error: String(error), sessionID })
+@@ -63,7 +89,8 @@ export async function sessionExists(sessionID: string): Promise<boolean> {
+ export async function readSessionMessages(sessionID: string): Promise<SessionMessage[]> {
+   if (isSqliteBackend() && sdkClient) {
+     try {
+-      return await getSdkSessionMessages(sdkClient, sessionID)
++      const sdkMessages = await getSdkSessionMessages(sdkClient, sessionID)
++      if (sdkMessages.length > 0) return sdkMessages
+     } catch (error) {
+       if (!shouldFallbackFromSdkError(error)) throw error
+       log("[session-manager] falling back to file session messages after SDK unavailable error", { error: String(error), sessionID })
+@@ -76,7 +103,8 @@ export async function readSessionMessages(sessionID: string): Promise<SessionMes
+ export async function readSessionTodos(sessionID: string): Promise<TodoItem[]> {
+   if (isSqliteBackend() && sdkClient) {
+     try {
+-      return await getSdkSessionTodos(sdkClient, sessionID)
++      const sdkTodos = await getSdkSessionTodos(sdkClient, sessionID)
++      if (sdkTodos.length > 0) return sdkTodos
+     } catch (error) {
+       if (!shouldFallbackFromSdkError(error)) throw error
+       log("[session-manager] falling back to file session todos after SDK unavailable error", { error: String(error), sessionID })
+-- 
+2.39.2
+

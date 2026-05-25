@@ -1,0 +1,206 @@
+From c25f75294e7290d3caf894aca7e48101b7696169 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 01:52:40 +0900
+Subject: [PATCH 5330/5749] perf(rules-injector): cache project root for
+ visited ancestors
+
+findProjectRoot was keyed by exact startPath, so sibling files in the
+same project repeated the entire upward marker walk. The walk does one
+existsSync per marker per ancestor directory, which adds up on every
+read/write/edit/multiedit tool call.
+
+Track every directory visited during the walk and seed the cache with
+the resolved root for each of them. Subsequent lookups for any
+descendant short-circuit to the cached ancestor without re-running
+marker probes. Cache invalidation still happens on session.deleted /
+session.compacted, so production semantics are unchanged.
+
+Pin the new contract via a sibling-startpath test, and make the
+existing finder.test.ts beforeEach explicit about cache state so the
+more aggressive cache does not leak between tests.
+---
+ src/hooks/rules-injector/finder.test.ts       |  3 +
+ .../project-root-finder.test.ts               | 34 +++++++++
+ .../rules-injector/project-root-finder.ts     | 75 +++++++++++++------
+ 3 files changed, 91 insertions(+), 21 deletions(-)
+
+diff --git a/src/hooks/rules-injector/finder.test.ts b/src/hooks/rules-injector/finder.test.ts
+index 5fcac504..23ca7d0e 100644
+--- a/src/hooks/rules-injector/finder.test.ts
++++ b/src/hooks/rules-injector/finder.test.ts
+@@ -3,12 +3,14 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { findProjectRoot, findRuleFiles } from "./finder";
++import { clearProjectRootCache } from "./project-root-finder";
+ 
+ describe("findRuleFiles", () => {
+   const TEST_DIR = join(tmpdir(), `rules-injector-test-${Date.now()}`);
+   const homeDir = join(TEST_DIR, "home");
+ 
+   beforeEach(() => {
++    clearProjectRootCache();
+     mkdirSync(TEST_DIR, { recursive: true });
+     mkdirSync(homeDir, { recursive: true });
+     mkdirSync(join(TEST_DIR, ".git"), { recursive: true });
+@@ -328,6 +330,7 @@ describe("findProjectRoot", () => {
+   const TEST_DIR = join(tmpdir(), `project-root-test-${Date.now()}`);
+ 
+   beforeEach(() => {
++    clearProjectRootCache();
+     mkdirSync(TEST_DIR, { recursive: true });
+   });
+ 
+diff --git a/src/hooks/rules-injector/project-root-finder.test.ts b/src/hooks/rules-injector/project-root-finder.test.ts
+index edda25ed..9f466dce 100644
+--- a/src/hooks/rules-injector/project-root-finder.test.ts
++++ b/src/hooks/rules-injector/project-root-finder.test.ts
+@@ -3,6 +3,10 @@ import { mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ 
++function createImportSuffix(): string {
++  return `?test=${Date.now()}-${Math.random()}`;
++}
++
+ let testRoot = "";
+ 
+ describe("findProjectRoot", () => {
+@@ -40,4 +44,34 @@ describe("findProjectRoot", () => {
+     expect(secondResult).toBe(projectRoot);
+     expect(thirdResult).toBeNull();
+   });
++
++  it("reuses cached ancestor project root for sibling start paths", async () => {
++    // given
++    testRoot = join(tmpdir(), `rules-project-root-sibling-${Date.now()}-${Math.random()}`);
++    const projectRoot = join(testRoot, "project");
++    const siblingDirA = join(projectRoot, "src", "alpha");
++    const siblingDirB = join(projectRoot, "src", "beta");
++    const siblingFileA = join(siblingDirA, "a.ts");
++    const siblingFileB = join(siblingDirB, "b.ts");
++    const packageJsonPath = join(projectRoot, "package.json");
++    mkdirSync(siblingDirA, { recursive: true });
++    mkdirSync(siblingDirB, { recursive: true });
++    writeFileSync(siblingFileA, "export const a = 1;\n");
++    writeFileSync(siblingFileB, "export const b = 2;\n");
++    writeFileSync(packageJsonPath, "{}\n");
++
++    const { clearProjectRootCache, findProjectRoot } = await import(
++      `./project-root-finder.ts${createImportSuffix()}`
++    );
++    clearProjectRootCache();
++
++    // when
++    const firstResult = findProjectRoot(siblingFileA);
++    unlinkSync(packageJsonPath);
++    const siblingResult = findProjectRoot(siblingFileB);
++
++    // then
++    expect(firstResult).toBe(projectRoot);
++    expect(siblingResult).toBe(projectRoot);
++  });
+ });
+diff --git a/src/hooks/rules-injector/project-root-finder.ts b/src/hooks/rules-injector/project-root-finder.ts
+index ea552e0c..613083c9 100644
+--- a/src/hooks/rules-injector/project-root-finder.ts
++++ b/src/hooks/rules-injector/project-root-finder.ts
+@@ -12,41 +12,74 @@ export function clearProjectRootCache(): void {
+  * Find project root by walking up from startPath.
+  * Checks for PROJECT_MARKERS (.git, pyproject.toml, package.json, etc.)
+  *
++ * Memoizes every directory visited during the walk so subsequent lookups for
++ * any descendant path resolve in O(1) without re-running marker existsSync
++ * probes.
++ *
+  * @param startPath - Starting path to search from (file or directory)
+  * @returns Project root path or null if not found
+  */
+ export function findProjectRoot(startPath: string): string | null {
+-  if (projectRootCache.has(startPath)) {
+-    return projectRootCache.get(startPath) ?? null;
++  const cached = projectRootCache.get(startPath);
++  if (cached !== undefined) {
++    return cached;
+   }
+ 
+-  const projectRoot = findProjectRootWithoutCache(startPath);
+-  projectRootCache.set(startPath, projectRoot);
+-  return projectRoot;
+-}
+-
+-function findProjectRootWithoutCache(startPath: string): string | null {
+-  let current: string;
+-
+-  try {
+-    const stat = statSync(startPath);
+-    current = stat.isDirectory() ? startPath : dirname(startPath);
+-  } catch {
+-    current = dirname(startPath);
++  const startDir = resolveStartDir(startPath);
++  const cachedFromStartDir = projectRootCache.get(startDir);
++  if (cachedFromStartDir !== undefined) {
++    projectRootCache.set(startPath, cachedFromStartDir);
++    return cachedFromStartDir;
+   }
+ 
++  const visited: string[] = [];
++  let current = startDir;
++  let resolved: string | null = null;
++
+   while (true) {
+-    for (const marker of PROJECT_MARKERS) {
+-      const markerPath = join(current, marker);
+-      if (existsSync(markerPath)) {
+-        return current;
+-      }
++    const cachedAncestor = projectRootCache.get(current);
++    if (cachedAncestor !== undefined) {
++      resolved = cachedAncestor;
++      break;
++    }
++
++    visited.push(current);
++
++    if (hasProjectMarker(current)) {
++      resolved = current;
++      break;
+     }
+ 
+     const parent = dirname(current);
+     if (parent === current) {
+-      return null;
++      resolved = null;
++      break;
+     }
+     current = parent;
+   }
++
++  for (const dir of visited) {
++    projectRootCache.set(dir, resolved);
++  }
++  projectRootCache.set(startPath, resolved);
++
++  return resolved;
++}
++
++function resolveStartDir(startPath: string): string {
++  try {
++    const stat = statSync(startPath);
++    return stat.isDirectory() ? startPath : dirname(startPath);
++  } catch {
++    return dirname(startPath);
++  }
++}
++
++function hasProjectMarker(dir: string): boolean {
++  for (const marker of PROJECT_MARKERS) {
++    if (existsSync(join(dir, marker))) {
++      return true;
++    }
++  }
++  return false;
+ }
+-- 
+2.39.2
+

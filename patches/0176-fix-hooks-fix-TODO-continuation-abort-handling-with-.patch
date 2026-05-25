@@ -1,0 +1,212 @@
+From 8102d178cbe7fe48c36834e7bb107145e65bf5f2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 10 Dec 2025 11:07:24 +0900
+Subject: [PATCH 0176/5749] fix(hooks): fix TODO continuation abort handling
+ with timer-based approach
+
+Replace blocking await with non-blocking timer scheduling to handle race
+condition between session.idle and session.error events. When ESC abort
+occurs, session.error immediately cancels the pending timer, preventing
+unwanted continuation prompts.
+
+Changes:
+- Add pendingTimers Map to track scheduled continuation checks
+- Cancel timer on session.error (especially abort cases)
+- Cancel timer on message.updated and session.deleted for cleanup
+- Reduce delay to 200ms for faster response
+- Maintain existing Set-based flag logic for compatibility
+
+This fixes the issue where ESC abort would not prevent continuation
+prompts due to event ordering (idle before error)
+---
+ src/hooks/todo-continuation-enforcer.ts | 136 +++++++++++++++---------
+ 1 file changed, 84 insertions(+), 52 deletions(-)
+
+diff --git a/src/hooks/todo-continuation-enforcer.ts b/src/hooks/todo-continuation-enforcer.ts
+index 9c6f9c97..7efeba8c 100644
+--- a/src/hooks/todo-continuation-enforcer.ts
++++ b/src/hooks/todo-continuation-enforcer.ts
+@@ -36,6 +36,7 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+   const remindedSessions = new Set<string>()
+   const interruptedSessions = new Set<string>()
+   const errorSessions = new Set<string>()
++  const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>()
+ 
+   return async ({ event }: { event: { type: string; properties?: unknown } }) => {
+     const props = event.properties as Record<string, unknown> | undefined
+@@ -47,6 +48,13 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+         if (detectInterrupt(props?.error)) {
+           interruptedSessions.add(sessionID)
+         }
++        
++        // Cancel pending continuation if error occurs
++        const timer = pendingTimers.get(sessionID)
++        if (timer) {
++          clearTimeout(timer)
++          pendingTimers.delete(sessionID)
++        }
+       }
+       return
+     }
+@@ -55,68 +63,78 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+       const sessionID = props?.sessionID as string | undefined
+       if (!sessionID) return
+ 
+-      // Wait for potential session.error events to be processed first
+-      await new Promise(resolve => setTimeout(resolve, 150))
++      // Cancel any existing timer to debounce
++      const existingTimer = pendingTimers.get(sessionID)
++      if (existingTimer) {
++        clearTimeout(existingTimer)
++      }
+ 
+-      const shouldBypass = interruptedSessions.has(sessionID) || errorSessions.has(sessionID)
+-      
+-      interruptedSessions.delete(sessionID)
+-      errorSessions.delete(sessionID)
++      // Schedule continuation check
++      const timer = setTimeout(async () => {
++        pendingTimers.delete(sessionID)
+ 
+-      if (shouldBypass) {
+-        return
+-      }
++        const shouldBypass = interruptedSessions.has(sessionID) || errorSessions.has(sessionID)
++        
++        interruptedSessions.delete(sessionID)
++        errorSessions.delete(sessionID)
+ 
+-      if (remindedSessions.has(sessionID)) {
+-        return
+-      }
++        if (shouldBypass) {
++          return
++        }
+ 
+-      let todos: Todo[] = []
+-      try {
+-        const response = await ctx.client.session.todo({
+-          path: { id: sessionID },
+-        })
+-        todos = (response.data ?? response) as Todo[]
+-      } catch {
+-        return
+-      }
++        if (remindedSessions.has(sessionID)) {
++          return
++        }
+ 
+-      if (!todos || todos.length === 0) {
+-        return
+-      }
++        let todos: Todo[] = []
++        try {
++          const response = await ctx.client.session.todo({
++            path: { id: sessionID },
++          })
++          todos = (response.data ?? response) as Todo[]
++        } catch {
++          return
++        }
+ 
+-      const incomplete = todos.filter(
+-        (t) => t.status !== "completed" && t.status !== "cancelled"
+-      )
++        if (!todos || todos.length === 0) {
++          return
++        }
+ 
+-      if (incomplete.length === 0) {
+-        return
+-      }
++        const incomplete = todos.filter(
++          (t) => t.status !== "completed" && t.status !== "cancelled"
++        )
+ 
+-      remindedSessions.add(sessionID)
++        if (incomplete.length === 0) {
++          return
++        }
+ 
+-      // Re-check if abort occurred during the delay
+-      if (interruptedSessions.has(sessionID) || errorSessions.has(sessionID)) {
+-        remindedSessions.delete(sessionID)
+-        return
+-      }
++        remindedSessions.add(sessionID)
+ 
+-      try {
+-        await ctx.client.session.prompt({
+-          path: { id: sessionID },
+-          body: {
+-            parts: [
+-              {
+-                type: "text",
+-                text: `${CONTINUATION_PROMPT}\n\n[Status: ${todos.length - incomplete.length}/${todos.length} completed, ${incomplete.length} remaining]`,
+-              },
+-            ],
+-          },
+-          query: { directory: ctx.directory },
+-        })
+-      } catch {
+-        remindedSessions.delete(sessionID)
+-      }
++        // Re-check if abort occurred during the delay/fetch
++        if (interruptedSessions.has(sessionID) || errorSessions.has(sessionID)) {
++          remindedSessions.delete(sessionID)
++          return
++        }
++
++        try {
++          await ctx.client.session.prompt({
++            path: { id: sessionID },
++            body: {
++              parts: [
++                {
++                  type: "text",
++                  text: `${CONTINUATION_PROMPT}\n\n[Status: ${todos.length - incomplete.length}/${todos.length} completed, ${incomplete.length} remaining]`,
++                },
++              ],
++            },
++            query: { directory: ctx.directory },
++          })
++        } catch {
++          remindedSessions.delete(sessionID)
++        }
++      }, 200)
++
++      pendingTimers.set(sessionID, timer)
+     }
+ 
+     if (event.type === "message.updated") {
+@@ -124,6 +142,13 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+       const sessionID = info?.sessionID as string | undefined
+       if (sessionID && info?.role === "user") {
+         remindedSessions.delete(sessionID)
++        
++        // Cancel pending continuation on user interaction
++        const timer = pendingTimers.get(sessionID)
++        if (timer) {
++          clearTimeout(timer)
++          pendingTimers.delete(sessionID)
++        }
+       }
+     }
+ 
+@@ -133,6 +158,13 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+         remindedSessions.delete(sessionInfo.id)
+         interruptedSessions.delete(sessionInfo.id)
+         errorSessions.delete(sessionInfo.id)
++        
++        // Cancel pending continuation
++        const timer = pendingTimers.get(sessionInfo.id)
++        if (timer) {
++          clearTimeout(timer)
++          pendingTimers.delete(sessionInfo.id)
++        }
+       }
+     }
+   }
+-- 
+2.39.2
+

@@ -1,0 +1,1269 @@
+From cc6ab1addcaa26f179c3e6de6e8bb5a270b1d6a4 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 28 Feb 2026 13:16:43 +0900
+Subject: [PATCH 2837/5749] feat(hooks): add read-image-resizer hook
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Intercepts Read tool output with image attachments and resizes to comply with Anthropic API limits (≤1568px long edge, ≤5MB). Only activates for Anthropic provider sessions and appends resize metadata (original/new resolution, token count) to tool output.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/config/schema/hooks.ts                    |   1 +
+ src/hooks/index.ts                            |   1 +
+ src/hooks/read-image-resizer/hook.test.ts     | 286 ++++++++++++++++++
+ src/hooks/read-image-resizer/hook.ts          | 197 ++++++++++++
+ .../image-dimensions.test.ts                  | 108 +++++++
+ .../read-image-resizer/image-dimensions.ts    | 187 ++++++++++++
+ .../read-image-resizer/image-resizer.test.ts  | 132 ++++++++
+ src/hooks/read-image-resizer/image-resizer.ts | 184 +++++++++++
+ src/hooks/read-image-resizer/index.ts         |   1 +
+ src/hooks/read-image-resizer/types.ts         |  16 +
+ src/plugin/hooks/create-tool-guard-hooks.ts   |   7 +
+ src/plugin/tool-execute-after.ts              |   1 +
+ 12 files changed, 1121 insertions(+)
+ create mode 100644 src/hooks/read-image-resizer/hook.test.ts
+ create mode 100644 src/hooks/read-image-resizer/hook.ts
+ create mode 100644 src/hooks/read-image-resizer/image-dimensions.test.ts
+ create mode 100644 src/hooks/read-image-resizer/image-dimensions.ts
+ create mode 100644 src/hooks/read-image-resizer/image-resizer.test.ts
+ create mode 100644 src/hooks/read-image-resizer/image-resizer.ts
+ create mode 100644 src/hooks/read-image-resizer/index.ts
+ create mode 100644 src/hooks/read-image-resizer/types.ts
+
+diff --git a/src/config/schema/hooks.ts b/src/config/schema/hooks.ts
+index 8a7ecfdf..28ab5885 100644
+--- a/src/config/schema/hooks.ts
++++ b/src/config/schema/hooks.ts
+@@ -49,6 +49,7 @@ export const HookNameSchema = z.enum([
+   "write-existing-file-guard",
+   "anthropic-effort",
+   "hashline-read-enhancer",
++  "read-image-resizer",
+ ])
+ 
+ export type HookName = z.infer<typeof HookNameSchema>
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index f992b0d7..171f5dd1 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -50,3 +50,4 @@ export { createRuntimeFallbackHook, type RuntimeFallbackHook, type RuntimeFallba
+ export { createWriteExistingFileGuardHook } from "./write-existing-file-guard";
+ export { createHashlineReadEnhancerHook } from "./hashline-read-enhancer";
+ export { createJsonErrorRecoveryHook, JSON_ERROR_TOOL_EXCLUDE_LIST, JSON_ERROR_PATTERNS, JSON_ERROR_REMINDER } from "./json-error-recovery";
++export { createReadImageResizerHook } from "./read-image-resizer"
+diff --git a/src/hooks/read-image-resizer/hook.test.ts b/src/hooks/read-image-resizer/hook.test.ts
+new file mode 100644
+index 00000000..0b55b885
+--- /dev/null
++++ b/src/hooks/read-image-resizer/hook.test.ts
+@@ -0,0 +1,286 @@
++/// <reference types="bun-types" />
++
++import { beforeEach, describe, expect, it, mock } from "bun:test"
++import type { PluginInput } from "@opencode-ai/plugin"
++
++import type { ImageDimensions, ResizeResult } from "./types"
++
++const mockParseImageDimensions = mock((): ImageDimensions | null => null)
++const mockCalculateTargetDimensions = mock((): ImageDimensions | null => null)
++const mockResizeImage = mock(async (): Promise<ResizeResult | null> => null)
++const mockGetSessionModel = mock((_sessionID: string) => ({
++  providerID: "anthropic",
++  modelID: "claude-sonnet-4-6",
++} as { providerID: string; modelID: string } | undefined))
++
++mock.module("./image-dimensions", () => ({
++  parseImageDimensions: mockParseImageDimensions,
++}))
++
++mock.module("./image-resizer", () => ({
++  calculateTargetDimensions: mockCalculateTargetDimensions,
++  resizeImage: mockResizeImage,
++}))
++
++mock.module("../../shared/session-model-state", () => ({
++  getSessionModel: mockGetSessionModel,
++}))
++
++import { createReadImageResizerHook } from "./hook"
++
++type ToolOutput = {
++  title: string
++  output: string
++  metadata: unknown
++  attachments?: Array<{ mime: string; url: string; filename?: string }>
++}
++
++function createMockContext(): PluginInput {
++  return {
++    client: {} as PluginInput["client"],
++    directory: "/test",
++  } as PluginInput
++}
++
++function createInput(tool: string): { tool: string; sessionID: string; callID: string } {
++  return {
++    tool,
++    sessionID: "session-1",
++    callID: "call-1",
++  }
++}
++
++describe("createReadImageResizerHook", () => {
++  beforeEach(() => {
++    mockParseImageDimensions.mockReset()
++    mockCalculateTargetDimensions.mockReset()
++    mockResizeImage.mockReset()
++    mockGetSessionModel.mockReset()
++    mockGetSessionModel.mockReturnValue({ providerID: "anthropic", modelID: "claude-sonnet-4-6" })
++  })
++
++  it("skips non-Read tools", async () => {
++    //#given
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "image.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Bash"), output)
++
++    //#then
++    expect(output.output).toBe("original output")
++    expect(mockParseImageDimensions).not.toHaveBeenCalled()
++  })
++
++  it("skips when provider is not anthropic", async () => {
++    //#given
++    mockGetSessionModel.mockReturnValue({ providerID: "openai", modelID: "gpt-5.3-codex" })
++    mockParseImageDimensions.mockReturnValue({ width: 3000, height: 2000 })
++    mockCalculateTargetDimensions.mockReturnValue({ width: 1568, height: 1045 })
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "image.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.output).toBe("original output")
++    expect(mockParseImageDimensions).not.toHaveBeenCalled()
++  })
++
++  it("skips when session model is unknown", async () => {
++    //#given
++    mockGetSessionModel.mockReturnValue(undefined)
++    mockParseImageDimensions.mockReturnValue({ width: 3000, height: 2000 })
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "image.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.output).toBe("original output")
++    expect(mockParseImageDimensions).not.toHaveBeenCalled()
++  })
++
++  it("skips Read output with no attachments", async () => {
++    //#given
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.output).toBe("original output")
++    expect(mockParseImageDimensions).not.toHaveBeenCalled()
++  })
++
++  it("skips non-image attachments", async () => {
++    //#given
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "application/pdf", url: "data:application/pdf;base64,AAAA", filename: "file.pdf" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.output).toBe("original output")
++    expect(mockParseImageDimensions).not.toHaveBeenCalled()
++  })
++
++  it("skips unsupported image mime types", async () => {
++    //#given
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/heic", url: "data:image/heic;base64,AAAA", filename: "photo.heic" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.output).toBe("original output")
++    expect(mockParseImageDimensions).not.toHaveBeenCalled()
++  })
++
++  it("appends within-limits metadata when image is already valid", async () => {
++    //#given
++    mockParseImageDimensions.mockReturnValue({ width: 800, height: 600 })
++    mockCalculateTargetDimensions.mockReturnValue(null)
++
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "image.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.output).toContain("[Image Info]")
++    expect(output.output).toContain("within limits")
++    expect(output.attachments?.[0]?.url).toBe("data:image/png;base64,old")
++    expect(mockResizeImage).not.toHaveBeenCalled()
++  })
++
++  it("replaces attachment URL and appends resize metadata for oversized image", async () => {
++    //#given
++    mockParseImageDimensions.mockReturnValue({ width: 3000, height: 2000 })
++    mockCalculateTargetDimensions.mockReturnValue({ width: 1568, height: 1045 })
++    mockResizeImage.mockResolvedValue({
++      resizedDataUrl: "data:image/png;base64,resized",
++      original: { width: 3000, height: 2000 },
++      resized: { width: 1568, height: 1045 },
++    })
++
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "big.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.attachments?.[0]?.url).toBe("data:image/png;base64,resized")
++    expect(output.output).toContain("[Image Resize Info]")
++    expect(output.output).toContain("resized")
++  })
++
++  it("keeps original attachment URL and marks resize skipped when resize fails", async () => {
++    //#given
++    mockParseImageDimensions.mockReturnValue({ width: 3000, height: 2000 })
++    mockCalculateTargetDimensions.mockReturnValue({ width: 1568, height: 1045 })
++    mockResizeImage.mockResolvedValue(null)
++
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "fail.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.attachments?.[0]?.url).toBe("data:image/png;base64,old")
++    expect(output.output).toContain("resize skipped")
++  })
++
++  it("appends unknown-dimensions metadata when parsing fails", async () => {
++    //#given
++    mockParseImageDimensions.mockReturnValue(null)
++
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "corrupt.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("Read"), output)
++
++    //#then
++    expect(output.output).toContain("dimensions could not be parsed")
++    expect(mockCalculateTargetDimensions).not.toHaveBeenCalled()
++  })
++
++  it("fires for lowercase read tool name", async () => {
++    //#given
++    mockParseImageDimensions.mockReturnValue({ width: 800, height: 600 })
++    mockCalculateTargetDimensions.mockReturnValue(null)
++
++    const hook = createReadImageResizerHook(createMockContext())
++    const output: ToolOutput = {
++      title: "Read",
++      output: "original output",
++      metadata: {},
++      attachments: [{ mime: "image/png", url: "data:image/png;base64,old", filename: "image.png" }],
++    }
++
++    //#when
++    await hook["tool.execute.after"](createInput("read"), output)
++
++    //#then
++    expect(mockParseImageDimensions).toHaveBeenCalledTimes(1)
++    expect(output.output).toContain("within limits")
++  })
++})
+diff --git a/src/hooks/read-image-resizer/hook.ts b/src/hooks/read-image-resizer/hook.ts
+new file mode 100644
+index 00000000..e5a199ae
+--- /dev/null
++++ b/src/hooks/read-image-resizer/hook.ts
+@@ -0,0 +1,197 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import type { ImageAttachment, ImageDimensions } from "./types"
++import { parseImageDimensions } from "./image-dimensions"
++import { calculateTargetDimensions, resizeImage } from "./image-resizer"
++import { log } from "../../shared"
++import { getSessionModel } from "../../shared/session-model-state"
++const SUPPORTED_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
++const TOKEN_DIVISOR = 750
++interface ResizeEntry {
++  filename: string
++  originalDims: ImageDimensions | null
++  resizedDims: ImageDimensions | null
++  status: "resized" | "within-limits" | "resize-skipped" | "unknown-dims"
++}
++function isReadTool(toolName: string): boolean {
++  return toolName.toLowerCase() === "read"
++}
++function asRecord(value: unknown): Record<string, unknown> | null {
++  if (!value || typeof value !== "object" || Array.isArray(value)) {
++    return null
++  }
++  return value as Record<string, unknown>
++}
++function isImageAttachmentRecord(
++  value: Record<string, unknown>,
++): value is Record<string, unknown> & ImageAttachment {
++  const filename = value.filename
++  return (
++    typeof value.mime === "string" &&
++    typeof value.url === "string" &&
++    (typeof filename === "undefined" || typeof filename === "string")
++  )
++}
++function extractImageAttachments(output: Record<string, unknown>): ImageAttachment[] {
++  const attachmentsValue = output.attachments
++  if (!Array.isArray(attachmentsValue)) {
++    return []
++  }
++  const attachments: ImageAttachment[] = []
++  for (const attachmentValue of attachmentsValue) {
++    const attachmentRecord = asRecord(attachmentValue)
++    if (!attachmentRecord) {
++      continue
++    }
++
++    const mime = attachmentRecord.mime
++    const url = attachmentRecord.url
++    if (typeof mime !== "string" || typeof url !== "string") {
++      continue
++    }
++
++    const normalizedMime = mime.toLowerCase()
++    if (!SUPPORTED_IMAGE_MIMES.has(normalizedMime)) {
++      continue
++    }
++
++    attachmentRecord.mime = normalizedMime
++    attachmentRecord.url = url
++    if (isImageAttachmentRecord(attachmentRecord)) {
++      attachments.push(attachmentRecord)
++    }
++  }
++
++  return attachments
++}
++function calculateTokens(width: number, height: number): number {
++  return Math.ceil((width * height) / TOKEN_DIVISOR)
++}
++function formatResizeAppendix(entries: ResizeEntry[]): string {
++  const header = entries.some((entry) => entry.status === "resized") ? "[Image Resize Info]" : "[Image Info]"
++  const lines = [`\n\n${header}`]
++
++  for (const entry of entries) {
++    if (entry.status === "unknown-dims" || !entry.originalDims) {
++      lines.push(`- ${entry.filename}: dimensions could not be parsed`)
++      continue
++    }
++
++    const original = entry.originalDims
++    const originalText = `${original.width}x${original.height}`
++    const originalTokens = calculateTokens(original.width, original.height)
++
++    if (entry.status === "within-limits") {
++      lines.push(`- ${entry.filename}: ${originalText} (within limits, tokens: ${originalTokens})`)
++      continue
++    }
++
++    if (entry.status === "resize-skipped") {
++      lines.push(`- ${entry.filename}: ${originalText} (resize skipped, tokens: ${originalTokens})`)
++      continue
++    }
++
++    if (!entry.resizedDims) {
++      lines.push(`- ${entry.filename}: ${originalText} (resize skipped, tokens: ${originalTokens})`)
++      continue
++    }
++
++    const resized = entry.resizedDims
++    const resizedText = `${resized.width}x${resized.height}`
++    const resizedTokens = calculateTokens(resized.width, resized.height)
++    lines.push(
++      `- ${entry.filename}: ${originalText} -> ${resizedText} (resized, tokens: ${originalTokens} -> ${resizedTokens})`,
++    )
++  }
++
++  return lines.join("\n")
++}
++function resolveFilename(attachment: ImageAttachment, index: number): string {
++  if (attachment.filename && attachment.filename.trim().length > 0) {
++    return attachment.filename
++  }
++
++  return `image-${index + 1}`
++}
++export function createReadImageResizerHook(_ctx: PluginInput) {
++  return {
++    "tool.execute.after": async (
++      input: { tool: string; sessionID: string; callID: string },
++      output: { title: string; output: string; metadata: unknown },
++    ) => {
++      if (!isReadTool(input.tool)) {
++        return
++      }
++
++      const sessionModel = getSessionModel(input.sessionID)
++      if (sessionModel?.providerID !== "anthropic") {
++        return
++      }
++
++      if (typeof output.output !== "string") {
++        return
++      }
++
++      const outputRecord = output as Record<string, unknown>
++      const attachments = extractImageAttachments(outputRecord)
++      if (attachments.length === 0) {
++        return
++      }
++
++      const entries: ResizeEntry[] = []
++      for (const [index, attachment] of attachments.entries()) {
++        const filename = resolveFilename(attachment, index)
++
++        try {
++          const originalDims = parseImageDimensions(attachment.url, attachment.mime)
++          if (!originalDims) {
++            entries.push({ filename, originalDims: null, resizedDims: null, status: "unknown-dims" })
++            continue
++          }
++
++          const targetDims = calculateTargetDimensions(originalDims.width, originalDims.height)
++          if (!targetDims) {
++            entries.push({
++              filename,
++              originalDims,
++              resizedDims: null,
++              status: "within-limits",
++            })
++            continue
++          }
++
++          const resizedResult = await resizeImage(attachment.url, attachment.mime, targetDims)
++          if (!resizedResult) {
++            entries.push({
++              filename,
++              originalDims,
++              resizedDims: null,
++              status: "resize-skipped",
++            })
++            continue
++          }
++
++          attachment.url = resizedResult.resizedDataUrl
++
++          entries.push({
++            filename,
++            originalDims: resizedResult.original,
++            resizedDims: resizedResult.resized,
++            status: "resized",
++          })
++        } catch (error) {
++          log("[read-image-resizer] attachment processing failed", {
++            error: error instanceof Error ? error.message : String(error),
++            filename,
++          })
++          entries.push({ filename, originalDims: null, resizedDims: null, status: "unknown-dims" })
++        }
++      }
++
++      if (entries.length === 0) {
++        return
++      }
++
++      output.output += formatResizeAppendix(entries)
++    },
++  }
++}
+diff --git a/src/hooks/read-image-resizer/image-dimensions.test.ts b/src/hooks/read-image-resizer/image-dimensions.test.ts
+new file mode 100644
+index 00000000..47beb271
+--- /dev/null
++++ b/src/hooks/read-image-resizer/image-dimensions.test.ts
+@@ -0,0 +1,108 @@
++/// <reference types="bun-types" />
++
++import { describe, expect, it } from "bun:test"
++
++import { parseImageDimensions } from "./image-dimensions"
++
++const PNG_1X1_DATA_URL =
++  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
++
++const GIF_1X1_DATA_URL =
++  "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
++
++function createPngDataUrl(width: number, height: number): string {
++  const buf = Buffer.alloc(33)
++  buf.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0)
++  buf.writeUInt32BE(13, 8)
++  buf.set([0x49, 0x48, 0x44, 0x52], 12)
++  buf.writeUInt32BE(width, 16)
++  buf.writeUInt32BE(height, 20)
++  return `data:image/png;base64,${buf.toString("base64")}`
++}
++
++function createGifDataUrl(width: number, height: number): string {
++  const buf = Buffer.alloc(10)
++  buf.set([0x47, 0x49, 0x46, 0x38, 0x39, 0x61], 0)
++  buf.writeUInt16LE(width, 6)
++  buf.writeUInt16LE(height, 8)
++  return `data:image/gif;base64,${buf.toString("base64")}`
++}
++
++describe("parseImageDimensions", () => {
++  it("parses PNG 1x1 dimensions", () => {
++    //#given
++    const dataUrl = PNG_1X1_DATA_URL
++
++    //#when
++    const result = parseImageDimensions(dataUrl, "image/png")
++
++    //#then
++    expect(result).toEqual({ width: 1, height: 1 })
++  })
++
++  it("parses PNG dimensions from IHDR", () => {
++    //#given
++    const dataUrl = createPngDataUrl(3000, 2000)
++
++    //#when
++    const result = parseImageDimensions(dataUrl, "image/png")
++
++    //#then
++    expect(result).toEqual({ width: 3000, height: 2000 })
++  })
++
++  it("parses GIF 1x1 dimensions", () => {
++    //#given
++    const dataUrl = GIF_1X1_DATA_URL
++
++    //#when
++    const result = parseImageDimensions(dataUrl, "image/gif")
++
++    //#then
++    expect(result).toEqual({ width: 1, height: 1 })
++  })
++
++  it("parses GIF dimensions from logical screen descriptor", () => {
++    //#given
++    const dataUrl = createGifDataUrl(320, 240)
++
++    //#when
++    const result = parseImageDimensions(dataUrl, "image/gif")
++
++    //#then
++    expect(result).toEqual({ width: 320, height: 240 })
++  })
++
++  it("returns null for empty input", () => {
++    //#given
++    const dataUrl = ""
++
++    //#when
++    const result = parseImageDimensions(dataUrl, "image/png")
++
++    //#then
++    expect(result).toBeNull()
++  })
++
++  it("returns null for too-short PNG buffer", () => {
++    //#given
++    const dataUrl = "data:image/png;base64,AAAA"
++
++    //#when
++    const result = parseImageDimensions(dataUrl, "image/png")
++
++    //#then
++    expect(result).toBeNull()
++  })
++
++  it("returns null for unsupported mime type", () => {
++    //#given
++    const dataUrl = PNG_1X1_DATA_URL
++
++    //#when
++    const result = parseImageDimensions(dataUrl, "image/heic")
++
++    //#then
++    expect(result).toBeNull()
++  })
++})
+diff --git a/src/hooks/read-image-resizer/image-dimensions.ts b/src/hooks/read-image-resizer/image-dimensions.ts
+new file mode 100644
+index 00000000..56088e97
+--- /dev/null
++++ b/src/hooks/read-image-resizer/image-dimensions.ts
+@@ -0,0 +1,187 @@
++import type { ImageDimensions } from "./types"
++
++import { extractBase64Data } from "../../tools/look-at/mime-type-inference"
++
++function toImageDimensions(width: number, height: number): ImageDimensions | null {
++  if (!Number.isFinite(width) || !Number.isFinite(height)) {
++    return null
++  }
++
++  if (width <= 0 || height <= 0) {
++    return null
++  }
++
++  return { width, height }
++}
++
++function parsePngDimensions(buffer: Buffer): ImageDimensions | null {
++  if (buffer.length < 24) {
++    return null
++  }
++
++  const isPngSignature =
++    buffer[0] === 0x89 &&
++    buffer[1] === 0x50 &&
++    buffer[2] === 0x4e &&
++    buffer[3] === 0x47 &&
++    buffer[4] === 0x0d &&
++    buffer[5] === 0x0a &&
++    buffer[6] === 0x1a &&
++    buffer[7] === 0x0a
++
++  if (!isPngSignature || buffer.toString("ascii", 12, 16) !== "IHDR") {
++    return null
++  }
++
++  const width = buffer.readUInt32BE(16)
++  const height = buffer.readUInt32BE(20)
++  return toImageDimensions(width, height)
++}
++
++function parseGifDimensions(buffer: Buffer): ImageDimensions | null {
++  if (buffer.length < 10) {
++    return null
++  }
++
++  if (buffer.toString("ascii", 0, 4) !== "GIF8") {
++    return null
++  }
++
++  const width = buffer.readUInt16LE(6)
++  const height = buffer.readUInt16LE(8)
++  return toImageDimensions(width, height)
++}
++
++function parseJpegDimensions(buffer: Buffer): ImageDimensions | null {
++  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) {
++    return null
++  }
++
++  let offset = 2
++
++  while (offset < buffer.length) {
++    if (buffer[offset] !== 0xff) {
++      offset += 1
++      continue
++    }
++
++    while (offset < buffer.length && buffer[offset] === 0xff) {
++      offset += 1
++    }
++
++    if (offset >= buffer.length) {
++      return null
++    }
++
++    const marker = buffer[offset]
++    offset += 1
++
++    if (marker === 0xd9 || marker === 0xda) {
++      break
++    }
++
++    if (offset + 1 >= buffer.length) {
++      return null
++    }
++
++    const segmentLength = buffer.readUInt16BE(offset)
++    if (segmentLength < 2) {
++      return null
++    }
++
++    if ((marker === 0xc0 || marker === 0xc2) && offset + 7 < buffer.length) {
++      const height = buffer.readUInt16BE(offset + 3)
++      const width = buffer.readUInt16BE(offset + 5)
++      return toImageDimensions(width, height)
++    }
++
++    offset += segmentLength
++  }
++
++  return null
++}
++
++function readUInt24LE(buffer: Buffer, offset: number): number {
++  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16)
++}
++
++function parseWebpDimensions(buffer: Buffer): ImageDimensions | null {
++  if (buffer.length < 16) {
++    return null
++  }
++
++  if (buffer.toString("ascii", 0, 4) !== "RIFF" || buffer.toString("ascii", 8, 12) !== "WEBP") {
++    return null
++  }
++
++  const chunkType = buffer.toString("ascii", 12, 16)
++
++  if (chunkType === "VP8 ") {
++    if (buffer[23] !== 0x9d || buffer[24] !== 0x01 || buffer[25] !== 0x2a) {
++      return null
++    }
++
++    const width = buffer.readUInt16LE(26) & 0x3fff
++    const height = buffer.readUInt16LE(28) & 0x3fff
++    return toImageDimensions(width, height)
++  }
++
++  if (chunkType === "VP8L") {
++    if (buffer.length < 25 || buffer[20] !== 0x2f) {
++      return null
++    }
++
++    const bits = buffer.readUInt32LE(21)
++    const width = (bits & 0x3fff) + 1
++    const height = ((bits >>> 14) & 0x3fff) + 1
++    return toImageDimensions(width, height)
++  }
++
++  if (chunkType === "VP8X") {
++    const width = readUInt24LE(buffer, 24) + 1
++    const height = readUInt24LE(buffer, 27) + 1
++    return toImageDimensions(width, height)
++  }
++
++  return null
++}
++
++export function parseImageDimensions(base64DataUrl: string, mimeType: string): ImageDimensions | null {
++  try {
++    if (!base64DataUrl || !mimeType) {
++      return null
++    }
++
++    const rawBase64 = extractBase64Data(base64DataUrl)
++    if (!rawBase64) {
++      return null
++    }
++
++    const buffer = Buffer.from(rawBase64, "base64")
++    if (buffer.length === 0) {
++      return null
++    }
++
++    const normalizedMime = mimeType.toLowerCase()
++
++    if (normalizedMime === "image/png") {
++      return parsePngDimensions(buffer)
++    }
++
++    if (normalizedMime === "image/gif") {
++      return parseGifDimensions(buffer)
++    }
++
++    if (normalizedMime === "image/jpeg" || normalizedMime === "image/jpg") {
++      return parseJpegDimensions(buffer)
++    }
++
++    if (normalizedMime === "image/webp") {
++      return parseWebpDimensions(buffer)
++    }
++
++    return null
++  } catch {
++    return null
++  }
++}
+diff --git a/src/hooks/read-image-resizer/image-resizer.test.ts b/src/hooks/read-image-resizer/image-resizer.test.ts
+new file mode 100644
+index 00000000..a885932b
+--- /dev/null
++++ b/src/hooks/read-image-resizer/image-resizer.test.ts
+@@ -0,0 +1,132 @@
++/// <reference types="bun-types" />
++
++import { afterEach, describe, expect, it, mock } from "bun:test"
++
++const PNG_1X1_DATA_URL =
++  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
++
++type ImageResizerModule = typeof import("./image-resizer")
++
++async function importFreshImageResizerModule(): Promise<ImageResizerModule> {
++  return import(`./image-resizer?test-${Date.now()}-${Math.random()}`)
++}
++
++describe("calculateTargetDimensions", () => {
++  it("returns null when dimensions are already within limits", async () => {
++    //#given
++    const { calculateTargetDimensions } = await importFreshImageResizerModule()
++
++    //#when
++    const result = calculateTargetDimensions(800, 600)
++
++    //#then
++    expect(result).toBeNull()
++  })
++
++  it("returns null at exact long-edge boundary", async () => {
++    //#given
++    const { calculateTargetDimensions } = await importFreshImageResizerModule()
++
++    //#when
++    const result = calculateTargetDimensions(1568, 1000)
++
++    //#then
++    expect(result).toBeNull()
++  })
++
++  it("scales landscape dimensions by max long edge", async () => {
++    //#given
++    const { calculateTargetDimensions } = await importFreshImageResizerModule()
++
++    //#when
++    const result = calculateTargetDimensions(3000, 2000)
++
++    //#then
++    expect(result).toEqual({
++      width: 1568,
++      height: Math.floor(2000 * (1568 / 3000)),
++    })
++  })
++
++  it("scales portrait dimensions by max long edge", async () => {
++    //#given
++    const { calculateTargetDimensions } = await importFreshImageResizerModule()
++
++    //#when
++    const result = calculateTargetDimensions(2000, 3000)
++
++    //#then
++    expect(result).toEqual({
++      width: Math.floor(2000 * (1568 / 3000)),
++      height: 1568,
++    })
++  })
++
++  it("scales square dimensions to exact target", async () => {
++    //#given
++    const { calculateTargetDimensions } = await importFreshImageResizerModule()
++
++    //#when
++    const result = calculateTargetDimensions(4000, 4000)
++
++    //#then
++    expect(result).toEqual({ width: 1568, height: 1568 })
++  })
++
++  it("uses custom maxLongEdge when provided", async () => {
++    //#given
++    const { calculateTargetDimensions } = await importFreshImageResizerModule()
++
++    //#when
++    const result = calculateTargetDimensions(2000, 1000, 1000)
++
++    //#then
++    expect(result).toEqual({ width: 1000, height: 500 })
++  })
++})
++
++describe("resizeImage", () => {
++  afterEach(() => {
++    mock.restore()
++  })
++
++  it("returns null when sharp import fails", async () => {
++    //#given
++    mock.module("sharp", () => {
++      throw new Error("sharp unavailable")
++    })
++    const { resizeImage } = await importFreshImageResizerModule()
++
++    //#when
++    const result = await resizeImage(PNG_1X1_DATA_URL, "image/png", {
++      width: 1,
++      height: 1,
++    })
++
++    //#then
++    expect(result).toBeNull()
++  })
++
++  it("returns null when sharp throws during resize", async () => {
++    //#given
++    const mockSharpFactory = mock(() => ({
++      resize: () => {
++        throw new Error("resize failed")
++      },
++    }))
++
++    mock.module("sharp", () => ({
++      default: mockSharpFactory,
++    }))
++    const { resizeImage } = await importFreshImageResizerModule()
++
++    //#when
++    const result = await resizeImage(PNG_1X1_DATA_URL, "image/png", {
++      width: 1,
++      height: 1,
++    })
++
++    //#then
++    expect(result).toBeNull()
++  })
++})
+diff --git a/src/hooks/read-image-resizer/image-resizer.ts b/src/hooks/read-image-resizer/image-resizer.ts
+new file mode 100644
+index 00000000..7ced5a9e
+--- /dev/null
++++ b/src/hooks/read-image-resizer/image-resizer.ts
+@@ -0,0 +1,184 @@
++import type { ImageDimensions, ResizeResult } from "./types"
++import { extractBase64Data } from "../../tools/look-at/mime-type-inference"
++import { log } from "../../shared"
++
++const ANTHROPIC_MAX_LONG_EDGE = 1568
++const ANTHROPIC_MAX_FILE_SIZE = 5 * 1024 * 1024
++
++type SharpFormat = "jpeg" | "png" | "gif" | "webp"
++
++interface SharpMetadata {
++  width?: number
++  height?: number
++}
++
++interface SharpInstance {
++  resize(width: number, height: number, options: { fit: "inside" }): SharpInstance
++  toFormat(format: SharpFormat, options?: { quality?: number }): SharpInstance
++  toBuffer(): Promise<Buffer>
++  metadata(): Promise<SharpMetadata>
++}
++
++type SharpFactory = (input: Buffer) => SharpInstance
++
++function resolveSharpFactory(sharpModule: unknown): SharpFactory | null {
++  if (typeof sharpModule === "function") {
++    return sharpModule as SharpFactory
++  }
++
++  if (!sharpModule || typeof sharpModule !== "object") {
++    return null
++  }
++
++  const defaultExport = Reflect.get(sharpModule, "default")
++  return typeof defaultExport === "function" ? (defaultExport as SharpFactory) : null
++}
++
++function resolveSharpFormat(mimeType: string): SharpFormat {
++  const normalizedMime = mimeType.toLowerCase()
++  if (normalizedMime === "image/png") {
++    return "png"
++  }
++  if (normalizedMime === "image/gif") {
++    return "gif"
++  }
++  if (normalizedMime === "image/webp") {
++    return "webp"
++  }
++  return "jpeg"
++}
++
++function canAdjustQuality(format: SharpFormat): boolean {
++  return format === "jpeg" || format === "webp"
++}
++
++function toDimensions(metadata: SharpMetadata): ImageDimensions | null {
++  const { width, height } = metadata
++  if (!width || !height) {
++    return null
++  }
++  return { width, height }
++}
++
++async function renderResizedBuffer(args: {
++  sharpFactory: SharpFactory
++  inputBuffer: Buffer
++  target: ImageDimensions
++  format: SharpFormat
++  quality?: number
++}): Promise<Buffer> {
++  const { sharpFactory, inputBuffer, target, format, quality } = args
++  return sharpFactory(inputBuffer)
++    .resize(target.width, target.height, { fit: "inside" })
++    .toFormat(format, quality ? { quality } : undefined)
++    .toBuffer()
++}
++
++function getErrorMessage(error: unknown): string {
++  return error instanceof Error ? error.message : String(error)
++}
++
++export function calculateTargetDimensions(
++  width: number,
++  height: number,
++  maxLongEdge = ANTHROPIC_MAX_LONG_EDGE,
++): ImageDimensions | null {
++  if (width <= 0 || height <= 0 || maxLongEdge <= 0) {
++    return null
++  }
++
++  const longEdge = Math.max(width, height)
++  if (longEdge <= maxLongEdge) {
++    return null
++  }
++
++  if (width >= height) {
++    return {
++      width: maxLongEdge,
++      height: Math.max(1, Math.floor((height * maxLongEdge) / width)),
++    }
++  }
++
++  return {
++    width: Math.max(1, Math.floor((width * maxLongEdge) / height)),
++    height: maxLongEdge,
++  }
++}
++
++export async function resizeImage(
++  base64DataUrl: string,
++  mimeType: string,
++  target: ImageDimensions,
++): Promise<ResizeResult | null> {
++  try {
++    const sharpModuleName = "sharp"
++    const sharpModule = await import(sharpModuleName).catch(() => null)
++    if (!sharpModule) {
++      log("[read-image-resizer] sharp unavailable, skipping resize")
++      return null
++    }
++
++    const sharpFactory = resolveSharpFactory(sharpModule)
++    if (!sharpFactory) {
++      log("[read-image-resizer] sharp import has unexpected shape")
++      return null
++    }
++
++    const rawBase64 = extractBase64Data(base64DataUrl)
++    if (!rawBase64) {
++      return null
++    }
++
++    const inputBuffer = Buffer.from(rawBase64, "base64")
++    if (inputBuffer.length === 0) {
++      return null
++    }
++
++    const original = toDimensions(await sharpFactory(inputBuffer).metadata())
++    if (!original) {
++      return null
++    }
++
++    const format = resolveSharpFormat(mimeType)
++    let resizedBuffer = await renderResizedBuffer({
++      sharpFactory,
++      inputBuffer,
++      target,
++      format,
++    })
++
++    if (resizedBuffer.length > ANTHROPIC_MAX_FILE_SIZE && canAdjustQuality(format)) {
++      for (const quality of [80, 60, 40]) {
++        resizedBuffer = await renderResizedBuffer({
++          sharpFactory,
++          inputBuffer,
++          target,
++          format,
++          quality,
++        })
++
++        if (resizedBuffer.length <= ANTHROPIC_MAX_FILE_SIZE) {
++          break
++        }
++      }
++    }
++
++    const resized = toDimensions(await sharpFactory(resizedBuffer).metadata())
++    if (!resized) {
++      return null
++    }
++
++    return {
++      resizedDataUrl: `data:${mimeType};base64,${resizedBuffer.toString("base64")}`,
++      original,
++      resized,
++    }
++  } catch (error) {
++    log("[read-image-resizer] resize failed", {
++      error: getErrorMessage(error),
++      mimeType,
++      target,
++    })
++    return null
++  }
++}
+diff --git a/src/hooks/read-image-resizer/index.ts b/src/hooks/read-image-resizer/index.ts
+new file mode 100644
+index 00000000..d6fbcc25
+--- /dev/null
++++ b/src/hooks/read-image-resizer/index.ts
+@@ -0,0 +1 @@
++export { createReadImageResizerHook } from "./hook"
+diff --git a/src/hooks/read-image-resizer/types.ts b/src/hooks/read-image-resizer/types.ts
+new file mode 100644
+index 00000000..4b6a7b05
+--- /dev/null
++++ b/src/hooks/read-image-resizer/types.ts
+@@ -0,0 +1,16 @@
++export interface ImageDimensions {
++  width: number
++  height: number
++}
++
++export interface ImageAttachment {
++  mime: string
++  url: string
++  filename?: string
++}
++
++export interface ResizeResult {
++  resizedDataUrl: string
++  original: ImageDimensions
++  resized: ImageDimensions
++}
+diff --git a/src/plugin/hooks/create-tool-guard-hooks.ts b/src/plugin/hooks/create-tool-guard-hooks.ts
+index 492dd17d..758b78c5 100644
+--- a/src/plugin/hooks/create-tool-guard-hooks.ts
++++ b/src/plugin/hooks/create-tool-guard-hooks.ts
+@@ -12,6 +12,7 @@ import {
+   createTasksTodowriteDisablerHook,
+   createWriteExistingFileGuardHook,
+   createHashlineReadEnhancerHook,
++  createReadImageResizerHook,
+   createJsonErrorRecoveryHook,
+ } from "../../hooks"
+ import {
+@@ -33,6 +34,7 @@ export type ToolGuardHooks = {
+   writeExistingFileGuard: ReturnType<typeof createWriteExistingFileGuardHook> | null
+   hashlineReadEnhancer: ReturnType<typeof createHashlineReadEnhancerHook> | null
+   jsonErrorRecovery: ReturnType<typeof createJsonErrorRecoveryHook> | null
++  readImageResizer: ReturnType<typeof createReadImageResizerHook> | null
+ }
+ 
+ export function createToolGuardHooks(args: {
+@@ -105,6 +107,10 @@ export function createToolGuardHooks(args: {
+     ? safeHook("json-error-recovery", () => createJsonErrorRecoveryHook(ctx))
+     : null
+ 
++  const readImageResizer = isHookEnabled("read-image-resizer")
++    ? safeHook("read-image-resizer", () => createReadImageResizerHook(ctx))
++    : null
++
+   return {
+     commentChecker,
+     toolOutputTruncator,
+@@ -116,5 +122,6 @@ export function createToolGuardHooks(args: {
+     writeExistingFileGuard,
+     hashlineReadEnhancer,
+     jsonErrorRecovery,
++    readImageResizer,
+   }
+ }
+diff --git a/src/plugin/tool-execute-after.ts b/src/plugin/tool-execute-after.ts
+index fa6c8dad..58717c9b 100644
+--- a/src/plugin/tool-execute-after.ts
++++ b/src/plugin/tool-execute-after.ts
+@@ -43,6 +43,7 @@ export function createToolExecuteAfterHandler(args: {
+     await hooks.delegateTaskRetry?.["tool.execute.after"]?.(input, output)
+     await hooks.atlasHook?.["tool.execute.after"]?.(input, output)
+     await hooks.taskResumeInfo?.["tool.execute.after"]?.(input, output)
++    await hooks.readImageResizer?.["tool.execute.after"]?.(input, output)
+     await hooks.hashlineReadEnhancer?.["tool.execute.after"]?.(input, output)
+     await hooks.jsonErrorRecovery?.["tool.execute.after"]?.(input, output)
+   }
+-- 
+2.39.2
+

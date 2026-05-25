@@ -1,0 +1,415 @@
+From cd1c1a59215fbda36374cf996ff5511390e8ba06 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 14:39:55 +0900
+Subject: [PATCH 5194/5749] fix(background-agent): avoid branched parent wakes
+
+---
+ src/features/background-agent/manager.test.ts |  66 +++++++
+ src/features/background-agent/manager.ts      | 173 +++++++++++++++++-
+ .../task-completion-cleanup.test.ts           |  47 ++++-
+ 3 files changed, 282 insertions(+), 4 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 385f85da..bf722c5c 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -32,6 +32,7 @@ type PendingParentWakeForTest = {
+   promptContext: Record<string, unknown>
+   notifications: string[]
+   shouldReply: boolean
++  dispatchedAt?: number
+ }
+ 
+ class MockBackgroundManager {
+@@ -5168,6 +5169,71 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+     manager.shutdown()
+   })
+ 
++  test("does not requeue dispatched parent wake when session history already contains assistant output after the wake", async () => {
++    //#given
++    const promptCalls: Array<{ path: { id: string }; body: Record<string, unknown> }> = []
++    const client = {
++      session: {
++        status: async () => ({ data: { "parent-session-wake": { type: "idle" } } }),
++        messages: async () => [
++          {
++            info: {
++              role: "assistant",
++              time: { created: Date.now() },
++            },
++            parts: [{ type: "text", text: "wake was already accepted" }],
++          },
++        ],
++        promptAsync: async (args: { path: { id: string }; body: Record<string, unknown> }) => {
++          promptCalls.push(args)
++          return {}
++        },
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ pluginContext: createPluginInput(client) })
++    const managerInternals = cast<{
++      queuePendingParentWake: (
++        sessionID: string,
++        notification: string,
++        promptContext: Record<string, unknown>,
++        shouldReply: boolean,
++        delayMs?: number,
++      ) => void
++      flushPendingParentWake: (sessionID: string) => Promise<void>
++    }>(manager)
++    managerInternals.queuePendingParentWake(
++      "parent-session-wake",
++      "<system-reminder>done</system-reminder>",
++      { agent: "sisyphus" },
++      true,
++      0,
++    )
++    await managerInternals.flushPendingParentWake("parent-session-wake")
++    const wake = getDispatchedParentWakes(manager).get("parent-session-wake")
++    if (!wake) {
++      throw new Error("Missing dispatched parent wake")
++    }
++    wake.dispatchedAt = Date.now() - 1_000
++
++    //#when
++    manager.handleEvent({
++      type: "session.error",
++      properties: {
++        sessionID: "parent-session-wake",
++        error: { name: "UnknownError", message: "late provider failure" },
++      },
++    })
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(promptCalls).toHaveLength(1)
++    expect(getDispatchedParentWakes(manager).has("parent-session-wake")).toBe(false)
++    expect(getPendingParentWakes(manager).has("parent-session-wake")).toBe(false)
++
++    manager.shutdown()
++  })
++
+   test("terminates task on session.error when session is gone", async () => {
+     //#given
+     const manager = createBackgroundManager()
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 579033be..d0b50677 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -108,6 +108,23 @@ type PendingParentWake = {
+   promptContext: ParentWakePromptContext
+   notifications: string[]
+   shouldReply: boolean
++  dispatchedAt?: number
++}
++
++type ParentWakeSessionMessage = {
++  info?: {
++    role?: string
++    finish?: string
++    time?: { created?: unknown }
++  }
++  role?: string
++  finish?: string
++  time?: { created?: unknown }
++  parts?: Array<{
++    type?: string
++    text?: string
++    content?: unknown
++  }>
+ }
+ 
+ type ResumeTaskSnapshot = {
+@@ -127,6 +144,7 @@ type ResumeTaskSnapshot = {
+ 
+ const PENDING_PARENT_WAKE_RETRY_MS = 1_000
+ const PENDING_PARENT_WAKE_DEBOUNCE_MS = 100
++const PARENT_WAKE_ACCEPTED_MESSAGE_SKEW_MS = 5_000
+ 
+ interface MessagePartInfo {
+   id?: string
+@@ -1358,6 +1376,7 @@ The fallback retry session is now created and can be inspected directly.
+       },
+       notifications: [...wake.notifications],
+       shouldReply: wake.shouldReply,
++      ...(wake.dispatchedAt !== undefined ? { dispatchedAt: wake.dispatchedAt } : {}),
+     }
+   }
+ 
+@@ -1372,7 +1391,9 @@ The fallback retry session is now created and can be inspected directly.
+ 
+   private trackDispatchedParentWake(sessionID: string, wake: PendingParentWake): void {
+     this.clearDispatchedParentWake(sessionID)
+-    this.dispatchedParentWakes.set(sessionID, this.cloneParentWake(wake))
++    const dispatchedWake = this.cloneParentWake(wake)
++    dispatchedWake.dispatchedAt = Date.now()
++    this.dispatchedParentWakes.set(sessionID, dispatchedWake)
+     const timer = setTimeout(() => {
+       this.dispatchedParentWakeTimers.delete(sessionID)
+       this.dispatchedParentWakes.delete(sessionID)
+@@ -1380,12 +1401,21 @@ The fallback retry session is now created and can be inspected directly.
+     this.dispatchedParentWakeTimers.set(sessionID, timer)
+   }
+ 
+-  private requeueDispatchedParentWake(sessionID: string, reason: string): boolean {
++  private async requeueDispatchedParentWake(sessionID: string, reason: string): Promise<boolean> {
+     const wake = this.dispatchedParentWakes.get(sessionID)
+     if (!wake) {
+       return false
+     }
+ 
++    if (await this.hasAcceptedMessageAfterDispatchedParentWake(sessionID, wake)) {
++      this.clearDispatchedParentWake(sessionID)
++      log("[background-agent] Ignored late parent wake failure after assistant output:", {
++        sessionID,
++        reason,
++      })
++      return false
++    }
++
+     this.clearDispatchedParentWake(sessionID)
+     const pendingWake = this.pendingParentWakes.get(sessionID)
+     if (pendingWake) {
+@@ -1403,6 +1433,136 @@ The fallback retry session is now created and can be inspected directly.
+     return true
+   }
+ 
++  private async loadParentWakeSessionMessages(sessionID: string): Promise<ParentWakeSessionMessage[]> {
++    try {
++      const messagesResp = await messagesInDirectory(this.client, {
++        path: { id: sessionID },
++      }, this.directory)
++      return normalizeSDKResponse(messagesResp, [] as ParentWakeSessionMessage[])
++    } catch (error) {
++      log("[background-agent] Failed to inspect parent session messages for wake safety:", {
++        sessionID,
++        error,
++      })
++      return []
++    }
++  }
++
++  private getParentWakeMessageRole(message: ParentWakeSessionMessage): string | undefined {
++    return message.info?.role ?? message.role
++  }
++
++  private getParentWakeMessageFinish(message: ParentWakeSessionMessage): string | undefined {
++    return message.info?.finish ?? message.finish
++  }
++
++  private getParentWakeMessageCreatedAt(message: ParentWakeSessionMessage): number | undefined {
++    const value = message.info?.time?.created ?? message.time?.created
++    if (typeof value === "number" && Number.isFinite(value)) {
++      return value
++    }
++    if (typeof value === "string") {
++      const parsed = Date.parse(value)
++      return Number.isFinite(parsed) ? parsed : undefined
++    }
++    if (value instanceof Date) {
++      return value.getTime()
++    }
++    return undefined
++  }
++
++  private latestAssistantTurnIsWaitingOnTools(messages: ParentWakeSessionMessage[]): boolean {
++    for (let index = messages.length - 1; index >= 0; index--) {
++      const message = messages[index]
++      if (!message) {
++        continue
++      }
++      const role = this.getParentWakeMessageRole(message)
++      if (role === "assistant") {
++        return this.getParentWakeMessageFinish(message) === "tool-calls"
++      }
++      if (role === "user") {
++        return false
++      }
++    }
++    return false
++  }
++
++  private parentWakeMessageHasOutput(message: ParentWakeSessionMessage): boolean {
++    const role = this.getParentWakeMessageRole(message)
++    if (role !== "assistant" && role !== "tool") {
++      return false
++    }
++    if (!message.parts || message.parts.length === 0) {
++      return role === "assistant"
++    }
++    return message.parts.some((part) => {
++      if (part.type === "text" || part.type === "reasoning") {
++        return typeof part.text === "string" && part.text.trim().length > 0
++      }
++      if (part.type === "tool" || part.type === "tool_result") {
++        return true
++      }
++      if (part.content !== undefined) {
++        if (typeof part.content === "string") {
++          return part.content.trim().length > 0
++        }
++        if (Array.isArray(part.content)) {
++          return part.content.length > 0
++        }
++        return true
++      }
++      return false
++    })
++  }
++
++  private parentWakeMessageContainsNotification(
++    message: ParentWakeSessionMessage,
++    wake: PendingParentWake,
++  ): boolean {
++    if (this.getParentWakeMessageRole(message) !== "user") {
++      return false
++    }
++    return message.parts?.some((part) =>
++      typeof part.text === "string" && wake.notifications.some((notification) => part.text?.includes(notification))
++    ) ?? false
++  }
++
++  private async shouldDeferParentWakeForSessionHistory(sessionID: string): Promise<boolean> {
++    const messages = await this.loadParentWakeSessionMessages(sessionID)
++    if (!this.latestAssistantTurnIsWaitingOnTools(messages)) {
++      return false
++    }
++    log("[background-agent] Deferred parent wake because latest assistant turn is waiting on tool results:", {
++      sessionID,
++    })
++    return true
++  }
++
++  private async hasAcceptedMessageAfterDispatchedParentWake(
++    sessionID: string,
++    wake: PendingParentWake,
++  ): Promise<boolean> {
++    if (wake.dispatchedAt === undefined) {
++      return false
++    }
++    const dispatchedAt = wake.dispatchedAt
++    const messages = await this.loadParentWakeSessionMessages(sessionID)
++    return messages.some((message) => {
++      const createdAt = this.getParentWakeMessageCreatedAt(message)
++      if (createdAt === undefined) {
++        return false
++      }
++      if (
++        createdAt >= dispatchedAt - PARENT_WAKE_ACCEPTED_MESSAGE_SKEW_MS
++        && this.parentWakeMessageContainsNotification(message, wake)
++      ) {
++        return true
++      }
++      return createdAt >= dispatchedAt && this.parentWakeMessageHasOutput(message)
++    })
++  }
++
+   private clearSessionOutputObserved(sessionID: string): void {
+     this.observedOutputSessions.delete(sessionID)
+   }
+@@ -1599,7 +1759,9 @@ The fallback retry session is now created and can be inspected directly.
+ 
+       const resolved = this.resolveTaskAttemptBySession(sessionID)
+       if (!resolved?.isCurrent) {
+-        this.requeueDispatchedParentWake(sessionID, "session.error")
++        void this.requeueDispatchedParentWake(sessionID, "session.error").catch((error) => {
++          log("[background-agent] Failed to requeue dispatched parent wake:", { sessionID, error })
++        })
+         return
+       }
+ 
+@@ -2534,6 +2696,11 @@ The task was re-queued on a fallback model after a retryable failure.
+       return
+     }
+ 
++    if (await this.shouldDeferParentWakeForSessionHistory(sessionID)) {
++      this.schedulePendingParentWakeFlush(sessionID)
++      return
++    }
++
+     const latestWake = this.pendingParentWakes.get(sessionID)
+     if (!latestWake) {
+       return
+diff --git a/src/features/background-agent/task-completion-cleanup.test.ts b/src/features/background-agent/task-completion-cleanup.test.ts
+index 943dabc4..5a6494bb 100644
+--- a/src/features/background-agent/task-completion-cleanup.test.ts
++++ b/src/features/background-agent/task-completion-cleanup.test.ts
+@@ -18,6 +18,15 @@ type PromptAsyncCall = {
+   }
+ }
+ 
++type SessionMessageForTest = {
++  info?: {
++    role?: string
++    finish?: string
++    time?: { created?: number }
++  }
++  parts?: Array<{ type?: string }>
++}
++
+ type FakeTimers = {
+   getDelay: (timer: ReturnType<typeof setTimeout>) => number | undefined
+   run: (timer: ReturnType<typeof setTimeout>) => void
+@@ -61,6 +70,7 @@ function createManager(
+   enableParentSessionNotifications: boolean,
+   sessionStatuses?: Record<string, { type: string }>,
+   promptAsyncImpl?: (call: PromptAsyncCall) => Promise<unknown>,
++  sessionMessages: SessionMessageForTest[] = [],
+ ): {
+   manager: BackgroundManager
+   promptAsyncCalls: PromptAsyncCall[]
+@@ -68,7 +78,7 @@ function createManager(
+   const promptAsyncCalls: PromptAsyncCall[] = []
+   const client = {
+     session: {
+-      messages: async () => [],
++      messages: async () => sessionMessages,
+       status: async () => ({ data: sessionStatuses ?? {} }),
+       prompt: async () => ({}),
+       promptAsync: async (call: PromptAsyncCall) => {
+@@ -401,6 +411,41 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+       expect(notificationPayload).toContain(taskB.id)
+     })
+ 
++    test("#when parent status is idle but latest assistant turn is still waiting on tool results #then background completion does not fork a reply", async () => {
++      // given
++      const sessionStatuses: Record<string, { type: string }> = {
++        "parent-1": { type: "idle" },
++      }
++      const sessionMessages: SessionMessageForTest[] = [
++        {
++          info: { role: "user", time: { created: 1778819814009 } },
++          parts: [{ type: "text" }],
++        },
++        {
++          info: { role: "assistant", finish: "tool-calls", time: { created: 1778819997535 } },
++          parts: [{ type: "tool" }],
++        },
++      ]
++      const { manager, promptAsyncCalls } = createManager(true, sessionStatuses, undefined, sessionMessages)
++      managerUnderTest = manager
++      const task = createTask({
++        id: "task-a",
++        parentSessionId: "parent-1",
++        description: "task A",
++        status: "completed",
++        completedAt: new Date("2026-05-15T13:40:19.368Z"),
++      })
++      getTasks(manager).set(task.id, task)
++      getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++
++      // when
++      await notifyParentSessionForTest(manager, task)
++      await waitForCoalescedFlush()
++
++      // then
++      expect(promptAsyncCalls).toHaveLength(0)
++    })
++
+     test("#when all-complete notification wakes parent #then prompt stays in the same OpenCode directory instance", async () => {
+       // given
+       const { manager, promptAsyncCalls } = createManager(true)
+-- 
+2.39.2
+

@@ -1,0 +1,360 @@
+From 59209f06592769cf3751446a4945c61b62336e3c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 11 May 2026 12:37:20 +0900
+Subject: [PATCH 5028/5749] fix(team-mode): track session-created team runs
+
+---
+ .../cleanup-team-run-resources.ts             |  2 +
+ .../team-mode/team-runtime/create.test.ts     | 26 ++++++-
+ src/features/team-mode/team-runtime/create.ts |  2 +
+ .../team-mode/team-runtime/delete-team.ts     |  2 +
+ .../team-runtime/session-cleanup.test.ts      | 57 +++++++++++++++
+ .../team-mode/team-runtime/session-cleanup.ts | 71 +++++++++++++++++++
+ .../team-runtime/session-team-run-registry.ts | 17 +++++
+ .../team-mode/team-runtime/shutdown.test.ts   | 23 ++++++
+ 8 files changed, 199 insertions(+), 1 deletion(-)
+ create mode 100644 src/features/team-mode/team-runtime/session-cleanup.test.ts
+ create mode 100644 src/features/team-mode/team-runtime/session-cleanup.ts
+ create mode 100644 src/features/team-mode/team-runtime/session-team-run-registry.ts
+
+diff --git a/src/features/team-mode/team-runtime/cleanup-team-run-resources.ts b/src/features/team-mode/team-runtime/cleanup-team-run-resources.ts
+index 931339d4..e3096f96 100644
+--- a/src/features/team-mode/team-runtime/cleanup-team-run-resources.ts
++++ b/src/features/team-mode/team-runtime/cleanup-team-run-resources.ts
+@@ -7,6 +7,7 @@ import { removeTeamLayout } from "../team-layout-tmux/layout"
+ import { unregisterTeamSessionsByTeam } from "../team-session-registry"
+ import { loadRuntimeState, transitionRuntimeState } from "../team-state-store/store"
+ import type { TeamRunCreateError } from "./create"
++import { unregisterTeamRunForSessionCleanup } from "./session-team-run-registry"
+ 
+ type SpawnedMemberResource = {
+   taskId?: string
+@@ -72,6 +73,7 @@ export async function cleanupTeamRunResources(args: {
+   })
+ 
+   unregisterTeamSessionsByTeam(args.teamRunId)
++  unregisterTeamRunForSessionCleanup(args.teamRunId)
+ 
+   return cleanupReport
+ }
+diff --git a/src/features/team-mode/team-runtime/create.test.ts b/src/features/team-mode/team-runtime/create.test.ts
+index a45d8da2..b14ad4f3 100644
+--- a/src/features/team-mode/team-runtime/create.test.ts
++++ b/src/features/team-mode/team-runtime/create.test.ts
+@@ -1,6 +1,6 @@
+ /// <reference types="bun-types" />
+ 
+-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test"
++import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+ import { access, mkdtemp, readdir, rm } from "node:fs/promises"
+ import { tmpdir } from "node:os"
+ import path from "node:path"
+@@ -14,6 +14,10 @@ import { BackgroundManager } from "../../background-agent/manager"
+ import { loadRuntimeState } from "../team-state-store/store"
+ import { clearTeamSessionRegistry, lookupTeamSession } from "../team-session-registry"
+ import type { TeamSpec } from "../types"
++import {
++  clearSessionTeamRunCleanupRegistry,
++  getSessionCreatedTeamRunIds,
++} from "./session-cleanup"
+ 
+ const resolveMemberMock = mock(async (member: TeamSpec["members"][number]) => ({
+   agentToUse: `${member.name}-agent`,
+@@ -92,9 +96,15 @@ describe("createTeamRun", () => {
+   beforeEach(() => {
+     resolveMemberMock.mockClear()
+     clearTeamSessionRegistry()
++    clearSessionTeamRunCleanupRegistry()
++  })
++
++  afterEach(() => {
++    clearSessionTeamRunCleanupRegistry()
+   })
+ 
+   afterAll(async () => {
++    clearSessionTeamRunCleanupRegistry()
+     await Promise.all(temporaryDirectories.splice(0).map(async (directoryPath) => rm(directoryPath, { recursive: true, force: true })))
+   })
+ 
+@@ -117,6 +127,19 @@ describe("createTeamRun", () => {
+     expect((launchMock.mock.calls as Array<[LaunchInput]>).every(([input]) => input.suppressTmuxSpawn === true)).toBe(true)
+   })
+ 
++  test("#given a new team runtime #when createTeamRun succeeds #then it registers the run for session cleanup", async () => {
++    // given
++    const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-session-cleanup-"))
++    temporaryDirectories.push(baseDir)
++    const { manager } = createManager(baseDir, async () => ({ id: "task-1", sessionId: "session-1", status: "running" } as BackgroundTask))
++
++    // when
++    const runtimeState = await createTeamRun(createSpec(1), "lead-session", createContext(baseDir, manager), createConfig(baseDir), manager)
++
++    // then
++    expect(getSessionCreatedTeamRunIds()).toEqual([runtimeState.teamRunId])
++  })
++
+   test("registers a member session as soon as launch reports the real sessionId", async () => {
+     // given
+     const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-session-lineage-"))
+@@ -230,6 +253,7 @@ describe("createTeamRun", () => {
+     }
+     expect((cancelTaskMock.mock.calls as Array<[string]>).map(([taskId]) => taskId)).toEqual(["task-3", "task-2", "task-1"])
+     expect((await loadSingleRuntimeState(baseDir)).status).toBe("failed")
++    expect(getSessionCreatedTeamRunIds()).toEqual([])
+   })
+ 
+   test("removes all created worktrees when spawn fails after worktree creation", async () => {
+diff --git a/src/features/team-mode/team-runtime/create.ts b/src/features/team-mode/team-runtime/create.ts
+index 7671b03e..8e6b707c 100644
+--- a/src/features/team-mode/team-runtime/create.ts
++++ b/src/features/team-mode/team-runtime/create.ts
+@@ -17,6 +17,7 @@ import { buildTeammateCommunicationAddendum } from "../member-guidance"
+ import { resolveMember } from "./resolve-member"
+ import { shouldReuseCallerLeadSession } from "../resolve-caller-team-lead"
+ import { sweepStaleTeamSessions } from "../team-layout-tmux/sweep-stale-team-sessions"
++import { registerTeamRunForSessionCleanup } from "./session-team-run-registry"
+ 
+ const SESSION_ID_POLL_MS = 25
+ 
+@@ -129,6 +130,7 @@ export async function createTeamRun(
+   await ensureBaseDirs(baseDir)
+   const reusesCallerLeadSession = shouldReuseCallerLeadSession(spec, options?.callerAgentTypeId)
+   let runtimeState = await createRuntimeState(spec, leadSessionId, await resolveSpecSource(spec, ctx, config), config)
++  registerTeamRunForSessionCleanup(runtimeState.teamRunId)
+   if (reusesCallerLeadSession && spec.leadAgentId) {
+     const callerLeadSubagentType = options?.callerAgentTypeId
+     registerTeamSession(leadSessionId, {
+diff --git a/src/features/team-mode/team-runtime/delete-team.ts b/src/features/team-mode/team-runtime/delete-team.ts
+index bd8e8bb9..201b44a6 100644
+--- a/src/features/team-mode/team-runtime/delete-team.ts
++++ b/src/features/team-mode/team-runtime/delete-team.ts
+@@ -9,6 +9,7 @@ import { unregisterTeamSessionsByTeam } from "../team-session-registry"
+ import { listActiveTeams, loadRuntimeState, saveRuntimeState, transitionRuntimeState } from "../team-state-store/store"
+ import type { RuntimeState } from "../types"
+ import { DELETABLE_MEMBER_STATUSES, removeWorktrees } from "./shutdown-helpers"
++import { unregisterTeamRunForSessionCleanup } from "./session-team-run-registry"
+ 
+ export type DeleteTeamDeps = {
+   canVisualize: typeof canVisualize
+@@ -139,6 +140,7 @@ export async function deleteTeam(
+   await removeWorktrees([getRuntimeStateDir(resolveBaseDir(config), teamRunId)])
+ 
+   unregisterTeamSessionsByTeam(teamRunId)
++  unregisterTeamRunForSessionCleanup(teamRunId)
+ 
+   const activeTeams = await listActiveTeams(config)
+   sweepStaleTeamSessions(new Set(activeTeams.map((team) => team.teamRunId))).catch(() => {})
+diff --git a/src/features/team-mode/team-runtime/session-cleanup.test.ts b/src/features/team-mode/team-runtime/session-cleanup.test.ts
+new file mode 100644
+index 00000000..ae745f14
+--- /dev/null
++++ b/src/features/team-mode/team-runtime/session-cleanup.test.ts
+@@ -0,0 +1,57 @@
++/// <reference types="bun-types" />
++
++import { afterEach, describe, expect, mock, test } from "bun:test"
++
++import { TeamModeConfigSchema } from "../../../config/schema/team-mode"
++import type { BackgroundManager } from "../../background-agent/manager"
++import type { TmuxSessionManager } from "../../tmux-subagent/manager"
++import type { deleteTeam } from "./delete-team"
++import {
++  cleanupSessionTeamRuns,
++  clearSessionTeamRunCleanupRegistry,
++  getSessionCreatedTeamRunIds,
++  registerTeamRunForSessionCleanup,
++} from "./session-cleanup"
++
++describe("session team cleanup", () => {
++  afterEach(() => {
++    clearSessionTeamRunCleanupRegistry()
++    mock.restore()
++  })
++
++  test("#given team runs created in this process #when session cleanup runs #then it force deletes them with the tmux visualizer manager", async () => {
++    // given
++    const config = TeamModeConfigSchema.parse({ enabled: true, tmux_visualization: true })
++    const tmuxMgr = { getServerUrl: () => "http://127.0.0.1:4096" } as TmuxSessionManager
++    const bgMgr = { cancelTask: mock(async () => true) } as BackgroundManager
++    const deleteTeamMock = mock(async () => ({
++      removedLayout: true,
++      removedWorktrees: [],
++    })) as typeof deleteTeam
++
++    registerTeamRunForSessionCleanup("team-run-a")
++    registerTeamRunForSessionCleanup("team-run-b")
++
++    // when
++    const report = await cleanupSessionTeamRuns({
++      config,
++      tmuxMgr,
++      bgMgr,
++      deps: {
++        deleteTeam: deleteTeamMock,
++        log: mock(() => {}),
++      },
++    })
++
++    // then
++    expect(deleteTeamMock).toHaveBeenCalledTimes(2)
++    expect(deleteTeamMock).toHaveBeenNthCalledWith(1, "team-run-a", config, tmuxMgr, bgMgr, { force: true })
++    expect(deleteTeamMock).toHaveBeenNthCalledWith(2, "team-run-b", config, tmuxMgr, bgMgr, { force: true })
++    expect(report).toEqual({
++      cleanedTeamRunIds: ["team-run-a", "team-run-b"],
++      removedLayoutTeamRunIds: ["team-run-a", "team-run-b"],
++      errors: [],
++    })
++    expect(getSessionCreatedTeamRunIds()).toEqual([])
++  })
++})
+diff --git a/src/features/team-mode/team-runtime/session-cleanup.ts b/src/features/team-mode/team-runtime/session-cleanup.ts
+new file mode 100644
+index 00000000..9250c17c
+--- /dev/null
++++ b/src/features/team-mode/team-runtime/session-cleanup.ts
+@@ -0,0 +1,71 @@
++import type { TeamModeConfig } from "../../../config/schema/team-mode"
++import { log } from "../../../shared/logger"
++import type { BackgroundManager } from "../../background-agent/manager"
++import type { TmuxSessionManager } from "../../tmux-subagent/manager"
++import { deleteTeam } from "./delete-team"
++import {
++  getSessionCreatedTeamRunIds,
++  unregisterTeamRunForSessionCleanup,
++} from "./session-team-run-registry"
++
++export {
++  clearSessionTeamRunCleanupRegistry,
++  getSessionCreatedTeamRunIds,
++  registerTeamRunForSessionCleanup,
++  unregisterTeamRunForSessionCleanup,
++} from "./session-team-run-registry"
++
++export type SessionTeamCleanupReport = {
++  cleanedTeamRunIds: string[]
++  removedLayoutTeamRunIds: string[]
++  errors: string[]
++}
++
++export type SessionTeamCleanupDeps = {
++  deleteTeam: typeof deleteTeam
++  log: typeof log
++}
++
++const defaultSessionTeamCleanupDeps: SessionTeamCleanupDeps = {
++  deleteTeam,
++  log,
++}
++
++function normalizeError(error: unknown): Error {
++  return error instanceof Error ? error : new Error(String(error))
++}
++
++export async function cleanupSessionTeamRuns(args: {
++  config: TeamModeConfig
++  tmuxMgr?: TmuxSessionManager
++  bgMgr?: BackgroundManager
++  deps?: SessionTeamCleanupDeps
++}): Promise<SessionTeamCleanupReport> {
++  const deps = args.deps ?? defaultSessionTeamCleanupDeps
++  const report: SessionTeamCleanupReport = {
++    cleanedTeamRunIds: [],
++    removedLayoutTeamRunIds: [],
++    errors: [],
++  }
++
++  for (const teamRunId of getSessionCreatedTeamRunIds()) {
++    try {
++      const result = await deps.deleteTeam(teamRunId, args.config, args.tmuxMgr, args.bgMgr, { force: true })
++      report.cleanedTeamRunIds.push(teamRunId)
++      if (result.removedLayout) {
++        report.removedLayoutTeamRunIds.push(teamRunId)
++      }
++    } catch (error) {
++      const normalizedError = normalizeError(error)
++      report.errors.push(`${teamRunId}: ${normalizedError.message}`)
++      deps.log("session team cleanup failed", {
++        teamRunId,
++        error: normalizedError.message,
++      })
++    } finally {
++      unregisterTeamRunForSessionCleanup(teamRunId)
++    }
++  }
++
++  return report
++}
+diff --git a/src/features/team-mode/team-runtime/session-team-run-registry.ts b/src/features/team-mode/team-runtime/session-team-run-registry.ts
+new file mode 100644
+index 00000000..24ab4a48
+--- /dev/null
++++ b/src/features/team-mode/team-runtime/session-team-run-registry.ts
+@@ -0,0 +1,17 @@
++const sessionCreatedTeamRunIds = new Set<string>()
++
++export function registerTeamRunForSessionCleanup(teamRunId: string): void {
++  sessionCreatedTeamRunIds.add(teamRunId)
++}
++
++export function unregisterTeamRunForSessionCleanup(teamRunId: string): void {
++  sessionCreatedTeamRunIds.delete(teamRunId)
++}
++
++export function getSessionCreatedTeamRunIds(): string[] {
++  return Array.from(sessionCreatedTeamRunIds)
++}
++
++export function clearSessionTeamRunCleanupRegistry(): void {
++  sessionCreatedTeamRunIds.clear()
++}
+diff --git a/src/features/team-mode/team-runtime/shutdown.test.ts b/src/features/team-mode/team-runtime/shutdown.test.ts
+index 89682fa8..88e95f11 100644
+--- a/src/features/team-mode/team-runtime/shutdown.test.ts
++++ b/src/features/team-mode/team-runtime/shutdown.test.ts
+@@ -15,6 +15,11 @@ import {
+   readInboxMessages,
+   updateMemberStatuses,
+ } from "./shutdown-test-fixtures"
++import {
++  clearSessionTeamRunCleanupRegistry,
++  getSessionCreatedTeamRunIds,
++  registerTeamRunForSessionCleanup,
++} from "./session-cleanup"
+ 
+ const { approveShutdown, deleteTeam, rejectShutdown, requestShutdownOfMember } = await import("./shutdown")
+ 
+@@ -25,6 +30,7 @@ describe("team-runtime shutdown", () => {
+     await Promise.all(temporaryDirectories.splice(0).map(async (directoryPath) => {
+       await rm(directoryPath, { recursive: true, force: true })
+     }))
++    clearSessionTeamRunCleanupRegistry()
+     mock.restore()
+   })
+ 
+@@ -161,6 +167,23 @@ describe("team-runtime shutdown", () => {
+     )
+   })
+ 
++  test("#given a team run is tracked for session cleanup #when deleteTeam succeeds #then it unregisters the run", async () => {
++    // given
++    const fixture = await createFixture()
++    temporaryDirectories.push(fixture.baseDir)
++    registerTeamRunForSessionCleanup(fixture.teamRunId)
++    await updateMemberStatuses(fixture.teamRunId, fixture.config, {
++      "member-a": "shutdown_approved",
++      "member-b": "shutdown_approved",
++    })
++
++    // when
++    await deleteTeam(fixture.teamRunId, fixture.config)
++
++    // then
++    expect(getSessionCreatedTeamRunIds()).toEqual([])
++  })
++
+   test("deletes team even with active members when force=true", async () => {
+     // given
+     const fixture = await createFixture()
+-- 
+2.39.2
+

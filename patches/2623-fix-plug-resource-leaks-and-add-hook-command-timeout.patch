@@ -1,0 +1,1255 @@
+From 6aa1e96f9e707c2fc993b776f556217e119ef53c Mon Sep 17 00:00:00 2001
+From: Cole Leavitt <cole@unwrap.rs>
+Date: Sat, 21 Feb 2026 15:42:47 -0700
+Subject: [PATCH 2623/5749] fix: plug resource leaks and add hook command
+ timeout
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- LSP signal handlers: store refs, return unregister handle, call in stopAll()
+- session-tools-store: add per-session deleteSessionTools(), wire into session.deleted
+- executeHookCommand: add 30s timeout with SIGTERM→SIGKILL escalation
+---
+ src/plugin/event.ts                           | 469 +++++++++---------
+ .../command-executor/execute-hook-command.ts  |  44 +-
+ src/shared/session-tools-store.ts             |  14 +-
+ src/tools/lsp/lsp-manager-process-cleanup.ts  |  70 ++-
+ src/tools/lsp/lsp-server.ts                   | 181 +++----
+ 5 files changed, 422 insertions(+), 356 deletions(-)
+
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index e22089aa..04e3f602 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -1,53 +1,58 @@
+-import type { OhMyOpenCodeConfig } from "../config"
+-import type { PluginContext } from "./types"
++import type { OhMyOpenCodeConfig } from "../config";
++import type { PluginContext } from "./types";
+ 
+ import {
+   clearSessionAgent,
+   getMainSessionID,
+   getSessionAgent,
++  setMainSession,
+   subagentSessions,
+   syncSubagentSessions,
+-  setMainSession,
+   updateSessionAgent,
+-} from "../features/claude-code-session-state"
+-import { resetMessageCursor } from "../shared"
+-import { lspManager } from "../tools"
+-import { shouldRetryError } from "../shared/model-error-classifier"
+-import { clearPendingModelFallback, clearSessionFallbackChain, setPendingModelFallback } from "../hooks/model-fallback/hook"
+-import { log } from "../shared/logger"
+-import { clearSessionModel, setSessionModel } from "../shared/session-model-state"
+-
+-import type { CreatedHooks } from "../create-hooks"
+-import type { Managers } from "../create-managers"
+-import { normalizeSessionStatusToIdle } from "./session-status-normalizer"
+-import { pruneRecentSyntheticIdles } from "./recent-synthetic-idles"
++} from "../features/claude-code-session-state";
++import {
++  clearPendingModelFallback,
++  clearSessionFallbackChain,
++  setPendingModelFallback,
++} from "../hooks/model-fallback/hook";
++import { resetMessageCursor } from "../shared";
++import { log } from "../shared/logger";
++import { shouldRetryError } from "../shared/model-error-classifier";
++import { clearSessionModel, setSessionModel } from "../shared/session-model-state";
++import { deleteSessionTools } from "../shared/session-tools-store";
++import { lspManager } from "../tools";
++
++import type { CreatedHooks } from "../create-hooks";
++import type { Managers } from "../create-managers";
++import { pruneRecentSyntheticIdles } from "./recent-synthetic-idles";
++import { normalizeSessionStatusToIdle } from "./session-status-normalizer";
+ 
+ type FirstMessageVariantGate = {
+-  markSessionCreated: (sessionInfo: { id?: string; title?: string; parentID?: string } | undefined) => void
+-  clear: (sessionID: string) => void
+-}
++  markSessionCreated: (sessionInfo: { id?: string; title?: string; parentID?: string } | undefined) => void;
++  clear: (sessionID: string) => void;
++};
+ 
+ function isRecord(value: unknown): value is Record<string, unknown> {
+-  return typeof value === "object" && value !== null
++  return typeof value === "object" && value !== null;
+ }
+ 
+ function normalizeFallbackModelID(modelID: string): string {
+   return modelID
+     .replace(/-thinking$/i, "")
+     .replace(/-max$/i, "")
+-    .replace(/-high$/i, "")
++    .replace(/-high$/i, "");
+ }
+ 
+ function extractErrorName(error: unknown): string | undefined {
+-  if (isRecord(error) && typeof error.name === "string") return error.name
+-  if (error instanceof Error) return error.name
+-  return undefined
++  if (isRecord(error) && typeof error.name === "string") return error.name;
++  if (error instanceof Error) return error.name;
++  return undefined;
+ }
+ 
+ function extractErrorMessage(error: unknown): string {
+-  if (!error) return ""
+-  if (typeof error === "string") return error
+-  if (error instanceof Error) return error.message
++  if (!error) return "";
++  if (typeof error === "string") return error;
++  if (error instanceof Error) return error.message;
+ 
+   if (isRecord(error)) {
+     const candidates: unknown[] = [
+@@ -56,116 +61,112 @@ function extractErrorMessage(error: unknown): string {
+       error.error,
+       isRecord(error.data) ? error.data.error : undefined,
+       error.cause,
+-    ]
++    ];
+ 
+     for (const candidate of candidates) {
+       if (isRecord(candidate) && typeof candidate.message === "string" && candidate.message.length > 0) {
+-        return candidate.message
++        return candidate.message;
+       }
+     }
+   }
+ 
+   try {
+-    return JSON.stringify(error)
++    return JSON.stringify(error);
+   } catch {
+-    return String(error)
++    return String(error);
+   }
+ }
+ 
+-function extractProviderModelFromErrorMessage(
+-  message: string,
+-): { providerID?: string; modelID?: string } {
+-  const lower = message.toLowerCase()
++function extractProviderModelFromErrorMessage(message: string): { providerID?: string; modelID?: string } {
++  const lower = message.toLowerCase();
+ 
+-  const providerModel = lower.match(/model\s+not\s+found:\s*([a-z0-9_-]+)\s*\/\s*([a-z0-9._-]+)/i)
++  const providerModel = lower.match(/model\s+not\s+found:\s*([a-z0-9_-]+)\s*\/\s*([a-z0-9._-]+)/i);
+   if (providerModel) {
+     return {
+       providerID: providerModel[1],
+       modelID: providerModel[2],
+-    }
++    };
+   }
+ 
+-  const modelOnly = lower.match(/unknown\s+provider\s+for\s+model\s+([a-z0-9._-]+)/i)
++  const modelOnly = lower.match(/unknown\s+provider\s+for\s+model\s+([a-z0-9._-]+)/i);
+   if (modelOnly) {
+     return {
+       modelID: modelOnly[1],
+-    }
++    };
+   }
+ 
+-  return {}
++  return {};
+ }
+-type EventInput = Parameters<
+-  NonNullable<NonNullable<CreatedHooks["writeExistingFileGuard"]>["event"]>
+->[0]
++type EventInput = Parameters<NonNullable<NonNullable<CreatedHooks["writeExistingFileGuard"]>["event"]>>[0];
+ export function createEventHandler(args: {
+-  ctx: PluginContext
+-  pluginConfig: OhMyOpenCodeConfig
+-  firstMessageVariantGate: FirstMessageVariantGate
+-  managers: Managers
+-  hooks: CreatedHooks
++  ctx: PluginContext;
++  pluginConfig: OhMyOpenCodeConfig;
++  firstMessageVariantGate: FirstMessageVariantGate;
++  managers: Managers;
++  hooks: CreatedHooks;
+ }): (input: EventInput) => Promise<void> {
+-  const { ctx, firstMessageVariantGate, managers, hooks } = args
++  const { ctx, firstMessageVariantGate, managers, hooks } = args;
+   const pluginContext = ctx as {
+-    directory: string
++    directory: string;
+     client: {
+       session: {
+-        abort: (input: { path: { id: string } }) => Promise<unknown>
++        abort: (input: { path: { id: string } }) => Promise<unknown>;
+         prompt: (input: {
+-          path: { id: string }
+-          body: { parts: Array<{ type: "text"; text: string }> }
+-          query: { directory: string }
+-        }) => Promise<unknown>
+-      }
+-    }
+-  }
++          path: { id: string };
++          body: { parts: Array<{ type: "text"; text: string }> };
++          query: { directory: string };
++        }) => Promise<unknown>;
++      };
++    };
++  };
+   const isRuntimeFallbackEnabled =
+     hooks.runtimeFallback !== null &&
+     hooks.runtimeFallback !== undefined &&
+     (typeof args.pluginConfig.runtime_fallback === "boolean"
+       ? args.pluginConfig.runtime_fallback
+-      : (args.pluginConfig.runtime_fallback?.enabled ?? false))
++      : (args.pluginConfig.runtime_fallback?.enabled ?? false));
+ 
+   // Avoid triggering multiple abort+continue cycles for the same failing assistant message.
+-  const lastHandledModelErrorMessageID = new Map<string, string>()
+-  const lastHandledRetryStatusKey = new Map<string, string>()
+-  const lastKnownModelBySession = new Map<string, { providerID: string; modelID: string }>()
++  const lastHandledModelErrorMessageID = new Map<string, string>();
++  const lastHandledRetryStatusKey = new Map<string, string>();
++  const lastKnownModelBySession = new Map<string, { providerID: string; modelID: string }>();
+ 
+   const dispatchToHooks = async (input: EventInput): Promise<void> => {
+-    await Promise.resolve(hooks.autoUpdateChecker?.event?.(input))
+-    await Promise.resolve(hooks.claudeCodeHooks?.event?.(input))
+-    await Promise.resolve(hooks.backgroundNotificationHook?.event?.(input))
+-    await Promise.resolve(hooks.sessionNotification?.(input))
+-    await Promise.resolve(hooks.todoContinuationEnforcer?.handler?.(input))
+-    await Promise.resolve(hooks.unstableAgentBabysitter?.event?.(input))
+-    await Promise.resolve(hooks.contextWindowMonitor?.event?.(input))
+-    await Promise.resolve(hooks.directoryAgentsInjector?.event?.(input))
+-    await Promise.resolve(hooks.directoryReadmeInjector?.event?.(input))
+-    await Promise.resolve(hooks.rulesInjector?.event?.(input))
+-    await Promise.resolve(hooks.thinkMode?.event?.(input))
+-    await Promise.resolve(hooks.anthropicContextWindowLimitRecovery?.event?.(input))
+-    await Promise.resolve(hooks.runtimeFallback?.event?.(input))
+-    await Promise.resolve(hooks.agentUsageReminder?.event?.(input))
+-    await Promise.resolve(hooks.categorySkillReminder?.event?.(input))
+-    await Promise.resolve(hooks.interactiveBashSession?.event?.(input as EventInput))
+-    await Promise.resolve(hooks.ralphLoop?.event?.(input))
+-    await Promise.resolve(hooks.stopContinuationGuard?.event?.(input))
+-    await Promise.resolve(hooks.compactionTodoPreserver?.event?.(input))
+-    await Promise.resolve(hooks.writeExistingFileGuard?.event?.(input))
+-    await Promise.resolve(hooks.atlasHook?.handler?.(input))
+-  }
+-
+-  const recentSyntheticIdles = new Map<string, number>()
+-  const recentRealIdles = new Map<string, number>()
+-  const DEDUP_WINDOW_MS = 500
++    await Promise.resolve(hooks.autoUpdateChecker?.event?.(input));
++    await Promise.resolve(hooks.claudeCodeHooks?.event?.(input));
++    await Promise.resolve(hooks.backgroundNotificationHook?.event?.(input));
++    await Promise.resolve(hooks.sessionNotification?.(input));
++    await Promise.resolve(hooks.todoContinuationEnforcer?.handler?.(input));
++    await Promise.resolve(hooks.unstableAgentBabysitter?.event?.(input));
++    await Promise.resolve(hooks.contextWindowMonitor?.event?.(input));
++    await Promise.resolve(hooks.directoryAgentsInjector?.event?.(input));
++    await Promise.resolve(hooks.directoryReadmeInjector?.event?.(input));
++    await Promise.resolve(hooks.rulesInjector?.event?.(input));
++    await Promise.resolve(hooks.thinkMode?.event?.(input));
++    await Promise.resolve(hooks.anthropicContextWindowLimitRecovery?.event?.(input));
++    await Promise.resolve(hooks.runtimeFallback?.event?.(input));
++    await Promise.resolve(hooks.agentUsageReminder?.event?.(input));
++    await Promise.resolve(hooks.categorySkillReminder?.event?.(input));
++    await Promise.resolve(hooks.interactiveBashSession?.event?.(input as EventInput));
++    await Promise.resolve(hooks.ralphLoop?.event?.(input));
++    await Promise.resolve(hooks.stopContinuationGuard?.event?.(input));
++    await Promise.resolve(hooks.compactionTodoPreserver?.event?.(input));
++    await Promise.resolve(hooks.writeExistingFileGuard?.event?.(input));
++    await Promise.resolve(hooks.atlasHook?.handler?.(input));
++  };
++
++  const recentSyntheticIdles = new Map<string, number>();
++  const recentRealIdles = new Map<string, number>();
++  const DEDUP_WINDOW_MS = 500;
+ 
+   const shouldAutoRetrySession = (sessionID: string): boolean => {
+-    if (syncSubagentSessions.has(sessionID)) return true
+-    const mainSessionID = getMainSessionID()
+-    if (mainSessionID) return sessionID === mainSessionID
++    if (syncSubagentSessions.has(sessionID)) return true;
++    const mainSessionID = getMainSessionID();
++    if (mainSessionID) return sessionID === mainSessionID;
+     // Headless runs (or resumed sessions) may not emit session.created, so mainSessionID can be unset.
+     // In that case, treat any non-subagent session as the "main" interactive session.
+-    return !subagentSessions.has(sessionID)
+-  }
++    return !subagentSessions.has(sessionID);
++  };
+ 
+   return async (input): Promise<void> => {
+     pruneRecentSyntheticIdles({
+@@ -173,97 +174,98 @@ export function createEventHandler(args: {
+       recentRealIdles,
+       now: Date.now(),
+       dedupWindowMs: DEDUP_WINDOW_MS,
+-    })
++    });
+ 
+     if (input.event.type === "session.idle") {
+-      const sessionID = (input.event.properties as Record<string, unknown> | undefined)?.sessionID as string | undefined
++      const sessionID = (input.event.properties as Record<string, unknown> | undefined)?.sessionID as
++        | string
++        | undefined;
+       if (sessionID) {
+-        const emittedAt = recentSyntheticIdles.get(sessionID)
++        const emittedAt = recentSyntheticIdles.get(sessionID);
+         if (emittedAt && Date.now() - emittedAt < DEDUP_WINDOW_MS) {
+-          recentSyntheticIdles.delete(sessionID)
+-          return
++          recentSyntheticIdles.delete(sessionID);
++          return;
+         }
+-        recentRealIdles.set(sessionID, Date.now())
++        recentRealIdles.set(sessionID, Date.now());
+       }
+     }
+ 
+-    await dispatchToHooks(input)
++    await dispatchToHooks(input);
+ 
+-    const syntheticIdle = normalizeSessionStatusToIdle(input)
++    const syntheticIdle = normalizeSessionStatusToIdle(input);
+     if (syntheticIdle) {
+-      const sessionID = (syntheticIdle.event.properties as Record<string, unknown>)?.sessionID as string
+-      const emittedAt = recentRealIdles.get(sessionID)
++      const sessionID = (syntheticIdle.event.properties as Record<string, unknown>)?.sessionID as string;
++      const emittedAt = recentRealIdles.get(sessionID);
+       if (emittedAt && Date.now() - emittedAt < DEDUP_WINDOW_MS) {
+-        recentRealIdles.delete(sessionID)
+-        return
++        recentRealIdles.delete(sessionID);
++        return;
+       }
+-      recentSyntheticIdles.set(sessionID, Date.now())
+-      await dispatchToHooks(syntheticIdle as EventInput)
++      recentSyntheticIdles.set(sessionID, Date.now());
++      await dispatchToHooks(syntheticIdle as EventInput);
+     }
+ 
+-    const { event } = input
+-    const props = event.properties as Record<string, unknown> | undefined
++    const { event } = input;
++    const props = event.properties as Record<string, unknown> | undefined;
+ 
+     if (event.type === "session.created") {
+-      const sessionInfo = props?.info as
+-        | { id?: string; title?: string; parentID?: string }
+-        | undefined
++      const sessionInfo = props?.info as { id?: string; title?: string; parentID?: string } | undefined;
+ 
+       if (!sessionInfo?.parentID) {
+-        setMainSession(sessionInfo?.id)
++        setMainSession(sessionInfo?.id);
+       }
+ 
+-      firstMessageVariantGate.markSessionCreated(sessionInfo)
++      firstMessageVariantGate.markSessionCreated(sessionInfo);
+ 
+       await managers.tmuxSessionManager.onSessionCreated(
+         event as {
+-          type: string
++          type: string;
+           properties?: {
+-            info?: { id?: string; parentID?: string; title?: string }
+-          }
++            info?: { id?: string; parentID?: string; title?: string };
++          };
+         },
+-      )
++      );
+     }
+ 
+     if (event.type === "session.deleted") {
+-      const sessionInfo = props?.info as { id?: string } | undefined
++      const sessionInfo = props?.info as { id?: string } | undefined;
+       if (sessionInfo?.id === getMainSessionID()) {
+-        setMainSession(undefined)
++        setMainSession(undefined);
+       }
+ 
+       if (sessionInfo?.id) {
+-        clearSessionAgent(sessionInfo.id)
+-        lastHandledModelErrorMessageID.delete(sessionInfo.id)
+-        lastHandledRetryStatusKey.delete(sessionInfo.id)
+-        lastKnownModelBySession.delete(sessionInfo.id)
+-        clearPendingModelFallback(sessionInfo.id)
+-        clearSessionFallbackChain(sessionInfo.id)
+-        resetMessageCursor(sessionInfo.id)
+-        firstMessageVariantGate.clear(sessionInfo.id)
+-        clearSessionModel(sessionInfo.id)
+-        syncSubagentSessions.delete(sessionInfo.id)
+-        await managers.skillMcpManager.disconnectSession(sessionInfo.id)
+-        await lspManager.cleanupTempDirectoryClients()
++        clearSessionAgent(sessionInfo.id);
++        lastHandledModelErrorMessageID.delete(sessionInfo.id);
++        lastHandledRetryStatusKey.delete(sessionInfo.id);
++        lastKnownModelBySession.delete(sessionInfo.id);
++        clearPendingModelFallback(sessionInfo.id);
++        clearSessionFallbackChain(sessionInfo.id);
++        resetMessageCursor(sessionInfo.id);
++        firstMessageVariantGate.clear(sessionInfo.id);
++        clearSessionModel(sessionInfo.id);
++        syncSubagentSessions.delete(sessionInfo.id);
++        deleteSessionTools(sessionInfo.id);
++        await managers.skillMcpManager.disconnectSession(sessionInfo.id);
++        await lspManager.cleanupTempDirectoryClients();
+         await managers.tmuxSessionManager.onSessionDeleted({
+           sessionID: sessionInfo.id,
+-        })
++        });
+       }
+     }
+ 
+     if (event.type === "message.updated") {
+-      const info = props?.info as Record<string, unknown> | undefined
+-      const sessionID = info?.sessionID as string | undefined
+-      const agent = info?.agent as string | undefined
+-      const role = info?.role as string | undefined
++      const info = props?.info as Record<string, unknown> | undefined;
++      const sessionID = info?.sessionID as string | undefined;
++      const agent = info?.agent as string | undefined;
++      const role = info?.role as string | undefined;
+       if (sessionID && role === "user") {
+         if (agent) {
+-          updateSessionAgent(sessionID, agent)
++          updateSessionAgent(sessionID, agent);
+         }
+-        const providerID = info?.providerID as string | undefined
+-        const modelID = info?.modelID as string | undefined
++        const providerID = info?.providerID as string | undefined;
++        const modelID = info?.modelID as string | undefined;
+         if (providerID && modelID) {
+-          lastKnownModelBySession.set(sessionID, { providerID, modelID })
+-          setSessionModel(sessionID, { providerID, modelID })
++          lastKnownModelBySession.set(sessionID, { providerID, modelID });
++          setSessionModel(sessionID, { providerID, modelID });
+         }
+       }
+ 
+@@ -271,132 +273,128 @@ export function createEventHandler(args: {
+       // session.error events are not guaranteed for all providers, so we also observe message.updated.
+       if (sessionID && role === "assistant" && !isRuntimeFallbackEnabled) {
+         try {
+-          const assistantMessageID = info?.id as string | undefined
+-          const assistantError = info?.error
++          const assistantMessageID = info?.id as string | undefined;
++          const assistantError = info?.error;
+           if (assistantMessageID && assistantError) {
+-            const lastHandled = lastHandledModelErrorMessageID.get(sessionID)
++            const lastHandled = lastHandledModelErrorMessageID.get(sessionID);
+             if (lastHandled === assistantMessageID) {
+-              return
++              return;
+             }
+ 
+-            const errorName = extractErrorName(assistantError)
+-            const errorMessage = extractErrorMessage(assistantError)
+-            const errorInfo = { name: errorName, message: errorMessage }
++            const errorName = extractErrorName(assistantError);
++            const errorMessage = extractErrorMessage(assistantError);
++            const errorInfo = { name: errorName, message: errorMessage };
+ 
+             if (shouldRetryError(errorInfo)) {
+               // Prefer the agent/model/provider from the assistant message payload.
+-              let agentName = agent ?? getSessionAgent(sessionID)
++              let agentName = agent ?? getSessionAgent(sessionID);
+               if (!agentName && sessionID === getMainSessionID()) {
+                 if (errorMessage.includes("claude-opus") || errorMessage.includes("opus")) {
+-                  agentName = "sisyphus"
++                  agentName = "sisyphus";
+                 } else if (errorMessage.includes("gpt-5")) {
+-                  agentName = "hephaestus"
++                  agentName = "hephaestus";
+                 } else {
+-                  agentName = "sisyphus"
++                  agentName = "sisyphus";
+                 }
+               }
+ 
+               if (agentName) {
+-                const currentProvider = (info?.providerID as string | undefined) ?? "opencode"
+-                const rawModel = (info?.modelID as string | undefined) ?? "claude-opus-4-6"
+-                const currentModel = normalizeFallbackModelID(rawModel)
++                const currentProvider = (info?.providerID as string | undefined) ?? "opencode";
++                const rawModel = (info?.modelID as string | undefined) ?? "claude-opus-4-6";
++                const currentModel = normalizeFallbackModelID(rawModel);
+ 
+-                const setFallback = setPendingModelFallback(
+-                  sessionID,
+-                  agentName,
+-                  currentProvider,
+-                  currentModel,
+-                )
++                const setFallback = setPendingModelFallback(sessionID, agentName, currentProvider, currentModel);
+ 
+-                if (setFallback && shouldAutoRetrySession(sessionID) && !hooks.stopContinuationGuard?.isStopped(sessionID)) {
+-                  lastHandledModelErrorMessageID.set(sessionID, assistantMessageID)
++                if (
++                  setFallback &&
++                  shouldAutoRetrySession(sessionID) &&
++                  !hooks.stopContinuationGuard?.isStopped(sessionID)
++                ) {
++                  lastHandledModelErrorMessageID.set(sessionID, assistantMessageID);
+ 
+-                  await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {})
++                  await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {});
+                   await pluginContext.client.session
+                     .prompt({
+                       path: { id: sessionID },
+                       body: { parts: [{ type: "text", text: "continue" }] },
+                       query: { directory: pluginContext.directory },
+                     })
+-                    .catch(() => {})
++                    .catch(() => {});
+                 }
+               }
+             }
+           }
+         } catch (err) {
+-          log("[event] model-fallback error in message.updated:", { sessionID, error: err })
++          log("[event] model-fallback error in message.updated:", { sessionID, error: err });
+         }
+       }
+     }
+ 
+     if (event.type === "session.status") {
+-      const sessionID = props?.sessionID as string | undefined
+-      const status = props?.status as
+-        | { type?: string; attempt?: number; message?: string; next?: number }
+-        | undefined
++      const sessionID = props?.sessionID as string | undefined;
++      const status = props?.status as { type?: string; attempt?: number; message?: string; next?: number } | undefined;
+ 
+       if (sessionID && status?.type === "retry") {
+         try {
+-          const retryMessage = typeof status.message === "string" ? status.message : ""
+-          const retryKey = `${status.attempt ?? "?"}:${status.next ?? "?"}:${retryMessage}`
++          const retryMessage = typeof status.message === "string" ? status.message : "";
++          const retryKey = `${status.attempt ?? "?"}:${status.next ?? "?"}:${retryMessage}`;
+           if (lastHandledRetryStatusKey.get(sessionID) === retryKey) {
+-            return
++            return;
+           }
+-          lastHandledRetryStatusKey.set(sessionID, retryKey)
++          lastHandledRetryStatusKey.set(sessionID, retryKey);
+ 
+-          const errorInfo = { name: undefined as string | undefined, message: retryMessage }
++          const errorInfo = { name: undefined as string | undefined, message: retryMessage };
+           if (shouldRetryError(errorInfo)) {
+-            let agentName = getSessionAgent(sessionID)
++            let agentName = getSessionAgent(sessionID);
+             if (!agentName && sessionID === getMainSessionID()) {
+               if (retryMessage.includes("claude-opus") || retryMessage.includes("opus")) {
+-                agentName = "sisyphus"
++                agentName = "sisyphus";
+               } else if (retryMessage.includes("gpt-5")) {
+-                agentName = "hephaestus"
++                agentName = "hephaestus";
+               } else {
+-                agentName = "sisyphus"
++                agentName = "sisyphus";
+               }
+             }
+ 
+             if (agentName) {
+-              const parsed = extractProviderModelFromErrorMessage(retryMessage)
+-              const lastKnown = lastKnownModelBySession.get(sessionID)
+-              const currentProvider = parsed.providerID ?? lastKnown?.providerID ?? "opencode"
+-              let currentModel = parsed.modelID ?? lastKnown?.modelID ?? "claude-opus-4-6"
+-              currentModel = normalizeFallbackModelID(currentModel)
+-
+-              const setFallback = setPendingModelFallback(
+-                sessionID,
+-                agentName,
+-                currentProvider,
+-                currentModel,
+-              )
+-
+-              if (setFallback && shouldAutoRetrySession(sessionID) && !hooks.stopContinuationGuard?.isStopped(sessionID)) {
+-                await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {})
++              const parsed = extractProviderModelFromErrorMessage(retryMessage);
++              const lastKnown = lastKnownModelBySession.get(sessionID);
++              const currentProvider = parsed.providerID ?? lastKnown?.providerID ?? "opencode";
++              let currentModel = parsed.modelID ?? lastKnown?.modelID ?? "claude-opus-4-6";
++              currentModel = normalizeFallbackModelID(currentModel);
++
++              const setFallback = setPendingModelFallback(sessionID, agentName, currentProvider, currentModel);
++
++              if (
++                setFallback &&
++                shouldAutoRetrySession(sessionID) &&
++                !hooks.stopContinuationGuard?.isStopped(sessionID)
++              ) {
++                await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {});
+                 await pluginContext.client.session
+                   .prompt({
+                     path: { id: sessionID },
+                     body: { parts: [{ type: "text", text: "continue" }] },
+                     query: { directory: pluginContext.directory },
+                   })
+-                  .catch(() => {})
++                  .catch(() => {});
+               }
+             }
+           }
+         } catch (err) {
+-          log("[event] model-fallback error in session.status:", { sessionID, error: err })
++          log("[event] model-fallback error in session.status:", { sessionID, error: err });
+         }
+       }
+     }
+ 
+     if (event.type === "session.error") {
+       try {
+-        const sessionID = props?.sessionID as string | undefined
+-        const error = props?.error
++        const sessionID = props?.sessionID as string | undefined;
++        const error = props?.error;
+ 
+-        const errorName = extractErrorName(error)
+-        const errorMessage = extractErrorMessage(error)
+-        const errorInfo = { name: errorName, message: errorMessage }
++        const errorName = extractErrorName(error);
++        const errorMessage = extractErrorMessage(error);
++        const errorInfo = { name: errorName, message: errorMessage };
+ 
+         // First, try session recovery for internal errors (thinking blocks, tool results, etc.)
+         if (hooks.sessionRecovery?.isRecoverableError(error)) {
+@@ -405,8 +403,8 @@ export function createEventHandler(args: {
+             role: "assistant" as const,
+             sessionID,
+             error,
+-          }
+-          const recovered = await hooks.sessionRecovery.handleSessionRecovery(messageInfo)
++          };
++          const recovered = await hooks.sessionRecovery.handleSessionRecovery(messageInfo);
+ 
+           if (
+             recovered &&
+@@ -420,53 +418,52 @@ export function createEventHandler(args: {
+                 body: { parts: [{ type: "text", text: "continue" }] },
+                 query: { directory: pluginContext.directory },
+               })
+-              .catch(() => {})
++              .catch(() => {});
+           }
+-        } 
++        }
+         // Second, try model fallback for model errors (rate limit, quota, provider issues, etc.)
+         else if (sessionID && shouldRetryError(errorInfo) && !isRuntimeFallbackEnabled) {
+-          let agentName = getSessionAgent(sessionID)
+-          
++          let agentName = getSessionAgent(sessionID);
++
+           if (!agentName && sessionID === getMainSessionID()) {
+             if (errorMessage.includes("claude-opus") || errorMessage.includes("opus")) {
+-              agentName = "sisyphus"
++              agentName = "sisyphus";
+             } else if (errorMessage.includes("gpt-5")) {
+-              agentName = "hephaestus"
++              agentName = "hephaestus";
+             } else {
+-              agentName = "sisyphus"
++              agentName = "sisyphus";
+             }
+           }
+-          
++
+           if (agentName) {
+-            const parsed = extractProviderModelFromErrorMessage(errorMessage)
+-            const currentProvider = props?.providerID as string || parsed.providerID || "opencode"
+-            let currentModel = props?.modelID as string || parsed.modelID || "claude-opus-4-6"
+-            currentModel = normalizeFallbackModelID(currentModel)
+-
+-            const setFallback = setPendingModelFallback(
+-              sessionID,
+-              agentName,
+-              currentProvider,
+-              currentModel,
+-            )
+-            
+-            if (setFallback && shouldAutoRetrySession(sessionID) && !hooks.stopContinuationGuard?.isStopped(sessionID)) {
+-                await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {})
+-                
+-                await pluginContext.client.session
+-                  .prompt({
+-                    path: { id: sessionID },
+-                    body: { parts: [{ type: "text", text: "continue" }] },
+-                    query: { directory: pluginContext.directory },
+-                  })
+-                  .catch(() => {})
++            const parsed = extractProviderModelFromErrorMessage(errorMessage);
++            const currentProvider = (props?.providerID as string) || parsed.providerID || "opencode";
++            let currentModel = (props?.modelID as string) || parsed.modelID || "claude-opus-4-6";
++            currentModel = normalizeFallbackModelID(currentModel);
++
++            const setFallback = setPendingModelFallback(sessionID, agentName, currentProvider, currentModel);
++
++            if (
++              setFallback &&
++              shouldAutoRetrySession(sessionID) &&
++              !hooks.stopContinuationGuard?.isStopped(sessionID)
++            ) {
++              await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {});
++
++              await pluginContext.client.session
++                .prompt({
++                  path: { id: sessionID },
++                  body: { parts: [{ type: "text", text: "continue" }] },
++                  query: { directory: pluginContext.directory },
++                })
++                .catch(() => {});
+             }
+           }
+         }
+       } catch (err) {
+-        const sessionID = props?.sessionID as string | undefined
+-        log("[event] model-fallback error in session.error:", { sessionID, error: err })
++        const sessionID = props?.sessionID as string | undefined;
++        log("[event] model-fallback error in session.error:", { sessionID, error: err });
+       }
+     }
+-  }
++  };
+ }
+diff --git a/src/shared/command-executor/execute-hook-command.ts b/src/shared/command-executor/execute-hook-command.ts
+index f0c60c99..65c6a678 100644
+--- a/src/shared/command-executor/execute-hook-command.ts
++++ b/src/shared/command-executor/execute-hook-command.ts
+@@ -8,9 +8,14 @@ export interface CommandResult {
+ 	stderr?: string
+ }
+ 
++const DEFAULT_HOOK_TIMEOUT_MS = 30_000
++const SIGKILL_GRACE_MS = 5_000
++
+ export interface ExecuteHookOptions {
+ 	forceZsh?: boolean
+ 	zshPath?: string
++	/** Timeout in milliseconds. Process is killed after this. Default: 30000 */
++	timeoutMs?: number
+ }
+ 
+ export async function executeHookCommand(
+@@ -20,6 +25,7 @@ export async function executeHookCommand(
+ 	options?: ExecuteHookOptions,
+ ): Promise<CommandResult> {
+ 	const home = getHomeDirectory()
++	const timeoutMs = options?.timeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS
+ 
+ 	const expandedCommand = command
+ 		.replace(/^~(?=\/|$)/g, home)
+@@ -43,6 +49,9 @@ export async function executeHookCommand(
+ 	}
+ 
+ 	return new Promise((resolve) => {
++		let settled = false
++		let killTimer: ReturnType<typeof setTimeout> | null = null
++
+ 		const proc = spawn(finalCommand, {
+ 			cwd,
+ 			shell: true,
+@@ -52,19 +61,27 @@ export async function executeHookCommand(
+ 		let stdout = ""
+ 		let stderr = ""
+ 
+-		proc.stdout?.on("data", (data) => {
++		proc.stdout?.on("data", (data: Buffer) => {
+ 			stdout += data.toString()
+ 		})
+ 
+-		proc.stderr?.on("data", (data) => {
++		proc.stderr?.on("data", (data: Buffer) => {
+ 			stderr += data.toString()
+ 		})
+ 
+ 		proc.stdin?.write(stdin)
+ 		proc.stdin?.end()
+ 
++		const settle = (result: CommandResult) => {
++			if (settled) return
++			settled = true
++			if (killTimer) clearTimeout(killTimer)
++			if (timeoutTimer) clearTimeout(timeoutTimer)
++			resolve(result)
++		}
++
+ 		proc.on("close", (code) => {
+-			resolve({
++			settle({
+ 				exitCode: code ?? 0,
+ 				stdout: stdout.trim(),
+ 				stderr: stderr.trim(),
+@@ -72,7 +89,26 @@ export async function executeHookCommand(
+ 		})
+ 
+ 		proc.on("error", (err) => {
+-			resolve({ exitCode: 1, stderr: err.message })
++			settle({ exitCode: 1, stderr: err.message })
+ 		})
++
++		const timeoutTimer = setTimeout(() => {
++			if (settled) return
++			// Try graceful shutdown first
++			proc.kill("SIGTERM")
++			killTimer = setTimeout(() => {
++				if (settled) return
++				try {
++					proc.kill("SIGKILL")
++				} catch {}
++			}, SIGKILL_GRACE_MS)
++			// Append timeout notice to stderr
++			stderr += `\nHook command timed out after ${timeoutMs}ms`
++		}, timeoutMs)
++
++		// Don't let the timeout timer keep the process alive
++		if (timeoutTimer && typeof timeoutTimer === "object" && "unref" in timeoutTimer) {
++			timeoutTimer.unref()
++		}
+ 	})
+ }
+diff --git a/src/shared/session-tools-store.ts b/src/shared/session-tools-store.ts
+index f717488e..c84b9ab7 100644
+--- a/src/shared/session-tools-store.ts
++++ b/src/shared/session-tools-store.ts
+@@ -1,14 +1,18 @@
+-const store = new Map<string, Record<string, boolean>>()
++const store = new Map<string, Record<string, boolean>>();
+ 
+ export function setSessionTools(sessionID: string, tools: Record<string, boolean>): void {
+-  store.set(sessionID, { ...tools })
++  store.set(sessionID, { ...tools });
+ }
+ 
+ export function getSessionTools(sessionID: string): Record<string, boolean> | undefined {
+-  const tools = store.get(sessionID)
+-  return tools ? { ...tools } : undefined
++  const tools = store.get(sessionID);
++  return tools ? { ...tools } : undefined;
++}
++
++export function deleteSessionTools(sessionID: string): void {
++  store.delete(sessionID);
+ }
+ 
+ export function clearSessionTools(): void {
+-  store.clear()
++  store.clear();
+ }
+diff --git a/src/tools/lsp/lsp-manager-process-cleanup.ts b/src/tools/lsp/lsp-manager-process-cleanup.ts
+index 9f769570..df9f299e 100644
+--- a/src/tools/lsp/lsp-manager-process-cleanup.ts
++++ b/src/tools/lsp/lsp-manager-process-cleanup.ts
+@@ -1,45 +1,71 @@
+ type ManagedClientForCleanup = {
+   client: {
+-    stop: () => Promise<void>
+-  }
+-}
++    stop: () => Promise<void>;
++  };
++};
+ 
+ type ProcessCleanupOptions = {
+-  getClients: () => IterableIterator<[string, ManagedClientForCleanup]>
+-  clearClients: () => void
+-  clearCleanupInterval: () => void
+-}
++  getClients: () => IterableIterator<[string, ManagedClientForCleanup]>;
++  clearClients: () => void;
++  clearCleanupInterval: () => void;
++};
++
++type RegisteredHandler = {
++  event: string;
++  listener: (...args: unknown[]) => void;
++};
++
++export type LspProcessCleanupHandle = {
++  unregister: () => void;
++};
++
++export function registerLspManagerProcessCleanup(options: ProcessCleanupOptions): LspProcessCleanupHandle {
++  const handlers: RegisteredHandler[] = [];
+ 
+-export function registerLspManagerProcessCleanup(options: ProcessCleanupOptions): void {
+   // Synchronous cleanup for 'exit' event (cannot await)
+   const syncCleanup = () => {
+     for (const [, managed] of options.getClients()) {
+       try {
+         // Fire-and-forget during sync exit - process is terminating
+-        void managed.client.stop().catch(() => {})
++        void managed.client.stop().catch(() => {});
+       } catch {}
+     }
+-    options.clearClients()
+-    options.clearCleanupInterval()
+-  }
++    options.clearClients();
++    options.clearCleanupInterval();
++  };
+ 
+   // Async cleanup for signal handlers - properly await all stops
+   const asyncCleanup = async () => {
+-    const stopPromises: Promise<void>[] = []
++    const stopPromises: Promise<void>[] = [];
+     for (const [, managed] of options.getClients()) {
+-      stopPromises.push(managed.client.stop().catch(() => {}))
++      stopPromises.push(managed.client.stop().catch(() => {}));
+     }
+-    await Promise.allSettled(stopPromises)
+-    options.clearClients()
+-    options.clearCleanupInterval()
+-  }
++    await Promise.allSettled(stopPromises);
++    options.clearClients();
++    options.clearCleanupInterval();
++  };
+ 
+-  process.on("exit", syncCleanup)
++  const registerHandler = (event: string, listener: (...args: unknown[]) => void) => {
++    handlers.push({ event, listener });
++    process.on(event, listener);
++  };
++
++  registerHandler("exit", syncCleanup);
+ 
+   // Don't call process.exit() here; other handlers (background-agent manager) handle final exit.
+-  process.on("SIGINT", () => void asyncCleanup().catch(() => {}))
+-  process.on("SIGTERM", () => void asyncCleanup().catch(() => {}))
++  const signalCleanup = () => void asyncCleanup().catch(() => {});
++  registerHandler("SIGINT", signalCleanup);
++  registerHandler("SIGTERM", signalCleanup);
+   if (process.platform === "win32") {
+-    process.on("SIGBREAK", () => void asyncCleanup().catch(() => {}))
++    registerHandler("SIGBREAK", signalCleanup);
+   }
++
++  return {
++    unregister: () => {
++      for (const { event, listener } of handlers) {
++        process.off(event, listener);
++      }
++      handlers.length = 0;
++    },
++  };
+ }
+diff --git a/src/tools/lsp/lsp-server.ts b/src/tools/lsp/lsp-server.ts
+index 9cbba484..69a004ed 100644
+--- a/src/tools/lsp/lsp-server.ts
++++ b/src/tools/lsp/lsp-server.ts
+@@ -1,73 +1,74 @@
+-import type { ResolvedServer } from "./types"
+-import { registerLspManagerProcessCleanup } from "./lsp-manager-process-cleanup"
+-import { cleanupTempDirectoryLspClients } from "./lsp-manager-temp-directory-cleanup"
+-import { LSPClient } from "./lsp-client"
++import { LSPClient } from "./lsp-client";
++import { registerLspManagerProcessCleanup, type LspProcessCleanupHandle } from "./lsp-manager-process-cleanup";
++import { cleanupTempDirectoryLspClients } from "./lsp-manager-temp-directory-cleanup";
++import type { ResolvedServer } from "./types";
+ interface ManagedClient {
+-  client: LSPClient
+-  lastUsedAt: number
+-  refCount: number
+-  initPromise?: Promise<void>
+-  isInitializing: boolean
+-  initializingSince?: number
++  client: LSPClient;
++  lastUsedAt: number;
++  refCount: number;
++  initPromise?: Promise<void>;
++  isInitializing: boolean;
++  initializingSince?: number;
+ }
+ class LSPServerManager {
+-  private static instance: LSPServerManager
+-  private clients = new Map<string, ManagedClient>()
+-  private cleanupInterval: ReturnType<typeof setInterval> | null = null
+-  private readonly IDLE_TIMEOUT = 5 * 60 * 1000
+-  private readonly INIT_TIMEOUT = 60 * 1000
++  private static instance: LSPServerManager;
++  private clients = new Map<string, ManagedClient>();
++  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
++  private readonly IDLE_TIMEOUT = 5 * 60 * 1000;
++  private readonly INIT_TIMEOUT = 60 * 1000;
++  private cleanupHandle: LspProcessCleanupHandle | null = null;
+   private constructor() {
+-    this.startCleanupTimer()
+-    this.registerProcessCleanup()
++    this.startCleanupTimer();
++    this.registerProcessCleanup();
+   }
+   private registerProcessCleanup(): void {
+-    registerLspManagerProcessCleanup({
++    this.cleanupHandle = registerLspManagerProcessCleanup({
+       getClients: () => this.clients.entries(),
+       clearClients: () => {
+-        this.clients.clear()
++        this.clients.clear();
+       },
+       clearCleanupInterval: () => {
+         if (this.cleanupInterval) {
+-          clearInterval(this.cleanupInterval)
+-          this.cleanupInterval = null
++          clearInterval(this.cleanupInterval);
++          this.cleanupInterval = null;
+         }
+       },
+-    })
++    });
+   }
+ 
+   static getInstance(): LSPServerManager {
+     if (!LSPServerManager.instance) {
+-      LSPServerManager.instance = new LSPServerManager()
++      LSPServerManager.instance = new LSPServerManager();
+     }
+-    return LSPServerManager.instance
++    return LSPServerManager.instance;
+   }
+ 
+   private getKey(root: string, serverId: string): string {
+-    return `${root}::${serverId}`
++    return `${root}::${serverId}`;
+   }
+ 
+   private startCleanupTimer(): void {
+-    if (this.cleanupInterval) return
++    if (this.cleanupInterval) return;
+     this.cleanupInterval = setInterval(() => {
+-      this.cleanupIdleClients()
+-    }, 60000)
++      this.cleanupIdleClients();
++    }, 60000);
+   }
+ 
+   private cleanupIdleClients(): void {
+-    const now = Date.now()
++    const now = Date.now();
+     for (const [key, managed] of this.clients) {
+       if (managed.refCount === 0 && now - managed.lastUsedAt > this.IDLE_TIMEOUT) {
+-        managed.client.stop()
+-        this.clients.delete(key)
++        managed.client.stop();
++        this.clients.delete(key);
+       }
+     }
+   }
+ 
+   async getClient(root: string, server: ResolvedServer): Promise<LSPClient> {
+-    const key = this.getKey(root, server.id)
+-    let managed = this.clients.get(key)
++    const key = this.getKey(root, server.id);
++    let managed = this.clients.get(key);
+     if (managed) {
+-      const now = Date.now()
++      const now = Date.now();
+       if (
+         managed.isInitializing &&
+         managed.initializingSince !== undefined &&
+@@ -75,45 +76,45 @@ class LSPServerManager {
+       ) {
+         // Stale init can permanently block subsequent calls (e.g., LSP process hang)
+         try {
+-          await managed.client.stop()
++          await managed.client.stop();
+         } catch {}
+-        this.clients.delete(key)
+-        managed = undefined
++        this.clients.delete(key);
++        managed = undefined;
+       }
+     }
+     if (managed) {
+       if (managed.initPromise) {
+         try {
+-          await managed.initPromise
++          await managed.initPromise;
+         } catch {
+           // Failed init should not keep the key blocked forever.
+           try {
+-            await managed.client.stop()
++            await managed.client.stop();
+           } catch {}
+-          this.clients.delete(key)
+-          managed = undefined
++          this.clients.delete(key);
++          managed = undefined;
+         }
+       }
+ 
+       if (managed) {
+         if (managed.client.isAlive()) {
+-          managed.refCount++
+-          managed.lastUsedAt = Date.now()
+-          return managed.client
++          managed.refCount++;
++          managed.lastUsedAt = Date.now();
++          return managed.client;
+         }
+         try {
+-          await managed.client.stop()
++          await managed.client.stop();
+         } catch {}
+-        this.clients.delete(key)
++        this.clients.delete(key);
+       }
+     }
+ 
+-    const client = new LSPClient(root, server)
++    const client = new LSPClient(root, server);
+     const initPromise = (async () => {
+-      await client.start()
+-      await client.initialize()
+-    })()
+-    const initStartedAt = Date.now()
++      await client.start();
++      await client.initialize();
++    })();
++    const initStartedAt = Date.now();
+     this.clients.set(key, {
+       client,
+       lastUsedAt: initStartedAt,
+@@ -121,37 +122,37 @@ class LSPServerManager {
+       initPromise,
+       isInitializing: true,
+       initializingSince: initStartedAt,
+-    })
++    });
+ 
+     try {
+-      await initPromise
++      await initPromise;
+     } catch (error) {
+-      this.clients.delete(key)
++      this.clients.delete(key);
+       try {
+-        await client.stop()
++        await client.stop();
+       } catch {}
+-      throw error
++      throw error;
+     }
+-    const m = this.clients.get(key)
++    const m = this.clients.get(key);
+     if (m) {
+-      m.initPromise = undefined
+-      m.isInitializing = false
+-      m.initializingSince = undefined
++      m.initPromise = undefined;
++      m.isInitializing = false;
++      m.initializingSince = undefined;
+     }
+ 
+-    return client
++    return client;
+   }
+ 
+   warmupClient(root: string, server: ResolvedServer): void {
+-    const key = this.getKey(root, server.id)
+-    if (this.clients.has(key)) return
+-    const client = new LSPClient(root, server)
++    const key = this.getKey(root, server.id);
++    if (this.clients.has(key)) return;
++    const client = new LSPClient(root, server);
+     const initPromise = (async () => {
+-      await client.start()
+-      await client.initialize()
+-    })()
++      await client.start();
++      await client.initialize();
++    })();
+ 
+-    const initStartedAt = Date.now()
++    const initStartedAt = Date.now();
+     this.clients.set(key, {
+       client,
+       lastUsedAt: initStartedAt,
+@@ -159,53 +160,55 @@ class LSPServerManager {
+       initPromise,
+       isInitializing: true,
+       initializingSince: initStartedAt,
+-    })
++    });
+ 
+     initPromise
+       .then(() => {
+-        const m = this.clients.get(key)
++        const m = this.clients.get(key);
+         if (m) {
+-          m.initPromise = undefined
+-          m.isInitializing = false
+-          m.initializingSince = undefined
++          m.initPromise = undefined;
++          m.isInitializing = false;
++          m.initializingSince = undefined;
+         }
+       })
+       .catch(() => {
+         // Warmup failures must not permanently block future initialization.
+-        this.clients.delete(key)
+-        void client.stop().catch(() => {})
+-      })
++        this.clients.delete(key);
++        void client.stop().catch(() => {});
++      });
+   }
+ 
+   releaseClient(root: string, serverId: string): void {
+-    const key = this.getKey(root, serverId)
+-    const managed = this.clients.get(key)
++    const key = this.getKey(root, serverId);
++    const managed = this.clients.get(key);
+     if (managed && managed.refCount > 0) {
+-      managed.refCount--
+-      managed.lastUsedAt = Date.now()
++      managed.refCount--;
++      managed.lastUsedAt = Date.now();
+     }
+   }
+ 
+   isServerInitializing(root: string, serverId: string): boolean {
+-    const key = this.getKey(root, serverId)
+-    const managed = this.clients.get(key)
+-    return managed?.isInitializing ?? false
++    const key = this.getKey(root, serverId);
++    const managed = this.clients.get(key);
++    return managed?.isInitializing ?? false;
+   }
+ 
+   async stopAll(): Promise<void> {
++    this.cleanupHandle?.unregister();
++    this.cleanupHandle = null;
+     for (const [, managed] of this.clients) {
+-      await managed.client.stop()
++      await managed.client.stop();
+     }
+-    this.clients.clear()
++    this.clients.clear();
+     if (this.cleanupInterval) {
+-      clearInterval(this.cleanupInterval)
+-      this.cleanupInterval = null
++      clearInterval(this.cleanupInterval);
++      this.cleanupInterval = null;
+     }
+   }
+ 
+   async cleanupTempDirectoryClients(): Promise<void> {
+-    await cleanupTempDirectoryLspClients(this.clients)
++    await cleanupTempDirectoryLspClients(this.clients);
+   }
+ }
+ 
+-export const lspManager = LSPServerManager.getInstance()
++export const lspManager = LSPServerManager.getInstance();
+-- 
+2.39.2
+

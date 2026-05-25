@@ -1,0 +1,425 @@
+From ae3a8d628b91dfeaa012b73882db74e5f2b217ec Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 7 Apr 2026 19:56:51 +0900
+Subject: [PATCH 4021/5749] fix(delegate-task): tighten subagent depth guard +
+ add regression smoke tests
+
+The depth limit (default maxDepth=3) was being silently bypassed when
+sync-task.ts could not reach the manager's spawn enforcement methods --
+the fallback hardcoded childDepth: 1, allowing infinite recursion of
+delegate_task calls in degraded environments.
+
+This was hard to catch because:
+1. The fallback path took the dangerous default silently (no log).
+2. There were no end-to-end smoke tests asserting that the depth value
+   coming back from reserveSubagentSpawn is actually used.
+3. The unit tests for resolveSubagentSpawnContext only covered error
+   cases, not the actual depth calculation.
+
+Changes:
+- sync-task.ts: split the spawnContext fallback into an explicit if/else
+  with a WARNING log when the manager is missing enforcement methods.
+  This makes the dangerous path observable in logs.
+- subagent-spawn-limits.test.ts: add depth calculation regression tests
+  (root, depth-1, depth-2, depth at max, parent cycle detection).
+- sync-task.test.ts: add two regression smoke tests:
+  1. depth limit error from reserveSubagentSpawn must be propagated and
+     must NOT create the session.
+  2. spawnDepth recorded in metadata must equal what reserveSubagentSpawn
+     returns -- guards against silent fallback to childDepth: 1.
+
+15 new spawn-limits tests + 2 new sync-task tests pass.
+Full suite: 5105 pass, 0 fail.
+---
+ .../subagent-spawn-limits.test.ts             | 183 +++++++++++++++++-
+ src/tools/delegate-task/sync-task.test.ts     | 133 +++++++++++++
+ src/tools/delegate-task/sync-task.ts          |  31 ++-
+ 3 files changed, 338 insertions(+), 9 deletions(-)
+
+diff --git a/src/features/background-agent/subagent-spawn-limits.test.ts b/src/features/background-agent/subagent-spawn-limits.test.ts
+index 154718db..85824d46 100644
+--- a/src/features/background-agent/subagent-spawn-limits.test.ts
++++ b/src/features/background-agent/subagent-spawn-limits.test.ts
+@@ -1,6 +1,14 @@
+ import { describe, expect, test } from "bun:test"
+ import type { OpencodeClient } from "./constants"
+-import { resolveSubagentSpawnContext } from "./subagent-spawn-limits"
++import {
++  resolveSubagentSpawnContext,
++  getMaxSubagentDepth,
++  DEFAULT_MAX_SUBAGENT_DEPTH,
++  createSubagentDepthLimitError,
++  createSubagentDescendantLimitError,
++  getMaxRootSessionSpawnBudget,
++  DEFAULT_MAX_ROOT_SESSION_SPAWN_BUDGET,
++} from "./subagent-spawn-limits"
+ 
+ function createMockClient(sessionGet: OpencodeClient["session"]["get"]): OpencodeClient {
+   return {
+@@ -41,4 +49,177 @@ describe("resolveSubagentSpawnContext", () => {
+       await expect(result).rejects.toThrow(/background_task\.maxDescendants cannot be enforced safely.*No session data returned/)
+     })
+   })
++
++  describe("depth calculation smoke tests (regression guard)", () => {
++    test("root session (no parentID) reports depth 0 and childDepth 1", async () => {
++      // given - a root session with no parent
++      const client = createMockClient(async (opts) => {
++        if (opts.path.id === "root-session") {
++          return { data: { id: "root-session", parentID: undefined } }
++        }
++        return { error: "not found", data: undefined }
++      })
++
++      // when
++      const result = await resolveSubagentSpawnContext(client, "root-session")
++
++      // then
++      expect(result.rootSessionID).toBe("root-session")
++      expect(result.parentDepth).toBe(0)
++      expect(result.childDepth).toBe(1)
++    })
++
++    test("depth-1 child reports childDepth 2", async () => {
++      // given - child -> root chain
++      const client = createMockClient(async (opts) => {
++        if (opts.path.id === "child-1") {
++          return { data: { id: "child-1", parentID: "root-session" } }
++        }
++        if (opts.path.id === "root-session") {
++          return { data: { id: "root-session", parentID: undefined } }
++        }
++        return { error: "not found", data: undefined }
++      })
++
++      // when
++      const result = await resolveSubagentSpawnContext(client, "child-1")
++
++      // then
++      expect(result.rootSessionID).toBe("root-session")
++      expect(result.parentDepth).toBe(1)
++      expect(result.childDepth).toBe(2)
++    })
++
++    test("depth-2 grandchild reports childDepth 3", async () => {
++      // given - grandchild -> child -> root chain
++      const client = createMockClient(async (opts) => {
++        const sessions: Record<string, { id: string; parentID?: string }> = {
++          "grandchild": { id: "grandchild", parentID: "child" },
++          "child": { id: "child", parentID: "root" },
++          "root": { id: "root", parentID: undefined },
++        }
++        const session = sessions[opts.path.id]
++        if (session) return { data: session }
++        return { error: "not found", data: undefined }
++      })
++
++      // when
++      const result = await resolveSubagentSpawnContext(client, "grandchild")
++
++      // then
++      expect(result.rootSessionID).toBe("root")
++      expect(result.parentDepth).toBe(2)
++      expect(result.childDepth).toBe(3)
++    })
++
++    test("depth at DEFAULT_MAX_SUBAGENT_DEPTH reports exact max childDepth", async () => {
++      // given - chain of exactly DEFAULT_MAX_SUBAGENT_DEPTH depth
++      // With default=3: session-3 -> session-2 -> session-1 -> root
++      const sessions: Record<string, { id: string; parentID?: string }> = {
++        "root": { id: "root" },
++      }
++      for (let i = 1; i <= DEFAULT_MAX_SUBAGENT_DEPTH; i++) {
++        sessions[`session-${i}`] = {
++          id: `session-${i}`,
++          parentID: i === 1 ? "root" : `session-${i - 1}`,
++        }
++      }
++
++      const client = createMockClient(async (opts) => {
++        const session = sessions[opts.path.id]
++        if (session) return { data: session }
++        return { error: "not found", data: undefined }
++      })
++
++      // when - resolve from the deepest session
++      const deepest = `session-${DEFAULT_MAX_SUBAGENT_DEPTH}`
++      const result = await resolveSubagentSpawnContext(client, deepest)
++
++      // then - childDepth should be DEFAULT_MAX_SUBAGENT_DEPTH + 1 (exceeds limit)
++      expect(result.childDepth).toBe(DEFAULT_MAX_SUBAGENT_DEPTH + 1)
++      expect(result.parentDepth).toBe(DEFAULT_MAX_SUBAGENT_DEPTH)
++    })
++
++    test("detects parent cycle and throws", async () => {
++      // given - A -> B -> A (cycle)
++      const client = createMockClient(async (opts) => {
++        const sessions: Record<string, { id: string; parentID?: string }> = {
++          "session-a": { id: "session-a", parentID: "session-b" },
++          "session-b": { id: "session-b", parentID: "session-a" },
++        }
++        const session = sessions[opts.path.id]
++        if (session) return { data: session }
++        return { error: "not found", data: undefined }
++      })
++
++      // when
++      const result = resolveSubagentSpawnContext(client, "session-a")
++
++      // then
++      await expect(result).rejects.toThrow(/session parent cycle/)
++    })
++  })
++})
++
++describe("getMaxSubagentDepth", () => {
++  test("returns DEFAULT_MAX_SUBAGENT_DEPTH when no config", () => {
++    expect(getMaxSubagentDepth()).toBe(DEFAULT_MAX_SUBAGENT_DEPTH)
++    expect(getMaxSubagentDepth(undefined)).toBe(DEFAULT_MAX_SUBAGENT_DEPTH)
++  })
++
++  test("returns config.maxDepth when provided", () => {
++    expect(getMaxSubagentDepth({ maxDepth: 5 })).toBe(5)
++    expect(getMaxSubagentDepth({ maxDepth: 1 })).toBe(1)
++    expect(getMaxSubagentDepth({ maxDepth: 0 })).toBe(0)
++  })
++
++  test("default is 3", () => {
++    expect(DEFAULT_MAX_SUBAGENT_DEPTH).toBe(3)
++  })
++})
++
++describe("getMaxRootSessionSpawnBudget", () => {
++  test("returns DEFAULT_MAX_ROOT_SESSION_SPAWN_BUDGET when no config", () => {
++    expect(getMaxRootSessionSpawnBudget()).toBe(DEFAULT_MAX_ROOT_SESSION_SPAWN_BUDGET)
++  })
++
++  test("returns config.maxDescendants when provided", () => {
++    expect(getMaxRootSessionSpawnBudget({ maxDescendants: 10 })).toBe(10)
++  })
++
++  test("default is 50", () => {
++    expect(DEFAULT_MAX_ROOT_SESSION_SPAWN_BUDGET).toBe(50)
++  })
++})
++
++describe("createSubagentDepthLimitError", () => {
++  test("includes childDepth, maxDepth, and session IDs in message", () => {
++    const error = createSubagentDepthLimitError({
++      childDepth: 4,
++      maxDepth: 3,
++      parentSessionID: "parent-123",
++      rootSessionID: "root-456",
++    })
++
++    expect(error.message).toContain("child depth 4")
++    expect(error.message).toContain("maxDepth=3")
++    expect(error.message).toContain("parent-123")
++    expect(error.message).toContain("root-456")
++    expect(error.message).toContain("spawn blocked")
++  })
++})
++
++describe("createSubagentDescendantLimitError", () => {
++  test("includes descendant count, max, and root session ID", () => {
++    const error = createSubagentDescendantLimitError({
++      rootSessionID: "root-789",
++      descendantCount: 50,
++      maxDescendants: 50,
++    })
++
++    expect(error.message).toContain("root-789")
++    expect(error.message).toContain("50")
++    expect(error.message).toContain("maxDescendants=50")
++    expect(error.message).toContain("spawn blocked")
++  })
+ })
+diff --git a/src/tools/delegate-task/sync-task.test.ts b/src/tools/delegate-task/sync-task.test.ts
+index 483a826b..b34a3cc6 100644
+--- a/src/tools/delegate-task/sync-task.test.ts
++++ b/src/tools/delegate-task/sync-task.test.ts
+@@ -282,6 +282,139 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     expect(deleteCalls.length).toBe(1)
+     expect(deleteCalls[0]).toBe("ses_test_12345678")
+   })
++
++  test("depth regression: blocks spawn when reserveSubagentSpawn throws depth limit error", async () => {
++    // This is a smoke test guarding against regressions where the depth limit
++    // would be silently bypassed (e.g. via a fallback path that hardcodes
++    // childDepth: 1).
++
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ses_test_12345678" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++
++    const reserveSubagentSpawn = mock(async () => {
++      throw new Error(
++        "Subagent spawn blocked: child depth 4 exceeds background_task.maxDepth=3. Parent session: parent. Root session: root. Continue in an existing subagent session instead of spawning another."
++      )
++    })
++
++    const deps = {
++      createSyncSession: async () => ({ ok: true, sessionID: "ses_test_12345678" }),
++      sendSyncPrompt: async () => null,
++      pollSyncSession: async () => null,
++      fetchSyncResult: async () => ({ ok: true as const, textContent: "Result" }),
++    }
++
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: () => {},
++    }
++
++    const mockExecutorCtx = {
++      manager: { reserveSubagentSpawn },
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    //#when - executeSyncTask is called from a session at max depth
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "test-agent", undefined, undefined, undefined, undefined, deps)
++
++    //#then - should propagate the depth limit error and NOT create the session
++    expect(result).toContain("Subagent spawn blocked")
++    expect(result).toContain("child depth 4")
++    expect(result).toContain("maxDepth=3")
++    expect(reserveSubagentSpawn).toHaveBeenCalledWith("parent-session")
++    // critical: createSyncSession must NOT have been called -- if it was,
++    // the depth guard was bypassed.
++    expect(addCalls.length).toBe(0)
++  })
++
++  test("depth regression: does not silently fall back to childDepth: 1 when manager methods are present", async () => {
++    // Guards against the dangerous fallback path in sync-task.ts that
++    // hardcodes childDepth: 1 if reserveSubagentSpawn / assertCanSpawn are
++    // not functions. With a real manager present, the fallback must NOT be
++    // taken.
++
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ses_test_12345678" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++
++    let reservedDepth: number | undefined
++    const commit = mock(() => 1)
++    const rollback = mock(() => {})
++    const reserveSubagentSpawn = mock(async () => {
++      // Return a depth that proves the real manager was consulted
++      reservedDepth = 3
++      return {
++        spawnContext: { rootSessionID: "root", parentDepth: 2, childDepth: 3 },
++        descendantCount: 5,
++        commit,
++        rollback,
++      }
++    })
++
++    const deps = {
++      createSyncSession: async () => ({ ok: true, sessionID: "ses_test_12345678" }),
++      sendSyncPrompt: async () => null,
++      pollSyncSession: async () => null,
++      fetchSyncResult: async () => ({ ok: true as const, textContent: "Result" }),
++    }
++
++    const metadataCalls: any[] = []
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: (input: any) => { metadataCalls.push(input) },
++    }
++
++    const mockExecutorCtx = {
++      manager: { reserveSubagentSpawn },
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++    }
++
++    const args = {
++      prompt: "test prompt",
++      description: "test task",
++      category: "test",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    //#when
++    await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "test-agent", undefined, undefined, undefined, undefined, deps)
++
++    //#then - the spawnDepth recorded in metadata MUST match what reserveSubagentSpawn returned
++    expect(reservedDepth).toBe(3)
++    const taskMeta = metadataCalls.find((c) => c.metadata?.spawnDepth !== undefined)
++    expect(taskMeta).toBeDefined()
++    expect(taskMeta.metadata.spawnDepth).toBe(3) // NOT 1 (the fallback value)
++  })
+ })
+ 
+ export {}
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index 07372d8a..d1ee6ff3 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -37,14 +37,29 @@ export async function executeSyncTask(
+       spawnReservation = await manager.reserveSubagentSpawn(parentContext.sessionID)
+     }
+ 
+-    const spawnContext = spawnReservation?.spawnContext
+-      ?? (typeof manager?.assertCanSpawn === "function"
+-        ? await manager.assertCanSpawn(parentContext.sessionID)
+-        : {
+-            rootSessionID: parentContext.sessionID,
+-            parentDepth: 0,
+-            childDepth: 1,
+-          })
++    // Depth/descendant guard. We must NOT silently fall back to childDepth: 1
++    // when the manager is unavailable or lacks the spawn methods, because that
++    // would let subagents recurse without bound. The only safe fallback is
++    // when the manager genuinely cannot enforce limits (legacy SDK), in which
++    // case we still record childDepth: 1 but log a warning so regressions are
++    // visible.
++    let spawnContext: { rootSessionID: string; parentDepth: number; childDepth: number }
++    if (spawnReservation?.spawnContext) {
++      spawnContext = spawnReservation.spawnContext
++    } else if (typeof manager?.assertCanSpawn === "function") {
++      spawnContext = await manager.assertCanSpawn(parentContext.sessionID)
++    } else {
++      log(
++        "[task] WARNING: BackgroundManager has no spawn enforcement methods (reserveSubagentSpawn / assertCanSpawn). " +
++        "Depth and descendant limits cannot be enforced for this task. This indicates an old SDK or a misconfiguration.",
++        { parentSessionID: parentContext.sessionID }
++      )
++      spawnContext = {
++        rootSessionID: parentContext.sessionID,
++        parentDepth: 0,
++        childDepth: 1,
++      }
++    }
+ 
+     const createSessionResult = await deps.createSyncSession(client, {
+       parentSessionID: parentContext.sessionID,
+-- 
+2.39.2
+

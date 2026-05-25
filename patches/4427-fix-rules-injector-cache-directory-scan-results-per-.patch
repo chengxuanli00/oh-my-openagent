@@ -1,0 +1,439 @@
+From 52512f226aaa4e87070fa74fea53fb2f899ab181 Mon Sep 17 00:00:00 2001
+From: Sisyphus <sisyphus@omo.ai>
+Date: Sat, 18 Apr 2026 14:13:51 +0900
+Subject: [PATCH 4427/5749] fix(rules-injector): cache directory scan results
+ per session
+
+---
+ src/hooks/rules-injector/cache.ts            |  28 +++
+ src/hooks/rules-injector/hook.ts             |  14 +-
+ src/hooks/rules-injector/injector.ts         |  12 +-
+ src/hooks/rules-injector/rule-file-finder.ts | 186 +++++++++++--------
+ src/hooks/rules-injector/rule-scan-cache.ts  |  21 +++
+ 5 files changed, 182 insertions(+), 79 deletions(-)
+ create mode 100644 src/hooks/rules-injector/rule-scan-cache.ts
+
+diff --git a/src/hooks/rules-injector/cache.ts b/src/hooks/rules-injector/cache.ts
+index b2327314..43d64565 100644
+--- a/src/hooks/rules-injector/cache.ts
++++ b/src/hooks/rules-injector/cache.ts
+@@ -1,4 +1,6 @@
+ import { clearInjectedRules, loadInjectedRules } from "./storage";
++import { createRuleScanCache } from "./rule-scan-cache";
++import type { RuleScanCache } from "./rule-scan-cache";
+ 
+ export type SessionInjectedRulesCache = {
+   contentHashes: Set<string>;
+@@ -25,3 +27,29 @@ export function createSessionCacheStore(): {
+ 
+   return { getSessionCache, clearSessionCache };
+ }
++
++export function createSessionRuleScanCacheStore(): {
++  getSessionRuleScanCache: (sessionID: string) => RuleScanCache;
++  clearSessionRuleScanCache: (sessionID: string) => void;
++} {
++  const sessionCaches = new Map<string, RuleScanCache>();
++
++  function getSessionRuleScanCache(sessionID: string): RuleScanCache {
++    const existingCache = sessionCaches.get(sessionID);
++    if (existingCache) {
++      return existingCache;
++    }
++
++    const cache = createRuleScanCache();
++    sessionCaches.set(sessionID, cache);
++    return cache;
++  }
++
++  function clearSessionRuleScanCache(sessionID: string): void {
++    const cache = sessionCaches.get(sessionID);
++    cache?.clear();
++    sessionCaches.delete(sessionID);
++  }
++
++  return { getSessionRuleScanCache, clearSessionRuleScanCache };
++}
+diff --git a/src/hooks/rules-injector/hook.ts b/src/hooks/rules-injector/hook.ts
+index f46af457..781acc4a 100644
+--- a/src/hooks/rules-injector/hook.ts
++++ b/src/hooks/rules-injector/hook.ts
+@@ -1,7 +1,7 @@
+ import type { PluginInput } from "@opencode-ai/plugin";
+ import { createDynamicTruncator } from "../../shared/dynamic-truncator";
+ import { getRuleInjectionFilePath } from "./output-path";
+-import { createSessionCacheStore } from "./cache";
++import { createSessionCacheStore, createSessionRuleScanCacheStore } from "./cache";
+ import { createRuleInjectionProcessor } from "./injector";
+ 
+ interface ToolExecuteInput {
+@@ -36,15 +36,23 @@ export function createRulesInjectorHook(
+ ) {
+   const truncator = createDynamicTruncator(ctx, modelCacheState);
+   const { getSessionCache, clearSessionCache } = createSessionCacheStore();
++  const { getSessionRuleScanCache, clearSessionRuleScanCache } =
++    createSessionRuleScanCacheStore();
+   const { processFilePathForInjection } = createRuleInjectionProcessor({
+     workspaceDirectory: ctx.directory,
+     truncator,
+     getSessionCache,
++    getSessionRuleScanCache,
+     ruleFinderOptions: options?.skipClaudeUserRules
+       ? { skipClaudeUserRules: true }
+       : undefined,
+   });
+ 
++  function clearSessionState(sessionID: string): void {
++    clearSessionCache(sessionID);
++    clearSessionRuleScanCache(sessionID);
++  }
++
+   const toolExecuteAfter = async (
+     input: ToolExecuteInput,
+     output: ToolExecuteOutput
+@@ -73,7 +81,7 @@ export function createRulesInjectorHook(
+     if (event.type === "session.deleted") {
+       const sessionInfo = props?.info as { id?: string } | undefined;
+       if (sessionInfo?.id) {
+-        clearSessionCache(sessionInfo.id);
++        clearSessionState(sessionInfo.id);
+       }
+     }
+ 
+@@ -81,7 +89,7 @@ export function createRulesInjectorHook(
+       const sessionID = (props?.sessionID ??
+         (props?.info as { id?: string } | undefined)?.id) as string | undefined;
+       if (sessionID) {
+-        clearSessionCache(sessionID);
++        clearSessionState(sessionID);
+       }
+     }
+   };
+diff --git a/src/hooks/rules-injector/injector.ts b/src/hooks/rules-injector/injector.ts
+index dc4e9fe2..0cd64be5 100644
+--- a/src/hooks/rules-injector/injector.ts
++++ b/src/hooks/rules-injector/injector.ts
+@@ -12,6 +12,7 @@ import {
+ import { parseRuleFrontmatter } from "./parser";
+ import { saveInjectedRules } from "./storage";
+ import type { SessionInjectedRulesCache } from "./cache";
++import type { RuleScanCache } from "./rule-scan-cache";
+ import type { RuleMetadata } from "./types";
+ 
+ type ToolExecuteOutput = {
+@@ -56,6 +57,7 @@ export function createRuleInjectionProcessor(deps: {
+   workspaceDirectory: string;
+   truncator: DynamicTruncator;
+   getSessionCache: (sessionID: string) => SessionInjectedRulesCache;
++  getSessionRuleScanCache?: (sessionID: string) => RuleScanCache;
+   ruleFinderOptions?: FindRuleFilesOptions;
+   readFileSync?: typeof readFileSync;
+   statSync?: typeof statSync;
+@@ -76,6 +78,7 @@ export function createRuleInjectionProcessor(deps: {
+     workspaceDirectory,
+     truncator,
+     getSessionCache,
++    getSessionRuleScanCache,
+     ruleFinderOptions,
+     readFileSync: readRuleFileSync = readFileSync,
+     statSync: statRuleSync = statSync,
+@@ -121,9 +124,16 @@ export function createRuleInjectionProcessor(deps: {
+ 
+     const projectRoot = findProjectRoot(resolved);
+     const cache = getSessionCache(sessionID);
++    const ruleScanCache = getSessionRuleScanCache?.(sessionID);
+     const home = getHomeDir();
+ 
+-    const ruleFileCandidates = findRuleFiles(projectRoot, home, resolved, ruleFinderOptions);
++    const ruleFileCandidates = findRuleFiles(
++      projectRoot,
++      home,
++      resolved,
++      ruleFinderOptions,
++      ruleScanCache,
++    );
+     const toInject: RuleToInject[] = [];
+     let dirty = false;
+ 
+diff --git a/src/hooks/rules-injector/rule-file-finder.ts b/src/hooks/rules-injector/rule-file-finder.ts
+index 98bd6942..7059804d 100644
+--- a/src/hooks/rules-injector/rule-file-finder.ts
++++ b/src/hooks/rules-injector/rule-file-finder.ts
+@@ -1,51 +1,108 @@
+ import { existsSync, statSync } from "node:fs";
+-import { dirname, join } from "node:path";
++import { dirname, join, sep } from "node:path";
+ import {
++  OPENCODE_USER_RULE_DIRS,
+   PROJECT_RULE_FILES,
+   PROJECT_RULE_SUBDIRS,
+   USER_RULE_DIR,
+-  OPENCODE_USER_RULE_DIRS,
+ } from "./constants";
+-import type { RuleFileCandidate } from "./types";
++import type { RuleScanCache } from "./rule-scan-cache";
+ import { findRuleFilesRecursive, safeRealpathSync } from "./rule-file-scanner";
++import type { RuleFileCandidate } from "./types";
+ 
+ export interface FindRuleFilesOptions {
+-  /**
+-   * When true, skip loading rules from ~/.claude/rules/.
+-   * Use when claude_code integration is disabled to prevent
+-   * Claude Code-specific instructions from leaking into non-Claude agents.
+-   */
+   skipClaudeUserRules?: boolean;
+ }
+ 
+-/**
+- * Find all rule files for a given context.
+- * Searches from currentFile upward to projectRoot for rule directories,
+- * then user-level directory (~/.claude/rules).
+- *
+- * IMPORTANT: This searches EVERY directory from file to project root.
+- * Not just the project root itself.
+- *
+- * @param projectRoot - Project root path (or null if outside any project)
+- * @param homeDir - User home directory
+- * @param currentFile - Current file being edited (for distance calculation)
+- * @returns Array of rule file candidates sorted by distance
+- */
++function getUserRuleDirs(homeDir: string, skipClaudeUserRules: boolean): string[] {
++  const userRuleDirs = OPENCODE_USER_RULE_DIRS.map((dir) => join(homeDir, dir));
++  if (!skipClaudeUserRules) {
++    userRuleDirs.push(join(homeDir, USER_RULE_DIR));
++  }
++  return userRuleDirs;
++}
++
++function createCacheKey(
++  projectRoot: string | null,
++  startDir: string,
++  skipClaudeUserRules: boolean,
++): string {
++  return `${projectRoot ?? ""}|${startDir}|${skipClaudeUserRules ? "1" : "0"}`;
++}
++
++function createCachedCandidate(
++  filePath: string,
++  projectRoot: string | null,
++  startDir: string,
++  userRuleDirs: string[],
++): RuleFileCandidate | undefined {
++  const realPath = safeRealpathSync(filePath);
++
++  for (const userRuleDir of userRuleDirs) {
++    if (filePath.startsWith(`${userRuleDir}${sep}`)) {
++      return { path: filePath, realPath, isGlobal: true, distance: 9999 };
++    }
++  }
++
++  if (projectRoot) {
++    for (const ruleFile of PROJECT_RULE_FILES) {
++      if (filePath === join(projectRoot, ruleFile)) {
++        return {
++          path: filePath,
++          realPath,
++          isGlobal: false,
++          distance: 0,
++          isSingleFile: true,
++        };
++      }
++    }
++  }
++
++  let currentDir = startDir;
++  let distance = 0;
++  while (true) {
++    for (const [parent, subdir] of PROJECT_RULE_SUBDIRS) {
++      const ruleDir = join(currentDir, parent, subdir);
++      if (filePath.startsWith(`${ruleDir}${sep}`)) {
++        return { path: filePath, realPath, isGlobal: false, distance };
++      }
++    }
++
++    if (projectRoot && currentDir === projectRoot) break;
++    const parentDir = dirname(currentDir);
++    if (parentDir === currentDir) break;
++    currentDir = parentDir;
++    distance += 1;
++  }
++
++  return undefined;
++}
++
+ export function findRuleFiles(
+   projectRoot: string | null,
+   homeDir: string,
+   currentFile: string,
+   options?: FindRuleFilesOptions,
++  cache?: RuleScanCache,
+ ): RuleFileCandidate[] {
++  const startDir = dirname(currentFile);
++  const skipClaudeUserRules = options?.skipClaudeUserRules ?? false;
++  const userRuleDirs = getUserRuleDirs(homeDir, skipClaudeUserRules);
++  const cacheKey = createCacheKey(projectRoot, startDir, skipClaudeUserRules);
++  const cachedPaths = cache?.get(cacheKey);
++
++  if (cachedPaths) {
++    return cachedPaths
++      .map((filePath) => createCachedCandidate(filePath, projectRoot, startDir, userRuleDirs))
++      .filter((candidate): candidate is RuleFileCandidate => candidate !== undefined);
++  }
++
+   const candidates: RuleFileCandidate[] = [];
+   const seenRealPaths = new Set<string>();
+-
+-  // Search from current file's directory up to project root
+-  let currentDir = dirname(currentFile);
++  let currentDir = startDir;
+   let distance = 0;
+ 
+   while (true) {
+-    // Search rule directories in current directory
+     for (const [parent, subdir] of PROJECT_RULE_SUBDIRS) {
+       const ruleDir = join(currentDir, parent, subdir);
+       const files: string[] = [];
+@@ -55,60 +112,41 @@ export function findRuleFiles(
+         const realPath = safeRealpathSync(filePath);
+         if (seenRealPaths.has(realPath)) continue;
+         seenRealPaths.add(realPath);
+-
+-        candidates.push({
+-          path: filePath,
+-          realPath,
+-          isGlobal: false,
+-          distance,
+-        });
++        candidates.push({ path: filePath, realPath, isGlobal: false, distance });
+       }
+     }
+ 
+-    // Stop at project root or filesystem root
+     if (projectRoot && currentDir === projectRoot) break;
+     const parentDir = dirname(currentDir);
+     if (parentDir === currentDir) break;
+     currentDir = parentDir;
+-    distance++;
++    distance += 1;
+   }
+ 
+-  // Check for single-file rules at project root (e.g., .github/copilot-instructions.md)
+   if (projectRoot) {
+     for (const ruleFile of PROJECT_RULE_FILES) {
+       const filePath = join(projectRoot, ruleFile);
+-      if (existsSync(filePath)) {
+-        try {
+-          const stat = statSync(filePath);
+-          if (stat.isFile()) {
+-            const realPath = safeRealpathSync(filePath);
+-            if (!seenRealPaths.has(realPath)) {
+-              seenRealPaths.add(realPath);
+-              candidates.push({
+-                path: filePath,
+-                realPath,
+-                isGlobal: false,
+-                distance: 0,
+-                isSingleFile: true,
+-              });
+-            }
+-          }
+-        } catch {
+-          // Skip if file can't be read
+-        }
++      if (!existsSync(filePath)) continue;
++
++      try {
++        const stat = statSync(filePath);
++        if (!stat.isFile()) continue;
++        const realPath = safeRealpathSync(filePath);
++        if (seenRealPaths.has(realPath)) continue;
++        seenRealPaths.add(realPath);
++        candidates.push({
++          path: filePath,
++          realPath,
++          isGlobal: false,
++          distance: 0,
++          isSingleFile: true,
++        });
++      } catch {
++        continue;
+       }
+     }
+   }
+ 
+-  // Search user-level rule directories
+-  // Always search OpenCode-native dirs (~/.sisyphus/rules, ~/.opencode/rules)
+-  const userRuleDirs: string[] = OPENCODE_USER_RULE_DIRS.map((dir) => join(homeDir, dir));
+-
+-  // Only search ~/.claude/rules when claude_code integration is not disabled
+-  if (!options?.skipClaudeUserRules) {
+-    userRuleDirs.push(join(homeDir, USER_RULE_DIR));
+-  }
+-
+   for (const userRuleDir of userRuleDirs) {
+     const userFiles: string[] = [];
+     findRuleFilesRecursive(userRuleDir, userFiles);
+@@ -117,23 +155,21 @@ export function findRuleFiles(
+       const realPath = safeRealpathSync(filePath);
+       if (seenRealPaths.has(realPath)) continue;
+       seenRealPaths.add(realPath);
+-
+-      candidates.push({
+-        path: filePath,
+-        realPath,
+-        isGlobal: true,
+-        distance: 9999, // Global rules always have max distance
+-      });
++      candidates.push({ path: filePath, realPath, isGlobal: true, distance: 9999 });
+     }
+   }
+ 
+-  // Sort by distance (closest first, then global rules last)
+-  candidates.sort((a, b) => {
+-    if (a.isGlobal !== b.isGlobal) {
+-      return a.isGlobal ? 1 : -1;
++  candidates.sort((left, right) => {
++    if (left.isGlobal !== right.isGlobal) {
++      return left.isGlobal ? 1 : -1;
+     }
+-    return a.distance - b.distance;
++    return left.distance - right.distance;
+   });
+ 
++  cache?.set(
++    cacheKey,
++    candidates.map((candidate) => candidate.path),
++  );
++
+   return candidates;
+ }
+diff --git a/src/hooks/rules-injector/rule-scan-cache.ts b/src/hooks/rules-injector/rule-scan-cache.ts
+new file mode 100644
+index 00000000..fc8ff1a2
+--- /dev/null
++++ b/src/hooks/rules-injector/rule-scan-cache.ts
+@@ -0,0 +1,21 @@
++export type RuleScanCache = {
++  get: (key: string) => string[] | undefined;
++  set: (key: string, value: string[]) => void;
++  clear: () => void;
++};
++
++export function createRuleScanCache(): RuleScanCache {
++  const cache = new Map<string, string[]>();
++
++  return {
++    get(key: string): string[] | undefined {
++      return cache.get(key);
++    },
++    set(key: string, value: string[]): void {
++      cache.set(key, value);
++    },
++    clear(): void {
++      cache.clear();
++    },
++  };
++}
+-- 
+2.39.2
+

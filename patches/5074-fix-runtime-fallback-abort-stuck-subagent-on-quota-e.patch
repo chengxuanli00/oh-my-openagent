@@ -1,0 +1,211 @@
+From ecb92c1e703c4c8fdd55c528ef2d230a85fef987 Mon Sep 17 00:00:00 2001
+From: Ivan Smetanin <smetanin23@yandex.ru>
+Date: Mon, 11 May 2026 14:40:43 +0100
+Subject: [PATCH 5074/5749] fix(runtime-fallback): abort stuck subagent on
+ quota error with no fallback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a subagent session (e.g. Momus on GPT) hits a quota/usage-limit
+error and the agent's category has no `fallback_models` configured, the
+runtime-fallback hook previously returned silently. The OpenCode session
+stayed in `retry` status indefinitely while the SDK kept hitting the
+limit, the sync-task poller treated `retry` as active work, and the
+parent's pending `task` tool call never resolved — leaving a stuck
+"waiting for subagent" indicator in the parent conversation.
+
+Narrow fix: at the `fallbackModels.length === 0` exit point, if the
+session is a known subagent AND the error classifies as
+`quota_exceeded`, abort the subagent session. The existing
+`getTerminalSessionError` path in `sync-session-poller.ts` then surfaces
+the error via the parent's tool result, which is the persistent surface
+the user is already watching.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../message-update-handler.ts                 |  11 ++
+ .../subagent-quota-abort.test.ts              | 142 ++++++++++++++++++
+ 2 files changed, 153 insertions(+)
+ create mode 100644 src/hooks/runtime-fallback/subagent-quota-abort.test.ts
+
+diff --git a/src/hooks/runtime-fallback/message-update-handler.ts b/src/hooks/runtime-fallback/message-update-handler.ts
+index 0c07405a..7382ebd2 100644
+--- a/src/hooks/runtime-fallback/message-update-handler.ts
++++ b/src/hooks/runtime-fallback/message-update-handler.ts
+@@ -8,6 +8,7 @@ import { getFallbackModelsForSession } from "./fallback-models"
+ import { resolveFallbackBootstrapModel } from "./fallback-bootstrap-model"
+ import { dispatchFallbackRetry } from "./fallback-retry-dispatcher"
+ import { hasVisibleAssistantResponse } from "./visible-assistant-response"
++import { subagentSessions } from "../../features/claude-code-session-state"
+ 
+ export { hasVisibleAssistantResponse } from "./visible-assistant-response"
+ 
+@@ -112,6 +113,16 @@ export function createMessageUpdateHandler(deps: HookDeps, helpers: AutoRetryHel
+       const fallbackModels = getFallbackModelsForSession(sessionID, resolvedAgent, pluginConfig)
+ 
+       if (fallbackModels.length === 0) {
++        if (
++          subagentSessions.has(sessionID) &&
++          classifyErrorType(error) === "quota_exceeded"
++        ) {
++          log(`[${HOOK_NAME}] Aborting subagent on unrecoverable quota error (no fallback configured)`, {
++            sessionID,
++            model,
++          })
++          await helpers.abortSessionRequest(sessionID, "message.updated.subagent-quota-no-fallback")
++        }
+         return
+       }
+ 
+diff --git a/src/hooks/runtime-fallback/subagent-quota-abort.test.ts b/src/hooks/runtime-fallback/subagent-quota-abort.test.ts
+new file mode 100644
+index 00000000..1507cf6f
+--- /dev/null
++++ b/src/hooks/runtime-fallback/subagent-quota-abort.test.ts
+@@ -0,0 +1,142 @@
++import { afterEach, beforeEach, describe, expect, it } from "bun:test"
++import type { HookDeps, RuntimeFallbackPluginInput } from "./types"
++import type { AutoRetryHelpers } from "./auto-retry"
++import { subagentSessions } from "../../features/claude-code-session-state"
++
++type MessageUpdateHandlerModule = typeof import("./message-update-handler")
++
++async function importFreshMessageUpdateHandlerModule(): Promise<MessageUpdateHandlerModule> {
++  return import(`./message-update-handler?subagent-quota-${Date.now()}-${Math.random()}`)
++}
++
++function createContext(): RuntimeFallbackPluginInput {
++  return {
++    client: {
++      session: {
++        abort: async () => ({}),
++        messages: async () => ({ data: [] }),
++        promptAsync: async () => ({}),
++      },
++      tui: {
++        showToast: async () => ({}),
++      },
++    },
++    directory: "/test/dir",
++  }
++}
++
++function createDeps(): HookDeps {
++  return {
++    ctx: createContext(),
++    config: {
++      enabled: true,
++      retry_on_errors: [429, 503, 529],
++      max_fallback_attempts: 3,
++      cooldown_seconds: 60,
++      timeout_seconds: 30,
++      notify_on_fallback: false,
++    },
++    options: undefined,
++    pluginConfig: {},
++    sessionStates: new Map(),
++    sessionLastAccess: new Map(),
++    sessionRetryInFlight: new Set(),
++    sessionAwaitingFallbackResult: new Set(),
++    sessionFallbackTimeouts: new Map(),
++    sessionStatusRetryKeys: new Map(),
++  }
++}
++
++function createHelpers(abortCalls: Array<{ sessionID: string; source: string }>): AutoRetryHelpers {
++  return {
++    abortSessionRequest: async (sessionID: string, source: string) => {
++      abortCalls.push({ sessionID, source })
++    },
++    clearSessionFallbackTimeout: () => {},
++    scheduleSessionFallbackTimeout: () => {},
++    autoRetryWithFallback: async () => {},
++    resolveAgentForSessionFromContext: async () => undefined,
++    cleanupStaleSessions: () => {},
++  }
++}
++
++const QUOTA_ERROR = {
++  name: "QuotaExceededError",
++  message: "You exceeded your current quota. Please check your plan and billing details.",
++}
++
++const QUOTA_INFO = {
++  role: "assistant",
++  model: "openai/gpt-5.5",
++  error: QUOTA_ERROR,
++}
++
++describe("createMessageUpdateHandler subagent quota abort", () => {
++  beforeEach(() => {
++    subagentSessions.clear()
++  })
++
++  afterEach(() => {
++    subagentSessions.clear()
++  })
++
++  it("#given a subagent session hits a quota error with no fallback configured #when the assistant error event fires #then the subagent session is aborted so the parent tool call can resolve", async () => {
++    // given
++    const { createMessageUpdateHandler } = await importFreshMessageUpdateHandlerModule()
++    const sessionID = "session-momus-subagent"
++    subagentSessions.add(sessionID)
++    const abortCalls: Array<{ sessionID: string; source: string }> = []
++    const deps = createDeps()
++    const handler = createMessageUpdateHandler(deps, createHelpers(abortCalls))
++
++    // when
++    await handler({ info: { sessionID, ...QUOTA_INFO } })
++
++    // then
++    expect(abortCalls).toEqual([
++      { sessionID, source: "message.updated.subagent-quota-no-fallback" },
++    ])
++  })
++
++  it("#given a non-subagent (user) session hits the same quota error #when the assistant error event fires #then the user session is NOT aborted", async () => {
++    // given
++    const { createMessageUpdateHandler } = await importFreshMessageUpdateHandlerModule()
++    const sessionID = "session-user-foreground"
++    // NOT added to subagentSessions
++    const abortCalls: Array<{ sessionID: string; source: string }> = []
++    const deps = createDeps()
++    const handler = createMessageUpdateHandler(deps, createHelpers(abortCalls))
++
++    // when
++    await handler({ info: { sessionID, ...QUOTA_INFO } })
++
++    // then
++    expect(abortCalls).toEqual([])
++  })
++
++  it("#given a subagent session hits a non-quota retryable error (rate limit) with no fallback configured #when the assistant error event fires #then the subagent is NOT aborted (preserves existing behavior for other error classes)", async () => {
++    // given
++    const { createMessageUpdateHandler } = await importFreshMessageUpdateHandlerModule()
++    const sessionID = "session-rate-limited-subagent"
++    subagentSessions.add(sessionID)
++    const abortCalls: Array<{ sessionID: string; source: string }> = []
++    const deps = createDeps()
++    const handler = createMessageUpdateHandler(deps, createHelpers(abortCalls))
++
++    // when
++    await handler({
++      info: {
++        sessionID,
++        role: "assistant",
++        model: "openai/gpt-5.5",
++        error: {
++          name: "RateLimitError",
++          message: "rate limit exceeded, retrying in 30s",
++        },
++      },
++    })
++
++    // then
++    expect(abortCalls).toEqual([])
++  })
++})
+-- 
+2.39.2
+

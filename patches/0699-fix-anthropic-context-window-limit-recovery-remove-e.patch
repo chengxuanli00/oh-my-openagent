@@ -1,0 +1,589 @@
+From d49c221cb17ecb3aa2866ad0c4b99c07bf7d0fe5 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 31 Dec 2025 12:31:24 +0900
+Subject: [PATCH 0699/5749] fix(anthropic-context-window-limit-recovery):
+ remove emergency fallback message revert logic
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Remove the FallbackState interface and related fallback recovery mechanism that deleted message pairs when all other compaction attempts failed. This simplifies the recovery strategy by eliminating the last-resort fallback approach.
+
+Changes:
+- Removed FallbackState interface and FALLBACK_CONFIG from types.ts
+- Removed fallbackStateBySession from AutoCompactState
+- Removed getOrCreateFallbackState and getLastMessagePair functions
+- Removed emergency revert block that deleted user+assistant message pairs
+- Updated clearSessionState and timeout reset logic
+- Removed related test cases
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ .../executor.test.ts                          |  36 -----
+ .../executor.ts                               | 139 +-----------------
+ .../index.ts                                  |   4 +-
+ .../types.ts                                  |  11 --
+ src/tools/session-manager/storage.test.ts     | 139 ++++++++++++++++++
+ src/tools/session-manager/tools.test.ts       |  21 +++
+ src/tools/session-manager/types.ts            |  19 +++
+ 7 files changed, 183 insertions(+), 186 deletions(-)
+
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts b/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
+index 3650a8dc..8c958aa6 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
+@@ -15,7 +15,6 @@ describe("executeCompact lock management", () => {
+       pendingCompact: new Set<string>(),
+       errorDataBySession: new Map(),
+       retryStateBySession: new Map(),
+-      fallbackStateBySession: new Map(),
+       truncateStateBySession: new Map(),
+       dcpStateBySession: new Map(),
+       emptyContentAttemptBySession: new Map(),
+@@ -68,38 +67,6 @@ describe("executeCompact lock management", () => {
+     expect(autoCompactState.compactionInProgress.has(sessionID)).toBe(false)
+   })
+ 
+-  test("clears lock when revert throws exception", async () => {
+-    // #given: Force revert path by exhausting retry attempts and making revert fail
+-    mockClient.session.revert = mock(() =>
+-      Promise.reject(new Error("Revert failed")),
+-    )
+-    mockClient.session.messages = mock(() =>
+-      Promise.resolve({
+-        data: [
+-          { info: { id: "msg1", role: "user" } },
+-          { info: { id: "msg2", role: "assistant" } },
+-        ],
+-      }),
+-    )
+-
+-    // Exhaust retry attempts
+-    autoCompactState.retryStateBySession.set(sessionID, {
+-      attempt: 5,
+-      lastAttemptTime: Date.now(),
+-    })
+-    autoCompactState.errorDataBySession.set(sessionID, {
+-      errorType: "token_limit",
+-      currentTokens: 100000,
+-      maxTokens: 200000,
+-    })
+-
+-    // #when: Execute compaction
+-    await executeCompact(sessionID, msg, autoCompactState, mockClient, directory)
+-
+-    // #then: Lock cleared even though revert failed
+-    expect(autoCompactState.compactionInProgress.has(sessionID)).toBe(false)
+-  })
+-
+   test("shows toast when lock already held", async () => {
+     // #given: Lock already held
+     autoCompactState.compactionInProgress.add(sessionID)
+@@ -195,9 +162,6 @@ describe("executeCompact lock management", () => {
+       attempt: 5,
+       lastAttemptTime: Date.now(),
+     })
+-    autoCompactState.fallbackStateBySession.set(sessionID, {
+-      revertAttempt: 5,
+-    })
+     autoCompactState.truncateStateBySession.set(sessionID, {
+       truncateAttempt: 5,
+     })
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/executor.ts b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+index 3c1fac9d..baeeef38 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/executor.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+@@ -1,12 +1,11 @@
+ import type {
+   AutoCompactState,
+   DcpState,
+-  FallbackState,
+   RetryState,
+   TruncateState,
+ } from "./types";
+ import type { ExperimentalConfig } from "../../config";
+-import { FALLBACK_CONFIG, RETRY_CONFIG, TRUNCATE_CONFIG } from "./types";
++import { RETRY_CONFIG, TRUNCATE_CONFIG } from "./types";
+ import { executeDynamicContextPruning } from "./pruning-executor";
+ import {
+   findLargestToolResult,
+@@ -69,17 +68,7 @@ function getOrCreateRetryState(
+   return state;
+ }
+ 
+-function getOrCreateFallbackState(
+-  autoCompactState: AutoCompactState,
+-  sessionID: string,
+-): FallbackState {
+-  let state = autoCompactState.fallbackStateBySession.get(sessionID);
+-  if (!state) {
+-    state = { revertAttempt: 0 };
+-    autoCompactState.fallbackStateBySession.set(sessionID, state);
+-  }
+-  return state;
+-}
++
+ 
+ function getOrCreateTruncateState(
+   autoCompactState: AutoCompactState,
+@@ -135,58 +124,6 @@ function sanitizeEmptyMessagesBeforeSummarize(sessionID: string): number {
+   return fixedCount;
+ }
+ 
+-async function getLastMessagePair(
+-  sessionID: string,
+-  client: Client,
+-  directory: string,
+-): Promise<{ userMessageID: string; assistantMessageID?: string } | null> {
+-  try {
+-    const resp = await client.session.messages({
+-      path: { id: sessionID },
+-      query: { directory },
+-    });
+-
+-    const data = (resp as { data?: unknown[] }).data;
+-    if (
+-      !Array.isArray(data) ||
+-      data.length < FALLBACK_CONFIG.minMessagesRequired
+-    ) {
+-      return null;
+-    }
+-
+-    const reversed = [...data].reverse();
+-
+-    const lastAssistant = reversed.find((m) => {
+-      const msg = m as Record<string, unknown>;
+-      const info = msg.info as Record<string, unknown> | undefined;
+-      return info?.role === "assistant";
+-    });
+-
+-    const lastUser = reversed.find((m) => {
+-      const msg = m as Record<string, unknown>;
+-      const info = msg.info as Record<string, unknown> | undefined;
+-      return info?.role === "user";
+-    });
+-
+-    if (!lastUser) return null;
+-    const userInfo = (lastUser as { info?: Record<string, unknown> }).info;
+-    const userMessageID = userInfo?.id as string | undefined;
+-    if (!userMessageID) return null;
+-
+-    let assistantMessageID: string | undefined;
+-    if (lastAssistant) {
+-      const assistantInfo = (
+-        lastAssistant as { info?: Record<string, unknown> }
+-      ).info;
+-      assistantMessageID = assistantInfo?.id as string | undefined;
+-    }
+-
+-    return { userMessageID, assistantMessageID };
+-  } catch {
+-    return null;
+-  }
+-}
+-
+ function formatBytes(bytes: number): string {
+   if (bytes < 1024) return `${bytes}B`;
+   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+@@ -228,7 +165,6 @@ function clearSessionState(
+   autoCompactState.pendingCompact.delete(sessionID);
+   autoCompactState.errorDataBySession.delete(sessionID);
+   autoCompactState.retryStateBySession.delete(sessionID);
+-  autoCompactState.fallbackStateBySession.delete(sessionID);
+   autoCompactState.truncateStateBySession.delete(sessionID);
+   autoCompactState.dcpStateBySession.delete(sessionID);
+   autoCompactState.emptyContentAttemptBySession.delete(sessionID);
+@@ -642,7 +578,6 @@ export async function executeCompact(
+ 
+     if (Date.now() - retryState.lastAttemptTime > 300000) {
+       retryState.attempt = 0;
+-      autoCompactState.fallbackStateBySession.delete(sessionID);
+       autoCompactState.truncateStateBySession.delete(sessionID);
+     }
+ 
+@@ -708,75 +643,7 @@ export async function executeCompact(
+           .showToast({
+             body: {
+               title: "Summarize Skipped",
+-              message: "Missing providerID or modelID. Skipping to revert...",
+-              variant: "warning",
+-              duration: 3000,
+-            },
+-          })
+-          .catch(() => {});
+-      }
+-    }
+-
+-    const fallbackState = getOrCreateFallbackState(autoCompactState, sessionID);
+-
+-    if (fallbackState.revertAttempt < FALLBACK_CONFIG.maxRevertAttempts) {
+-      const pair = await getLastMessagePair(
+-        sessionID,
+-        client as Client,
+-        directory,
+-      );
+-
+-      if (pair) {
+-        try {
+-          await (client as Client).tui
+-            .showToast({
+-              body: {
+-                title: "Emergency Recovery",
+-                message: "Removing last message pair...",
+-                variant: "warning",
+-                duration: 3000,
+-              },
+-            })
+-            .catch(() => {});
+-
+-          if (pair.assistantMessageID) {
+-            await (client as Client).session.revert({
+-              path: { id: sessionID },
+-              body: { messageID: pair.assistantMessageID },
+-              query: { directory },
+-            });
+-          }
+-
+-          await (client as Client).session.revert({
+-            path: { id: sessionID },
+-            body: { messageID: pair.userMessageID },
+-            query: { directory },
+-          });
+-
+-          fallbackState.revertAttempt++;
+-          fallbackState.lastRevertedMessageID = pair.userMessageID;
+-
+-          // Clear all state after successful revert - don't recurse
+-          clearSessionState(autoCompactState, sessionID);
+-
+-          // Send "Continue" prompt to resume session
+-          setTimeout(async () => {
+-            try {
+-              await (client as Client).session.prompt_async({
+-                path: { sessionID },
+-                body: { parts: [{ type: "text", text: "Continue" }] },
+-                query: { directory },
+-              });
+-            } catch {}
+-          }, 500);
+-          return;
+-        } catch {}
+-      } else {
+-        await (client as Client).tui
+-          .showToast({
+-            body: {
+-              title: "Revert Skipped",
+-              message: "Could not find last message pair to revert.",
++              message: "Missing providerID or modelID.",
+               variant: "warning",
+               duration: 3000,
+             },
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/index.ts b/src/hooks/anthropic-context-window-limit-recovery/index.ts
+index a9246649..418b4e0d 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/index.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/index.ts
+@@ -15,7 +15,6 @@ function createRecoveryState(): AutoCompactState {
+     pendingCompact: new Set<string>(),
+     errorDataBySession: new Map<string, ParsedTokenLimitError>(),
+     retryStateBySession: new Map(),
+-    fallbackStateBySession: new Map(),
+     truncateStateBySession: new Map(),
+     dcpStateBySession: new Map(),
+     emptyContentAttemptBySession: new Map(),
+@@ -37,7 +36,6 @@ export function createAnthropicContextWindowLimitRecoveryHook(ctx: PluginInput,
+         autoCompactState.pendingCompact.delete(sessionInfo.id)
+         autoCompactState.errorDataBySession.delete(sessionInfo.id)
+         autoCompactState.retryStateBySession.delete(sessionInfo.id)
+-        autoCompactState.fallbackStateBySession.delete(sessionInfo.id)
+         autoCompactState.truncateStateBySession.delete(sessionInfo.id)
+         autoCompactState.dcpStateBySession.delete(sessionInfo.id)
+         autoCompactState.emptyContentAttemptBySession.delete(sessionInfo.id)
+@@ -154,6 +152,6 @@ export function createAnthropicContextWindowLimitRecoveryHook(ctx: PluginInput,
+   }
+ }
+ 
+-export type { AutoCompactState, DcpState, FallbackState, ParsedTokenLimitError, TruncateState } from "./types"
++export type { AutoCompactState, DcpState, ParsedTokenLimitError, TruncateState } from "./types"
+ export { parseAnthropicTokenLimitError } from "./parser"
+ export { executeCompact, getLastAssistant } from "./executor"
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/types.ts b/src/hooks/anthropic-context-window-limit-recovery/types.ts
+index ae62e46e..024fd544 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/types.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/types.ts
+@@ -13,11 +13,6 @@ export interface RetryState {
+   lastAttemptTime: number
+ }
+ 
+-export interface FallbackState {
+-  revertAttempt: number
+-  lastRevertedMessageID?: string
+-}
+-
+ export interface TruncateState {
+   truncateAttempt: number
+   lastTruncatedPartId?: string
+@@ -32,7 +27,6 @@ export interface AutoCompactState {
+   pendingCompact: Set<string>
+   errorDataBySession: Map<string, ParsedTokenLimitError>
+   retryStateBySession: Map<string, RetryState>
+-  fallbackStateBySession: Map<string, FallbackState>
+   truncateStateBySession: Map<string, TruncateState>
+   dcpStateBySession: Map<string, DcpState>
+   emptyContentAttemptBySession: Map<string, number>
+@@ -46,11 +40,6 @@ export const RETRY_CONFIG = {
+   maxDelayMs: 30000,
+ } as const
+ 
+-export const FALLBACK_CONFIG = {
+-  maxRevertAttempts: 3,
+-  minMessagesRequired: 2,
+-} as const
+-
+ export const TRUNCATE_CONFIG = {
+   maxTruncateAttempts: 20,
+   minOutputSizeToTruncate: 500,
+diff --git a/src/tools/session-manager/storage.test.ts b/src/tools/session-manager/storage.test.ts
+index 2af396be..174cdbe0 100644
+--- a/src/tools/session-manager/storage.test.ts
++++ b/src/tools/session-manager/storage.test.ts
+@@ -6,6 +6,7 @@ import { tmpdir } from "node:os"
+ const TEST_DIR = join(tmpdir(), "omo-test-session-manager")
+ const TEST_MESSAGE_STORAGE = join(TEST_DIR, "message")
+ const TEST_PART_STORAGE = join(TEST_DIR, "part")
++const TEST_SESSION_STORAGE = join(TEST_DIR, "session")
+ const TEST_TODO_DIR = join(TEST_DIR, "todos")
+ const TEST_TRANSCRIPT_DIR = join(TEST_DIR, "transcripts")
+ 
+@@ -13,6 +14,7 @@ mock.module("./constants", () => ({
+   OPENCODE_STORAGE: TEST_DIR,
+   MESSAGE_STORAGE: TEST_MESSAGE_STORAGE,
+   PART_STORAGE: TEST_PART_STORAGE,
++  SESSION_STORAGE: TEST_SESSION_STORAGE,
+   TODO_DIR: TEST_TODO_DIR,
+   TRANSCRIPT_DIR: TEST_TRANSCRIPT_DIR,
+   SESSION_LIST_DESCRIPTION: "test",
+@@ -26,6 +28,8 @@ mock.module("./constants", () => ({
+ const { getAllSessions, getMessageDir, sessionExists, readSessionMessages, readSessionTodos, getSessionInfo } =
+   await import("./storage")
+ 
++const storage = await import("./storage")
++
+ describe("session-manager storage", () => {
+   beforeEach(() => {
+     if (existsSync(TEST_DIR)) {
+@@ -34,6 +38,7 @@ describe("session-manager storage", () => {
+     mkdirSync(TEST_DIR, { recursive: true })
+     mkdirSync(TEST_MESSAGE_STORAGE, { recursive: true })
+     mkdirSync(TEST_PART_STORAGE, { recursive: true })
++    mkdirSync(TEST_SESSION_STORAGE, { recursive: true })
+     mkdirSync(TEST_TODO_DIR, { recursive: true })
+     mkdirSync(TEST_TRANSCRIPT_DIR, { recursive: true })
+   })
+@@ -174,3 +179,137 @@ describe("session-manager storage", () => {
+     expect(info?.agents_used).toContain("oracle")
+   })
+ })
++
++describe("session-manager storage - getMainSessions", () => {
++  beforeEach(() => {
++    if (existsSync(TEST_DIR)) {
++      rmSync(TEST_DIR, { recursive: true, force: true })
++    }
++    mkdirSync(TEST_DIR, { recursive: true })
++    mkdirSync(TEST_MESSAGE_STORAGE, { recursive: true })
++    mkdirSync(TEST_PART_STORAGE, { recursive: true })
++    mkdirSync(TEST_SESSION_STORAGE, { recursive: true })
++    mkdirSync(TEST_TODO_DIR, { recursive: true })
++    mkdirSync(TEST_TRANSCRIPT_DIR, { recursive: true })
++  })
++
++  afterEach(() => {
++    if (existsSync(TEST_DIR)) {
++      rmSync(TEST_DIR, { recursive: true, force: true })
++    }
++  })
++
++  function createSessionMetadata(
++    projectID: string,
++    sessionID: string,
++    opts: { parentID?: string; directory: string; updated: number }
++  ) {
++    const projectDir = join(TEST_SESSION_STORAGE, projectID)
++    mkdirSync(projectDir, { recursive: true })
++    writeFileSync(
++      join(projectDir, `${sessionID}.json`),
++      JSON.stringify({
++        id: sessionID,
++        projectID,
++        directory: opts.directory,
++        parentID: opts.parentID,
++        time: { created: opts.updated - 1000, updated: opts.updated },
++      })
++    )
++  }
++
++  function createMessageForSession(sessionID: string, msgID: string, created: number) {
++    const sessionPath = join(TEST_MESSAGE_STORAGE, sessionID)
++    mkdirSync(sessionPath, { recursive: true })
++    writeFileSync(
++      join(sessionPath, `${msgID}.json`),
++      JSON.stringify({ id: msgID, role: "user", time: { created } })
++    )
++  }
++
++  test("getMainSessions returns only sessions without parentID", async () => {
++    // #given
++    const projectID = "proj_abc123"
++    const now = Date.now()
++
++    createSessionMetadata(projectID, "ses_main1", { directory: "/test/path", updated: now })
++    createSessionMetadata(projectID, "ses_main2", { directory: "/test/path", updated: now - 1000 })
++    createSessionMetadata(projectID, "ses_child1", { directory: "/test/path", updated: now, parentID: "ses_main1" })
++
++    createMessageForSession("ses_main1", "msg_001", now)
++    createMessageForSession("ses_main2", "msg_001", now - 1000)
++    createMessageForSession("ses_child1", "msg_001", now)
++
++    // #when
++    const sessions = await storage.getMainSessions({ directory: "/test/path" })
++
++    // #then
++    expect(sessions.length).toBe(2)
++    expect(sessions.map((s) => s.id)).not.toContain("ses_child1")
++  })
++
++  test("getMainSessions sorts by time.updated descending (most recent first)", async () => {
++    // #given
++    const projectID = "proj_abc123"
++    const now = Date.now()
++
++    createSessionMetadata(projectID, "ses_old", { directory: "/test/path", updated: now - 5000 })
++    createSessionMetadata(projectID, "ses_mid", { directory: "/test/path", updated: now - 2000 })
++    createSessionMetadata(projectID, "ses_new", { directory: "/test/path", updated: now })
++
++    createMessageForSession("ses_old", "msg_001", now - 5000)
++    createMessageForSession("ses_mid", "msg_001", now - 2000)
++    createMessageForSession("ses_new", "msg_001", now)
++
++    // #when
++    const sessions = await storage.getMainSessions({ directory: "/test/path" })
++
++    // #then
++    expect(sessions.length).toBe(3)
++    expect(sessions[0].id).toBe("ses_new")
++    expect(sessions[1].id).toBe("ses_mid")
++    expect(sessions[2].id).toBe("ses_old")
++  })
++
++  test("getMainSessions filters by directory (project path)", async () => {
++    // #given
++    const projectA = "proj_aaa"
++    const projectB = "proj_bbb"
++    const now = Date.now()
++
++    createSessionMetadata(projectA, "ses_projA", { directory: "/path/to/projectA", updated: now })
++    createSessionMetadata(projectB, "ses_projB", { directory: "/path/to/projectB", updated: now })
++
++    createMessageForSession("ses_projA", "msg_001", now)
++    createMessageForSession("ses_projB", "msg_001", now)
++
++    // #when
++    const sessionsA = await storage.getMainSessions({ directory: "/path/to/projectA" })
++    const sessionsB = await storage.getMainSessions({ directory: "/path/to/projectB" })
++
++    // #then
++    expect(sessionsA.length).toBe(1)
++    expect(sessionsA[0].id).toBe("ses_projA")
++    expect(sessionsB.length).toBe(1)
++    expect(sessionsB[0].id).toBe("ses_projB")
++  })
++
++  test("getMainSessions returns all main sessions when directory is not specified", async () => {
++    // #given
++    const projectA = "proj_aaa"
++    const projectB = "proj_bbb"
++    const now = Date.now()
++
++    createSessionMetadata(projectA, "ses_projA", { directory: "/path/to/projectA", updated: now })
++    createSessionMetadata(projectB, "ses_projB", { directory: "/path/to/projectB", updated: now - 1000 })
++
++    createMessageForSession("ses_projA", "msg_001", now)
++    createMessageForSession("ses_projB", "msg_001", now - 1000)
++
++    // #when
++    const sessions = await storage.getMainSessions({})
++
++    // #then
++    expect(sessions.length).toBe(2)
++  })
++})
+diff --git a/src/tools/session-manager/tools.test.ts b/src/tools/session-manager/tools.test.ts
+index 33871ef3..a44f7dbe 100644
+--- a/src/tools/session-manager/tools.test.ts
++++ b/src/tools/session-manager/tools.test.ts
+@@ -31,6 +31,27 @@ describe("session-manager tools", () => {
+     expect(typeof result).toBe("string")
+   })
+ 
++  test("session_list filters by project_path", async () => {
++    // #given
++    const projectPath = "/Users/yeongyu/local-workspaces/oh-my-opencode"
++
++    // #when
++    const result = await session_list.execute({ project_path: projectPath }, mockContext)
++
++    // #then
++    expect(typeof result).toBe("string")
++  })
++
++  test("session_list uses process.cwd() as default project_path", async () => {
++    // #given - no project_path provided
++
++    // #when
++    const result = await session_list.execute({}, mockContext)
++
++    // #then - should not throw and return string (uses process.cwd() internally)
++    expect(typeof result).toBe("string")
++  })
++
+   test("session_read handles non-existent session", async () => {
+     const result = await session_read.execute({ session_id: "ses_nonexistent" }, mockContext)
+     
+diff --git a/src/tools/session-manager/types.ts b/src/tools/session-manager/types.ts
+index a3801edd..becaf13b 100644
+--- a/src/tools/session-manager/types.ts
++++ b/src/tools/session-manager/types.ts
+@@ -49,11 +49,30 @@ export interface SearchResult {
+   timestamp?: number
+ }
+ 
++export interface SessionMetadata {
++  id: string
++  version?: string
++  projectID: string
++  directory: string
++  title?: string
++  parentID?: string
++  time: {
++    created: number
++    updated: number
++  }
++  summary?: {
++    additions: number
++    deletions: number
++    files: number
++  }
++}
++
+ export interface SessionListArgs {
+   limit?: number
+   offset?: number
+   from_date?: string
+   to_date?: string
++  project_path?: string
+ }
+ 
+ export interface SessionReadArgs {
+-- 
+2.39.2
+

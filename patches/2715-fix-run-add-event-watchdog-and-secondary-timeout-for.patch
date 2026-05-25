@@ -1,0 +1,172 @@
+From 159ade05cc5ddfa9a95ad871b8c387137021eaef Mon Sep 17 00:00:00 2001
+From: CloudWaddie <CloudWaddie@users.noreply.github.com>
+Date: Fri, 20 Feb 2026 14:33:16 +1030
+Subject: [PATCH 2715/5749] fix(run): add event watchdog and secondary timeout
+ for hasReceivedMeaningfulWork
+
+Implements fixes from issue #1880 and #1934 to prevent exit code 130 timeout in CI environments:
+
+- Add lastEventTimestamp to EventState for tracking when events were last received
+- Add event watchdog: if no events for 30s, verify session status via direct API call
+- Add secondary timeout: after 60s without meaningful work events, check for active children/todos and assume work is in progress
+
+This prevents the poll loop from waiting for full 600s timeout when:
+1. Event stream drops silently (common in CI with network instability)
+2. Main session delegates to children without producing meaningful work on main session
+---
+ src/cli/run/event-state.ts            |  3 ++
+ src/cli/run/event-stream-processor.ts |  3 ++
+ src/cli/run/poll-for-completion.ts    | 76 +++++++++++++++++++++++++++
+ 3 files changed, 82 insertions(+)
+
+diff --git a/src/cli/run/event-state.ts b/src/cli/run/event-state.ts
+index 4d05f7da..eee23f5f 100644
+--- a/src/cli/run/event-state.ts
++++ b/src/cli/run/event-state.ts
+@@ -7,6 +7,8 @@ export interface EventState {
+   currentTool: string | null
+   /** Set to true when the main session has produced meaningful work (text, tool call, or tool result) */
+   hasReceivedMeaningfulWork: boolean
++  /** Timestamp of the last received event (for watchdog detection) */
++  lastEventTimestamp: number
+   /** Count of assistant messages for the main session */
+   messageCount: number
+   /** Current agent name from the latest assistant message */
+@@ -54,6 +56,7 @@ export function createEventState(): EventState {
+     lastPartText: "",
+     currentTool: null,
+     hasReceivedMeaningfulWork: false,
++    lastEventTimestamp: Date.now(),
+     messageCount: 0,
+     currentAgent: null,
+     currentModel: null,
+diff --git a/src/cli/run/event-stream-processor.ts b/src/cli/run/event-stream-processor.ts
+index c5e600e9..757c1a44 100644
+--- a/src/cli/run/event-stream-processor.ts
++++ b/src/cli/run/event-stream-processor.ts
+@@ -35,6 +35,9 @@ export async function processEvents(
+         logEventVerbose(ctx, payload)
+       }
+ 
++      // Update last event timestamp for watchdog detection
++      state.lastEventTimestamp = Date.now()
++
+       handleSessionError(ctx, payload, state)
+       handleSessionIdle(ctx, payload, state)
+       handleSessionStatus(ctx, payload, state)
+diff --git a/src/cli/run/poll-for-completion.ts b/src/cli/run/poll-for-completion.ts
+index 684670cb..a5c7c406 100644
+--- a/src/cli/run/poll-for-completion.ts
++++ b/src/cli/run/poll-for-completion.ts
+@@ -8,11 +8,15 @@ const DEFAULT_POLL_INTERVAL_MS = 500
+ const DEFAULT_REQUIRED_CONSECUTIVE = 1
+ const ERROR_GRACE_CYCLES = 3
+ const MIN_STABILIZATION_MS = 1_000
++const DEFAULT_EVENT_WATCHDOG_MS = 30_000 // 30 seconds
++const DEFAULT_SECONDARY_MEANINGFUL_WORK_TIMEOUT_MS = 60_000 // 60 seconds
+ 
+ export interface PollOptions {
+   pollIntervalMs?: number
+   requiredConsecutive?: number
+   minStabilizationMs?: number
++  eventWatchdogMs?: number
++  secondaryMeaningfulWorkTimeoutMs?: number
+ }
+ 
+ export async function pollForCompletion(
+@@ -28,6 +32,11 @@ export async function pollForCompletion(
+     options.minStabilizationMs ?? MIN_STABILIZATION_MS
+   const minStabilizationMs =
+     rawMinStabilizationMs > 0 ? rawMinStabilizationMs : MIN_STABILIZATION_MS
++  const eventWatchdogMs =
++    options.eventWatchdogMs ?? DEFAULT_EVENT_WATCHDOG_MS
++  const secondaryMeaningfulWorkTimeoutMs =
++    options.secondaryMeaningfulWorkTimeoutMs ??
++    DEFAULT_SECONDARY_MEANINGFUL_WORK_TIMEOUT_MS
+   let consecutiveCompleteChecks = 0
+   let errorCycleCount = 0
+   let firstWorkTimestamp: number | null = null
+@@ -59,6 +68,32 @@ export async function pollForCompletion(
+       errorCycleCount = 0
+     }
+ 
++    // Watchdog: if no events received for N seconds, verify session status via API
++    if (eventState.lastEventTimestamp !== null) {
++      const timeSinceLastEvent = Date.now() - eventState.lastEventTimestamp
++      if (timeSinceLastEvent > eventWatchdogMs) {
++        // Events stopped coming - verify actual session state
++        console.log(
++          pc.yellow(
++            `\n  No events for ${Math.round(
++              timeSinceLastEvent / 1000
++            )}s, verifying session status...`
++          )
++        )
++
++        // Force check session status directly
++        const directStatus = await getMainSessionStatus(ctx)
++        if (directStatus === "idle") {
++          eventState.mainSessionIdle = true
++        } else if (directStatus === "busy" || directStatus === "retry") {
++          eventState.mainSessionIdle = false
++        }
++
++        // Reset timestamp to avoid repeated checks
++        eventState.lastEventTimestamp = Date.now()
++      }
++    }
++
+     const mainSessionStatus = await getMainSessionStatus(ctx)
+     if (mainSessionStatus === "busy" || mainSessionStatus === "retry") {
+       eventState.mainSessionIdle = false
+@@ -81,6 +116,47 @@ export async function pollForCompletion(
+         consecutiveCompleteChecks = 0
+         continue
+       }
++
++      // Secondary timeout: if we've been polling for reasonable time but haven't
++      // received meaningful work via events, check if there's active work via API
++      if (Date.now() - pollStartTimestamp > secondaryMeaningfulWorkTimeoutMs) {
++        // Check if session actually has pending work (children, todos, etc.)
++        const childrenRes = await ctx.client.session.children({
++          path: { id: ctx.sessionID },
++          query: { directory: ctx.directory },
++        })
++        const children = normalizeSDKResponse(childrenRes, [] as unknown[])
++        const todosRes = await ctx.client.session.todo({
++          path: { id: ctx.sessionID },
++          query: { directory: ctx.directory },
++        })
++        const todos = normalizeSDKResponse(todosRes, [] as unknown[])
++
++        const hasActiveWork =
++          Array.isArray(children)
++            ? children.length > 0
++            : false || Array.isArray(todos)
++            ? todos.some(
++                (
++                  t: unknown
++                ) =>
++                  (t as { status?: string })?.status !== "completed" &&
++                  (t as { status?: string })?.status !== "cancelled"
++              )
++            : false
++
++        if (hasActiveWork) {
++          // Assume meaningful work is happening even without events
++          eventState.hasReceivedMeaningfulWork = true
++          console.log(
++            pc.yellow(
++              `\n  No meaningful work events for ${Math.round(
++                secondaryMeaningfulWorkTimeoutMs / 1000
++              )}s but session has active work - assuming in progress`
++            )
++          )
++        }
++      }
+     } else {
+       // Track when first meaningful work was received
+       if (firstWorkTimestamp === null) {
+-- 
+2.39.2
+

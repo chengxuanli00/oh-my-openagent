@@ -1,0 +1,287 @@
+From 73b5a7eb0e79e221b34edaea98d8958e553ef76a Mon Sep 17 00:00:00 2001
+From: heunghingwan <heunghingwan@users.noreply.github.com>
+Date: Thu, 21 May 2026 05:17:54 +0800
+Subject: [PATCH 5596/5749] Add plan format validator hook to detect malformed
+ task labels
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Strengthen Prometheus plan template with FORMAT constraint
+- Add task label format check to Oracle phase-2 (N/6 → N/7)
+- Add format checks to self-review checklist
+- New plan-format-validator hook: compares raw checkbox count
+  against getPlanProgress() after plan writes, warns agent when
+  labels are malformed (0/0 or partial skip scenarios)
+---
+ src/agents/prometheus/plan-generation.ts    |   6 +-
+ src/agents/prometheus/plan-template.ts      |   3 +
+ src/config/schema/hooks.ts                  |   1 +
+ src/hooks/index.ts                          |   1 +
+ src/hooks/plan-format-validator/hook.ts     | 134 ++++++++++++++++++++
+ src/hooks/plan-format-validator/index.ts    |   1 +
+ src/plugin/hooks/create-tool-guard-hooks.ts |   7 +
+ src/plugin/tool-execute-after.ts            |   1 +
+ 8 files changed, 153 insertions(+), 1 deletion(-)
+ create mode 100644 src/hooks/plan-format-validator/hook.ts
+ create mode 100644 src/hooks/plan-format-validator/index.ts
+
+diff --git a/src/agents/prometheus/plan-generation.ts b/src/agents/prometheus/plan-generation.ts
+index 152de847..bca18aa1 100644
+--- a/src/agents/prometheus/plan-generation.ts
++++ b/src/agents/prometheus/plan-generation.ts
+@@ -95,7 +95,9 @@ task(
+   4. Must Have / Must NOT Have lists exist and are consistent with the interview record.
+   5. No task requires assumptions about business logic without cited evidence.
+   6. Plan path is .omo/plans/, not docs/ or plans/.
+-  Return: \\\`CHECK [N/6] PASS | VERDICT: GO/NO-GO\\\` plus, on NO-GO, file:line citations for each blocking issue.\`
++  7. All TODO task labels use bare-number format ("1. xxx"), NOT "T1.", "Phase 1:", "Task-1." etc.
++     All Final Wave labels use "FN. xxx" format, NOT "T-F1.", "F-1.", "Final-1." etc.
++  Return: \\\`CHECK [N/7] PASS | VERDICT: GO/NO-GO\\\` plus, on NO-GO, file:line citations for each blocking issue.\`
+ )
+ \`\`\`
+ 
+@@ -201,6 +203,8 @@ Before presenting summary, verify:
+ □ QA scenarios include BOTH happy-path AND negative/error scenarios?
+ □ Zero acceptance criteria require human intervention?
+ □ QA scenarios use specific selectors/data, not vague descriptions?
++□ All TODO labels use bare-number format ("1. ", "2. ")? NO T1./Phase 1:/Task-1. etc.
++□ All Final Wave labels use "FN. " format? NO T-F1./F-1./Final-1. etc.
+ \`\`\`
+ 
+ ### Gap Handling Protocol
+diff --git a/src/agents/prometheus/plan-template.ts b/src/agents/prometheus/plan-template.ts
+index 452d6259..fe715e38 100644
+--- a/src/agents/prometheus/plan-template.ts
++++ b/src/agents/prometheus/plan-template.ts
+@@ -163,6 +163,9 @@ Max Concurrent: 7 (Waves 1 & 2)
+ > Implementation + Test = ONE Task. Never separate.
+ > EVERY task MUST have: Recommended Agent Profile + Parallelization info + QA Scenarios.
+ > **A task WITHOUT QA Scenarios is INCOMPLETE. No exceptions.**
++> **FORMAT**: Task labels MUST use bare numbers: \`1.\`, \`2.\`, \`3.\` — NOT \`T1.\`, \`Task 1.\`, \`Phase 1:\`.
++> The /start-work progress counter requires exact format. Deviation = progress shows 0/0.
++> Final Verification Wave labels MUST use \`F1.\`, \`F2.\`, etc. — NOT \`T-F1.\`, \`F-1.\`, \`Final 1.\`.
+ 
+ - [ ] 1. [Task Title]
+ 
+diff --git a/src/config/schema/hooks.ts b/src/config/schema/hooks.ts
+index bdee7071..72a43722 100644
+--- a/src/config/schema/hooks.ts
++++ b/src/config/schema/hooks.ts
+@@ -57,6 +57,7 @@ export const HookNameSchema = z.enum([
+   "todo-description-override",
+   "webfetch-redirect-guard",
+   "fsync-skip-warning",
++  "plan-format-validator",
+   "legacy-plugin-toast",
+ ])
+ 
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 3dc50307..493414d3 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -67,3 +67,4 @@ export { createWebFetchRedirectGuardHook } from "./webfetch-redirect-guard"
+ export { createLegacyPluginToastHook } from "./legacy-plugin-toast"
+ export { createFsyncSkipWarningHook } from "./fsync-skip-warning"
+ export { createNotepadWriteGuardHook } from "./notepad-write-guard"
++export { createPlanFormatValidatorHook } from "./plan-format-validator"
+diff --git a/src/hooks/plan-format-validator/hook.ts b/src/hooks/plan-format-validator/hook.ts
+new file mode 100644
+index 00000000..db708a87
+--- /dev/null
++++ b/src/hooks/plan-format-validator/hook.ts
+@@ -0,0 +1,134 @@
++import { existsSync, readFileSync } from "node:fs"
++import { resolve } from "node:path"
++
++import type { PluginInput } from "@opencode-ai/plugin"
++
++import { getPlanProgress } from "../../features/boulder-state/storage"
++import { log } from "../../shared/logger"
++
++const WRITE_TOOLS = new Set(["Write", "Edit", "write", "edit"])
++
++const CHECKBOX_PATTERN = /^[-*]\s*\[[ xX]\]/m
++
++const HEADING_SECOND_LEVEL = /^##\s+/
++const HEADING_TODOS = /^##\s+TODOs\b/i
++const HEADING_FINAL_WAVE = /^##\s+Final Verification Wave\b/i
++const TOPLEVEL_CHECKBOX = /^[-*]\s*\[[ xX]?\]/
++
++function countRawTopLevelCheckboxes(content: string): number {
++  const lines = content.split(/\r?\n/)
++  let section: "todo" | "final-wave" | "other" = "other"
++  let count = 0
++
++  for (const line of lines) {
++    if (HEADING_SECOND_LEVEL.test(line)) {
++      section = HEADING_TODOS.test(line)
++        ? "todo"
++        : HEADING_FINAL_WAVE.test(line)
++          ? "final-wave"
++          : "other"
++      continue
++    }
++
++    if (section === "other") continue
++    if (!TOPLEVEL_CHECKBOX.test(line)) continue
++
++    count++
++  }
++
++  return count
++}
++
++function buildWarning(rawCount: number, parsedCount: number): string {
++  const skipped = rawCount - parsedCount
++
++  if (parsedCount === 0) {
++    return [
++      "",
++      "<plan-format-warning>",
++      `Plan has **${rawCount} task checkbox(es)** but \`getPlanProgress()\` parsed **0**.`,
++      "This means `/start-work` will show **\"Progress: 0/0\"** for this plan.",
++      "",
++      "**Fix**: Every task checkbox under `## TODOs` MUST start with a bare number",
++      "followed by dot + space: `1.`, `2.`, `3.` — NOT `T1.`, `Phase 1:`, `Task-1.` etc.",
++      "Every Final Verification Wave checkbox MUST start with `F` + number:",
++      "`F1.`, `F2.` — NOT `T-F1.`, `F-1.`, `Final-1.` etc.",
++      "</plan-format-warning>",
++    ].join("\n")
++  }
++
++  return [
++    "",
++    "<plan-format-warning>",
++    `Plan has **${rawCount} task checkbox(es)** but \`getPlanProgress()\` only parsed **${parsedCount}**. `,
++    `**${skipped} task(s)** have malformed labels and will be SKIPPED by the progress counter.`,
++    `\`/start-work\` will show \"Progress: ${parsedCount} tasks\" — missing ${skipped} task(s).`,
++    "",
++    "**Fix**: Ensure every skipped task checkbox uses bare-number format:",
++    "  `## TODOs` → `1.`, `2.`, `3.` (NOT `T1.`, `Phase 1:`, `Task-1.`)",
++    "  `## Final Verification Wave` → `F1.`, `F2.`, `F3.` (NOT `T-F1.`, `F-1.`, `Final-1.`)",
++    "</plan-format-warning>",
++  ].join("\n")
++}
++
++function isPlanWrite(tool: string, args: Record<string, unknown>): string | null {
++  if (!WRITE_TOOLS.has(tool)) return null
++
++  const filePath = (args.filePath ?? args.path ?? args.file) as string | undefined
++  if (!filePath) return null
++
++  return filePath
++}
++
++function isPlanFilePath(filePath: string): boolean {
++  const normalized = filePath.toLowerCase().replace(/\\/g, "/")
++  return normalized.includes(".omo/plans/") && normalized.endsWith(".md")
++}
++
++/**
++ * Programmatic plan format validator.
++ *
++ * After any agent writes to a `.omo/plans/*.md` file, compares the
++ * raw top-level checkbox count against `getPlanProgress()` to detect
++ * malformed task labels. Warns the agent when some or all tasks
++ * will be skipped by the progress counter.
++ */
++export function createPlanFormatValidatorHook(_ctx: PluginInput) {
++  return {
++    "tool.execute.after": async (
++      input: { tool: string; sessionID: string; callID: string; args?: Record<string, unknown> },
++      output: { title: string; output: string; metadata: unknown },
++    ): Promise<void> => {
++      if (!input.args) return
++      if (typeof output.output !== "string") return
++      if (output.output.includes("<plan-format-warning>")) return
++
++      const filePath = isPlanWrite(input.tool, input.args)
++      if (!filePath) return
++      if (!isPlanFilePath(filePath)) return
++
++      const resolvedPath = resolve(_ctx.directory, filePath)
++      if (!existsSync(resolvedPath)) return
++
++      const content = readFileSync(resolvedPath, "utf-8")
++      if (!CHECKBOX_PATTERN.test(content)) return
++
++      const rawCount = countRawTopLevelCheckboxes(content)
++      if (rawCount === 0) return
++
++      const progress = getPlanProgress(resolvedPath)
++      const parsedCount = progress.total
++
++      if (rawCount === parsedCount) return
++
++      log(`[plan-format-validator] Plan ${filePath}: ${parsedCount}/${rawCount} tasks parsed`, {
++        sessionID: input.sessionID,
++        filePath,
++        rawCount,
++        parsedCount,
++      })
++
++      output.output = `${output.output}${buildWarning(rawCount, parsedCount)}`
++    },
++  }
++}
+diff --git a/src/hooks/plan-format-validator/index.ts b/src/hooks/plan-format-validator/index.ts
+new file mode 100644
+index 00000000..0363ee2d
+--- /dev/null
++++ b/src/hooks/plan-format-validator/index.ts
+@@ -0,0 +1 @@
++export { createPlanFormatValidatorHook } from "./hook"
+diff --git a/src/plugin/hooks/create-tool-guard-hooks.ts b/src/plugin/hooks/create-tool-guard-hooks.ts
+index d2f06146..0ddfea11 100644
+--- a/src/plugin/hooks/create-tool-guard-hooks.ts
++++ b/src/plugin/hooks/create-tool-guard-hooks.ts
+@@ -20,6 +20,7 @@ import {
+   createTeamToolGating,
+   createFsyncSkipWarningHook,
+   createNotepadWriteGuardHook,
++  createPlanFormatValidatorHook,
+ } from "../../hooks"
+ import {
+   getOpenCodeVersion,
+@@ -47,6 +48,7 @@ export type ToolGuardHooks = {
+   fsyncSkipWarning: ReturnType<typeof createFsyncSkipWarningHook> | null
+   teamToolGating: ReturnType<typeof createTeamToolGating> | null
+   notepadWriteGuard: ReturnType<typeof createNotepadWriteGuardHook> | null
++  planFormatValidator: ReturnType<typeof createPlanFormatValidatorHook> | null
+ }
+ 
+ export function createToolGuardHooks(args: {
+@@ -147,6 +149,10 @@ export function createToolGuardHooks(args: {
+     ? safeHook("fsync-skip-warning", () => createFsyncSkipWarningHook())
+     : null
+ 
++  const planFormatValidator = isHookEnabled("plan-format-validator")
++    ? safeHook("plan-format-validator", () => createPlanFormatValidatorHook(ctx))
++    : null
++
+   const notepadWriteGuard = isHookEnabled("notepad-write-guard")
+     ? safeHook("notepad-write-guard", () => createNotepadWriteGuardHook())
+     : null
+@@ -169,5 +175,6 @@ export function createToolGuardHooks(args: {
+     fsyncSkipWarning,
+     teamToolGating,
+     notepadWriteGuard,
++    planFormatValidator,
+   }
+ }
+diff --git a/src/plugin/tool-execute-after.ts b/src/plugin/tool-execute-after.ts
+index 104cd6fd..859bbb06 100644
+--- a/src/plugin/tool-execute-after.ts
++++ b/src/plugin/tool-execute-after.ts
+@@ -170,6 +170,7 @@ export function createToolExecuteAfterHandler(args: {
+       await hooks.webfetchRedirectGuard?.["tool.execute.after"]?.(hookInput, output)
+       await hooks.fsyncSkipWarning?.["tool.execute.after"]?.(hookInput, output)
+       await hooks.jsonErrorRecovery?.["tool.execute.after"]?.(hookInput, output)
++      await hooks.planFormatValidator?.["tool.execute.after"]?.(hookInput, output)
+     }
+ 
+     if (input.tool === "extract" || input.tool === "discard") {
+-- 
+2.39.2
+

@@ -1,0 +1,249 @@
+From ece8fd4f257772e0f3f5ea309947dae0501c19f1 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 28 Apr 2026 17:59:25 +0900
+Subject: [PATCH 4613/5749] perf(shared): cache context window usage per
+ session
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/plugin/event.ts                  |  8 ++-
+ src/shared/dynamic-truncator.test.ts | 68 ++++++++++++++++++++++-
+ src/shared/dynamic-truncator.ts      | 82 ++++++++++++++++++++++++++--
+ 3 files changed, 150 insertions(+), 8 deletions(-)
+
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 5a5f177b..3db715a2 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -1,4 +1,5 @@
+ import type { OhMyOpenCodeConfig } from "../config";
++import type { PluginInput } from "@opencode-ai/plugin";
+ import type { PluginContext } from "./types";
+ 
+ import {
+@@ -26,6 +27,7 @@ import {
+ import { resetMessageCursor } from "../shared";
+ import { getAgentConfigKey } from "../shared/agent-display-names";
+ import { readConnectedProvidersCache } from "../shared/connected-providers-cache";
++import { invalidateContextWindowUsageCache } from "../shared/dynamic-truncator";
+ import { log } from "../shared/logger";
+ import { shouldRetryError } from "../shared/model-error-classifier";
+ import { buildFallbackChainFromModels } from "../shared/fallback-chain-from-models";
+@@ -160,8 +162,7 @@ export function createEventHandler(args: {
+           body: { parts: Array<{ type: "text"; text: string }> };
+           query: { directory: string };
+         }) => Promise<unknown>;
+-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+-        summarize: (...args: any[]) => Promise<unknown>;
++        summarize: (...args: unknown[]) => Promise<unknown>;
+       };
+     };
+   };
+@@ -475,6 +476,9 @@ export function createEventHandler(args: {
+       const sessionID = info?.sessionID as string | undefined;
+       const agent = info?.agent as string | undefined;
+       const role = info?.role as string | undefined;
++      if (sessionID && info?.finish === true) {
++        invalidateContextWindowUsageCache(pluginContext as PluginInput, sessionID);
++      }
+       if (sessionID && role === "user") {
+         const isCompactionMessage = agent ? isCompactionAgent(agent) : false;
+         if (agent && !isCompactionMessage) {
+diff --git a/src/shared/dynamic-truncator.test.ts b/src/shared/dynamic-truncator.test.ts
+index 3e19512a..d090dd26 100644
+--- a/src/shared/dynamic-truncator.test.ts
++++ b/src/shared/dynamic-truncator.test.ts
+@@ -2,7 +2,7 @@
+ 
+ import { describe, expect, it, afterEach } from "bun:test"
+ 
+-import { getContextWindowUsage } from "./dynamic-truncator"
++import { getContextWindowUsage, invalidateContextWindowUsageCache } from "./dynamic-truncator"
+ 
+ const ANTHROPIC_CONTEXT_ENV_KEY = "ANTHROPIC_1M_CONTEXT"
+ const VERTEX_CONTEXT_ENV_KEY = "VERTEX_ANTHROPIC_1M_CONTEXT"
+@@ -53,6 +53,39 @@ function createContextUsageMockContext(
+   }
+ }
+ 
++function createCountingContextUsageMockContext(inputTokens: number) {
++  let messagesCalls = 0
++  return {
++    ctx: {
++      client: {
++        session: {
++          messages: async () => {
++            messagesCalls += 1
++            return {
++              data: [
++                {
++                  info: {
++                    role: "assistant",
++                    providerID: "anthropic",
++                    modelID: "claude-sonnet-4-5",
++                    tokens: {
++                      input: inputTokens,
++                      output: 0,
++                      reasoning: 0,
++                      cache: { read: 0, write: 0 },
++                    },
++                  },
++                },
++              ],
++            }
++          },
++        },
++      },
++    },
++    getMessagesCalls: () => messagesCalls,
++  }
++}
++
+ describe("getContextWindowUsage", () => {
+   afterEach(() => {
+     resetContextLimitEnv()
+@@ -125,6 +158,39 @@ describe("getContextWindowUsage", () => {
+     expect(usage?.remainingTokens).toBe(82144)
+   })
+ 
++  it("reuses context usage for repeated calls in the same session", async () => {
++    // given
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++    const { ctx, getMessagesCalls } = createCountingContextUsageMockContext(100000)
++    const modelCacheState = { anthropicContext1MEnabled: false }
++
++    // when
++    const firstUsage = await getContextWindowUsage(ctx as never, "ses_cached_usage", modelCacheState)
++    const secondUsage = await getContextWindowUsage(ctx as never, "ses_cached_usage", modelCacheState)
++
++    // then
++    expect(firstUsage?.remainingTokens).toBe(100000)
++    expect(secondUsage?.remainingTokens).toBe(100000)
++    expect(getMessagesCalls()).toBe(1)
++  })
++
++  it("refetches context usage after cache invalidation", async () => {
++    // given
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++    const { ctx, getMessagesCalls } = createCountingContextUsageMockContext(100000)
++    const modelCacheState = { anthropicContext1MEnabled: false }
++
++    // when
++    await getContextWindowUsage(ctx as never, "ses_invalidated_usage", modelCacheState)
++    invalidateContextWindowUsageCache(ctx as never, "ses_invalidated_usage")
++    await getContextWindowUsage(ctx as never, "ses_invalidated_usage", modelCacheState)
++
++    // then
++    expect(getMessagesCalls()).toBe(2)
++  })
++
+   it("returns null for non-anthropic providers without a cached limit", async () => {
+     // given
+     const ctx = createContextUsageMockContext(180000, {
+diff --git a/src/shared/dynamic-truncator.ts b/src/shared/dynamic-truncator.ts
+index 3b445759..504f1a73 100644
+--- a/src/shared/dynamic-truncator.ts
++++ b/src/shared/dynamic-truncator.ts
+@@ -24,6 +24,66 @@ interface MessageWrapper {
+ 	info: { role: string } & Partial<AssistantMessageInfo>;
+ }
+ 
++type ContextWindowUsage = {
++	usedTokens: number;
++	remainingTokens: number;
++	usagePercentage: number;
++}
++
++type ContextWindowUsageClient = Pick<PluginInput["client"], "session">
++
++const usageCacheByClient = new WeakMap<object, Map<string, Map<string, Promise<ContextWindowUsage | null>>>>()
++
++function createModelCacheKey(modelCacheState?: ContextLimitModelCacheState): string {
++	if (!modelCacheState) {
++		return "default"
++	}
++
++	const cachedLimits = modelCacheState.modelContextLimitsCache
++		? [...modelCacheState.modelContextLimitsCache.entries()]
++			.sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
++			.map(([modelKey, limit]) => `${modelKey}:${limit}`)
++			.join(",")
++		: ""
++
++	return `${modelCacheState.anthropicContext1MEnabled ? "1m" : "200k"}|${cachedLimits}`
++}
++
++function getUsageCache(
++	client: ContextWindowUsageClient,
++	modelCacheState?: ContextLimitModelCacheState,
++): Map<string, Promise<ContextWindowUsage | null>> {
++	let cacheByModelState = usageCacheByClient.get(client)
++	if (!cacheByModelState) {
++		cacheByModelState = new Map()
++		usageCacheByClient.set(client, cacheByModelState)
++	}
++
++	const modelCacheKey = createModelCacheKey(modelCacheState)
++	let cache = cacheByModelState.get(modelCacheKey)
++	if (!cache) {
++		cache = new Map()
++		cacheByModelState.set(modelCacheKey, cache)
++	}
++
++	return cache
++}
++
++export function invalidateContextWindowUsageCache(ctx: PluginInput, sessionID?: string): void {
++	const cacheByModelState = usageCacheByClient.get(ctx.client)
++	if (!cacheByModelState) {
++		return
++	}
++
++	for (const cache of cacheByModelState.values()) {
++		if (sessionID) {
++			cache.delete(sessionID)
++		} else {
++			cache.clear()
++		}
++	}
++}
++
+ export interface TruncationResult {
+ 	result: string;
+ 	truncated: boolean;
+@@ -112,11 +172,23 @@ export async function getContextWindowUsage(
+ 	ctx: PluginInput,
+ 	sessionID: string,
+ 	modelCacheState?: ContextLimitModelCacheState,
+-): Promise<{
+-	usedTokens: number;
+-	remainingTokens: number;
+-	usagePercentage: number;
+-} | null> {
++): Promise<ContextWindowUsage | null> {
++	const cache = getUsageCache(ctx.client, modelCacheState)
++	const cached = cache.get(sessionID)
++	if (cached) {
++		return cached
++	}
++
++	const usagePromise = fetchContextWindowUsage(ctx, sessionID, modelCacheState)
++	cache.set(sessionID, usagePromise)
++	return usagePromise
++}
++
++async function fetchContextWindowUsage(
++	ctx: PluginInput,
++	sessionID: string,
++	modelCacheState?: ContextLimitModelCacheState,
++): Promise<ContextWindowUsage | null> {
+ 	try {
+ 		const response = await ctx.client.session.messages({
+ 			path: { id: sessionID },
+-- 
+2.39.2
+

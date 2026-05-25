@@ -1,0 +1,446 @@
+From 954aa1f12107af81b0764729a65fe6d6d28e8684 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 11 May 2026 12:54:32 +0900
+Subject: [PATCH 5035/5749] fix(compaction): isolate preservation hook failures
+
+---
+ src/index.compacting.test.ts                  | 130 +++++++++++-------
+ ...x.compaction-model-agnostic.static.test.ts |  22 +--
+ src/index.ts                                  |  35 ++---
+ src/plugin/session-compacting.ts              | 110 +++++++++++++++
+ 4 files changed, 211 insertions(+), 86 deletions(-)
+ create mode 100644 src/plugin/session-compacting.ts
+
+diff --git a/src/index.compacting.test.ts b/src/index.compacting.test.ts
+index 2a83e4cf..2a96cde5 100644
+--- a/src/index.compacting.test.ts
++++ b/src/index.compacting.test.ts
+@@ -1,46 +1,9 @@
+ import { describe, expect, it, mock } from "bun:test"
+ 
+-function createCompactingHandler(hooks: {
+-  compactionContextInjector?: {
+-    capture: (sessionID: string) => Promise<void>
+-    inject: (sessionID: string) => string
+-  }
+-  compactionTodoPreserver?: { capture: (sessionID: string) => Promise<void> }
+-  claudeCodeHooks?: {
+-    "experimental.session.compacting"?: (
+-      input: { sessionID: string },
+-      output: { context: string[] },
+-    ) => Promise<void>
+-  }
+-}) {
+-  return async (
+-    input: { sessionID: string },
+-    output: { context: string[] },
+-  ): Promise<void> => {
+-    await hooks.compactionContextInjector?.capture(input.sessionID)
+-    await hooks.compactionTodoPreserver?.capture(input.sessionID)
+-    await hooks.claudeCodeHooks?.["experimental.session.compacting"]?.(
+-      input,
+-      output,
+-    )
+-    if (hooks.compactionContextInjector) {
+-      output.context.push(hooks.compactionContextInjector.inject(input.sessionID))
+-    }
+-  }
+-}
+-
+-function createCompactionAutocontinueHandler(hooks: {
+-  compactionContextInjector?: { restore: (sessionID: string) => Promise<boolean> }
+-  compactionTodoPreserver?: { restore: (sessionID: string) => Promise<void> }
+-}) {
+-  return async (
+-    input: { sessionID: string },
+-    _output: { enabled: boolean },
+-  ): Promise<void> => {
+-    await hooks.compactionContextInjector?.restore(input.sessionID)
+-    await hooks.compactionTodoPreserver?.restore(input.sessionID)
+-  }
+-}
++import {
++  createCompactionAutocontinueHandler,
++  createSessionCompactingHandler,
++} from "./plugin/session-compacting"
+ 
+ describe("experimental.session.compacting handler", () => {
+   //#given all three hooks are present
+@@ -49,7 +12,7 @@ describe("experimental.session.compacting handler", () => {
+   it("calls claudeCodeHooks PreCompact alongside other hooks", async () => {
+     const callOrder: string[] = []
+ 
+-    const handler = createCompactingHandler({
++    const handler = createSessionCompactingHandler({
+       compactionContextInjector: {
+         capture: mock(async () => {
+           callOrder.push("checkpointCapture")
+@@ -71,7 +34,7 @@ describe("experimental.session.compacting handler", () => {
+       },
+     })
+ 
+-    const output = { context: [] as string[] }
++    const output = { context: [] as string[], prompt: undefined as string | undefined }
+     await handler({ sessionID: "ses_test" }, output)
+ 
+     expect(callOrder).toEqual([
+@@ -87,7 +50,7 @@ describe("experimental.session.compacting handler", () => {
+   //#when compacting handler is invoked
+   //#then injected context from PreCompact is preserved in output
+   it("preserves context injected by PreCompact hooks", async () => {
+-    const handler = createCompactingHandler({
++    const handler = createSessionCompactingHandler({
+       claudeCodeHooks: {
+         "experimental.session.compacting": async (_input, output) => {
+           output.context.push("precompact-injected-context")
+@@ -95,7 +58,7 @@ describe("experimental.session.compacting handler", () => {
+       },
+     })
+ 
+-    const output = { context: [] as string[] }
++    const output = { context: [] as string[], prompt: undefined as string | undefined }
+     await handler({ sessionID: "ses_test" }, output)
+ 
+     expect(output.context).toContain("precompact-injected-context")
+@@ -109,7 +72,7 @@ describe("experimental.session.compacting handler", () => {
+     const checkpointCaptureMock = mock(async () => {})
+     const contextMock = mock(() => "injected-context")
+ 
+-    const handler = createCompactingHandler({
++    const handler = createSessionCompactingHandler({
+       compactionContextInjector: {
+         capture: checkpointCaptureMock,
+         inject: contextMock,
+@@ -118,7 +81,7 @@ describe("experimental.session.compacting handler", () => {
+       claudeCodeHooks: undefined,
+     })
+ 
+-    const output = { context: [] as string[] }
++    const output = { context: [] as string[], prompt: undefined as string | undefined }
+     await handler({ sessionID: "ses_test" }, output)
+ 
+     expect(checkpointCaptureMock).toHaveBeenCalledWith("ses_test")
+@@ -133,19 +96,67 @@ describe("experimental.session.compacting handler", () => {
+   it("does not early-return when compactionContextInjector is null", async () => {
+     const preCompactMock = mock(async () => {})
+ 
+-    const handler = createCompactingHandler({
++    const handler = createSessionCompactingHandler({
+       claudeCodeHooks: {
+         "experimental.session.compacting": preCompactMock,
+       },
+       compactionContextInjector: undefined,
+     })
+ 
+-    const output = { context: [] as string[] }
++    const output = { context: [] as string[], prompt: undefined as string | undefined }
+     await handler({ sessionID: "ses_test" }, output)
+ 
+     expect(preCompactMock).toHaveBeenCalled()
+     expect(output.context).toEqual([])
+   })
++
++  //#given a preservation hook throws while OpenCode is compacting
++  //#when compacting handler is invoked
++  //#then compaction still continues so the user does not see a failed compact
++  it("continues compaction when an internal preservation hook throws", async () => {
++    const preCompactMock = mock(async (_input, output: { context: string[] }) => {
++      output.context.push("precompact-context")
++    })
++
++    const handler = createSessionCompactingHandler({
++      compactionContextInjector: {
++        capture: mock(async () => {
++          throw new Error("checkpoint api down")
++        }),
++        inject: mock(() => "injected-context"),
++      },
++      compactionTodoPreserver: {
++        capture: mock(async () => {}),
++      },
++      claudeCodeHooks: {
++        "experimental.session.compacting": preCompactMock,
++      },
++    })
++
++    const output = { context: [] as string[], prompt: undefined as string | undefined }
++
++    await expect(handler({ sessionID: "ses_test" }, output)).resolves.toBeUndefined()
++    expect(preCompactMock).toHaveBeenCalled()
++    expect(output.context).toContain("precompact-context")
++  })
++
++  //#given a PreCompact hook replaces the OpenCode compaction prompt
++  //#when compacting handler is invoked
++  //#then the prompt replacement is preserved for OpenCode
++  it("preserves prompt replacement from PreCompact hooks", async () => {
++    const handler = createSessionCompactingHandler({
++      claudeCodeHooks: {
++        "experimental.session.compacting": mock(async (_input, output) => {
++          output.prompt = "custom compaction prompt"
++        }),
++      },
++    })
++
++    const output = { context: [] as string[], prompt: undefined as string | undefined }
++    await handler({ sessionID: "ses_prompt" }, output)
++
++    expect(output.prompt).toBe("custom compaction prompt")
++  })
+ })
+ 
+ describe("experimental.compaction.autocontinue handler", () => {
+@@ -177,4 +188,25 @@ describe("experimental.compaction.autocontinue handler", () => {
+     expect(callOrder).toEqual(["context", "todos:ses_autocontinue"])
+     expect(output.enabled).toBe(true)
+   })
++
++  it("continues autocontinue restore when one restore hook throws", async () => {
++    //#given
++    const restoreMock = mock(async () => {})
++    const handler = createCompactionAutocontinueHandler({
++      compactionContextInjector: {
++        restore: mock(async () => {
++          throw new Error("checkpoint restore failed")
++        }),
++      },
++      compactionTodoPreserver: { restore: restoreMock },
++    })
++    const output = { enabled: true }
++
++    //#when
++    await expect(handler({ sessionID: "ses_autocontinue" }, output)).resolves.toBeUndefined()
++
++    //#then
++    expect(restoreMock).toHaveBeenCalledWith("ses_autocontinue")
++    expect(output.enabled).toBe(true)
++  })
+ })
+diff --git a/src/index.compaction-model-agnostic.static.test.ts b/src/index.compaction-model-agnostic.static.test.ts
+index 91326dd2..91b427ba 100644
+--- a/src/index.compaction-model-agnostic.static.test.ts
++++ b/src/index.compaction-model-agnostic.static.test.ts
+@@ -5,32 +5,34 @@ describe("experimental.session.compacting", () => {
+   test("does not hardcode a model and uses output.context", () => {
+     //#given
+     const indexUrl = new URL("./index.ts", import.meta.url)
++    const compactionUrl = new URL("./plugin/session-compacting.ts", import.meta.url)
+     const content = readFileSync(indexUrl, "utf-8")
+-    const hookIndex = content.indexOf('"experimental.session.compacting"')
++    const compactionContent = readFileSync(compactionUrl, "utf-8")
+ 
+     //#when
+-    const hookSlice = hookIndex >= 0 ? content.slice(hookIndex, hookIndex + 1200) : ""
++    const hookIndex = content.indexOf("createSessionCompactingHandler")
+ 
+     //#then
+     expect(hookIndex).toBeGreaterThanOrEqual(0)
+-    expect(content.includes('modelID: "claude-opus-4-7"')).toBe(false)
+-    expect(hookSlice.includes("output.context.push")).toBe(true)
+-    expect(hookSlice.includes("providerID:")).toBe(false)
+-    expect(hookSlice.includes("modelID:")).toBe(false)
++    expect(`${content}\n${compactionContent}`.includes('modelID: "claude-opus-4-7"')).toBe(false)
++    expect(compactionContent.includes("output.context.push")).toBe(true)
++    expect(compactionContent.includes("providerID:")).toBe(false)
++    expect(compactionContent.includes("modelID:")).toBe(false)
+   })
+ 
+   test("registers autocontinue restores before OpenCode synthetic continue", () => {
+     //#given
+     const indexUrl = new URL("./index.ts", import.meta.url)
++    const compactionUrl = new URL("./plugin/session-compacting.ts", import.meta.url)
+     const content = readFileSync(indexUrl, "utf-8")
+-    const hookIndex = content.lastIndexOf('"experimental.compaction.autocontinue"')
++    const compactionContent = readFileSync(compactionUrl, "utf-8")
+ 
+     //#when
+-    const hookSlice = hookIndex >= 0 ? content.slice(hookIndex, hookIndex + 500) : ""
++    const hookIndex = content.indexOf("createCompactionAutocontinueHandler")
+ 
+     //#then
+     expect(hookIndex).toBeGreaterThanOrEqual(0)
+-    expect(hookSlice.includes("compactionContextInjector?.restore")).toBe(true)
+-    expect(hookSlice.includes("compactionTodoPreserver?.restore")).toBe(true)
++    expect(compactionContent.includes("compactionContextInjector?.restore")).toBe(true)
++    expect(compactionContent.includes("compactionTodoPreserver?.restore")).toBe(true)
+   })
+ })
+diff --git a/src/index.ts b/src/index.ts
+index 88e6150a..808141b3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -9,6 +9,11 @@ import { createRuntimeTmuxConfig, isTmuxIntegrationEnabled } from "./create-runt
+ import { createTools } from "./create-tools"
+ import { initializeOpenClaw } from "./openclaw"
+ import { createPluginInterface } from "./plugin-interface"
++import {
++  createCompactionAutocontinueHandler,
++  createSessionCompactingHandler,
++  type CompactionAutocontinueHook,
++} from "./plugin/session-compacting"
+ 
+ import { loadPluginConfig } from "./plugin-config"
+ import { createModelCacheState } from "./plugin-state"
+@@ -18,11 +23,6 @@ import { installAgentSortShim, setAgentSortOrder } from "./shared/agent-sort-shi
+ import { detectExternalSkillPlugin, getSkillPluginConflictWarning } from "./shared/external-plugin-detector"
+ import { startBackgroundCheck as startTmuxCheck } from "./tools/interactive-bash"
+ 
+-type CompactionAutocontinueHook = (
+-  input: { sessionID: string },
+-  output: { enabled: boolean },
+-) => Promise<void>
+-
+ type HooksWithCompactionAutocontinue = Hooks & {
+   "experimental.compaction.autocontinue"?: CompactionAutocontinueHook
+ }
+@@ -117,28 +117,9 @@ const serverPlugin: Plugin = async (input, _options): Promise<Hooks> => {
+   const pluginHooks: HooksWithCompactionAutocontinue = {
+     ...pluginInterface,
+ 
+-    "experimental.session.compacting": async (
+-      compactingInput: { sessionID: string },
+-      output: { context: string[] },
+-    ): Promise<void> => {
+-      await hooks.compactionContextInjector?.capture(compactingInput.sessionID)
+-      await hooks.compactionTodoPreserver?.capture(compactingInput.sessionID)
+-      await hooks.claudeCodeHooks?.["experimental.session.compacting"]?.(
+-        compactingInput,
+-        output,
+-      )
+-      if (hooks.compactionContextInjector) {
+-        output.context.push(hooks.compactionContextInjector.inject(compactingInput.sessionID))
+-      }
+-    },
+-
+-    "experimental.compaction.autocontinue": async (
+-      autocontinueInput: { sessionID: string },
+-      _output: { enabled: boolean },
+-    ): Promise<void> => {
+-      await hooks.compactionContextInjector?.restore(autocontinueInput.sessionID)
+-      await hooks.compactionTodoPreserver?.restore(autocontinueInput.sessionID)
+-    },
++    "experimental.session.compacting": createSessionCompactingHandler(hooks),
++
++    "experimental.compaction.autocontinue": createCompactionAutocontinueHandler(hooks),
+   }
+ 
+   return pluginHooks
+diff --git a/src/plugin/session-compacting.ts b/src/plugin/session-compacting.ts
+new file mode 100644
+index 00000000..940b029a
+--- /dev/null
++++ b/src/plugin/session-compacting.ts
+@@ -0,0 +1,110 @@
++import type { Hooks } from "@opencode-ai/plugin"
++
++import { log } from "../shared/logger"
++
++type SessionCompactingHook = NonNullable<Hooks["experimental.session.compacting"]>
++type SessionCompactingInput = Parameters<SessionCompactingHook>[0]
++type SessionCompactingOutput = Parameters<SessionCompactingHook>[1]
++
++export type CompactionAutocontinueInput = {
++  sessionID: string
++  agent?: string
++  model?: unknown
++  provider?: unknown
++  message?: unknown
++  overflow?: boolean
++}
++
++export type CompactionAutocontinueOutput = {
++  enabled: boolean
++}
++
++export type CompactionAutocontinueHook = (
++  input: CompactionAutocontinueInput,
++  output: CompactionAutocontinueOutput,
++) => Promise<void>
++
++type CompactionHookDependencies = {
++  compactionContextInjector?: {
++    capture?: (sessionID: string) => Promise<void>
++    inject?: (sessionID: string) => string
++    restore?: (sessionID: string) => Promise<boolean>
++  } | null
++  compactionTodoPreserver?: {
++    capture?: (sessionID: string) => Promise<void>
++    restore?: (sessionID: string) => Promise<void>
++  } | null
++  claudeCodeHooks?: {
++    "experimental.session.compacting"?: SessionCompactingHook
++  } | null
++}
++
++async function runCompactionStep(
++  hook: string,
++  sessionID: string,
++  action: () => Promise<void> | void,
++): Promise<void> {
++  try {
++    await action()
++  } catch (error) {
++    log("[session-compacting] hook execution failed", {
++      hook,
++      sessionID,
++      error: String(error),
++    })
++  }
++}
++
++export function createSessionCompactingHandler(
++  hooks: CompactionHookDependencies,
++): SessionCompactingHook {
++  return async (
++    input: SessionCompactingInput,
++    output: SessionCompactingOutput,
++  ): Promise<void> => {
++    await runCompactionStep("compactionContextInjector.capture", input.sessionID, async () => {
++      const capture = hooks.compactionContextInjector?.capture
++      if (capture) {
++        await capture(input.sessionID)
++      }
++    })
++    await runCompactionStep("compactionTodoPreserver.capture", input.sessionID, async () => {
++      const capture = hooks.compactionTodoPreserver?.capture
++      if (capture) {
++        await capture(input.sessionID)
++      }
++    })
++    await runCompactionStep("claudeCodeHooks.experimental.session.compacting", input.sessionID, async () => {
++      await hooks.claudeCodeHooks?.["experimental.session.compacting"]?.(input, output)
++    })
++    await runCompactionStep("compactionContextInjector.inject", input.sessionID, () => {
++      const inject = hooks.compactionContextInjector?.inject
++      const context = inject ? inject(input.sessionID) : undefined
++      if (context) {
++        output.context.push(context)
++      }
++    })
++  }
++}
++
++export function createCompactionAutocontinueHandler(
++  hooks: CompactionHookDependencies,
++): CompactionAutocontinueHook {
++  return async (
++    input: CompactionAutocontinueInput,
++    _output: CompactionAutocontinueOutput,
++  ): Promise<void> => {
++    await runCompactionStep("compactionContextInjector.restore", input.sessionID, async () => {
++      const restore = hooks.compactionContextInjector?.restore
++      if (restore) {
++        await restore(input.sessionID)
++      }
++    })
++    await runCompactionStep("compactionTodoPreserver.restore", input.sessionID, async () => {
++      const restore = hooks.compactionTodoPreserver?.restore
++      if (restore) {
++        await restore(input.sessionID)
++      }
++    })
++  }
++}
+-- 
+2.39.2
+

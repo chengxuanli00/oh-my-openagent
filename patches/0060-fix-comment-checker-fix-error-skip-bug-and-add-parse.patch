@@ -1,0 +1,327 @@
+From f5f2053b7a9ee9b569b256460f36ca14b4f5a32f Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 5 Dec 2025 10:56:08 +0900
+Subject: [PATCH 0060/5749] fix(comment-checker): fix error skip bug and add
+ parser/language caching
+
+- Fix overly broad error detection that skipped comments when LSP warnings present
+- Add Parser class and language WASM caching for ~3.5x faster subsequent parses
+- Add debug logging controlled by COMMENT_CHECKER_DEBUG=1 env var
+---
+ src/hooks/comment-checker/detector.ts | 131 ++++++++++++++++++++------
+ src/hooks/comment-checker/index.ts    |  53 ++++++++++-
+ 2 files changed, 151 insertions(+), 33 deletions(-)
+
+diff --git a/src/hooks/comment-checker/detector.ts b/src/hooks/comment-checker/detector.ts
+index cfbb01ef..f03dc2cd 100644
+--- a/src/hooks/comment-checker/detector.ts
++++ b/src/hooks/comment-checker/detector.ts
+@@ -1,5 +1,92 @@
+ import type { CommentInfo, CommentType } from "./types"
+ import { getLanguageByExtension, QUERY_TEMPLATES, DOCSTRING_QUERIES } from "./constants"
++import * as fs from "fs"
++
++// =============================================================================
++// Debug logging
++// =============================================================================
++
++const DEBUG = process.env.COMMENT_CHECKER_DEBUG === "1"
++const DEBUG_FILE = "/tmp/comment-checker-debug.log"
++
++function debugLog(...args: unknown[]) {
++  if (DEBUG) {
++    const msg = `[${new Date().toISOString()}] [comment-checker:detector] ${args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')}\n`
++    fs.appendFileSync(DEBUG_FILE, msg)
++  }
++}
++
++// =============================================================================
++// Parser caching for performance
++// =============================================================================
++
++// eslint-disable-next-line @typescript-eslint/no-explicit-any
++let parserClass: any = null
++let parserInitialized = false
++const languageCache = new Map<string, unknown>()
++
++async function getParser() {
++  if (!parserClass) {
++    debugLog("importing web-tree-sitter (first time)...")
++    parserClass = (await import("web-tree-sitter")).default
++  }
++  
++  if (!parserInitialized) {
++    debugLog("initializing Parser (first time)...")
++    const treeSitterWasmPath = require.resolve("web-tree-sitter/tree-sitter.wasm")
++    debugLog("wasm path:", treeSitterWasmPath)
++    await parserClass.init({
++      locateFile: () => treeSitterWasmPath,
++    })
++    parserInitialized = true
++    debugLog("Parser initialized")
++  }
++  
++  return new parserClass()
++}
++
++async function getLanguage(langName: string) {
++  if (languageCache.has(langName)) {
++    debugLog("using cached language:", langName)
++    return languageCache.get(langName)
++  }
++  
++  debugLog("loading language wasm:", langName)
++  
++  let wasmPath: string
++  try {
++    const wasmModule = await import(`tree-sitter-wasms/out/tree-sitter-${langName}.wasm`)
++    wasmPath = wasmModule.default
++  } catch {
++    const languageMap: Record<string, string> = {
++      golang: "go",
++      csharp: "c_sharp",
++      cpp: "cpp",
++    }
++    const mappedLang = languageMap[langName] || langName
++    try {
++      const wasmModule = await import(`tree-sitter-wasms/out/tree-sitter-${mappedLang}.wasm`)
++      wasmPath = wasmModule.default
++    } catch (err) {
++      debugLog("failed to load language wasm:", langName, err)
++      return null
++    }
++  }
++  
++  if (!parserClass) {
++    await getParser() // ensure parserClass is initialized
++  }
++  
++  const language = await parserClass!.Language.load(wasmPath)
++  languageCache.set(langName, language)
++  debugLog("language loaded and cached:", langName)
++  
++  return language
++}
++
++// =============================================================================
++// Public API
++// =============================================================================
+ 
+ export function isSupportedFile(filePath: string): boolean {
+   return getLanguageByExtension(filePath) !== null
+@@ -35,52 +122,34 @@ export async function detectComments(
+   content: string,
+   includeDocstrings = true
+ ): Promise<CommentInfo[]> {
++  debugLog("detectComments called:", { filePath, contentLength: content.length })
++  
+   const langName = getLanguageByExtension(filePath)
+   if (!langName) {
++    debugLog("unsupported language for:", filePath)
+     return []
+   }
+ 
+   const queryPattern = QUERY_TEMPLATES[langName]
+   if (!queryPattern) {
++    debugLog("no query pattern for:", langName)
+     return []
+   }
+ 
+   try {
+-    const Parser = (await import("web-tree-sitter")).default
++    const parser = await getParser()
++    const language = await getLanguage(langName)
+     
+-    const treeSitterWasmPath = require.resolve("web-tree-sitter/tree-sitter.wasm")
+-    await Parser.init({
+-      locateFile: () => treeSitterWasmPath,
+-    })
+-
+-    const parser = new Parser()
+-
+-    let wasmPath: string
+-    try {
+-      const wasmModule = await import(`tree-sitter-wasms/out/tree-sitter-${langName}.wasm`)
+-      wasmPath = wasmModule.default
+-    } catch {
+-      const languageMap: Record<string, string> = {
+-        golang: "go",
+-        csharp: "c_sharp",
+-        cpp: "cpp",
+-      }
+-      const mappedLang = languageMap[langName] || langName
+-      try {
+-        const wasmModule = await import(`tree-sitter-wasms/out/tree-sitter-${mappedLang}.wasm`)
+-        wasmPath = wasmModule.default
+-      } catch {
+-        return []
+-      }
++    if (!language) {
++      debugLog("language not available:", langName)
++      return []
+     }
+ 
+-    const language = await Parser.Language.load(wasmPath)
+     parser.setLanguage(language)
+-
+     const tree = parser.parse(content)
+     const comments: CommentInfo[] = []
+ 
+-    const query = language.query(queryPattern)
++    const query = (language as { query: (pattern: string) => { matches: (node: unknown) => Array<{ captures: Array<{ node: { text: string; type: string; startPosition: { row: number } } }> }> } }).query(queryPattern)
+     const matches = query.matches(tree.rootNode)
+ 
+     for (const match of matches) {
+@@ -110,7 +179,7 @@ export async function detectComments(
+       const docQuery = DOCSTRING_QUERIES[langName]
+       if (docQuery) {
+         try {
+-          const docQueryObj = language.query(docQuery)
++          const docQueryObj = (language as { query: (pattern: string) => { matches: (node: unknown) => Array<{ captures: Array<{ node: { text: string; startPosition: { row: number } } }> }> } }).query(docQuery)
+           const docMatches = docQueryObj.matches(tree.rootNode)
+ 
+           for (const match of docMatches) {
+@@ -139,8 +208,10 @@ export async function detectComments(
+ 
+     comments.sort((a, b) => a.lineNumber - b.lineNumber)
+ 
++    debugLog("detected comments:", comments.length)
+     return comments
+-  } catch {
++  } catch (err) {
++    debugLog("detectComments failed:", err)
+     return []
+   }
+ }
+diff --git a/src/hooks/comment-checker/index.ts b/src/hooks/comment-checker/index.ts
+index 5182a9ca..55ce05d7 100644
+--- a/src/hooks/comment-checker/index.ts
++++ b/src/hooks/comment-checker/index.ts
+@@ -3,6 +3,18 @@ import { detectComments, isSupportedFile } from "./detector"
+ import { applyFilters } from "./filters"
+ import { formatHookMessage } from "./output"
+ 
++import * as fs from "fs"
++
++const DEBUG = process.env.COMMENT_CHECKER_DEBUG === "1"
++const DEBUG_FILE = "/tmp/comment-checker-debug.log"
++
++function debugLog(...args: unknown[]) {
++  if (DEBUG) {
++    const msg = `[${new Date().toISOString()}] [comment-checker:hook] ${args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')}\n`
++    fs.appendFileSync(DEBUG_FILE, msg)
++  }
++}
++
+ const pendingCalls = new Map<string, PendingCall>()
+ const PENDING_CALL_TTL = 60_000
+ 
+@@ -18,27 +30,37 @@ function cleanupOldPendingCalls(): void {
+ setInterval(cleanupOldPendingCalls, 10_000)
+ 
+ export function createCommentCheckerHooks() {
++  debugLog("createCommentCheckerHooks called")
++  
+   return {
+     "tool.execute.before": async (
+       input: { tool: string; sessionID: string; callID: string },
+       output: { args: Record<string, unknown> }
+     ): Promise<void> => {
++      debugLog("tool.execute.before:", { tool: input.tool, callID: input.callID, args: output.args })
++      
+       const toolLower = input.tool.toLowerCase()
+       if (toolLower !== "write" && toolLower !== "edit" && toolLower !== "multiedit") {
++        debugLog("skipping non-write/edit tool:", toolLower)
+         return
+       }
+ 
+       const filePath = (output.args.filePath ?? output.args.file_path ?? output.args.path) as string | undefined
+       const content = output.args.content as string | undefined
+ 
++      debugLog("extracted filePath:", filePath)
++
+       if (!filePath) {
++        debugLog("no filePath found")
+         return
+       }
+ 
+       if (!isSupportedFile(filePath)) {
++        debugLog("unsupported file:", filePath)
+         return
+       }
+ 
++      debugLog("registering pendingCall:", { callID: input.callID, filePath, tool: toolLower })
+       pendingCalls.set(input.callID, {
+         filePath,
+         content,
+@@ -52,14 +74,28 @@ export function createCommentCheckerHooks() {
+       input: { tool: string; sessionID: string; callID: string },
+       output: { title: string; output: string; metadata: unknown }
+     ): Promise<void> => {
++      debugLog("tool.execute.after:", { tool: input.tool, callID: input.callID })
++      
+       const pendingCall = pendingCalls.get(input.callID)
+       if (!pendingCall) {
++        debugLog("no pendingCall found for:", input.callID)
+         return
+       }
+ 
+       pendingCalls.delete(input.callID)
+-
+-      if (output.output.toLowerCase().includes("error")) {
++      debugLog("processing pendingCall:", pendingCall)
++
++      // Only skip if the output indicates a tool execution failure
++      // (not LSP warnings/errors or other incidental "error" strings)
++      const outputLower = output.output.toLowerCase()
++      const isToolFailure = 
++        outputLower.includes("error:") || 
++        outputLower.includes("failed to") ||
++        outputLower.includes("could not") ||
++        outputLower.startsWith("error")
++      
++      if (isToolFailure) {
++        debugLog("skipping due to tool failure in output")
+         return
+       }
+ 
+@@ -68,15 +104,23 @@ export function createCommentCheckerHooks() {
+ 
+         if (pendingCall.content) {
+           content = pendingCall.content
++          debugLog("using content from args")
+         } else {
++          debugLog("reading file:", pendingCall.filePath)
+           const file = Bun.file(pendingCall.filePath)
+           content = await file.text()
++          debugLog("file content length:", content.length)
+         }
+ 
++        debugLog("calling detectComments...")
+         const rawComments = await detectComments(pendingCall.filePath, content)
++        debugLog("raw comments:", rawComments.length)
++        
+         const filteredComments = applyFilters(rawComments)
++        debugLog("filtered comments:", filteredComments.length)
+ 
+         if (filteredComments.length === 0) {
++          debugLog("no comments after filtering")
+           return
+         }
+ 
+@@ -88,8 +132,11 @@ export function createCommentCheckerHooks() {
+         ]
+ 
+         const message = formatHookMessage(fileComments)
++        debugLog("appending message to output")
+         output.output += `\n\n${message}`
+-      } catch {}
++      } catch (err) {
++        debugLog("tool.execute.after failed:", err)
++      }
+     },
+   }
+ }
+-- 
+2.39.2
+

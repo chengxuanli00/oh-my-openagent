@@ -1,0 +1,211 @@
+From 98da8b675b25dc34f11c9f9ca5c162392fd3942d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 10 May 2026 15:32:36 +0900
+Subject: [PATCH 4994/5749] fix(installer): apply extractSemverFromOutput to
+ opencode-binary version probe
+
+The same output.trim() bug fixed in PR #3909 for doctor exists in the
+installer's opencode-binary.ts. Without this fix, `bunx oh-my-opencode
+install` would store polluted Electron stdout (e.g., `00:24:25.202 >
+app starting { version: '1.14.33', packaged: true }`) as the OpenCode
+version in config, breaking downstream version-dependent logic.
+
+- Extract extractSemverFromOutput to src/shared/extract-semver.ts
+  (precedent: spawn-with-windows-hide is in shared because used by
+  both doctor and installer)
+- src/cli/doctor/checks/system-binary.ts now imports from shared and
+  re-exports for backward compat
+- src/cli/config-manager/opencode-binary.ts uses the shared helper
+  with `?? output.trim()` fallback to preserve legacy behavior on
+  non-semver-shaped successful outputs (e.g., custom builds)
+- Add 4 installer regression tests covering: clean semver, polluted
+  Electron stdout (regression for #3765 installer caller), fallback
+  for non-semver, null when no binary on PATH
+
+Refs #3765
+---
+ .../config-manager/opencode-binary.test.ts    | 85 +++++++++++++++++++
+ src/cli/config-manager/opencode-binary.ts     |  3 +-
+ src/cli/doctor/checks/system-binary.test.ts   |  2 +-
+ src/cli/doctor/checks/system-binary.ts        | 14 +--
+ src/shared/extract-semver.ts                  |  9 ++
+ 5 files changed, 100 insertions(+), 13 deletions(-)
+ create mode 100644 src/cli/config-manager/opencode-binary.test.ts
+ create mode 100644 src/shared/extract-semver.ts
+
+diff --git a/src/cli/config-manager/opencode-binary.test.ts b/src/cli/config-manager/opencode-binary.test.ts
+new file mode 100644
+index 00000000..b298c102
+--- /dev/null
++++ b/src/cli/config-manager/opencode-binary.test.ts
+@@ -0,0 +1,85 @@
++/// <reference types="bun-types" />
++
++import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
++
++import * as configContext from "./config-context"
++import * as spawnHelpers from "../../shared/spawn-with-windows-hide"
++
++type OpenCodeBinaryModule = typeof import("./opencode-binary")
++
++type CreateProcOptions = {
++  exitCode?: number | null
++  output?: { stdout?: string; stderr?: string }
++}
++
++function createProc(options: CreateProcOptions = {}): ReturnType<typeof spawnHelpers.spawnWithWindowsHide> {
++  const exitCode = options.exitCode ?? 0
++  return {
++    exited: Promise.resolve(exitCode),
++    exitCode,
++    stdout: options.output?.stdout !== undefined ? new Blob([options.output.stdout]).stream() : undefined,
++    stderr: options.output?.stderr !== undefined ? new Blob([options.output.stderr]).stream() : undefined,
++    kill: () => {},
++  } satisfies ReturnType<typeof spawnHelpers.spawnWithWindowsHide>
++}
++
++describe("getOpenCodeVersion (installer)", () => {
++  let spawnSpy: ReturnType<typeof spyOn>
++  let initConfigContextSpy: ReturnType<typeof spyOn>
++  let getOpenCodeVersion: OpenCodeBinaryModule["getOpenCodeVersion"]
++
++  beforeEach(async () => {
++    spawnSpy = spyOn(spawnHelpers, "spawnWithWindowsHide")
++    initConfigContextSpy = spyOn(configContext, "initConfigContext").mockImplementation(() => {})
++    const mod = await import(`./opencode-binary?test=${Date.now()}-${Math.random()}`)
++    getOpenCodeVersion = mod.getOpenCodeVersion
++  })
++
++  afterEach(() => {
++    spawnSpy.mockRestore()
++    initConfigContextSpy.mockRestore()
++  })
++
++  describe("#given clean opencode --version stdout #when getOpenCodeVersion #then returns the semver string", () => {
++    it("plain semver", async () => {
++      spawnSpy.mockReturnValue(createProc({ output: { stdout: "1.14.33\n" } }))
++
++      const result = await getOpenCodeVersion()
++
++      expect(result).toBe("1.14.33")
++    })
++  })
++
++  describe("#given Electron-polluted opencode --version stdout #when getOpenCodeVersion #then returns extracted semver, not the timestamp-prefixed line", () => {
++    it("regression for #3765 installer caller", async () => {
++      const polluted = "00:24:25.202 > app starting { version: '1.14.33', packaged: true }"
++      spawnSpy.mockReturnValue(createProc({ output: { stdout: polluted } }))
++
++      const result = await getOpenCodeVersion()
++
++      expect(result).toBe("1.14.33")
++    })
++  })
++
++  describe("#given non-semver-shaped stdout #when getOpenCodeVersion #then falls back to trimmed output", () => {
++    it("preserves legacy behavior for unrecognized formats", async () => {
++      spawnSpy.mockReturnValue(createProc({ output: { stdout: "  custom-build\n" } }))
++
++      const result = await getOpenCodeVersion()
++
++      expect(result).toBe("custom-build")
++    })
++  })
++
++  describe("#given no opencode binary on PATH #when getOpenCodeVersion #then returns null", () => {
++    it("all candidate spawns throw", async () => {
++      spawnSpy.mockImplementation(() => {
++        throw new Error("ENOENT")
++      })
++
++      const result = await getOpenCodeVersion()
++
++      expect(result).toBe(null)
++    })
++  })
++})
+diff --git a/src/cli/config-manager/opencode-binary.ts b/src/cli/config-manager/opencode-binary.ts
+index 6fb14040..d5256a0b 100644
+--- a/src/cli/config-manager/opencode-binary.ts
++++ b/src/cli/config-manager/opencode-binary.ts
+@@ -1,3 +1,4 @@
++import { extractSemverFromOutput } from "../../shared/extract-semver"
+ import type { OpenCodeBinaryType } from "../../shared/opencode-config-dir-types"
+ import { spawnWithWindowsHide } from "../../shared/spawn-with-windows-hide"
+ import { initConfigContext } from "./config-context"
+@@ -19,7 +20,7 @@ async function findOpenCodeBinaryWithVersion(): Promise<OpenCodeBinaryResult | n
+       const output = await new Response(proc.stdout).text()
+       await proc.exited
+       if (proc.exitCode === 0) {
+-        const version = output.trim()
++        const version = extractSemverFromOutput(output) ?? output.trim()
+         initConfigContext(binary, version)
+         return { binary, version }
+       }
+diff --git a/src/cli/doctor/checks/system-binary.test.ts b/src/cli/doctor/checks/system-binary.test.ts
+index 701f54d9..55742230 100644
+--- a/src/cli/doctor/checks/system-binary.test.ts
++++ b/src/cli/doctor/checks/system-binary.test.ts
+@@ -1,7 +1,7 @@
+ /// <reference types="bun-types" />
+ 
+ import { describe, expect, it } from "bun:test"
+-import { extractSemverFromOutput } from "./system-binary"
++import { extractSemverFromOutput } from "../../../shared/extract-semver"
+ 
+ describe("extractSemverFromOutput", () => {
+   describe("#given clean version output #when extractSemverFromOutput #then returns the semver token", () => {
+diff --git a/src/cli/doctor/checks/system-binary.ts b/src/cli/doctor/checks/system-binary.ts
+index 4a76648f..9a92f723 100644
+--- a/src/cli/doctor/checks/system-binary.ts
++++ b/src/cli/doctor/checks/system-binary.ts
+@@ -1,10 +1,13 @@
+ import { existsSync } from "node:fs"
+ import { homedir } from "node:os"
+ import { join } from "node:path"
++import { extractSemverFromOutput } from "../../../shared/extract-semver"
+ import { spawnWithTimeout } from "../spawn-with-timeout"
+ 
+ import { OPENCODE_BINARIES } from "../constants"
+ 
++export { extractSemverFromOutput }
++
+ const WINDOWS_EXECUTABLE_EXTS = [".exe", ".cmd", ".bat", ".ps1"]
+ 
+ export interface OpenCodeBinaryInfo {
+@@ -105,17 +108,6 @@ export async function findOpenCodeBinary(): Promise<OpenCodeBinaryInfo | null> {
+   return findDesktopBinary()
+ }
+ 
+-export function extractSemverFromOutput(output: string): string | null {
+-  const trimmed = output.trim()
+-  if (!trimmed) return null
+-  // Match a semver-shaped token, allowing optional `v` prefix and `-prerelease+build` suffix.
+-  // The negative lookbehind `(?<![\d:])` prevents matching the milliseconds segment of timestamps
+-  // like `00:24:25.202` that the Electron-based OpenCode binary leaks into stdout.
+-  const semverPattern = /(?<![\d:])v?(\d+\.\d+\.\d+(?:[-+][\w.]+)*)/
+-  const match = trimmed.match(semverPattern)
+-  return match?.[1] ?? null
+-}
+-
+ export async function getOpenCodeVersion(
+   binaryPath: string,
+   platform: NodeJS.Platform = process.platform
+diff --git a/src/shared/extract-semver.ts b/src/shared/extract-semver.ts
+new file mode 100644
+index 00000000..37e55d05
+--- /dev/null
++++ b/src/shared/extract-semver.ts
+@@ -0,0 +1,9 @@
++export function extractSemverFromOutput(output: string): string | null {
++  const trimmed = output.trim()
++  if (!trimmed) return null
++  // The negative lookbehind `(?<![\d:])` prevents matching the milliseconds segment of timestamps
++  // like `00:24:25.202` that the Electron-based OpenCode binary leaks into stdout.
++  const semverPattern = /(?<![\d:])v?(\d+\.\d+\.\d+(?:[-+][\w.]+)*)/
++  const match = trimmed.match(semverPattern)
++  return match?.[1] ?? null
++}
+-- 
+2.39.2
+

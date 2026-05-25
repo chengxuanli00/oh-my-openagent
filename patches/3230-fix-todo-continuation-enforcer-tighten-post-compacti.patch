@@ -1,0 +1,249 @@
+From 088844474a27eb5d74fe964522789fbecf1877ce Mon Sep 17 00:00:00 2001
+From: conversun <conversun@gmail.com>
+Date: Fri, 13 Mar 2026 00:55:37 +0800
+Subject: [PATCH 3230/5749] fix(todo-continuation-enforcer): tighten
+ post-compaction guard with session-agent fallback
+
+Refine continuation agent resolution to prefer session-state agent fallback while keeping compaction-specific protection. Replace sticky boolean compaction flag with a short-lived timestamp guard so unresolved agents are blocked only during the immediate post-compaction window, avoiding long-lived suppression and preserving existing continuation behavior.
+---
+ .../compaction-guard.ts                       | 10 +++++
+ .../todo-continuation-enforcer/constants.ts   |  1 +
+ .../continuation-injection.ts                 |  6 ++-
+ .../todo-continuation-enforcer/handler.ts     |  4 +-
+ .../todo-continuation-enforcer/idle-event.ts  | 44 +++++++------------
+ .../resolve-message-info.ts                   | 31 +++++++++++++
+ src/hooks/todo-continuation-enforcer/types.ts |  2 +-
+ 7 files changed, 66 insertions(+), 32 deletions(-)
+ create mode 100644 src/hooks/todo-continuation-enforcer/compaction-guard.ts
+ create mode 100644 src/hooks/todo-continuation-enforcer/resolve-message-info.ts
+
+diff --git a/src/hooks/todo-continuation-enforcer/compaction-guard.ts b/src/hooks/todo-continuation-enforcer/compaction-guard.ts
+new file mode 100644
+index 00000000..38f3d640
+--- /dev/null
++++ b/src/hooks/todo-continuation-enforcer/compaction-guard.ts
+@@ -0,0 +1,10 @@
++import { COMPACTION_GUARD_MS } from "./constants"
++import type { SessionState } from "./types"
++
++export function isCompactionGuardActive(state: SessionState, now: number): boolean {
++  if (!state.recentCompactionAt) {
++    return false
++  }
++
++  return now - state.recentCompactionAt < COMPACTION_GUARD_MS
++}
+diff --git a/src/hooks/todo-continuation-enforcer/constants.ts b/src/hooks/todo-continuation-enforcer/constants.ts
+index a26c7bc0..5829ea86 100644
+--- a/src/hooks/todo-continuation-enforcer/constants.ts
++++ b/src/hooks/todo-continuation-enforcer/constants.ts
+@@ -17,6 +17,7 @@ export const TOAST_DURATION_MS = 900
+ export const COUNTDOWN_GRACE_PERIOD_MS = 500
+ 
+ export const ABORT_WINDOW_MS = 3000
++export const COMPACTION_GUARD_MS = 60_000
+ export const CONTINUATION_COOLDOWN_MS = 5_000
+ export const MAX_STAGNATION_COUNT = 3
+ export const MAX_CONSECUTIVE_FAILURES = 5
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index 6dcac904..f5b2b84e 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -1,6 +1,7 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ 
+ import type { BackgroundManager } from "../../features/background-agent"
++import { getSessionAgent } from "../../features/claude-code-session-state"
+ import {
+   createInternalAgentTextPart,
+   normalizeSDKResponse,
+@@ -20,6 +21,7 @@ import {
+   DEFAULT_SKIP_AGENTS,
+   HOOK_NAME,
+ } from "./constants"
++import { isCompactionGuardActive } from "./compaction-guard"
+ import { getMessageDir } from "./message-directory"
+ import { getIncompleteCount } from "./todo"
+ import type { ResolvedMessageInfo, Todo } from "./types"
+@@ -88,7 +90,7 @@ export async function injectContinuation(args: {
+     return
+   }
+ 
+-  let agentName = resolvedInfo?.agent
++  let agentName = resolvedInfo?.agent ?? getSessionAgent(sessionID)
+   let model = resolvedInfo?.model
+   let tools = resolvedInfo?.tools
+ 
+@@ -122,7 +124,7 @@ export async function injectContinuation(args: {
+ 
+   if (!agentName) {
+     const compactionState = sessionStateStore.getExistingState(sessionID)
+-    if (compactionState?.hasRecentCompaction) {
++    if (compactionState && isCompactionGuardActive(compactionState, Date.now())) {
+       log(`[${HOOK_NAME}] Skipped: agent unknown after compaction`, { sessionID })
+       return
+     }
+diff --git a/src/hooks/todo-continuation-enforcer/handler.ts b/src/hooks/todo-continuation-enforcer/handler.ts
+index ee8168d6..a3eb71bf 100644
+--- a/src/hooks/todo-continuation-enforcer/handler.ts
++++ b/src/hooks/todo-continuation-enforcer/handler.ts
+@@ -67,9 +67,9 @@ export function createTodoContinuationHandler(args: {
+       const sessionID = (props?.sessionID ?? (props?.info as { id?: string } | undefined)?.id) as string | undefined
+       if (sessionID) {
+         const state = sessionStateStore.getState(sessionID)
+-        state.hasRecentCompaction = true
++        state.recentCompactionAt = Date.now()
+         sessionStateStore.cancelCountdown(sessionID)
+-        log(`[${HOOK_NAME}] Session compacted: marked hasRecentCompaction`, { sessionID })
++        log(`[${HOOK_NAME}] Session compacted: marked recentCompactionAt`, { sessionID })
+       }
+       return
+     }
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 834ed005..58a20012 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -1,7 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+-
+ import type { BackgroundManager } from "../../features/background-agent"
+-import type { ToolPermission } from "../../features/hook-message-injector"
++import { getSessionAgent } from "../../features/claude-code-session-state"
+ import { normalizeSDKResponse } from "../../shared"
+ import { log } from "../../shared/logger"
+ import { getAgentConfigKey } from "../../shared/agent-display-names"
+@@ -19,6 +18,8 @@ import { hasUnansweredQuestion } from "./pending-question-detection"
+ import { shouldStopForStagnation } from "./stagnation-detection"
+ import { getIncompleteCount } from "./todo"
+ import type { MessageInfo, ResolvedMessageInfo, Todo } from "./types"
++import { resolveLatestMessageInfo } from "./resolve-message-info"
++import { isCompactionGuardActive } from "./compaction-guard"
+ import type { SessionStateStore } from "./session-state"
+ import { startCountdown } from "./countdown"
+ 
+@@ -119,10 +120,7 @@ export async function handleSessionIdle(args: {
+     && Date.now() - state.lastInjectedAt >= FAILURE_RESET_WINDOW_MS
+   ) {
+     state.consecutiveFailures = 0
+-    log(`[${HOOK_NAME}] Reset consecutive failures after recovery window`, {
+-      sessionID,
+-      failureResetWindowMs: FAILURE_RESET_WINDOW_MS,
+-    })
++    log(`[${HOOK_NAME}] Reset consecutive failures after recovery window`, { sessionID, failureResetWindowMs: FAILURE_RESET_WINDOW_MS })
+   }
+ 
+   if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+@@ -147,39 +145,32 @@ export async function handleSessionIdle(args: {
+ 
+   let resolvedInfo: ResolvedMessageInfo | undefined
+   try {
+-    const messagesResp = await ctx.client.session.messages({
+-      path: { id: sessionID },
+-    })
+-    const messages = normalizeSDKResponse(messagesResp, [] as Array<{ info?: MessageInfo }>)
+-    for (let i = messages.length - 1; i >= 0; i--) {
+-      const info = messages[i].info
+-      if (info?.agent === "compaction") {
+-        continue
+-      }
+-      if (info?.agent || info?.model || (info?.modelID && info?.providerID)) {
+-        resolvedInfo = {
+-          agent: info.agent,
+-          model: info.model ?? (info.providerID && info.modelID ? { providerID: info.providerID, modelID: info.modelID } : undefined),
+-          tools: info.tools as Record<string, ToolPermission> | undefined,
+-        }
+-        break
+-      }
+-    }
++    resolvedInfo = await resolveLatestMessageInfo(ctx, sessionID)
+   } catch (error) {
+     log(`[${HOOK_NAME}] Failed to fetch messages for agent check`, { sessionID, error: String(error) })
+   }
+ 
+-  log(`[${HOOK_NAME}] Agent check`, { sessionID, agentName: resolvedInfo?.agent, skipAgents, hasRecentCompaction: state.hasRecentCompaction })
++  const sessionAgent = getSessionAgent(sessionID)
++  if (!resolvedInfo?.agent && sessionAgent) {
++    resolvedInfo = { ...resolvedInfo, agent: sessionAgent }
++  }
++
++  const compactionGuardActive = isCompactionGuardActive(state, Date.now())
++
++  log(`[${HOOK_NAME}] Agent check`, { sessionID, agentName: resolvedInfo?.agent, skipAgents, compactionGuardActive })
+ 
+   const resolvedAgentName = resolvedInfo?.agent
+   if (resolvedAgentName && skipAgents.some(s => getAgentConfigKey(s) === getAgentConfigKey(resolvedAgentName))) {
+     log(`[${HOOK_NAME}] Skipped: agent in skipAgents list`, { sessionID, agent: resolvedAgentName })
+     return
+   }
+-  if (state.hasRecentCompaction && !resolvedInfo?.agent) {
++  if (compactionGuardActive && !resolvedInfo?.agent) {
+     log(`[${HOOK_NAME}] Skipped: compaction occurred but no agent info resolved`, { sessionID })
+     return
+   }
++  if (state.recentCompactionAt && resolvedInfo?.agent) {
++    state.recentCompactionAt = undefined
++  }
+ 
+   if (isContinuationStopped?.(sessionID)) {
+     log(`[${HOOK_NAME}] Skipped: continuation stopped for session`, { sessionID })
+@@ -195,7 +186,6 @@ export async function handleSessionIdle(args: {
+   if (shouldStopForStagnation({ sessionID, incompleteCount, progressUpdate })) {
+     return
+   }
+-
+   startCountdown({
+     ctx,
+     sessionID,
+diff --git a/src/hooks/todo-continuation-enforcer/resolve-message-info.ts b/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
+new file mode 100644
+index 00000000..cf4c5170
+--- /dev/null
++++ b/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
+@@ -0,0 +1,31 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++
++import { normalizeSDKResponse } from "../../shared"
++
++import type { MessageInfo, ResolvedMessageInfo } from "./types"
++
++export async function resolveLatestMessageInfo(
++  ctx: PluginInput,
++  sessionID: string
++): Promise<ResolvedMessageInfo | undefined> {
++  const messagesResp = await ctx.client.session.messages({
++    path: { id: sessionID },
++  })
++  const messages = normalizeSDKResponse(messagesResp, [] as Array<{ info?: MessageInfo }>)
++
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const info = messages[i].info
++    if (info?.agent === "compaction") {
++      continue
++    }
++    if (info?.agent || info?.model || (info?.modelID && info?.providerID)) {
++      return {
++        agent: info.agent,
++        model: info.model ?? (info.providerID && info.modelID ? { providerID: info.providerID, modelID: info.modelID } : undefined),
++        tools: info.tools,
++      }
++    }
++  }
++
++  return undefined
++}
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index e8ea96af..b7a434e1 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -35,7 +35,7 @@ export interface SessionState {
+   inFlight?: boolean
+   stagnationCount: number
+   consecutiveFailures: number
+-  hasRecentCompaction?: boolean
++  recentCompactionAt?: number
+ }
+ 
+ export interface MessageInfo {
+-- 
+2.39.2
+

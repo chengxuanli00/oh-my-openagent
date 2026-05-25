@@ -1,0 +1,333 @@
+From 15de6f637e88948d104a7234fe93f26b58050157 Mon Sep 17 00:00:00 2001
+From: Steven Vo <875426+stevenvo@users.noreply.github.com>
+Date: Fri, 26 Dec 2025 21:14:11 +0700
+Subject: [PATCH 0601/5749] feat: add two-layer thinking block validation
+ (proactive + reactive) (#248)
+
+- Add thinking-block-validator hook for proactive prevention before API calls
+- Enhance session-recovery to include previous thinking content
+- Fix hook registration to actually invoke the validator
+
+Addresses extended thinking errors with Claude Opus/Sonnet 4.5 using tool calls.
+
+Related: https://github.com/vercel/ai/issues/7729
+Related: https://github.com/sst/opencode/issues/2599
+---
+ assets/oh-my-opencode.schema.json           |   3 +-
+ src/config/schema.ts                        |   1 +
+ src/hooks/index.ts                          |   1 +
+ src/hooks/session-recovery/storage.ts       |  40 ++++-
+ src/hooks/thinking-block-validator/index.ts | 170 ++++++++++++++++++++
+ src/index.ts                                |   6 +
+ 6 files changed, 219 insertions(+), 2 deletions(-)
+ create mode 100644 src/hooks/thinking-block-validator/index.ts
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index 823fd7eb..2dee23b0 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -59,7 +59,8 @@
+           "agent-usage-reminder",
+           "non-interactive-env",
+           "interactive-bash-session",
+-          "empty-message-sanitizer"
++          "empty-message-sanitizer",
++          "thinking-block-validator"
+         ]
+       }
+     },
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index a959a0c3..724762d2 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -64,6 +64,7 @@ export const HookNameSchema = z.enum([
+   "non-interactive-env",
+   "interactive-bash-session",
+   "empty-message-sanitizer",
++  "thinking-block-validator",
+ ])
+ 
+ export const AgentOverrideConfigSchema = z.object({
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 9b7bf862..a409813d 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -21,3 +21,4 @@ export { createKeywordDetectorHook } from "./keyword-detector";
+ export { createNonInteractiveEnvHook } from "./non-interactive-env";
+ export { createInteractiveBashSessionHook } from "./interactive-bash-session";
+ export { createEmptyMessageSanitizerHook } from "./empty-message-sanitizer";
++export { createThinkingBlockValidatorHook } from "./thinking-block-validator";
+diff --git a/src/hooks/session-recovery/storage.ts b/src/hooks/session-recovery/storage.ts
+index c67f1fd3..17be4d36 100644
+--- a/src/hooks/session-recovery/storage.ts
++++ b/src/hooks/session-recovery/storage.ts
+@@ -223,6 +223,41 @@ export function findMessagesWithOrphanThinking(sessionID: string): string[] {
+   return result
+ }
+ 
++/**
++ * Find the most recent thinking content from previous assistant messages
++ * Following Anthropic's recommendation to include thinking blocks from previous turns
++ */
++function findLastThinkingContent(sessionID: string, beforeMessageID: string): string {
++  const messages = readMessages(sessionID)
++
++  // Find the index of the current message
++  const currentIndex = messages.findIndex(m => m.id === beforeMessageID)
++  if (currentIndex === -1) return ""
++
++  // Search backwards through previous assistant messages
++  for (let i = currentIndex - 1; i >= 0; i--) {
++    const msg = messages[i]
++    if (msg.role !== "assistant") continue
++
++    // Look for thinking parts in this message
++    const parts = readParts(msg.id)
++    for (const part of parts) {
++      if (THINKING_TYPES.has(part.type)) {
++        // Found thinking content - return it
++        // Note: 'thinking' type uses 'thinking' property, 'reasoning' type uses 'text' property
++        const thinking = (part as { thinking?: string; text?: string }).thinking
++        const reasoning = (part as { thinking?: string; text?: string }).text
++        const content = thinking || reasoning
++        if (content && content.trim().length > 0) {
++          return content
++        }
++      }
++    }
++  }
++
++  return ""
++}
++
+ export function prependThinkingPart(sessionID: string, messageID: string): boolean {
+   const partDir = join(PART_STORAGE, messageID)
+ 
+@@ -230,13 +265,16 @@ export function prependThinkingPart(sessionID: string, messageID: string): boole
+     mkdirSync(partDir, { recursive: true })
+   }
+ 
++  // Try to get thinking content from previous turns (Anthropic's recommendation)
++  const previousThinking = findLastThinkingContent(sessionID, messageID)
++
+   const partId = `prt_0000000000_thinking`
+   const part = {
+     id: partId,
+     sessionID,
+     messageID,
+     type: "thinking",
+-    thinking: "",
++    thinking: previousThinking || "[Continuing from previous reasoning]",
+     synthetic: true,
+   }
+ 
+diff --git a/src/hooks/thinking-block-validator/index.ts b/src/hooks/thinking-block-validator/index.ts
+new file mode 100644
+index 00000000..463d3a87
+--- /dev/null
++++ b/src/hooks/thinking-block-validator/index.ts
+@@ -0,0 +1,170 @@
++/**
++ * Proactive Thinking Block Validator Hook
++ *
++ * Prevents "Expected thinking/redacted_thinking but found tool_use" errors
++ * by validating and fixing message structure BEFORE sending to Anthropic API.
++ *
++ * This hook runs on the "experimental.chat.messages.transform" hook point,
++ * which is called before messages are converted to ModelMessage format and
++ * sent to the API.
++ *
++ * Key differences from session-recovery hook:
++ * - PROACTIVE (prevents error) vs REACTIVE (fixes after error)
++ * - Runs BEFORE API call vs AFTER API error
++ * - User never sees the error vs User sees error then recovery
++ */
++
++import type { Message, Part } from "@opencode-ai/sdk"
++
++interface MessageWithParts {
++  info: Message
++  parts: Part[]
++}
++
++type MessagesTransformHook = {
++  "experimental.chat.messages.transform"?: (
++    input: Record<string, never>,
++    output: { messages: MessageWithParts[] }
++  ) => Promise<void>
++}
++
++/**
++ * Check if a model has extended thinking enabled
++ * Uses patterns from think-mode/switcher.ts for consistency
++ */
++function isExtendedThinkingModel(modelID: string): boolean {
++  if (!modelID) return false
++  const lower = modelID.toLowerCase()
++
++  // Check for explicit thinking/high variants (always enabled)
++  if (lower.includes("thinking") || lower.endsWith("-high")) {
++    return true
++  }
++
++  // Check for thinking-capable models (claude-4 family, claude-3)
++  // Aligns with THINKING_CAPABLE_MODELS in think-mode/switcher.ts
++  return (
++    lower.includes("claude-sonnet-4") ||
++    lower.includes("claude-opus-4") ||
++    lower.includes("claude-3")
++  )
++}
++
++/**
++ * Check if a message has tool parts (tool_use)
++ */
++function hasToolParts(parts: Part[]): boolean {
++  if (!parts || parts.length === 0) return false
++
++  return parts.some((part: Part) => {
++    const type = part.type as string
++    return type === "tool" || type === "tool_use"
++  })
++}
++
++/**
++ * Check if a message starts with a thinking/reasoning block
++ */
++function startsWithThinkingBlock(parts: Part[]): boolean {
++  if (!parts || parts.length === 0) return false
++
++  const firstPart = parts[0]
++  const type = firstPart.type as string
++  return type === "thinking" || type === "reasoning"
++}
++
++/**
++ * Find the most recent thinking content from previous assistant messages
++ */
++function findPreviousThinkingContent(
++  messages: MessageWithParts[],
++  currentIndex: number
++): string {
++  // Search backwards from current message
++  for (let i = currentIndex - 1; i >= 0; i--) {
++    const msg = messages[i]
++    if (msg.info.role !== "assistant") continue
++
++    // Look for thinking parts
++    if (!msg.parts) continue
++    for (const part of msg.parts) {
++      const type = part.type as string
++      if (type === "thinking" || type === "reasoning") {
++        const thinking = (part as any).thinking || (part as any).text
++        if (thinking && typeof thinking === "string" && thinking.trim().length > 0) {
++          return thinking
++        }
++      }
++    }
++  }
++
++  return ""
++}
++
++/**
++ * Prepend a thinking block to a message's parts array
++ */
++function prependThinkingBlock(
++  message: MessageWithParts,
++  thinkingContent: string
++): void {
++  if (!message.parts) {
++    message.parts = []
++  }
++
++  // Create synthetic thinking part
++  const thinkingPart = {
++    type: "thinking" as const,
++    id: `prt_0000000000_synthetic_thinking`,
++    sessionID: (message.info as any).sessionID || "",
++    messageID: message.info.id,
++    thinking: thinkingContent,
++    synthetic: true,
++  }
++
++  // Prepend to parts array
++  message.parts.unshift(thinkingPart as unknown as Part)
++}
++
++/**
++ * Validate and fix assistant messages that have tool_use but no thinking block
++ */
++export function createThinkingBlockValidatorHook(): MessagesTransformHook {
++  return {
++    "experimental.chat.messages.transform": async (_input, output) => {
++      const { messages } = output
++
++      if (!messages || messages.length === 0) {
++        return
++      }
++
++      // Get the model info from the last user message
++      const lastUserMessage = messages.findLast(m => m.info.role === "user")
++      const modelID = (lastUserMessage?.info as any)?.modelID || ""
++
++      // Only process if extended thinking might be enabled
++      if (!isExtendedThinkingModel(modelID)) {
++        return
++      }
++
++      // Process all assistant messages
++      for (let i = 0; i < messages.length; i++) {
++        const msg = messages[i]
++
++        // Only check assistant messages
++        if (msg.info.role !== "assistant") continue
++
++        // Check if message has tool parts but doesn't start with thinking
++        if (hasToolParts(msg.parts) && !startsWithThinkingBlock(msg.parts)) {
++          // Find thinking content from previous turns
++          const previousThinking = findPreviousThinkingContent(messages, i)
++
++          // Prepend thinking block with content from previous turn or placeholder
++          const thinkingContent = previousThinking || "[Continuing from previous reasoning]"
++
++          prependThinkingBlock(msg, thinkingContent)
++        }
++      }
++    },
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 008fc13c..655eb954 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -23,6 +23,7 @@ import {
+   createNonInteractiveEnvHook,
+   createInteractiveBashSessionHook,
+   createEmptyMessageSanitizerHook,
++  createThinkingBlockValidatorHook,
+ } from "./hooks";
+ import { createGoogleAntigravityAuthPlugin } from "./auth/antigravity";
+ import {
+@@ -319,6 +320,9 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const emptyMessageSanitizer = isHookEnabled("empty-message-sanitizer")
+     ? createEmptyMessageSanitizerHook()
+     : null;
++  const thinkingBlockValidator = isHookEnabled("thinking-block-validator")
++    ? createThinkingBlockValidatorHook()
++    : null;
+ 
+   const backgroundManager = new BackgroundManager(ctx);
+ 
+@@ -365,6 +369,8 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       input: Record<string, never>,
+       output: { messages: Array<{ info: unknown; parts: unknown[] }> }
+     ) => {
++      // eslint-disable-next-line @typescript-eslint/no-explicit-any
++      await thinkingBlockValidator?.["experimental.chat.messages.transform"]?.(input, output as any);
+       // eslint-disable-next-line @typescript-eslint/no-explicit-any
+       await emptyMessageSanitizer?.["experimental.chat.messages.transform"]?.(input, output as any);
+     },
+-- 
+2.39.2
+

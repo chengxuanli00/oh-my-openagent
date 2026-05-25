@@ -1,0 +1,348 @@
+From 4738379ad73d3ba98eed1d66abc54e00122d1259 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 8 Feb 2026 14:34:11 +0900
+Subject: [PATCH 1897/5749] fix(lsp): reset safety block on server restart to
+ prevent permanent blocks (#1366)
+
+---
+ .../claude-code-mcp-loader/loader.test.ts     |  11 ++
+ .../unstable-agent-babysitter/index.test.ts   |   6 +-
+ src/tools/lsp/client.test.ts                  | 114 +++++++++++++++++-
+ src/tools/lsp/client.ts                       |  82 ++++++++++---
+ 4 files changed, 193 insertions(+), 20 deletions(-)
+
+diff --git a/src/features/claude-code-mcp-loader/loader.test.ts b/src/features/claude-code-mcp-loader/loader.test.ts
+index 8a1b9f6e..a7fffe7e 100644
+--- a/src/features/claude-code-mcp-loader/loader.test.ts
++++ b/src/features/claude-code-mcp-loader/loader.test.ts
+@@ -8,6 +8,17 @@ const TEST_DIR = join(tmpdir(), "mcp-loader-test-" + Date.now())
+ describe("getSystemMcpServerNames", () => {
+   beforeEach(() => {
+     mkdirSync(TEST_DIR, { recursive: true })
++
++    // Isolate tests from real user environment (e.g., ~/.claude.json).
++    // loader.ts reads user-level config via os.homedir() + getClaudeConfigDir().
++    mock.module("os", () => ({
++      homedir: () => TEST_DIR,
++      tmpdir,
++    }))
++
++    mock.module("../../shared", () => ({
++      getClaudeConfigDir: () => join(TEST_DIR, ".claude"),
++    }))
+   })
+ 
+   afterEach(() => {
+diff --git a/src/hooks/unstable-agent-babysitter/index.test.ts b/src/hooks/unstable-agent-babysitter/index.test.ts
+index f9900e7d..355072b5 100644
+--- a/src/hooks/unstable-agent-babysitter/index.test.ts
++++ b/src/hooks/unstable-agent-babysitter/index.test.ts
+@@ -1,8 +1,9 @@
++import { afterEach, describe, expect, test } from "bun:test"
+ import { _resetForTesting, setMainSession } from "../../features/claude-code-session-state"
+ import type { BackgroundTask } from "../../features/background-agent"
+ import { createUnstableAgentBabysitterHook } from "./index"
+ 
+-const projectDir = "/Users/yeongyu/local-workspaces/oh-my-opencode"
++const projectDir = process.cwd()
+ 
+ type BabysitterContext = Parameters<typeof createUnstableAgentBabysitterHook>[0]
+ 
+@@ -21,6 +22,9 @@ function createMockPluginInput(options: {
+         prompt: async (input: unknown) => {
+           promptCalls.push({ input })
+         },
++        promptAsync: async (input: unknown) => {
++          promptCalls.push({ input })
++        },
+       },
+     },
+   }
+diff --git a/src/tools/lsp/client.test.ts b/src/tools/lsp/client.test.ts
+index 3ca6ee3b..8c805d14 100644
+--- a/src/tools/lsp/client.test.ts
++++ b/src/tools/lsp/client.test.ts
+@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+ import { join } from "node:path"
+ import { tmpdir } from "node:os"
+ 
+-import { describe, it, expect, spyOn, mock } from "bun:test"
++import { describe, it, expect, spyOn, mock, beforeEach, afterEach } from "bun:test"
+ 
+ mock.module("vscode-jsonrpc/node", () => ({
+   createMessageConnection: () => {
+@@ -12,10 +12,18 @@ mock.module("vscode-jsonrpc/node", () => ({
+   StreamMessageWriter: function StreamMessageWriter() {},
+ }))
+ 
+-import { LSPClient, validateCwd } from "./client"
++import { LSPClient, lspManager, validateCwd } from "./client"
+ import type { ResolvedServer } from "./types"
+ 
+ describe("LSPClient", () => {
++  beforeEach(async () => {
++    await lspManager.stopAll()
++  })
++
++  afterEach(async () => {
++    await lspManager.stopAll()
++  })
++
+   describe("openFile", () => {
+     it("sends didChange when a previously opened file changes on disk", async () => {
+       // #given
+@@ -61,6 +69,108 @@ describe("LSPClient", () => {
+     })
+   })
+ 
++  describe("LSPServerManager", () => {
++    it("recreates client after init failure instead of staying permanently blocked", async () => {
++      //#given
++      const dir = mkdtempSync(join(tmpdir(), "lsp-manager-test-"))
++
++      const server: ResolvedServer = {
++        id: "typescript",
++        command: ["typescript-language-server", "--stdio"],
++        extensions: [".ts"],
++        priority: 0,
++      }
++
++      const startSpy = spyOn(LSPClient.prototype, "start")
++      const initializeSpy = spyOn(LSPClient.prototype, "initialize")
++      const isAliveSpy = spyOn(LSPClient.prototype, "isAlive")
++      const stopSpy = spyOn(LSPClient.prototype, "stop")
++
++      startSpy.mockImplementationOnce(async () => {
++        throw new Error("boom")
++      })
++      startSpy.mockImplementation(async () => {})
++      initializeSpy.mockImplementation(async () => {})
++      isAliveSpy.mockImplementation(() => true)
++      stopSpy.mockImplementation(async () => {})
++
++      try {
++        //#when
++        await expect(lspManager.getClient(dir, server)).rejects.toThrow("boom")
++
++        const client = await lspManager.getClient(dir, server)
++
++        //#then
++        expect(client).toBeInstanceOf(LSPClient)
++        expect(startSpy).toHaveBeenCalledTimes(2)
++        expect(stopSpy).toHaveBeenCalled()
++      } finally {
++        startSpy.mockRestore()
++        initializeSpy.mockRestore()
++        isAliveSpy.mockRestore()
++        stopSpy.mockRestore()
++        rmSync(dir, { recursive: true, force: true })
++      }
++    })
++
++    it("resets stale initializing entry so a hung init does not permanently block future clients", async () => {
++      //#given
++      const dir = mkdtempSync(join(tmpdir(), "lsp-manager-stale-test-"))
++
++      const server: ResolvedServer = {
++        id: "typescript",
++        command: ["typescript-language-server", "--stdio"],
++        extensions: [".ts"],
++        priority: 0,
++      }
++
++      const dateNowSpy = spyOn(Date, "now")
++
++      const startSpy = spyOn(LSPClient.prototype, "start")
++      const initializeSpy = spyOn(LSPClient.prototype, "initialize")
++      const isAliveSpy = spyOn(LSPClient.prototype, "isAlive")
++      const stopSpy = spyOn(LSPClient.prototype, "stop")
++
++      // First client init hangs forever.
++      const never = new Promise<void>(() => {})
++      startSpy.mockImplementationOnce(async () => {
++        await never
++      })
++
++      // Second attempt should be allowed after stale reset.
++      startSpy.mockImplementationOnce(async () => {})
++      startSpy.mockImplementation(async () => {})
++      initializeSpy.mockImplementation(async () => {})
++      isAliveSpy.mockImplementation(() => true)
++      stopSpy.mockImplementation(async () => {})
++
++      try {
++        //#when
++        dateNowSpy.mockReturnValueOnce(0)
++        lspManager.warmupClient(dir, server)
++
++        dateNowSpy.mockReturnValueOnce(60_000)
++
++        const client = await Promise.race([
++          lspManager.getClient(dir, server),
++          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("test-timeout")), 50)),
++        ])
++
++        //#then
++        expect(client).toBeInstanceOf(LSPClient)
++        expect(startSpy).toHaveBeenCalledTimes(2)
++        expect(stopSpy).toHaveBeenCalled()
++      } finally {
++        dateNowSpy.mockRestore()
++        startSpy.mockRestore()
++        initializeSpy.mockRestore()
++        isAliveSpy.mockRestore()
++        stopSpy.mockRestore()
++        rmSync(dir, { recursive: true, force: true })
++      }
++    })
++  })
++
+   describe("validateCwd", () => {
+     it("returns valid for existing directory", () => {
+       // #given
+diff --git a/src/tools/lsp/client.ts b/src/tools/lsp/client.ts
+index 57f9a5c8..ae4fb9ab 100644
+--- a/src/tools/lsp/client.ts
++++ b/src/tools/lsp/client.ts
+@@ -221,6 +221,7 @@ interface ManagedClient {
+   refCount: number
+   initPromise?: Promise<void>
+   isInitializing: boolean
++  initializingSince?: number
+ }
+ 
+ class LSPServerManager {
+@@ -228,6 +229,7 @@ class LSPServerManager {
+   private clients = new Map<string, ManagedClient>()
+   private cleanupInterval: ReturnType<typeof setInterval> | null = null
+   private readonly IDLE_TIMEOUT = 5 * 60 * 1000
++  private readonly INIT_TIMEOUT = 60 * 1000
+ 
+   private constructor() {
+     this.startCleanupTimer()
+@@ -309,17 +311,43 @@ class LSPServerManager {
+     const key = this.getKey(root, server.id)
+ 
+     let managed = this.clients.get(key)
++    if (managed) {
++      const now = Date.now()
++      if (managed.isInitializing && managed.initializingSince !== undefined && now - managed.initializingSince >= this.INIT_TIMEOUT) {
++        // Stale init can permanently block subsequent calls (e.g., LSP process hang)
++        try {
++          await managed.client.stop()
++        } catch {}
++        this.clients.delete(key)
++        managed = undefined
++      }
++    }
++
+     if (managed) {
+       if (managed.initPromise) {
+-        await managed.initPromise
++        try {
++          await managed.initPromise
++        } catch {
++          // Failed init should not keep the key blocked forever.
++          try {
++            await managed.client.stop()
++          } catch {}
++          this.clients.delete(key)
++          managed = undefined
++        }
+       }
+-      if (managed.client.isAlive()) {
+-        managed.refCount++
+-        managed.lastUsedAt = Date.now()
+-        return managed.client
++
++      if (managed) {
++        if (managed.client.isAlive()) {
++          managed.refCount++
++          managed.lastUsedAt = Date.now()
++          return managed.client
++        }
++        try {
++          await managed.client.stop()
++        } catch {}
++        this.clients.delete(key)
+       }
+-      await managed.client.stop()
+-      this.clients.delete(key)
+     }
+ 
+     const client = new LSPClient(root, server)
+@@ -328,19 +356,30 @@ class LSPServerManager {
+       await client.initialize()
+     })()
+ 
++    const initStartedAt = Date.now()
+     this.clients.set(key, {
+       client,
+-      lastUsedAt: Date.now(),
++      lastUsedAt: initStartedAt,
+       refCount: 1,
+       initPromise,
+       isInitializing: true,
++      initializingSince: initStartedAt,
+     })
+ 
+-    await initPromise
++    try {
++      await initPromise
++    } catch (error) {
++      this.clients.delete(key)
++      try {
++        await client.stop()
++      } catch {}
++      throw error
++    }
+     const m = this.clients.get(key)
+     if (m) {
+       m.initPromise = undefined
+       m.isInitializing = false
++      m.initializingSince = undefined
+     }
+ 
+     return client
+@@ -356,21 +395,30 @@ class LSPServerManager {
+       await client.initialize()
+     })()
+ 
++    const initStartedAt = Date.now()
+     this.clients.set(key, {
+       client,
+-      lastUsedAt: Date.now(),
++      lastUsedAt: initStartedAt,
+       refCount: 0,
+       initPromise,
+       isInitializing: true,
++      initializingSince: initStartedAt,
+     })
+ 
+-    initPromise.then(() => {
+-      const m = this.clients.get(key)
+-      if (m) {
+-        m.initPromise = undefined
+-        m.isInitializing = false
+-      }
+-    })
++    initPromise
++      .then(() => {
++        const m = this.clients.get(key)
++        if (m) {
++          m.initPromise = undefined
++          m.isInitializing = false
++          m.initializingSince = undefined
++        }
++      })
++      .catch(() => {
++        // Warmup failures must not permanently block future initialization.
++        this.clients.delete(key)
++        void client.stop().catch(() => {})
++      })
+   }
+ 
+   releaseClient(root: string, serverId: string): void {
+-- 
+2.39.2
+

@@ -1,0 +1,350 @@
+From f1268c0448d2dfd46217c5272c4cf9127c703d15 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 18 Apr 2026 02:04:49 +0900
+Subject: [PATCH 4388/5749] feat(team-mode): add worktree manager (optional
+ per-member isolation)
+
+---
+ .sisyphus/notepads/team-mode/learnings.md     |   5 +
+ src/features/team-mode/index.ts               |   1 +
+ .../team-mode/team-worktree/cleanup.test.ts   |  31 ++++++
+ .../team-mode/team-worktree/cleanup.ts        |  77 +++++++++++++
+ src/features/team-mode/team-worktree/index.ts |   2 +
+ .../team-mode/team-worktree/manager.test.ts   | 104 ++++++++++++++++++
+ .../team-mode/team-worktree/manager.ts        |  62 +++++++++++
+ 7 files changed, 282 insertions(+)
+ create mode 100644 src/features/team-mode/team-worktree/cleanup.test.ts
+ create mode 100644 src/features/team-mode/team-worktree/cleanup.ts
+ create mode 100644 src/features/team-mode/team-worktree/index.ts
+ create mode 100644 src/features/team-mode/team-worktree/manager.test.ts
+ create mode 100644 src/features/team-mode/team-worktree/manager.ts
+
+diff --git a/.sisyphus/notepads/team-mode/learnings.md b/.sisyphus/notepads/team-mode/learnings.md
+index 5349aca4..97e13ba0 100644
+--- a/.sisyphus/notepads/team-mode/learnings.md
++++ b/.sisyphus/notepads/team-mode/learnings.md
+@@ -3,3 +3,8 @@
+ - `MemberSchema` needs `.strict()` on the base shape so the discriminatedUnion rejects members that mix `category` and `subagent_type`.
+ - `backendType` and `isActive` defaults are part of the schema contract, so tests should use `toMatchObject` instead of exact object equality.
+ - The eligibility registry must preserve the plan strings verbatim, especially the hard-reject messages for Momus verification.
++## Task 12 learnings
++
++- `git worktree remove` can leave prunable entries behind, so pruning after removal keeps the repo index tidy.
++- For testability, a tiny git command runner hook made git-unavailable coverage simpler than mocking Bun directly.
++- Detached worktrees need unique temp paths in tests to avoid cross-run collisions.
+diff --git a/src/features/team-mode/index.ts b/src/features/team-mode/index.ts
+index 51f739d0..6aa6742a 100644
+--- a/src/features/team-mode/index.ts
++++ b/src/features/team-mode/index.ts
+@@ -1 +1,2 @@
+ export * from "./types"
++export * from "./team-worktree"
+diff --git a/src/features/team-mode/team-worktree/cleanup.test.ts b/src/features/team-mode/team-worktree/cleanup.test.ts
+new file mode 100644
+index 00000000..f47c63af
+--- /dev/null
++++ b/src/features/team-mode/team-worktree/cleanup.test.ts
+@@ -0,0 +1,31 @@
++/// <reference types="bun-types" />
++
++import { afterAll, expect, test } from "bun:test"
++import fs from "node:fs/promises"
++import os from "node:os"
++import path from "node:path"
++
++import { findOrphanWorktrees } from "./cleanup"
++
++const temporaryDirectories: string[] = []
++
++afterAll(async () => {
++  for (const directory of temporaryDirectories) {
++    await fs.rm(directory, { recursive: true, force: true })
++  }
++})
++
++test("given runtime mismatch when findOrphanWorktrees then returns orphan paths", async () => {
++  // given
++  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "team-worktree-orphans-"))
++  temporaryDirectories.push(baseDir)
++  await fs.mkdir(path.join(baseDir, "worktrees", "t1", "m1"), { recursive: true })
++  await fs.mkdir(path.join(baseDir, "runtime", "t1"), { recursive: true })
++  await fs.writeFile(path.join(baseDir, "runtime", "t1", "state.json"), JSON.stringify({ status: "deleted" }))
++
++  // when
++  const result = await findOrphanWorktrees(baseDir, {})
++
++  // then
++  expect(result).toEqual([path.join(baseDir, "worktrees", "t1", "m1")])
++})
+diff --git a/src/features/team-mode/team-worktree/cleanup.ts b/src/features/team-mode/team-worktree/cleanup.ts
+new file mode 100644
+index 00000000..673ecebc
+--- /dev/null
++++ b/src/features/team-mode/team-worktree/cleanup.ts
+@@ -0,0 +1,77 @@
++import fs from "node:fs/promises"
++import path from "node:path"
++
++import type { TeamModeConfig } from "./manager"
++
++async function runGit(args: string[]): Promise<{ code: number; stderr: string }> {
++  const process = Bun.spawn({ cmd: ["git", ...args], stdout: "pipe", stderr: "pipe" })
++  const [exitCode, stderrText] = await Promise.all([process.exited, new Response(process.stderr).text()])
++  return { code: exitCode, stderr: stderrText }
++}
++
++export async function removeWorktree(worktreePath: string): Promise<void> {
++  await fs.rm(worktreePath, { recursive: true, force: true })
++
++  const rootLookup = await Bun.spawn({
++    cmd: ["git", "-C", worktreePath, "rev-parse", "--show-superproject-working-tree"],
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++  const [rootExitCode, rootStdout] = await Promise.all([
++    rootLookup.exited,
++    new Response(rootLookup.stdout).text(),
++    new Response(rootLookup.stderr).text(),
++  ])
++  const result =
++    rootExitCode === 0 && rootStdout.trim().length > 0
++      ? await runGit(["-C", rootStdout.trim(), "worktree", "remove", "--force", worktreePath])
++      : await runGit(["worktree", "remove", "--force", worktreePath])
++
++  if (
++    result.code !== 0 &&
++    !result.stderr.includes("not a worktree") &&
++    !result.stderr.includes("not a working tree") &&
++    !result.stderr.includes("already removed")
++  ) {
++    throw new Error(result.stderr.trim() || "git worktree remove failed")
++  }
++
++  if (rootExitCode === 0 && rootStdout.trim().length > 0) {
++    await runGit(["-C", rootStdout.trim(), "worktree", "prune"])
++  }
++}
++
++export async function findOrphanWorktrees(baseDir: string, _config: TeamModeConfig): Promise<string[]> {
++  const orphanWorktrees: string[] = []
++  const worktreesDir = path.join(baseDir, "worktrees")
++
++  let teamRunDirectories: string[]
++  try {
++    teamRunDirectories = await fs.readdir(worktreesDir)
++  } catch {
++    return orphanWorktrees
++  }
++
++  for (const teamRunId of teamRunDirectories) {
++    const teamRunPath = path.join(worktreesDir, teamRunId)
++    const memberNames = await fs.readdir(teamRunPath).catch(() => [])
++
++    for (const memberName of memberNames) {
++      const worktreePath = path.join(teamRunPath, memberName)
++      const statePath = path.join(baseDir, "runtime", teamRunId, "state.json")
++
++      try {
++        const stateContents = await fs.readFile(statePath, "utf8")
++        const state = JSON.parse(stateContents) as { status?: string }
++
++        if (state.status !== "active" && state.status !== "shutdown_requested") {
++          orphanWorktrees.push(worktreePath)
++        }
++      } catch {
++        orphanWorktrees.push(worktreePath)
++      }
++    }
++  }
++
++  return orphanWorktrees
++}
+diff --git a/src/features/team-mode/team-worktree/index.ts b/src/features/team-mode/team-worktree/index.ts
+new file mode 100644
+index 00000000..e311ff75
+--- /dev/null
++++ b/src/features/team-mode/team-worktree/index.ts
+@@ -0,0 +1,2 @@
++export { GitUnavailableError, createWorktree, isGitAvailable, validateWorktreeSpec } from "./manager"
++export { findOrphanWorktrees, removeWorktree } from "./cleanup"
+diff --git a/src/features/team-mode/team-worktree/manager.test.ts b/src/features/team-mode/team-worktree/manager.test.ts
+new file mode 100644
+index 00000000..b1e98556
+--- /dev/null
++++ b/src/features/team-mode/team-worktree/manager.test.ts
+@@ -0,0 +1,104 @@
++/// <reference types="bun-types" />
++
++import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test"
++import { randomUUID } from "node:crypto"
++import fs from "node:fs/promises"
++import os from "node:os"
++import path from "node:path"
++
++import { GitUnavailableError, createWorktree, setGitCommandRunnerForTests, validateWorktreeSpec } from "./manager"
++import { removeWorktree } from "./cleanup"
++
++const temporaryDirectories: string[] = []
++
++async function initGitRepo(): Promise<string> {
++  const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "team-worktree-"))
++  temporaryDirectories.push(repositoryRoot)
++  Bun.spawnSync(["git", "init"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" })
++  await fs.writeFile(path.join(repositoryRoot, "README.md"), "hello\n")
++  Bun.spawnSync(["git", "add", "README.md"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" })
++  Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" })
++  Bun.spawnSync(["git", "config", "user.name", "Test User"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" })
++  Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" })
++  return repositoryRoot
++}
++
++beforeAll(() => {
++  mock.restore()
++})
++
++afterAll(async () => {
++  for (const directory of temporaryDirectories) {
++    await fs.rm(directory, { recursive: true, force: true })
++  }
++  mock.restore()
++})
++
++describe("team-worktree manager", () => {
++  test("given tmp git repo when createWorktree then registers detached worktree", async () => {
++    // given
++    const repositoryRoot = await initGitRepo()
++    const worktreePath = `../worktree-${randomUUID()}`
++    const worktreeDirectory = path.resolve(repositoryRoot, worktreePath)
++
++    // when
++    const resultPath = await createWorktree(repositoryRoot, "t1", "m1", worktreePath, {})
++
++    // then
++    expect(resultPath).toBe(worktreeDirectory)
++    await expect(fs.stat(worktreeDirectory)).resolves.toBeDefined()
++    const listResult = Bun.spawnSync(["git", "worktree", "list"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" })
++    expect(new TextDecoder().decode(listResult.stdout)).toContain(worktreeDirectory)
++    const headResult = Bun.spawnSync(["git", "-C", worktreeDirectory, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" })
++    const repoHeadResult = Bun.spawnSync(["git", "-C", repositoryRoot, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" })
++    expect(new TextDecoder().decode(headResult.stdout).trim()).toBe(new TextDecoder().decode(repoHeadResult.stdout).trim())
++  })
++
++  test("validateWorktreeSpec rejects bare name", () => {
++    // given
++    const worktreePath = "feature-x"
++
++    // when
++    const validate = () => validateWorktreeSpec(worktreePath)
++
++    // then
++    expect(validate).toThrow("worktreePath must be a filesystem path (relative './...', '../...' or absolute '/...')")
++  })
++
++  test("given git unavailable when createWorktree then throws unavailable error", async () => {
++    // given
++    const repositoryRoot = await initGitRepo()
++    setGitCommandRunnerForTests(async (args) => {
++      if (args[0] === "--version") {
++        return { code: 1, stderr: "git missing" }
++      }
++
++      return { code: 0, stderr: "" }
++    })
++
++    // when
++    const create = createWorktree(repositoryRoot, "t1", "m1", `../worktree-${randomUUID()}`, {})
++
++    // then
++    await expect(create).rejects.toBeInstanceOf(GitUnavailableError)
++    setGitCommandRunnerForTests(async (args) => {
++      if (args[0] === "--version") {
++        return { code: 0, stderr: "" }
++      }
++
++      return { code: 0, stderr: "" }
++    })
++  })
++
++  test("given created worktree when removeWorktree then directory disappears", async () => {
++    // given
++    const repositoryRoot = await initGitRepo()
++    const worktreePath = await createWorktree(repositoryRoot, "t1", "m1", `../worktree-${randomUUID()}`, {})
++
++    // when
++    await removeWorktree(worktreePath)
++
++    // then
++    await expect(fs.stat(worktreePath)).rejects.toThrow()
++  })
++})
+diff --git a/src/features/team-mode/team-worktree/manager.ts b/src/features/team-mode/team-worktree/manager.ts
+new file mode 100644
+index 00000000..359df4cd
+--- /dev/null
++++ b/src/features/team-mode/team-worktree/manager.ts
+@@ -0,0 +1,62 @@
++import path from "node:path"
++
++export type TeamModeConfig = {
++  worktreeBaseDir?: string
++}
++
++export class GitUnavailableError extends Error {
++  constructor() {
++    super("git required for worktree members")
++    this.name = "GitUnavailableError"
++  }
++}
++
++function countParentSegments(spec: string): number {
++  return spec.split("/").filter((segment) => segment === "..").length
++}
++
++async function runGit(args: string[], cwd?: string): Promise<{ code: number; stderr: string }> {
++  const process = Bun.spawn({ cmd: ["git", ...args], cwd, stdout: "pipe", stderr: "pipe" })
++  const [exitCode, stderrBytes] = await Promise.all([process.exited, new Response(process.stderr).text()])
++  return { code: exitCode, stderr: stderrBytes }
++}
++
++let gitCommandRunner = runGit
++
++export function setGitCommandRunnerForTests(runner: typeof runGit): void {
++  gitCommandRunner = runner
++}
++
++export async function isGitAvailable(): Promise<boolean> {
++  const result = await gitCommandRunner(["--version"])
++  return result.code === 0
++}
++
++export function validateWorktreeSpec(spec: string): void {
++  if (!/^(\.\.?\/|\/).+/.test(spec) || countParentSegments(spec) > 2) {
++    throw new Error("worktreePath must be a filesystem path (relative './...', '../...' or absolute '/...')")
++  }
++}
++
++export async function createWorktree(
++  repoRoot: string,
++  _teamRunId: string,
++  _memberName: string,
++  worktreePath: string,
++  _config: TeamModeConfig,
++): Promise<string> {
++  validateWorktreeSpec(worktreePath)
++
++  if (!(await isGitAvailable())) {
++    throw new GitUnavailableError()
++  }
++
++  const absolutePath = path.isAbsolute(worktreePath) ? worktreePath : path.resolve(repoRoot, worktreePath)
++  const result = await gitCommandRunner(["-C", repoRoot, "worktree", "add", "--detach", absolutePath])
++
++  if (result.code !== 0) {
++    throw new Error(result.stderr.trim() || "git worktree add failed")
++  }
++
++  return absolutePath
++}
+-- 
+2.39.2
+

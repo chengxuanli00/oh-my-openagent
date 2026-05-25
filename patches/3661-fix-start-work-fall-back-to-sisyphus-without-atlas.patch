@@ -1,0 +1,156 @@
+From a3f9eb1337db0636402edf92f9391ba702a45e7a Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 31 Mar 2026 18:52:09 -0700
+Subject: [PATCH 3661/5749] fix(start-work): fall back to sisyphus without
+ atlas
+
+/start-work should leave plan mode even when Atlas is unavailable. This prevents Prometheus from being persisted into boulder state and keeping resumed work sessions in md-only mode.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/hooks/start-work/index.test.ts      | 65 ++++++++++++++++++++++++-
+ src/hooks/start-work/start-work-hook.ts | 22 ++++++---
+ 2 files changed, 78 insertions(+), 9 deletions(-)
+
+diff --git a/src/hooks/start-work/index.test.ts b/src/hooks/start-work/index.test.ts
+index 1b673b7b..af284f6f 100644
+--- a/src/hooks/start-work/index.test.ts
++++ b/src/hooks/start-work/index.test.ts
+@@ -1,7 +1,7 @@
+ import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test"
+ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+ import { join } from "node:path"
+-import { tmpdir, homedir } from "node:os"
++import { tmpdir } from "node:os"
+ import { randomUUID } from "node:crypto"
+ import { createStartWorkHook } from "./index"
+ import {
+@@ -448,6 +448,69 @@ describe("start-work hook", () => {
+       expect(output.message.agent).toBe("Sisyphus (Ultraworker)")
+       expect(sessionState.getSessionAgent("ses-prometheus-to-sisyphus")).toBe("sisyphus")
+     })
++
++    test("should fall back to Sisyphus instead of keeping Prometheus when Atlas is unavailable", async () => {
++      // given
++      sessionState._resetForTesting()
++      sessionState.registerAgentName("prometheus")
++      sessionState.registerAgentName("sisyphus")
++      sessionState.updateSessionAgent("ses-prometheus-to-worker", "prometheus")
++
++      const plansDir = join(testDir, ".sisyphus", "plans")
++      mkdirSync(plansDir, { recursive: true })
++      writeFileSync(join(plansDir, "worker-plan.md"), "# Plan\n- [ ] Task 1")
++
++      const hook = createStartWorkHook(createMockPluginInput())
++      const output = {
++        message: {} as Record<string, unknown>,
++        parts: [{ type: "text", text: "<session-context></session-context>" }],
++      }
++
++      // when
++      await hook["chat.message"](
++        { sessionID: "ses-prometheus-to-worker" },
++        output
++      )
++
++      // then
++      expect(output.message.agent).toBe("Sisyphus (Ultraworker)")
++      expect(sessionState.getSessionAgent("ses-prometheus-to-worker")).toBe("sisyphus")
++      expect(readBoulderState(testDir)?.agent).toBe("sisyphus")
++    })
++
++    test("should rewrite stale Prometheus boulder state to Sisyphus when resuming without Atlas", async () => {
++      // given
++      sessionState._resetForTesting()
++      sessionState.registerAgentName("prometheus")
++      sessionState.registerAgentName("sisyphus")
++      sessionState.updateSessionAgent("ses-prometheus-resume", "prometheus")
++
++      const planPath = join(testDir, "resume-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1")
++      writeBoulderState(testDir, {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: ["old-session"],
++        plan_name: "resume-plan",
++        agent: "prometheus",
++      })
++
++      const hook = createStartWorkHook(createMockPluginInput())
++      const output = {
++        message: {} as Record<string, unknown>,
++        parts: [{ type: "text", text: "<session-context></session-context>" }],
++      }
++
++      // when
++      await hook["chat.message"](
++        { sessionID: "ses-prometheus-resume" },
++        output
++      )
++
++      // then
++      expect(output.message.agent).toBe("Sisyphus (Ultraworker)")
++      expect(readBoulderState(testDir)?.agent).toBe("sisyphus")
++    })
+   })
+ 
+   describe("worktree support", () => {
+diff --git a/src/hooks/start-work/start-work-hook.ts b/src/hooks/start-work/start-work-hook.ts
+index ef41fb3b..7f9f0bcd 100644
+--- a/src/hooks/start-work/start-work-hook.ts
++++ b/src/hooks/start-work/start-work-hook.ts
+@@ -11,7 +11,7 @@ import {
+   clearBoulderState,
+ } from "../../features/boulder-state"
+ import { log } from "../../shared/logger"
+-import { getAgentDisplayName } from "../../shared/agent-display-names"
++import { getAgentConfigKey, getAgentDisplayName } from "../../shared/agent-display-names"
+ import { getSessionAgent, isAgentRegistered, updateSessionAgent } from "../../features/claude-code-session-state"
+ import { detectWorktreePath } from "./worktree-detector"
+ import { parseUserRequest } from "./parse-user-request"
+@@ -80,9 +80,12 @@ export function createStartWorkHook(ctx: PluginInput) {
+       if (!promptText.includes("<session-context>")) return
+ 
+       log(`[${HOOK_NAME}] Processing start-work command`, { sessionID: input.sessionID })
++      const currentSessionAgent = getSessionAgent(input.sessionID)
+       const activeAgent = isAgentRegistered("atlas")
+         ? "atlas"
+-        : getSessionAgent(input.sessionID) ?? "sisyphus"
++        : currentSessionAgent && getAgentConfigKey(currentSessionAgent) !== "prometheus"
++          ? currentSessionAgent
++          : "sisyphus"
+       const activeAgentDisplayName = getAgentDisplayName(activeAgent)
+       updateSessionAgent(input.sessionID, activeAgent)
+       if (output.message) {
+@@ -162,17 +165,20 @@ No incomplete plans available. Create a new plan with: /plan "your task"`
+ 
+         if (!progress.isComplete) {
+           const effectiveWorktree = worktreePath ?? existingState.worktree_path
++          const sessionAlreadyTracked = existingState.session_ids.includes(sessionId)
++          const updatedSessions = sessionAlreadyTracked
++            ? existingState.session_ids
++            : [...existingState.session_ids, sessionId]
++          const shouldRewriteState = existingState.agent !== activeAgent || worktreePath !== undefined
+ 
+-          if (worktreePath !== undefined) {
+-            const updatedSessions = existingState.session_ids.includes(sessionId)
+-              ? existingState.session_ids
+-              : [...existingState.session_ids, sessionId]
++          if (shouldRewriteState) {
+             writeBoulderState(ctx.directory, {
+               ...existingState,
+-              worktree_path: worktreePath,
++              agent: activeAgent,
++              ...(worktreePath !== undefined ? { worktree_path: worktreePath } : {}),
+               session_ids: updatedSessions,
+             })
+-          } else {
++          } else if (!sessionAlreadyTracked) {
+             appendSessionId(ctx.directory, sessionId)
+           }
+ 
+-- 
+2.39.2
+

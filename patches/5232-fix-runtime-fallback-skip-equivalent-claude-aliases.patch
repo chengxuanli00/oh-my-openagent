@@ -1,0 +1,176 @@
+From f501c47c49029d7f113099307ed0826965a51fdd Mon Sep 17 00:00:00 2001
+From: Ravi Tharuma <RaviTharuma@users.noreply.github.com>
+Date: Fri, 10 Apr 2026 23:34:38 +0200
+Subject: [PATCH 5232/5749] fix(runtime-fallback): skip equivalent claude
+ aliases
+
+Prevent runtime fallback from cycling through provider aliases that resolve to the same underlying Claude family model. This keeps retry handling moving toward a genuinely distinct fallback model instead of appearing to fallback while staying on the same effective model.
+
+Constraint: Live retry/fallback bug is in /Users/ravi/Code/personal/oh-my-opencode, while oh-my-openagent contribution work remains isolated to /Users/ravi/Code/forks/oh-my-openagent
+Rejected: Change fallback chain precedence (category vs agent) first | lower-confidence root cause than equivalent-model retry
+Confidence: high
+Scope-risk: narrow
+Directive: Keep alias-equivalence logic limited to model families that are intentionally interchangeable for runtime failover, and expand with targeted tests before broadening provider-family collapsing
+Tested: bun run typecheck
+Tested: bun test src/hooks/runtime-fallback/index.test.ts src/hooks/runtime-fallback/error-classifier.test.ts src/plugin/event.model-fallback.test.ts
+Not-tested: Full live end-to-end session repro against external provider outages
+---
+ src/hooks/runtime-fallback/fallback-state.ts | 68 +++++++++++++++++++-
+ src/hooks/runtime-fallback/index.test.ts     | 18 ++++--
+ 2 files changed, 78 insertions(+), 8 deletions(-)
+
+diff --git a/src/hooks/runtime-fallback/fallback-state.ts b/src/hooks/runtime-fallback/fallback-state.ts
+index bd0a3c43..bc49c728 100644
+--- a/src/hooks/runtime-fallback/fallback-state.ts
++++ b/src/hooks/runtime-fallback/fallback-state.ts
+@@ -2,6 +2,65 @@ import type { FallbackState, FallbackResult } from "./types"
+ import { HOOK_NAME } from "./constants"
+ import { log } from "../../shared/logger"
+ import type { RuntimeFallbackConfig } from "../../config"
++import { parseModelString } from "../../tools/delegate-task/model-string-parser"
++
++function canonicalizeModelID(modelID: string): string {
++  const loweredModelID = modelID.toLowerCase()
++  const dottedModelID = loweredModelID.replace(/\./g, "-")
++
++  if (
++    dottedModelID.startsWith("claude-opus-") ||
++    dottedModelID.startsWith("claude-sonnet-") ||
++    dottedModelID.startsWith("claude-haiku-")
++  ) {
++    return dottedModelID
++      .replace(/-thinking$/i, "")
++      .replace(/-max$/i, "")
++      .replace(/-high$/i, "")
++  }
++
++  return dottedModelID
++}
++
++function canonicalizeProviderFamily(providerID: string, modelID: string): string {
++  const canonicalModelID = canonicalizeModelID(modelID)
++
++  if (
++    canonicalModelID.startsWith("claude-opus-") ||
++    canonicalModelID.startsWith("claude-sonnet-") ||
++    canonicalModelID.startsWith("claude-haiku-")
++  ) {
++    return "anthropic-compatible-claude"
++  }
++
++  return providerID.toLowerCase()
++}
++
++function parseCanonicalModel(model: string): { providerID: string; modelID: string } | undefined {
++  const parsed = parseModelString(model)
++  if (!parsed?.providerID || !parsed.modelID) return undefined
++
++  const canonicalModelID = canonicalizeModelID(parsed.modelID)
++
++  return {
++    providerID: canonicalizeProviderFamily(parsed.providerID, parsed.modelID),
++    modelID: canonicalModelID,
++  }
++}
++
++function isEquivalentModel(candidate: string, current: string): boolean {
++  const parsedCandidate = parseCanonicalModel(candidate)
++  const parsedCurrent = parseCanonicalModel(current)
++
++  if (!parsedCandidate || !parsedCurrent) {
++    return candidate.toLowerCase() === current.toLowerCase()
++  }
++
++  return (
++    parsedCandidate.providerID === parsedCurrent.providerID &&
++    parsedCandidate.modelID === parsedCurrent.modelID
++  )
++}
+ 
+ export function createFallbackState(originalModel: string): FallbackState {
+   return {
+@@ -28,10 +87,15 @@ export function findNextAvailableFallback(
+ ): string | undefined {
+   for (let i = state.fallbackIndex + 1; i < fallbackModels.length; i++) {
+     const candidate = fallbackModels[i]
+-    if (candidate === state.currentModel) {
+-      log(`[${HOOK_NAME}] Skipping fallback model (same as current)`, { model: candidate, index: i })
++    if (isEquivalentModel(candidate, state.currentModel)) {
++      log(`[${HOOK_NAME}] Skipping equivalent fallback model`, {
++        model: candidate,
++        currentModel: state.currentModel,
++        index: i,
++      })
+       continue
+     }
++
+     if (!isModelInCooldown(candidate, state, cooldownSeconds)) {
+       return candidate
+     }
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index b3ae368f..dbb4dc22 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -1305,7 +1305,10 @@ describe("runtime-fallback", () => {
+ 
+       expect(retriedModels.length).toBeGreaterThanOrEqual(2)
+       expect(retriedModels[0]).toBe("github-copilot/claude-opus-4.7")
+-      expect(retriedModels[1]).toBe("anthropic/claude-opus-4-7")
++      expect(retriedModels[1]).toBe("openai/gpt-5.4")
++
++      const equivalentSkipLog = logCalls.find((c) => c.msg.includes("Skipping equivalent fallback model"))
++      expect(equivalentSkipLog).toBeDefined()
+ 
+       void sessionErrorPromise
+     })
+@@ -1374,7 +1377,7 @@ describe("runtime-fallback", () => {
+       await new Promise((resolve) => setTimeout(resolve, 50))
+ 
+       expect(retriedModels).toContain("github-copilot/claude-opus-4.7")
+-      expect(retriedModels).toContain("anthropic/claude-opus-4-7")
++      expect(retriedModels).toContain("openai/gpt-5.4")
+       expect(abortCalls.some((call) => call.path?.id === sessionID)).toBe(true)
+ 
+       const timeoutLog = logCalls.find((c) => c.msg.includes("Session fallback timeout reached"))
+@@ -1452,7 +1455,7 @@ describe("runtime-fallback", () => {
+       await new Promise((resolve) => setTimeout(resolve, 50))
+ 
+       expect(retriedModels).toContain("github-copilot/claude-opus-4.7")
+-      expect(retriedModels).toContain("anthropic/claude-opus-4-7")
++      expect(retriedModels).toContain("openai/gpt-5.4")
+     })
+ 
+     test("should abort in-flight fallback request before advancing on timeout", async () => {
+@@ -1526,7 +1529,7 @@ describe("runtime-fallback", () => {
+ 
+       expect(abortCalls.some((call) => call.path?.id === sessionID)).toBe(true)
+       expect(retriedModels).toContain("github-copilot/claude-opus-4.7")
+-      expect(retriedModels).toContain("anthropic/claude-opus-4-7")
++      expect(retriedModels).toContain("openai/gpt-5.4")
+ 
+       void sessionErrorPromise
+     })
+@@ -2451,7 +2454,10 @@ describe("runtime-fallback", () => {
+         }),
+         {
+           config: createMockConfig({ notify_on_fallback: false }),
+-          pluginConfig: createMockPluginConfigWithAgentFallback("prometheus", ["github-copilot/claude-opus-4.7"]),
++          pluginConfig: createMockPluginConfigWithAgentFallback("prometheus", [
++            "github-copilot/claude-opus-4.7",
++            "openai/gpt-5.4",
++          ]),
+         },
+       )
+       const sessionID = "test-preserve-agent-on-retry"
+@@ -2471,7 +2477,7 @@ describe("runtime-fallback", () => {
+       expect(promptCalls.length).toBe(1)
+       const callBody = promptCalls[0]?.body as Record<string, unknown>
+       expect(callBody?.agent).toBe("prometheus")
+-      expect(callBody?.model).toEqual({ providerID: "github-copilot", modelID: "claude-opus-4.7" })
++      expect(callBody?.model).toEqual({ providerID: "openai", modelID: "gpt-5.4" })
+     })
+ 
+     test("should not dispatch a second fallback prompt while the accepted retry session is still active", async () => {
+-- 
+2.39.2
+

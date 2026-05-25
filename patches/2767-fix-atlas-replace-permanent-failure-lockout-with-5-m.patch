@@ -1,0 +1,242 @@
+From 0b69a6c5079fdcccfb39842700b5c1af0db91560 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 26 Feb 2026 20:20:45 +0900
+Subject: [PATCH 2767/5749] fix(atlas): replace permanent failure lockout with
+ 5-minute backoff
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../atlas/boulder-continuation-injector.ts    |   1 +
+ src/hooks/atlas/event-handler.ts              |  20 ++-
+ src/hooks/atlas/index.test.ts                 | 138 ++++++++++++++++++
+ src/hooks/atlas/types.ts                      |   1 +
+ 4 files changed, 154 insertions(+), 6 deletions(-)
+
+diff --git a/src/hooks/atlas/boulder-continuation-injector.ts b/src/hooks/atlas/boulder-continuation-injector.ts
+index c74b2292..4f8e3580 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.ts
+@@ -66,6 +66,7 @@ export async function injectBoulderContinuation(input: {
+     log(`[${HOOK_NAME}] Boulder continuation injected`, { sessionID })
+   } catch (err) {
+     sessionState.promptFailureCount += 1
++    sessionState.lastFailureAt = Date.now()
+     log(`[${HOOK_NAME}] Boulder continuation failed`, {
+       sessionID,
+       error: String(err),
+diff --git a/src/hooks/atlas/event-handler.ts b/src/hooks/atlas/event-handler.ts
+index 6346dcbb..0f7187fc 100644
+--- a/src/hooks/atlas/event-handler.ts
++++ b/src/hooks/atlas/event-handler.ts
+@@ -10,6 +10,7 @@ import { getLastAgentFromSession } from "./session-last-agent"
+ import type { AtlasHookOptions, SessionState } from "./types"
+ 
+ const CONTINUATION_COOLDOWN_MS = 5000
++const FAILURE_BACKOFF_MS = 5 * 60 * 1000
+ 
+ export function createAtlasEventHandler(input: {
+   ctx: PluginInput
+@@ -53,6 +54,7 @@ export function createAtlasEventHandler(input: {
+       }
+ 
+       const state = getState(sessionID)
++      const now = Date.now()
+ 
+       if (state.lastEventWasAbortError) {
+         state.lastEventWasAbortError = false
+@@ -61,11 +63,18 @@ export function createAtlasEventHandler(input: {
+       }
+ 
+       if (state.promptFailureCount >= 2) {
+-        log(`[${HOOK_NAME}] Skipped: continuation disabled after repeated prompt failures`, {
+-          sessionID,
+-          promptFailureCount: state.promptFailureCount,
+-        })
+-        return
++        const timeSinceLastFailure = state.lastFailureAt !== undefined ? now - state.lastFailureAt : Number.POSITIVE_INFINITY
++        if (timeSinceLastFailure < FAILURE_BACKOFF_MS) {
++          log(`[${HOOK_NAME}] Skipped: continuation in backoff after repeated failures`, {
++            sessionID,
++            promptFailureCount: state.promptFailureCount,
++            backoffRemaining: FAILURE_BACKOFF_MS - timeSinceLastFailure,
++          })
++          return
++        }
++
++        state.promptFailureCount = 0
++        state.lastFailureAt = undefined
+       }
+ 
+       const backgroundManager = options?.backgroundManager
+@@ -111,7 +120,6 @@ export function createAtlasEventHandler(input: {
+         return
+       }
+ 
+-      const now = Date.now()
+       if (state.lastContinuationInjectedAt && now - state.lastContinuationInjectedAt < CONTINUATION_COOLDOWN_MS) {
+         log(`[${HOOK_NAME}] Skipped: continuation cooldown active`, {
+           sessionID,
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index 8c0efeba..36f30827 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -1154,6 +1154,144 @@ describe("atlas hook", () => {
+       }
+     })
+ 
++    test("should keep skipping continuation during 5-minute backoff after 2 consecutive failures", async () => {
++      //#given - boulder state with incomplete plan and prompt always fails
++      const planPath = join(TEST_DIR, "test-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: [MAIN_SESSION_ID],
++        plan_name: "test-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const promptMock = mock(() => Promise.reject(new Error("Bad Request")))
++      const mockInput = createMockPluginInput({ promptMock })
++      const hook = createAtlasHook(mockInput)
++
++      const originalDateNow = Date.now
++      let now = 0
++      Date.now = () => now
++
++      try {
++        //#when - third idle occurs inside 5-minute backoff window
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 6000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 60000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++
++        //#then - third attempt should still be skipped
++        expect(promptMock).toHaveBeenCalledTimes(2)
++      } finally {
++        Date.now = originalDateNow
++      }
++    })
++
++    test("should retry continuation after 5-minute backoff expires following 2 consecutive failures", async () => {
++      //#given - boulder state with incomplete plan and prompt always fails
++      const planPath = join(TEST_DIR, "test-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: [MAIN_SESSION_ID],
++        plan_name: "test-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const promptMock = mock(() => Promise.reject(new Error("Bad Request")))
++      const mockInput = createMockPluginInput({ promptMock })
++      const hook = createAtlasHook(mockInput)
++
++      const originalDateNow = Date.now
++      let now = 0
++      Date.now = () => now
++
++      try {
++        //#when - third idle occurs after 5+ minutes
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 6000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 300000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++
++        //#then - third attempt should run after backoff expiration
++        expect(promptMock).toHaveBeenCalledTimes(3)
++      } finally {
++        Date.now = originalDateNow
++      }
++    })
++
++    test("should reset prompt failure counter after successful retry beyond backoff window", async () => {
++      //#given - boulder state with incomplete plan and success on first retry after backoff
++      const planPath = join(TEST_DIR, "test-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: [MAIN_SESSION_ID],
++        plan_name: "test-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const promptMock = mock((): Promise<void> => Promise.reject(new Error("Bad Request")))
++      promptMock.mockImplementationOnce(() => Promise.reject(new Error("Bad Request")))
++      promptMock.mockImplementationOnce(() => Promise.reject(new Error("Bad Request")))
++      promptMock.mockImplementationOnce(() => Promise.resolve(undefined))
++      const mockInput = createMockPluginInput({ promptMock })
++      const hook = createAtlasHook(mockInput)
++
++      const originalDateNow = Date.now
++      let now = 0
++      Date.now = () => now
++
++      try {
++        //#when - fail twice, recover after backoff with success, then fail twice again
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 6000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 300000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 6000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 6000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++        now += 6000
++
++        await hook.handler({ event: { type: "session.idle", properties: { sessionID: MAIN_SESSION_ID } } })
++        await flushMicrotasks()
++
++        //#then - success retry resets counter, so two additional failures are allowed before skip
++        expect(promptMock).toHaveBeenCalledTimes(5)
++      } finally {
++        Date.now = originalDateNow
++      }
++    })
++
+     test("should reset continuation failure state on session.compacted event", async () => {
+       //#given - boulder state with incomplete plan and prompt always fails
+       const planPath = join(TEST_DIR, "test-plan.md")
+diff --git a/src/hooks/atlas/types.ts b/src/hooks/atlas/types.ts
+index e1919cd2..7302f830 100644
+--- a/src/hooks/atlas/types.ts
++++ b/src/hooks/atlas/types.ts
+@@ -26,4 +26,5 @@ export interface SessionState {
+   lastEventWasAbortError?: boolean
+   lastContinuationInjectedAt?: number
+   promptFailureCount: number
++  lastFailureAt?: number
+ }
+-- 
+2.39.2
+

@@ -1,0 +1,191 @@
+From 91848057ea1f32c6a6bd8520bd7b2b836f1baa4f Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 18 Apr 2026 17:22:11 +0900
+Subject: [PATCH 4443/5749] fix(background-agent): fire promptAsync before tmux
+ callback
+
+Awaiting the tmux callback blocked the prompt for up to 10s (waitForSessionReady downstream). During that window the spawned pane ran 'opencode attach' against an empty session and rendered a blank TUI. Users saw 'pane created but attach not working'.
+
+Start promptWithModelSuggestionRetry immediately after session.create, then invoke the tmux callback as fire-and-forget. The session becomes active before the attach client connects.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/features/background-agent/spawner.test.ts | 81 +++++++++++++++++++
+ src/features/background-agent/spawner.ts      | 50 ++++++------
+ 2 files changed, 106 insertions(+), 25 deletions(-)
+
+diff --git a/src/features/background-agent/spawner.test.ts b/src/features/background-agent/spawner.test.ts
+index b1f486c5..eb2cc294 100644
+--- a/src/features/background-agent/spawner.test.ts
++++ b/src/features/background-agent/spawner.test.ts
+@@ -577,3 +577,84 @@ describe("background-agent spawner fallback model promotion", () => {
+     expect(promptCalls[0]?.body?.agent).toBe("sisyphus-junior")
+   })
+ })
++
++describe("background-agent spawner tmux callback ordering", () => {
++  test("fires promptAsync before tmux callback resolves (no blocking)", async () => {
++    //#given
++    const events: string[] = []
++    let resolveTmuxCallback: () => void = () => {}
++    const tmuxCallbackPromise = new Promise<void>((resolve) => {
++      resolveTmuxCallback = resolve
++    })
++
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: "/tmp/test" } }),
++        create: async () => {
++          events.push("session.create")
++          return { data: { id: "ses_blocking_tmux" } }
++        },
++        promptAsync: async () => {
++          events.push("promptAsync")
++          return { data: {} }
++        },
++      },
++    } as any
++
++    const onSubagentSessionCreated = mock(async () => {
++      events.push("tmux.callback.start")
++      await tmuxCallbackPromise
++      events.push("tmux.callback.end")
++    })
++
++    const task = createTask({
++      description: "Blocking tmux test",
++      prompt: "Do work",
++      agent: "general",
++      parentSessionID: "ses_parent",
++      parentMessageID: "msg_parent",
++    })
++
++    const item = {
++      task,
++      input: {
++        description: task.description,
++        prompt: task.prompt,
++        agent: task.agent,
++        parentSessionID: task.parentSessionID,
++        parentMessageID: task.parentMessageID,
++      },
++    }
++
++    const ctx = {
++      client,
++      directory: "/tmp/test",
++      concurrencyManager: { release: () => {} },
++      tmuxEnabled: true,
++      onSubagentSessionCreated,
++      onTaskError: () => {},
++    }
++
++    const originalTmux = process.env.TMUX
++    process.env.TMUX = "/tmp/fake-tmux-socket"
++
++    try {
++      //#when
++      await startTask(item as any, ctx as any)
++      await new Promise((resolve) => setTimeout(resolve, 20))
++
++      //#then
++      expect(events).toContain("session.create")
++      expect(events).toContain("promptAsync")
++      expect(events).toContain("tmux.callback.start")
++      const promptIdx = events.indexOf("promptAsync")
++      const tmuxStartIdx = events.indexOf("tmux.callback.start")
++      expect(promptIdx < tmuxStartIdx).toBe(true)
++      expect(events).not.toContain("tmux.callback.end")
++    } finally {
++      resolveTmuxCallback()
++      if (originalTmux === undefined) delete process.env.TMUX
++      else process.env.TMUX = originalTmux
++    }
++  })
++})
+diff --git a/src/features/background-agent/spawner.ts b/src/features/background-agent/spawner.ts
+index 675aeb5d..ab6aaa2f 100644
+--- a/src/features/background-agent/spawner.ts
++++ b/src/features/background-agent/spawner.ts
+@@ -1,6 +1,5 @@
+ import type { BackgroundTask, LaunchInput, ResumeInput } from "./types"
+ import type { OpencodeClient, OnSubagentSessionCreated, QueueItem } from "./constants"
+-import { TMUX_CALLBACK_DELAY_MS } from "./constants"
+ import { log, getAgentToolRestrictions, promptWithModelSuggestionRetry, createInternalAgentTextPart } from "../../shared"
+ import { applySessionPromptParams } from "../../shared/session-prompt-params-helpers"
+ import { subagentSessions } from "../claude-code-session-state"
+@@ -115,29 +114,6 @@ export async function startTask(
+   const sessionID = createResult.data.id
+   subagentSessions.add(sessionID)
+ 
+-  log("[background-agent] tmux callback check", {
+-    hasCallback: !!onSubagentSessionCreated,
+-    tmuxEnabled,
+-    isInsideTmux: isInsideTmux(),
+-    sessionID,
+-    parentID: input.parentSessionID,
+-  })
+-
+-  if (onSubagentSessionCreated && tmuxEnabled && isInsideTmux()) {
+-    log("[background-agent] Invoking tmux callback NOW", { sessionID })
+-    await onSubagentSessionCreated({
+-      sessionID,
+-      parentID: input.parentSessionID,
+-      title: input.description,
+-    }).catch((err) => {
+-      log("[background-agent] Failed to spawn tmux pane:", err)
+-    })
+-    log("[background-agent] tmux callback completed, waiting")
+-    await new Promise(r => setTimeout(r, TMUX_CALLBACK_DELAY_MS))
+-  } else {
+-    log("[background-agent] SKIP tmux callback - conditions not met")
+-  }
+-
+   task.status = "running"
+   task.startedAt = new Date()
+   task.sessionID = sessionID
+@@ -188,7 +164,8 @@ export async function startTask(
+     parts: [createInternalAgentTextPart(input.prompt)],
+   }
+ 
+-  promptWithModelSuggestionRetry(client, {
++  // Must fire BEFORE tmux callback: attach client needs session activity to render TUI.
++  const promptChain = promptWithModelSuggestionRetry(client, {
+     path: { id: sessionID },
+     body: promptBody,
+   }).catch(async (error) => {
+@@ -214,6 +191,29 @@ export async function startTask(
+     log("[background-agent] promptAsync error:", error)
+     onTaskError(task, error instanceof Error ? error : new Error(String(error)))
+   })
++
++  void promptChain
++
++  log("[background-agent] tmux callback check", {
++    hasCallback: !!onSubagentSessionCreated,
++    tmuxEnabled,
++    isInsideTmux: isInsideTmux(),
++    sessionID,
++    parentID: input.parentSessionID,
++  })
++
++  if (onSubagentSessionCreated && tmuxEnabled && isInsideTmux()) {
++    log("[background-agent] Invoking tmux callback (fire-and-forget)", { sessionID })
++    void onSubagentSessionCreated({
++      sessionID,
++      parentID: input.parentSessionID,
++      title: input.description,
++    }).catch((err) => {
++      log("[background-agent] Failed to spawn tmux pane:", err)
++    })
++  } else {
++    log("[background-agent] SKIP tmux callback - conditions not met")
++  }
+ }
+ 
+ export async function resumeTask(
+-- 
+2.39.2
+

@@ -1,0 +1,136 @@
+From d3b4c022d2bdad201304e9e22674e08bfddc8eff Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 18 May 2026 12:43:06 +0900
+Subject: [PATCH 5429/5749] fix(atlas): stop stalled boulder continuations
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../atlas/boulder-continuation-injector.ts    |  2 ++
+ src/hooks/atlas/event-handler.ts              |  2 ++
+ src/hooks/atlas/idle-event.ts                 | 30 +++++++++++++++++++
+ src/hooks/atlas/tool-execute-after.ts         |  5 ++++
+ 4 files changed, 39 insertions(+)
+
+diff --git a/src/hooks/atlas/boulder-continuation-injector.ts b/src/hooks/atlas/boulder-continuation-injector.ts
+index 4451903a..640db5b8 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.ts
+@@ -9,6 +9,7 @@ import { createInternalAgentContinuationTextPart, resolveInheritedPromptTools }
+ import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
+ import { HOOK_NAME } from "./hook-name"
+ import { BOULDER_CONTINUATION_PROMPT } from "./system-reminder-templates"
++import { markContinuationInjectedAwaitingToolProgress } from "./tool-progress"
+ import { resolveRecentPromptContextForSession } from "./recent-model-resolver"
+ import type { BackgroundTaskStatusProvider, SessionState } from "./types"
+ 
+@@ -122,6 +123,7 @@ export async function injectBoulderContinuation(input: {
+     }
+ 
+     sessionState.promptFailureCount = 0
++    markContinuationInjectedAwaitingToolProgress(sessionState)
+     log(`[${HOOK_NAME}] Boulder continuation injected`, { sessionID })
+     return "injected"
+   } catch (err) {
+diff --git a/src/hooks/atlas/event-handler.ts b/src/hooks/atlas/event-handler.ts
+index 2ad001df..3d279e4c 100644
+--- a/src/hooks/atlas/event-handler.ts
++++ b/src/hooks/atlas/event-handler.ts
+@@ -96,6 +96,7 @@ export function createAtlasEventHandler(input: {
+         const deletedState = sessions.get(sessionID)
+         if (deletedState?.pendingRetryTimer) {
+           clearTimeout(deletedState.pendingRetryTimer)
++          deletedState.pendingRetryTimer = undefined
+         }
+         sessions.delete(sessionID)
+         log(`[${HOOK_NAME}] Session deleted: cleaned up`, { sessionID })
+@@ -109,6 +110,7 @@ export function createAtlasEventHandler(input: {
+         const compactedState = sessions.get(sessionID)
+         if (compactedState?.pendingRetryTimer) {
+           clearTimeout(compactedState.pendingRetryTimer)
++          compactedState.pendingRetryTimer = undefined
+         }
+         sessions.delete(sessionID)
+         log(`[${HOOK_NAME}] Session compacted: cleaned up`, { sessionID })
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 973b079e..716f3e2d 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -25,6 +25,11 @@ import { injectBoulderContinuation } from "./boulder-continuation-injector"
+ import { HOOK_NAME } from "./hook-name"
+ import { resolveActiveBoulderSession } from "./resolve-active-boulder-session"
+ import { BOULDER_COMPLETE_PROMPT } from "./system-reminder-templates"
++import {
++  markContinuationStalled,
++  shouldAbortForNoToolProgress,
++  updateNoToolProgressIterations,
++} from "./tool-progress"
+ import type { AtlasHookOptions, SessionState } from "./types"
+ 
+ const CONTINUATION_COOLDOWN_MS = 5000
+@@ -172,6 +177,7 @@ function scheduleRetry(input: {
+     sessionState.pendingRetryTimer = undefined
+ 
+     if (sessionState.promptFailureCount >= MAX_CONSECUTIVE_PROMPT_FAILURES) return
++    if (sessionState.stalledContinuationReason) return
+     if (sessionState.waitingForFinalWaveApproval) return
+ 
+     const now = Date.now()
+@@ -352,6 +358,30 @@ export async function handleAtlasSessionIdle(input: {
+     return
+   }
+ 
++  if (sessionState.stalledContinuationReason) {
++    log(`[${HOOK_NAME}] Skipped: boulder continuation stalled`, {
++      sessionID,
++      reason: sessionState.stalledContinuationReason,
++    })
++    return
++  }
++
++  const noProgressIterations = updateNoToolProgressIterations(sessionState)
++  if (shouldAbortForNoToolProgress(sessionState)) {
++    markContinuationStalled(sessionState, boulderState.plan_name)
++    if (sessionState.pendingRetryTimer) {
++      clearTimeout(sessionState.pendingRetryTimer)
++      sessionState.pendingRetryTimer = undefined
++    }
++    log(`[${HOOK_NAME}] Aborting boulder continuation after repeated no-tool-progress iterations`, {
++      sessionID,
++      plan: boulderState.plan_name,
++      noProgressIterations,
++      reason: sessionState.stalledContinuationReason,
++    })
++    return
++  }
++
+   if (sessionState.lastEventWasAbortError) {
+     sessionState.lastEventWasAbortError = false
+     log(`[${HOOK_NAME}] Skipped: abort error immediately before idle`, { sessionID })
+diff --git a/src/hooks/atlas/tool-execute-after.ts b/src/hooks/atlas/tool-execute-after.ts
+index 8aeef62f..42f958a6 100644
+--- a/src/hooks/atlas/tool-execute-after.ts
++++ b/src/hooks/atlas/tool-execute-after.ts
+@@ -22,6 +22,7 @@ import { DIRECT_WORK_REMINDER } from "./system-reminder-templates"
+ import { isOmoPath } from "./omo-path"
+ import { resolvePreferredSessionId, resolveTaskContext } from "./task-context"
+ import { extractSessionIdFromMetadata, extractSessionIdFromOutput, validateSubagentSessionId } from "./subagent-session-id"
++import { didToolMakeProgress, isTangibleProgressTool, recordToolProgress } from "./tool-progress"
+ import {
+   buildCompletionGate,
+   buildFinalWaveApprovalReminder,
+@@ -142,6 +143,10 @@ export function createToolExecuteAfterHandler(input: {
+       return
+     }
+ 
++    if (toolInput.sessionID && isTangibleProgressTool(toolInput.tool) && didToolMakeProgress(toolOutput)) {
++      recordToolProgress(getState(toolInput.sessionID))
++    }
++
+     if (!(await resolveIsCallerOrchestrator(toolInput.sessionID))) {
+       return
+     }
+-- 
+2.39.2
+

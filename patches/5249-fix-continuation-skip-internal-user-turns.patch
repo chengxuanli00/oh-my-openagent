@@ -1,0 +1,449 @@
+From be25109f6d36866b52940d6777d1d446fa715223 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 23:16:23 +0900
+Subject: [PATCH 5249/5749] fix(continuation): skip internal user turns
+
+---
+ src/hooks/session-recovery/resume.test.ts     | 41 ++++++++++-
+ src/hooks/session-recovery/resume.ts          | 13 ++--
+ src/hooks/session-recovery/types.ts           |  1 +
+ .../non-idle-events.test.ts                   | 70 +++++++++++++++++++
+ .../non-idle-events.ts                        | 35 ++++++++++
+ .../pending-question-detection.test.ts        | 37 ++++++++++
+ .../pending-question-detection.ts             | 10 ++-
+ .../resolve-message-info.test.ts              | 69 ++++++++++++++++++
+ .../resolve-message-info.ts                   |  5 +-
+ src/hooks/todo-continuation-enforcer/types.ts |  2 +-
+ 10 files changed, 275 insertions(+), 8 deletions(-)
+ create mode 100644 src/hooks/todo-continuation-enforcer/non-idle-events.test.ts
+ create mode 100644 src/hooks/todo-continuation-enforcer/resolve-message-info.test.ts
+
+diff --git a/src/hooks/session-recovery/resume.test.ts b/src/hooks/session-recovery/resume.test.ts
+index e7ef870d..1720870e 100644
+--- a/src/hooks/session-recovery/resume.test.ts
++++ b/src/hooks/session-recovery/resume.test.ts
+@@ -1,10 +1,49 @@
+ declare const require: (name: string) => any
+ const { describe, expect, test } = require("bun:test")
+-import { extractResumeConfig, resumeSession } from "./resume"
++
+ import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
++import { extractResumeConfig, findLastUserMessage, resumeSession } from "./resume"
+ import type { MessageData } from "./types"
+ 
+ describe("session-recovery resume", () => {
++  test("findLastUserMessage skips synthetic and internally marked user messages", () => {
++    // given
++    const realUserMessage: MessageData = {
++      info: {
++        role: "user",
++        agent: "Sisyphus",
++        model: { providerID: "openai", modelID: "gpt-5.3-codex" },
++      },
++      parts: [{ type: "text", text: "real user task" }],
++    }
++    const syntheticUserMessage: MessageData = {
++      info: {
++        role: "user",
++        agent: "Atlas",
++        model: { providerID: "anthropic", modelID: "claude-sonnet-4-6" },
++      },
++      parts: [{ type: "text", text: "synthetic wake", synthetic: true }],
++    }
++    const internalUserMessage: MessageData = {
++      info: {
++        role: "user",
++        agent: "Hephaestus",
++        model: { providerID: "openai", modelID: "gpt-5.4" },
++      },
++      parts: [{ type: "text", text: `internal wake\n${OMO_INTERNAL_INITIATOR_MARKER}` }],
++    }
++
++    // when
++    const result = findLastUserMessage([
++      realUserMessage,
++      syntheticUserMessage,
++      internalUserMessage,
++    ])
++
++    // then
++    expect(result).toBe(realUserMessage)
++  })
++
+   test("extractResumeConfig carries tools from last user message", () => {
+     // given
+     const userMessage: MessageData = {
+diff --git a/src/hooks/session-recovery/resume.ts b/src/hooks/session-recovery/resume.ts
+index 6049fdbc..24fbd05b 100644
+--- a/src/hooks/session-recovery/resume.ts
++++ b/src/hooks/session-recovery/resume.ts
+@@ -1,7 +1,11 @@
+ import type { createOpencodeClient } from "@opencode-ai/sdk"
+-import type { MessageData, ResumeConfig } from "./types"
+-import { createInternalAgentContinuationTextPart, resolveInheritedPromptTools } from "../../shared"
++import {
++  createInternalAgentContinuationTextPart,
++  isRealUserMessage,
++  resolveInheritedPromptTools,
++} from "../../shared"
+ import { promptAsyncAfterSessionIdle } from "../shared/prompt-async-gate"
++import type { MessageData, ResumeConfig } from "./types"
+ 
+ const RECOVERY_RESUME_TEXT = "[session recovered - continuing previous task]"
+ 
+@@ -9,8 +13,9 @@ type Client = ReturnType<typeof createOpencodeClient>
+ 
+ export function findLastUserMessage(messages: MessageData[]): MessageData | undefined {
+   for (let i = messages.length - 1; i >= 0; i--) {
+-    if (messages[i].info?.role === "user") {
+-      return messages[i]
++    const message = messages[i]
++    if (message !== undefined && isRealUserMessage(message)) {
++      return message
+     }
+   }
+   return undefined
+diff --git a/src/hooks/session-recovery/types.ts b/src/hooks/session-recovery/types.ts
+index 3485d62b..6b4714b3 100644
+--- a/src/hooks/session-recovery/types.ts
++++ b/src/hooks/session-recovery/types.ts
+@@ -82,6 +82,7 @@ export interface MessageData {
+     type: string
+     id?: string
+     text?: string
++    synthetic?: boolean
+     thinking?: string
+     name?: string
+     input?: Record<string, unknown>
+diff --git a/src/hooks/todo-continuation-enforcer/non-idle-events.test.ts b/src/hooks/todo-continuation-enforcer/non-idle-events.test.ts
+new file mode 100644
+index 00000000..b0030118
+--- /dev/null
++++ b/src/hooks/todo-continuation-enforcer/non-idle-events.test.ts
+@@ -0,0 +1,70 @@
++/// <reference types="bun-types" />
++import { afterEach, beforeEach, describe, expect, test } from "bun:test"
++
++import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
++import { handleNonIdleEvent } from "./non-idle-events"
++import { createSessionStateStore, type SessionStateStore } from "./session-state"
++
++describe("handleNonIdleEvent", () => {
++  let sessionStateStore: SessionStateStore
++
++  beforeEach(() => {
++    sessionStateStore = createSessionStateStore()
++  })
++
++  afterEach(() => {
++    sessionStateStore.shutdown()
++  })
++
++  test("given synthetic user message update, keeps continuation countdown state intact", () => {
++    // given
++    const sessionID = "ses_synthetic_user_event"
++    const state = sessionStateStore.getState(sessionID)
++    state.countdownStartedAt = Date.now() - 10_000
++    state.wasCancelled = true
++    state.tokenLimitDetected = true
++
++    // when
++    handleNonIdleEvent({
++      eventType: "message.updated",
++      properties: {
++        sessionID,
++        info: { role: "user" },
++        parts: [{ type: "text", text: "internal wake", synthetic: true }],
++      },
++      sessionStateStore,
++    })
++
++    // then
++    expect(state.countdownStartedAt).toBeDefined()
++    expect(state.wasCancelled).toBe(true)
++    expect(state.tokenLimitDetected).toBe(true)
++  })
++
++  test("given internally marked user message update, keeps continuation countdown state intact", () => {
++    // given
++    const sessionID = "ses_internal_user_event"
++    const state = sessionStateStore.getState(sessionID)
++    state.countdownStartedAt = Date.now() - 10_000
++    state.wasCancelled = true
++    state.tokenLimitDetected = true
++
++    // when
++    handleNonIdleEvent({
++      eventType: "message.updated",
++      properties: {
++        sessionID,
++        info: { role: "user" },
++        parts: [
++          { type: "text", text: `internal wake\n${OMO_INTERNAL_INITIATOR_MARKER}` },
++        ],
++      },
++      sessionStateStore,
++    })
++
++    // then
++    expect(state.countdownStartedAt).toBeDefined()
++    expect(state.wasCancelled).toBe(true)
++    expect(state.tokenLimitDetected).toBe(true)
++  })
++})
+diff --git a/src/hooks/todo-continuation-enforcer/non-idle-events.ts b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+index 25a4de11..d54ae627 100644
+--- a/src/hooks/todo-continuation-enforcer/non-idle-events.ts
++++ b/src/hooks/todo-continuation-enforcer/non-idle-events.ts
+@@ -1,9 +1,39 @@
+ import { resolveMessageEventSessionID, resolveSessionEventID } from "../../shared/event-session-id"
++import type { InternalInitiatorTextPartLike } from "../../shared/internal-initiator-marker"
++import { isSyntheticOrInternalOnlyTextParts } from "../../shared/internal-initiator-marker"
+ import { log } from "../../shared/logger"
+ 
+ import { COUNTDOWN_GRACE_PERIOD_MS, HOOK_NAME } from "./constants"
+ import type { SessionStateStore } from "./session-state"
+ 
++function isEventPart(value: unknown): value is InternalInitiatorTextPartLike {
++  if (typeof value !== "object" || value === null) {
++    return false
++  }
++
++  const record = value as Record<string, unknown>
++  const type = record.type
++  const text = record.text
++  const synthetic = record.synthetic
++
++  return (
++    (type === undefined || typeof type === "string") &&
++    (text === undefined || typeof text === "string") &&
++    (synthetic === undefined || typeof synthetic === "boolean")
++  )
++}
++
++function resolveEventParts(
++  properties: Record<string, unknown> | undefined
++): InternalInitiatorTextPartLike[] | undefined {
++  const parts = properties?.parts
++  if (!Array.isArray(parts) || !parts.every(isEventPart)) {
++    return undefined
++  }
++
++  return parts
++}
++
+ export function handleNonIdleEvent(args: {
+   eventType: string
+   properties: Record<string, unknown> | undefined
+@@ -18,6 +48,11 @@ export function handleNonIdleEvent(args: {
+     if (!sessionID) return
+ 
+     if (role === "user") {
++      const parts = resolveEventParts(properties)
++      if (isSyntheticOrInternalOnlyTextParts(parts)) {
++        log(`[${HOOK_NAME}] Ignoring synthetic/internal user message event`, { sessionID })
++        return
++      }
+       const state = sessionStateStore.getExistingState(sessionID)
+       if (state?.countdownStartedAt) {
+         const elapsed = Date.now() - state.countdownStartedAt
+diff --git a/src/hooks/todo-continuation-enforcer/pending-question-detection.test.ts b/src/hooks/todo-continuation-enforcer/pending-question-detection.test.ts
+index 5ea4b214..62c2a817 100644
+--- a/src/hooks/todo-continuation-enforcer/pending-question-detection.test.ts
++++ b/src/hooks/todo-continuation-enforcer/pending-question-detection.test.ts
+@@ -1,6 +1,7 @@
+ /// <reference types="bun-types" />
+ import { describe, expect, test } from "bun:test"
+ 
++import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
+ import { hasUnansweredQuestion } from "./pending-question-detection"
+ 
+ describe("hasUnansweredQuestion", () => {
+@@ -51,6 +52,42 @@ describe("hasUnansweredQuestion", () => {
+     expect(hasUnansweredQuestion(messages)).toBe(false)
+   })
+ 
++  test("given synthetic user message after question, still treats question as unanswered", () => {
++    const messages = [
++      {
++        info: { role: "assistant" },
++        parts: [
++          { type: "tool_use", name: "question" },
++        ],
++      },
++      {
++        info: { role: "user" },
++        parts: [
++          { type: "text", text: "internal continuation", synthetic: true },
++        ],
++      },
++    ]
++    expect(hasUnansweredQuestion(messages)).toBe(true)
++  })
++
++  test("given internally marked user message after question, still treats question as unanswered", () => {
++    const messages = [
++      {
++        info: { role: "assistant" },
++        parts: [
++          { type: "tool_use", name: "question" },
++        ],
++      },
++      {
++        info: { role: "user" },
++        parts: [
++          { type: "text", text: `internal continuation\n${OMO_INTERNAL_INITIATOR_MARKER}` },
++        ],
++      },
++    ]
++    expect(hasUnansweredQuestion(messages)).toBe(true)
++  })
++
+   test("given assistant message with non-question tool, returns false", () => {
+     const messages = [
+       { info: { role: "user" } },
+diff --git a/src/hooks/todo-continuation-enforcer/pending-question-detection.ts b/src/hooks/todo-continuation-enforcer/pending-question-detection.ts
+index 7777da03..f9bd4881 100644
+--- a/src/hooks/todo-continuation-enforcer/pending-question-detection.ts
++++ b/src/hooks/todo-continuation-enforcer/pending-question-detection.ts
+@@ -1,3 +1,4 @@
++import { isSyntheticOrInternalUserMessage } from "../../shared/internal-initiator-marker"
+ import { log } from "../../shared/logger"
+ import { HOOK_NAME } from "./constants"
+ 
+@@ -5,6 +6,8 @@ interface MessagePart {
+   type?: string
+   name?: string
+   toolName?: string
++  text?: string
++  synthetic?: boolean
+ }
+ 
+ interface Message {
+@@ -20,7 +23,12 @@ export function hasUnansweredQuestion(messages: Message[]): boolean {
+     const msg = messages[i]
+     const role = msg.info?.role ?? msg.role
+ 
+-    if (role === "user") return false
++    if (role === "user") {
++      if (isSyntheticOrInternalUserMessage(msg)) {
++        continue
++      }
++      return false
++    }
+ 
+     if (role === "assistant" && msg.parts) {
+       const hasQuestion = msg.parts.some(
+diff --git a/src/hooks/todo-continuation-enforcer/resolve-message-info.test.ts b/src/hooks/todo-continuation-enforcer/resolve-message-info.test.ts
+new file mode 100644
+index 00000000..6184412a
+--- /dev/null
++++ b/src/hooks/todo-continuation-enforcer/resolve-message-info.test.ts
+@@ -0,0 +1,69 @@
++/// <reference types="bun-types" />
++import { describe, expect, test } from "bun:test"
++
++import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker"
++import { resolveLatestMessageInfo } from "./resolve-message-info"
++import type { MessageWithInfo } from "./types"
++
++describe("resolveLatestMessageInfo", () => {
++  test("given synthetic latest user info, skips it and resolves the prior real user info", async () => {
++    // given
++    const realModel = { providerID: "openai", modelID: "gpt-5.3-codex" }
++    const syntheticModel = { providerID: "anthropic", modelID: "claude-sonnet-4-6" }
++    const messages: MessageWithInfo[] = [
++      {
++        info: { role: "user", agent: "sisyphus", model: realModel },
++        parts: [{ type: "text", text: "real user task" }],
++      },
++      {
++        info: { role: "user", agent: "atlas", model: syntheticModel },
++        parts: [{ type: "text", text: "synthetic wake", synthetic: true }],
++      },
++    ]
++
++    // when
++    const result = await resolveLatestMessageInfo(
++      unsafeTestValue({}),
++      "ses_synthetic_latest_info",
++      messages,
++    )
++
++    // then
++    expect(result.resolvedInfo).toEqual({
++      agent: "sisyphus",
++      model: realModel,
++      tools: undefined,
++    })
++  })
++
++  test("given internally marked latest user info, skips it and resolves the prior real user info", async () => {
++    // given
++    const realModel = { providerID: "openai", modelID: "gpt-5.3-codex" }
++    const internalModel = { providerID: "openai", modelID: "gpt-5.4" }
++    const messages: MessageWithInfo[] = [
++      {
++        info: { role: "user", agent: "sisyphus", model: realModel },
++        parts: [{ type: "text", text: "real user task" }],
++      },
++      {
++        info: { role: "user", agent: "hephaestus", model: internalModel },
++        parts: [{ type: "text", text: `internal wake\n${OMO_INTERNAL_INITIATOR_MARKER}` }],
++      },
++    ]
++
++    // when
++    const result = await resolveLatestMessageInfo(
++      unsafeTestValue({}),
++      "ses_internal_latest_info",
++      messages,
++    )
++
++    // then
++    expect(result.resolvedInfo).toEqual({
++      agent: "sisyphus",
++      model: realModel,
++      tools: undefined,
++    })
++  })
++})
+diff --git a/src/hooks/todo-continuation-enforcer/resolve-message-info.ts b/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
+index 42431aa0..b221534d 100644
+--- a/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
++++ b/src/hooks/todo-continuation-enforcer/resolve-message-info.ts
+@@ -1,6 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ 
+-import { normalizeSDKResponse } from "../../shared"
++import { isSyntheticOrInternalUserMessage, normalizeSDKResponse } from "../../shared"
+ import { isCompactionMessage } from "../../shared/compaction-marker"
+ 
+ import type { MessageInfo, MessageWithInfo, ResolveLatestMessageInfoResult } from "./types"
+@@ -31,6 +31,9 @@ export async function resolveLatestMessageInfo(
+       encounteredCompaction = true
+       continue
+     }
++    if (isSyntheticOrInternalUserMessage(message)) {
++      continue
++    }
+     if (info?.agent || info?.model || (info?.modelID && info?.providerID)) {
+       return {
+         resolvedInfo: {
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index 261aa47c..99fa7018 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -54,7 +54,7 @@ export interface MessageInfo {
+ 
+ export interface MessageWithInfo {
+   info?: MessageInfo
+-  parts?: Array<{ type?: string }>
++  parts?: Array<{ type?: string; text?: string; synthetic?: boolean }>
+ }
+ 
+ export interface ResolvedMessageInfo {
+-- 
+2.39.2
+

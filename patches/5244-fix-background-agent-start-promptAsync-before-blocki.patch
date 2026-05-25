@@ -1,0 +1,236 @@
+From 5238dd484e663099760419f3226ad571b046f46b Mon Sep 17 00:00:00 2001
+From: Momentum96 <wjsrjsdn12@gmail.com>
+Date: Thu, 7 May 2026 23:15:26 +0900
+Subject: [PATCH 5244/5749] fix(background-agent): start promptAsync before
+ blocking tmux callback
+
+- Fixes BackgroundManager to launch promptAsync before invoking the blocking tmux callback.
+- Adds regression test to ensure promptAsync is called before tmux callback.
+---
+ src/features/background-agent/manager.test.ts | 96 +++++++++++++++++--
+ src/features/background-agent/manager.ts      | 50 +++++-----
+ 2 files changed, 110 insertions(+), 36 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index e04d5976..b9480658 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -322,6 +322,82 @@ function createToastRemoveTaskTracker(): { removeTaskCalls: string[]; resetToast
+   }
+ }
+ 
++describe("BackgroundManager tmux callback ordering", () => {
++  test("starts promptAsync before a blocking tmux callback resolves", async () => {
++    //#given
++    const events: string[] = []
++    let resolveTmuxCallback: () => void = () => {}
++    const tmuxCallbackPromise = new Promise<void>((resolve) => {
++      resolveTmuxCallback = resolve
++    })
++
++    const client = {
++      session: {
++        get: async () => {
++          events.push("session.get")
++          return { data: { directory: "/tmp/test" } }
++        },
++        create: async () => {
++          events.push("session.create")
++          return { data: { id: "ses_manager_blocking_tmux" } }
++        },
++        promptAsync: async () => {
++          events.push("promptAsync")
++          return { data: {} }
++        },
++        abort: async () => ({ data: {} }),
++      },
++    }
++
++    const onSubagentSessionCreated = mock(async () => {
++      events.push("tmux.callback.start")
++      await tmuxCallbackPromise
++      events.push("tmux.callback.end")
++    })
++    const manager = new BackgroundManager({
++      pluginContext: createPluginInput(client, "/tmp/test"),
++      tmuxConfig: {
++        enabled: true,
++        layout: "main-vertical",
++        main_pane_size: 60,
++        main_pane_min_width: 120,
++        agent_pane_min_width: 40,
++        isolation: "inline",
++      },
++      onSubagentSessionCreated,
++      enableParentSessionNotifications: false,
++    })
++    const originalTmux = process.env.TMUX
++    process.env.TMUX = "/tmp/fake-tmux-socket"
++
++    try {
++      //#when
++      await manager.launch({
++        description: "Blocking tmux test",
++        prompt: "Do work",
++        agent: "general",
++        parentSessionId: "ses_parent",
++        parentMessageId: "msg_parent",
++      })
++      await new Promise((resolve) => setTimeout(resolve, 20))
++
++      //#then
++      expect(events).toContain("session.create")
++      expect(events).toContain("promptAsync")
++      expect(events).toContain("tmux.callback.start")
++      const promptIdx = events.indexOf("promptAsync")
++      const tmuxStartIdx = events.indexOf("tmux.callback.start")
++      expect(promptIdx < tmuxStartIdx).toBe(true)
++      expect(events).not.toContain("tmux.callback.end")
++    } finally {
++      resolveTmuxCallback()
++      if (originalTmux === undefined) delete process.env.TMUX
++      else process.env.TMUX = originalTmux
++      manager.shutdown()
++    }
++  })
++})
++
+ describe("BackgroundManager session.error fallback hydration", () => {
+   test("hydrates fallbackChain from session fallback state before retrying sync child-session errors", async () => {
+     //#given
+@@ -3463,7 +3539,7 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+       expect(getConcurrencyManager(manager).getCount("test-agent")).toBe(0)
+     })
+ 
+-    test("should keep task cancelled when cancelled during tmux callback before running state is assigned", async () => {
++      test("should start prompt before tmux callback cancellation", async () => {
+       // given
+       resetClaudeCodeSessionState()
+       const originalTmuxEnvironment = process.env.TMUX
+@@ -3474,9 +3550,9 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+         const abortCalls: string[] = []
+         const promptAsyncSessionIDs: string[] = []
+         let taskID: string | undefined
+-        let resolveAbortCalled: (() => void) | undefined
+-        const abortCalled = new Promise<void>((resolve) => {
+-          resolveAbortCalled = resolve
++        let resolveCancelCalled: (() => void) | undefined
++        const cancelCalled = new Promise<void>((resolve) => {
++          resolveCancelCalled = resolve
+         })
+ 
+         manager.shutdown()
+@@ -3496,7 +3572,6 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+                 status: async () => ({ data: {} }),
+                 abort: async ({ path }: { path: { id: string } }) => {
+                   abortCalls.push(path.id)
+-                  resolveAbortCalled?.()
+                   return {}
+                 },
+               },
+@@ -3523,6 +3598,7 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+                 source: "test",
+                 abortSession: false,
+               })
++              resolveCancelCalled?.()
+             }, }
+         )
+ 
+@@ -3539,7 +3615,7 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+ 
+         // when
+         await Promise.race([
+-          abortCalled,
++          cancelCalled,
+           new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 500)),
+         ])
+         await flushBackgroundNotifications()
+@@ -3547,12 +3623,12 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+         // then
+         const updatedTask = manager.getTask(task.id)
+         expect(updatedTask?.status).toBe("cancelled")
+-        expect(updatedTask?.sessionId).toBeUndefined()
+-        expect(promptAsyncSessionIDs).not.toContain(createdSessionID)
+-        expect(abortCalls).toEqual([createdSessionID])
++        expect(updatedTask?.sessionId).toBe(createdSessionID)
++        expect(promptAsyncSessionIDs).toContain(createdSessionID)
++        expect(abortCalls).toEqual([])
+         expect(getConcurrencyManager(manager).getCount("test-agent")).toBe(0)
+         expect(getRootDescendantCounts(manager).has("parent-session")).toBe(false)
+-        expect(subagentSessions.has(createdSessionID)).toBe(false)
++        expect(subagentSessions.has(createdSessionID)).toBe(true)
+       } finally {
+         resetClaudeCodeSessionState()
+         if (originalTmuxEnvironment === undefined) {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 84611c57..310e4404 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -761,33 +761,8 @@ export class BackgroundManager {
+     this.settlePreStartDescendantReservation(task)
+     subagentSessions.add(sessionID)
+ 
+-    log("[background-agent] tmux callback check", {
+-      hasCallback: !!this.onSubagentSessionCreated,
+-      tmuxEnabled: this.tmuxEnabled,
+-      isInsideTmux: isInsideTmux(),
+-      sessionID,
+-      parentID: input.parentSessionId,
+-    })
+-
+-    if (!input.suppressTmuxSpawn && this.onSubagentSessionCreated && this.tmuxEnabled && isInsideTmux()) {
+-      log("[background-agent] Invoking tmux callback NOW", { sessionID })
+-      await this.onSubagentSessionCreated({
+-        sessionID,
+-        parentID: input.parentSessionId,
+-        title: input.description,
+-      }).catch((err) => {
+-        log("[background-agent] Failed to spawn tmux pane:", err)
+-      })
+-      log("[background-agent] tmux callback completed, waiting 200ms")
+-      await new Promise(r => setTimeout(r, 200))
+-    } else {
+-      log("[background-agent] SKIP tmux callback - conditions not met", {
+-        suppressTmuxSpawn: !!input.suppressTmuxSpawn,
+-      })
+-    }
+-
+     if (this.tasks.get(task.id)?.status === "cancelled") {
+-      await this.abortSessionWithLogging(sessionID, "cancelled during tmux setup")
++      await this.abortSessionWithLogging(sessionID, "cancelled during launch setup")
+       subagentSessions.delete(sessionID)
+       if (task.rootSessionId) {
+         this.unregisterRootDescendant(task.rootSessionId)
+@@ -982,6 +957,29 @@ The fallback retry session is now created and can be inspected directly.
+         })
+       }
+     })
++
++    log("[background-agent] tmux callback check", {
++      hasCallback: !!this.onSubagentSessionCreated,
++      tmuxEnabled: this.tmuxEnabled,
++      isInsideTmux: isInsideTmux(),
++      sessionID,
++      parentID: input.parentSessionId,
++    })
++
++    if (!input.suppressTmuxSpawn && this.onSubagentSessionCreated && this.tmuxEnabled && isInsideTmux()) {
++      log("[background-agent] Invoking tmux callback (fire-and-forget)", { sessionID })
++      void this.onSubagentSessionCreated({
++        sessionID,
++        parentID: input.parentSessionId,
++        title: input.description,
++      }).catch((err) => {
++        log("[background-agent] Failed to spawn tmux pane:", err)
++      })
++    } else {
++      log("[background-agent] SKIP tmux callback - conditions not met", {
++        suppressTmuxSpawn: !!input.suppressTmuxSpawn,
++      })
++    }
+   }
+ 
+   getTask(id: string): BackgroundTask | undefined {
+-- 
+2.39.2
+

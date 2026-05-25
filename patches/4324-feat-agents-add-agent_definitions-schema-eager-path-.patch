@@ -1,0 +1,437 @@
+From fd28f7e668d4deb9327c063d2986dbc161b1da9a Mon Sep 17 00:00:00 2001
+From: Brandon Webb <brandon.webb@vista.com>
+Date: Tue, 14 Apr 2026 13:03:07 -0400
+Subject: [PATCH 4324/5749] feat(agents): add agent_definitions schema, eager
+ path resolution, and JSON agent loader
+
+Wave 1 of agent definitions enhancement (PR #2299):
+
+Schema & Configuration:
+- Add agent_definitions field to oh-my-opencode config schema
+- Support list of file paths to .md or .json agent definition files
+- Add to PARTIAL_STRING_ARRAY_KEYS for Set-union merge semantics
+- Implement eager path resolution in loadPluginConfig() before merging
+
+Path Resolution:
+- Create resolve-agent-definition-paths.ts helper
+- User-level paths resolve from ~/.config/opencode/ (no containment)
+- Project-level paths resolve from project root (with containment check)
+- Homedir expansion, absolute/relative path handling
+
+JSON Agent Loader:
+- Create parseJsonAgentFile() for .json/.jsonc agent definitions
+- Validate required fields (name, prompt)
+- Support tools as string (comma-separated) or array
+- Map model via mapClaudeModelToOpenCode()
+- Comprehensive test suite (7 test cases, all passing)
+
+Type Extensions:
+- Extend AgentScope: add 'definition-file' and 'opencode-config'
+- Add AgentJsonDefinition interface for JSON agent schema
+
+All automated checks passing:
+- lsp_diagnostics clean on all changed files
+- json-agent-loader.test.ts: 7/7 passing
+- Full typecheck: zero new errors
+- QA evidence saved to .sisyphus/evidence/
+---
+ src/config/schema/agent-definitions.ts        |   5 +
+ src/config/schema/oh-my-opencode-config.ts    |   3 +
+ .../json-agent-loader.test.ts                 | 139 ++++++++++++++++++
+ .../json-agent-loader.ts                      |  67 +++++++++
+ .../claude-code-agent-loader/types.ts         |  11 +-
+ src/plugin-config.ts                          |  26 ++++
+ src/shared/index.ts                           |   1 +
+ src/shared/resolve-agent-definition-paths.ts  |  22 +++
+ 8 files changed, 273 insertions(+), 1 deletion(-)
+ create mode 100644 src/config/schema/agent-definitions.ts
+ create mode 100644 src/features/claude-code-agent-loader/json-agent-loader.test.ts
+ create mode 100644 src/features/claude-code-agent-loader/json-agent-loader.ts
+ create mode 100644 src/shared/resolve-agent-definition-paths.ts
+
+diff --git a/src/config/schema/agent-definitions.ts b/src/config/schema/agent-definitions.ts
+new file mode 100644
+index 00000000..508bfde0
+--- /dev/null
++++ b/src/config/schema/agent-definitions.ts
+@@ -0,0 +1,5 @@
++import { z } from "zod"
++
++export const AgentDefinitionPathSchema = z.string()
++
++export const AgentDefinitionsConfigSchema = z.array(AgentDefinitionPathSchema).optional()
+diff --git a/src/config/schema/oh-my-opencode-config.ts b/src/config/schema/oh-my-opencode-config.ts
+index eb929976..e62413d2 100644
+--- a/src/config/schema/oh-my-opencode-config.ts
++++ b/src/config/schema/oh-my-opencode-config.ts
+@@ -1,6 +1,7 @@
+ import { z } from "zod"
+ import { AnyMcpNameSchema } from "../../mcp/types"
+ import { BuiltinSkillNameSchema } from "./agent-names"
++import { AgentDefinitionsConfigSchema } from "./agent-definitions"
+ import { AgentOverridesSchema } from "./agent-overrides"
+ import { BabysittingConfigSchema } from "./babysitting"
+ import { BackgroundTaskConfigSchema } from "./background-task"
+@@ -29,6 +30,8 @@ export const OhMyOpenCodeConfigSchema = z.object({
+   new_task_system_enabled: z.boolean().optional(),
+   /** Default agent name for `oh-my-opencode run` (env: OPENCODE_DEFAULT_AGENT) */
+   default_run_agent: z.string().optional(),
++  /** Paths to external agent definition files (.md or .json) */
++  agent_definitions: AgentDefinitionsConfigSchema,
+   disabled_mcps: z.array(AnyMcpNameSchema).optional(),
+   disabled_agents: z.array(z.string()).optional(),
+   disabled_skills: z.array(BuiltinSkillNameSchema).optional(),
+diff --git a/src/features/claude-code-agent-loader/json-agent-loader.test.ts b/src/features/claude-code-agent-loader/json-agent-loader.test.ts
+new file mode 100644
+index 00000000..b3f6a4f5
+--- /dev/null
++++ b/src/features/claude-code-agent-loader/json-agent-loader.test.ts
+@@ -0,0 +1,139 @@
++import { describe, test, expect, afterEach } from "bun:test"
++import { mkdtempSync, writeFileSync, rmSync } from "fs"
++import { join } from "path"
++import { tmpdir } from "os"
++import { parseJsonAgentFile } from "./json-agent-loader"
++
++describe("json-agent-loader", () => {
++  const dirs: string[] = []
++
++  afterEach(() => {
++    for (const dir of dirs) {
++      rmSync(dir, { recursive: true, force: true })
++    }
++    dirs.length = 0
++  })
++
++  function trackDir(dir: string): string {
++    dirs.push(dir)
++    return dir
++  }
++
++  test("parses valid JSON agent file", () => {
++    const dir = trackDir(mkdtempSync(join(tmpdir(), "json-agent-loader-test-")))
++    const filePath = join(dir, "agent.json")
++
++    writeFileSync(filePath, JSON.stringify({
++      name: "test-agent",
++      description: "A test agent",
++      prompt: "You are a test agent.",
++      tools: ["Bash", "Read"],
++      model: "claude-3-5-sonnet-20241022",
++      mode: "subagent",
++    }), "utf-8")
++
++    const result = parseJsonAgentFile(filePath, "definition-file")
++
++    expect(result).not.toBeNull()
++    expect(result?.name).toBe("test-agent")
++    expect(result?.path).toBe(filePath)
++    expect(result?.scope).toBe("definition-file")
++    expect(result?.config.description).toBe("(definition-file) A test agent")
++    expect(result?.config.prompt).toBe("You are a test agent.")
++    expect(result?.config.mode).toBe("subagent")
++    expect(result?.config.tools).toEqual({ bash: true, read: true })
++  })
++
++  test("parses JSONC with comments", () => {
++    const dir = trackDir(mkdtempSync(join(tmpdir(), "json-agent-loader-test-")))
++    const filePath = join(dir, "agent.jsonc")
++
++    writeFileSync(filePath, `{
++  // Agent name
++  "name": "commented-agent",
++  "description": "Agent with comments",
++  "prompt": "Do something.",
++  "tools": ["Bash"], // Tools for the agent
++  // Model specification
++  "model": "claude-3-5-sonnet-20241022"
++}`, "utf-8")
++
++    const result = parseJsonAgentFile(filePath, "definition-file")
++
++    expect(result).not.toBeNull()
++    expect(result?.name).toBe("commented-agent")
++    expect(result?.config.tools).toEqual({ bash: true })
++  })
++
++  test("returns null when required fields are missing (name)", () => {
++    const dir = trackDir(mkdtempSync(join(tmpdir(), "json-agent-loader-test-")))
++    const filePath = join(dir, "agent.json")
++
++    writeFileSync(filePath, JSON.stringify({
++      description: "Missing name",
++      prompt: "You are an agent.",
++    }), "utf-8")
++
++    const result = parseJsonAgentFile(filePath, "definition-file")
++    expect(result).toBeNull()
++  })
++
++  test("returns null when required fields are missing (prompt)", () => {
++    const dir = trackDir(mkdtempSync(join(tmpdir(), "json-agent-loader-test-")))
++    const filePath = join(dir, "agent.json")
++
++    writeFileSync(filePath, JSON.stringify({
++      name: "missing-prompt",
++      description: "Missing prompt",
++    }), "utf-8")
++
++    const result = parseJsonAgentFile(filePath, "definition-file")
++    expect(result).toBeNull()
++  })
++
++  test("defaults optional fields correctly", () => {
++    const dir = trackDir(mkdtempSync(join(tmpdir(), "json-agent-loader-test-")))
++    const filePath = join(dir, "agent.json")
++
++    writeFileSync(filePath, JSON.stringify({
++      name: "minimal-agent",
++      prompt: "You are minimal.",
++    }), "utf-8")
++
++    const result = parseJsonAgentFile(filePath, "definition-file")
++
++    expect(result).not.toBeNull()
++    expect(result?.config.description).toBe("(definition-file) ")
++    expect(result?.config.mode).toBe("subagent")
++    expect(result?.config.tools).toBeUndefined()
++    expect(result?.config.model).toBeUndefined()
++  })
++
++  test("handles tools as string comma-separated list", () => {
++    const dir = trackDir(mkdtempSync(join(tmpdir(), "json-agent-loader-test-")))
++    const filePath = join(dir, "agent.json")
++
++    writeFileSync(filePath, JSON.stringify({
++      name: "string-tools-agent",
++      prompt: "You are an agent.",
++      tools: "Bash, Read, Grep",
++    }), "utf-8")
++
++    const result = parseJsonAgentFile(filePath, "definition-file")
++
++    expect(result?.config.tools).toEqual({ bash: true, read: true, grep: true })
++  })
++
++  test("returns null for malformed JSON", () => {
++    const dir = trackDir(mkdtempSync(join(tmpdir(), "json-agent-loader-test-")))
++    const filePath = join(dir, "agent.json")
++
++    writeFileSync(filePath, `{
++  "name": "broken",
++  "prompt": "incomplete json`,
++      "utf-8")
++
++    const result = parseJsonAgentFile(filePath, "definition-file")
++    expect(result).toBeNull()
++  })
++})
+diff --git a/src/features/claude-code-agent-loader/json-agent-loader.ts b/src/features/claude-code-agent-loader/json-agent-loader.ts
+new file mode 100644
+index 00000000..394d2a25
+--- /dev/null
++++ b/src/features/claude-code-agent-loader/json-agent-loader.ts
+@@ -0,0 +1,67 @@
++import { existsSync, readFileSync } from "fs"
++import { parseJsoncSafe } from "../../shared/jsonc-parser"
++import { mapClaudeModelToOpenCode } from "./claude-model-mapper"
++import type { AgentScope, AgentJsonDefinition, ClaudeCodeAgentConfig, LoadedAgent } from "./types"
++
++function parseToolsConfig(tools?: string | string[]): Record<string, boolean> | undefined {
++  if (!tools) return undefined
++
++  const toolsArray = Array.isArray(tools) ? tools : tools.split(",").map((t) => t.trim())
++  const filtered = toolsArray.filter((t) => typeof t === "string" && t.length > 0)
++
++  if (filtered.length === 0) return undefined
++
++  const result: Record<string, boolean> = {}
++  for (const tool of filtered) {
++    result[tool.toLowerCase()] = true
++  }
++  return result
++}
++
++export function parseJsonAgentFile(filePath: string, scope: AgentScope): LoadedAgent | null {
++  try {
++    if (!existsSync(filePath)) {
++      return null
++    }
++
++    const content = readFileSync(filePath, "utf-8")
++    const { data } = parseJsoncSafe<AgentJsonDefinition>(content)
++
++    if (!data) {
++      return null
++    }
++
++    if (!data.name || !data.prompt) {
++      return null
++    }
++
++    const originalDescription = data.description ?? ""
++    const formattedDescription = `(${scope}) ${originalDescription}`
++
++    const mappedModelOverride = mapClaudeModelToOpenCode(data.model)
++    const modelString = mappedModelOverride
++      ? `${mappedModelOverride.providerID}/${mappedModelOverride.modelID}`
++      : undefined
++
++    const config: ClaudeCodeAgentConfig = {
++      description: formattedDescription,
++      mode: data.mode ?? "subagent",
++      prompt: data.prompt.trim(),
++      ...(modelString ? { model: modelString } : {}),
++    }
++
++    const toolsConfig = parseToolsConfig(data.tools)
++    if (toolsConfig) {
++      config.tools = toolsConfig
++    }
++
++    return {
++      name: data.name,
++      path: filePath,
++      config,
++      scope,
++    }
++  } catch {
++    return null
++  }
++}
+diff --git a/src/features/claude-code-agent-loader/types.ts b/src/features/claude-code-agent-loader/types.ts
+index 90a23682..db528724 100644
+--- a/src/features/claude-code-agent-loader/types.ts
++++ b/src/features/claude-code-agent-loader/types.ts
+@@ -1,6 +1,6 @@
+ import type { AgentConfig } from "@opencode-ai/sdk"
+ 
+-export type AgentScope = "user" | "project" | "opencode" | "opencode-project"
++export type AgentScope = "user" | "project" | "opencode" | "opencode-project" | "definition-file" | "opencode-config"
+ 
+ export type ClaudeCodeAgentConfig = Omit<AgentConfig, "model"> & {
+   model?: string | { providerID: string; modelID: string }
+@@ -14,6 +14,15 @@ export interface AgentFrontmatter {
+   mode?: "subagent" | "primary" | "all"
+ }
+ 
++export interface AgentJsonDefinition {
++  name: string
++  description?: string
++  model?: string
++  tools?: string | string[]
++  mode?: "subagent" | "primary" | "all"
++  prompt: string
++}
++
+ export interface LoadedAgent {
+   name: string
+   path: string
+diff --git a/src/plugin-config.ts b/src/plugin-config.ts
+index 0b79e96d..9cbe0030 100644
+--- a/src/plugin-config.ts
++++ b/src/plugin-config.ts
+@@ -9,6 +9,7 @@ import {
+   parseJsonc,
+   detectPluginConfigFile,
+   migrateConfigFile,
++  resolveAgentDefinitionPaths,
+ } from "./shared";
+ import { migrateLegacyConfigFile } from "./shared/migrate-legacy-config-file";
+ import { CONFIG_BASENAME, LEGACY_CONFIG_BASENAME } from "./shared/plugin-identity";
+@@ -41,6 +42,7 @@ const PARTIAL_STRING_ARRAY_KEYS = new Set([
+   "disabled_commands",
+   "disabled_tools",
+   "mcp_env_allowlist",
++  "agent_definitions",
+ ]);
+ 
+ export function parseConfigPartially(
+@@ -139,6 +141,12 @@ export function mergeConfigs(
+     ...override,
+     agents: deepMerge(base.agents, override.agents),
+     categories: deepMerge(base.categories, override.categories),
++    agent_definitions: [
++      ...new Set([
++        ...(base.agent_definitions ?? []),
++        ...(override.agent_definitions ?? []),
++      ]),
++    ],
+     disabled_agents: [
+       ...new Set([
+         ...(base.disabled_agents ?? []),
+@@ -250,6 +258,15 @@ export function loadPluginConfig(
+   // Load user config first (base). Parse empty config through Zod to apply field defaults.
+   const userConfig = loadConfigFromPath(userConfigPath, ctx)
+   const userGitMasterOverrides = loadExplicitGitMasterOverrides(userConfigPath)
++
++  if (userConfig?.agent_definitions) {
++    userConfig.agent_definitions = resolveAgentDefinitionPaths(
++      userConfig.agent_definitions,
++      configDir,
++      null
++    )
++  }
++
+   let config: OhMyOpenCodeConfig =
+     userConfig ?? OhMyOpenCodeConfigSchema.parse({});
+ 
+@@ -257,6 +274,15 @@ export function loadPluginConfig(
+   const defaultGitMaster = OhMyOpenCodeConfigSchema.parse({}).git_master
+   const projectConfig = loadConfigFromPath(projectConfigPath, ctx);
+   const projectGitMasterOverrides = loadExplicitGitMasterOverrides(projectConfigPath)
++
++  if (projectConfig?.agent_definitions) {
++    projectConfig.agent_definitions = resolveAgentDefinitionPaths(
++      projectConfig.agent_definitions,
++      directory,
++      directory
++    )
++  }
++
+   if (projectConfig) {
+     config = mergeConfigs(config, projectConfig);
+   }
+diff --git a/src/shared/index.ts b/src/shared/index.ts
+index 485926bf..cf979236 100644
+--- a/src/shared/index.ts
++++ b/src/shared/index.ts
+@@ -17,6 +17,7 @@ export * from "./claude-config-dir"
+ export * from "./jsonc-parser"
+ export * from "./migration"
+ export * from "./opencode-config-dir"
++export * from "./resolve-agent-definition-paths"
+ export type {
+   OpenCodeBinaryType,
+   OpenCodeConfigDirOptions,
+diff --git a/src/shared/resolve-agent-definition-paths.ts b/src/shared/resolve-agent-definition-paths.ts
+new file mode 100644
+index 00000000..c7334e4b
+--- /dev/null
++++ b/src/shared/resolve-agent-definition-paths.ts
+@@ -0,0 +1,22 @@
++import { homedir } from "os"
++import { isAbsolute, resolve } from "path"
++import { isWithinProject } from "./contains-path"
++import { log } from "./logger"
++
++export function resolveAgentDefinitionPaths(
++  paths: string[],
++  baseDir: string,
++  containmentDir: string | null
++): string[] {
++  return paths.flatMap((p) => {
++    const expanded = p.startsWith("~/") ? p.replace(/^~\//, `${homedir()}/`) : p
++    const resolved = isAbsolute(expanded) ? expanded : resolve(baseDir, expanded)
++
++    if (containmentDir !== null && !isWithinProject(resolved, containmentDir)) {
++      log(`agent_definitions path rejected (outside project boundary): ${p} -> ${resolved}`)
++      return []
++    }
++
++    return [resolved]
++  })
++}
+-- 
+2.39.2
+

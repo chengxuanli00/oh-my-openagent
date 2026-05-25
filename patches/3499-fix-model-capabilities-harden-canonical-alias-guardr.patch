@@ -1,0 +1,488 @@
+From 5043cc21ac3ab5a0ee4869673b1545573f2c57e4 Mon Sep 17 00:00:00 2001
+From: Ravi Tharuma <RaviTharuma@users.noreply.github.com>
+Date: Wed, 25 Mar 2026 17:13:43 +0100
+Subject: [PATCH 3499/5749] fix(model-capabilities): harden canonical alias
+ guardrails
+
+---
+ .../workflows/refresh-model-capabilities.yml  |   3 +
+ docs/model-capabilities-maintenance.md        |  33 ++++
+ package.json                                  |   1 +
+ src/shared/model-capabilities.test.ts         |   6 +-
+ src/shared/model-capability-aliases.test.ts   |   6 +-
+ src/shared/model-capability-aliases.ts        |  55 ++++---
+ .../model-capability-guardrails.test.ts       |  92 +++++++++++
+ src/shared/model-capability-guardrails.ts     | 149 ++++++++++++++++++
+ 8 files changed, 321 insertions(+), 24 deletions(-)
+ create mode 100644 docs/model-capabilities-maintenance.md
+ create mode 100644 src/shared/model-capability-guardrails.test.ts
+ create mode 100644 src/shared/model-capability-guardrails.ts
+
+diff --git a/.github/workflows/refresh-model-capabilities.yml b/.github/workflows/refresh-model-capabilities.yml
+index 5d2d053f..dd34e43e 100644
+--- a/.github/workflows/refresh-model-capabilities.yml
++++ b/.github/workflows/refresh-model-capabilities.yml
+@@ -28,6 +28,9 @@ jobs:
+       - name: Refresh bundled model capabilities snapshot
+         run: bun run build:model-capabilities
+ 
++      - name: Validate capability guardrails
++        run: bun run test:model-capabilities
++
+       - name: Create refresh pull request
+         uses: peter-evans/create-pull-request@v7
+         with:
+diff --git a/docs/model-capabilities-maintenance.md b/docs/model-capabilities-maintenance.md
+new file mode 100644
+index 00000000..4f6d6bbc
+--- /dev/null
++++ b/docs/model-capabilities-maintenance.md
+@@ -0,0 +1,33 @@
++# Model Capabilities Maintenance
++
++This project treats model capability resolution as a layered system:
++
++1. runtime metadata from connected providers
++2. `models.dev` bundled/runtime snapshot data
++3. explicit compatibility aliases
++4. heuristic fallback as the last resort
++
++## Internal policy
++
++- Built-in OmO agent/category requirement models must use canonical model IDs.
++- Aliases exist only to preserve compatibility with historical OmO names or provider-specific decorations.
++- New decorated names like `-high`, `-low`, or `-thinking` should not be added to built-in requirements when a canonical model ID plus structured settings can express the same thing.
++- If a provider or config input still uses an alias, normalize it at the edge and continue internally with the canonical ID.
++
++## When adding an alias
++
++- Add the alias rule to `src/shared/model-capability-aliases.ts`.
++- Include a rationale for why the alias exists.
++- Add or update tests so the alias is covered explicitly.
++- Ensure the alias canonical target exists in the bundled `models.dev` snapshot.
++
++## Guardrails
++
++`bun run test:model-capabilities` enforces the following invariants:
++
++- exact alias targets must exist in the bundled snapshot
++- exact alias keys must not silently become canonical `models.dev` IDs
++- pattern aliases must not rewrite canonical snapshot IDs
++- built-in requirement models must stay canonical and snapshot-backed
++
++The scheduled `refresh-model-capabilities` workflow runs these guardrails before opening an automated snapshot refresh PR.
+diff --git a/package.json b/package.json
+index 1b496f00..2c4a4e85 100644
+--- a/package.json
++++ b/package.json
+@@ -30,6 +30,7 @@
+     "prepare": "bun run build",
+     "postinstall": "node postinstall.mjs",
+     "prepublishOnly": "bun run clean && bun run build",
++    "test:model-capabilities": "bun test src/shared/model-capability-aliases.test.ts src/shared/model-capability-guardrails.test.ts src/shared/model-capabilities.test.ts src/cli/doctor/checks/model-resolution.test.ts --bail",
+     "typecheck": "tsc --noEmit",
+     "test": "bun test"
+   },
+diff --git a/src/shared/model-capabilities.test.ts b/src/shared/model-capabilities.test.ts
+index afad4ba0..4a97002f 100644
+--- a/src/shared/model-capabilities.test.ts
++++ b/src/shared/model-capabilities.test.ts
+@@ -161,7 +161,7 @@ describe("getModelCapabilities", () => {
+     expect(result.variants).toEqual(["low", "medium", "high", "xhigh"])
+   })
+ 
+-  test("normalizes thinking suffix aliases before snapshot lookup", () => {
++  test("normalizes the legacy Claude Opus thinking alias before snapshot lookup", () => {
+     const result = getModelCapabilities({
+       providerID: "anthropic",
+       modelID: "claude-opus-4-6-thinking",
+@@ -178,8 +178,8 @@ describe("getModelCapabilities", () => {
+     expect(result.diagnostics).toMatchObject({
+       resolutionMode: "alias-backed",
+       canonicalization: {
+-        source: "pattern-alias",
+-        ruleID: "anthropic-thinking-suffix",
++        source: "exact-alias",
++        ruleID: "claude-opus-4-6-thinking-legacy-alias",
+       },
+       snapshot: { source: "bundled-snapshot" },
+     })
+diff --git a/src/shared/model-capability-aliases.test.ts b/src/shared/model-capability-aliases.test.ts
+index 31be1852..a164ffb6 100644
+--- a/src/shared/model-capability-aliases.test.ts
++++ b/src/shared/model-capability-aliases.test.ts
+@@ -24,14 +24,14 @@ describe("model-capability-aliases", () => {
+     })
+   })
+ 
+-  test("normalizes decorated thinking aliases through a named pattern rule", () => {
++  test("normalizes legacy Claude thinking aliases through a named exact rule", () => {
+     const result = resolveModelIDAlias("claude-opus-4-6-thinking")
+ 
+     expect(result).toEqual({
+       requestedModelID: "claude-opus-4-6-thinking",
+       canonicalModelID: "claude-opus-4-6",
+-      source: "pattern-alias",
+-      ruleID: "anthropic-thinking-suffix",
++      source: "exact-alias",
++      ruleID: "claude-opus-4-6-thinking-legacy-alias",
+     })
+   })
+ })
+diff --git a/src/shared/model-capability-aliases.ts b/src/shared/model-capability-aliases.ts
+index 92454ad5..523755d6 100644
+--- a/src/shared/model-capability-aliases.ts
++++ b/src/shared/model-capability-aliases.ts
+@@ -1,10 +1,13 @@
+-type ExactAliasRule = {
++export type ExactAliasRule = {
++  aliasModelID: string
+   ruleID: string
+   canonicalModelID: string
++  rationale: string
+ }
+ 
+-type PatternAliasRule = {
++export type PatternAliasRule = {
+   ruleID: string
++  description: string
+   match: (normalizedModelID: string) => boolean
+   canonicalize: (normalizedModelID: string) => string
+ }
+@@ -16,44 +19,52 @@ export type ModelIDAliasResolution = {
+   ruleID?: string
+ }
+ 
+-const EXACT_ALIAS_RULES: Record<string, ExactAliasRule> = {
+-  "gpt-5.3-codex-spark": {
+-    ruleID: "gpt-5.3-codex-spark-alias",
+-    canonicalModelID: "gpt-5.3-codex",
+-  },
+-  "gemini-3.1-pro-high": {
++const EXACT_ALIAS_RULES: ReadonlyArray<ExactAliasRule> = [
++  {
++    aliasModelID: "gemini-3.1-pro-high",
+     ruleID: "gemini-3.1-pro-tier-alias",
+     canonicalModelID: "gemini-3.1-pro-preview",
++    rationale: "OmO historically encoded Gemini tier selection in the model name instead of variant metadata.",
+   },
+-  "gemini-3.1-pro-low": {
++  {
++    aliasModelID: "gemini-3.1-pro-low",
+     ruleID: "gemini-3.1-pro-tier-alias",
+     canonicalModelID: "gemini-3.1-pro-preview",
++    rationale: "OmO historically encoded Gemini tier selection in the model name instead of variant metadata.",
+   },
+-  "gemini-3-pro-high": {
++  {
++    aliasModelID: "gemini-3-pro-high",
+     ruleID: "gemini-3-pro-tier-alias",
+     canonicalModelID: "gemini-3-pro-preview",
++    rationale: "Legacy Gemini 3 tier suffixes still need to land on the canonical preview model.",
+   },
+-  "gemini-3-pro-low": {
++  {
++    aliasModelID: "gemini-3-pro-low",
+     ruleID: "gemini-3-pro-tier-alias",
+     canonicalModelID: "gemini-3-pro-preview",
++    rationale: "Legacy Gemini 3 tier suffixes still need to land on the canonical preview model.",
+   },
+-}
+-
+-const PATTERN_ALIAS_RULES: ReadonlyArray<PatternAliasRule> = [
+   {
+-    ruleID: "anthropic-thinking-suffix",
+-    match: (normalizedModelID) => normalizedModelID.startsWith("claude-") && normalizedModelID.endsWith("-thinking"),
+-    canonicalize: (normalizedModelID) => normalizedModelID.replace(/-thinking$/i, ""),
++    aliasModelID: "claude-opus-4-6-thinking",
++    ruleID: "claude-opus-4-6-thinking-legacy-alias",
++    canonicalModelID: "claude-opus-4-6",
++    rationale: "OmO historically used a legacy compatibility suffix before models.dev shipped canonical thinking variants for newer Claude families.",
+   },
+ ]
+ 
++const EXACT_ALIAS_RULES_BY_MODEL: Readonly<Record<string, ExactAliasRule>> = Object.fromEntries(
++  EXACT_ALIAS_RULES.map((rule) => [rule.aliasModelID, rule]),
++)
++
++const PATTERN_ALIAS_RULES: ReadonlyArray<PatternAliasRule> = []
++
+ function normalizeLookupModelID(modelID: string): string {
+   return modelID.trim().toLowerCase()
+ }
+ 
+ export function resolveModelIDAlias(modelID: string): ModelIDAliasResolution {
+   const normalizedModelID = normalizeLookupModelID(modelID)
+-  const exactRule = EXACT_ALIAS_RULES[normalizedModelID]
++  const exactRule = EXACT_ALIAS_RULES_BY_MODEL[normalizedModelID]
+   if (exactRule) {
+     return {
+       requestedModelID: normalizedModelID,
+@@ -82,3 +93,11 @@ export function resolveModelIDAlias(modelID: string): ModelIDAliasResolution {
+     source: "canonical",
+   }
+ }
++
++export function getExactModelIDAliasRules(): ReadonlyArray<ExactAliasRule> {
++  return EXACT_ALIAS_RULES
++}
++
++export function getPatternModelIDAliasRules(): ReadonlyArray<PatternAliasRule> {
++  return PATTERN_ALIAS_RULES
++}
+diff --git a/src/shared/model-capability-guardrails.test.ts b/src/shared/model-capability-guardrails.test.ts
+new file mode 100644
+index 00000000..c5e7c54f
+--- /dev/null
++++ b/src/shared/model-capability-guardrails.test.ts
+@@ -0,0 +1,92 @@
++import { describe, expect, test } from "bun:test"
++
++import type { ModelCapabilitiesSnapshot } from "./model-capabilities"
++import { getBundledModelCapabilitiesSnapshot } from "./model-capabilities"
++import {
++  collectModelCapabilityGuardrailIssues,
++  getBuiltInRequirementModelIDs,
++} from "./model-capability-guardrails"
++
++describe("model-capability-guardrails", () => {
++  test("keeps the current alias registry and built-in requirements aligned with the bundled snapshot", () => {
++    const issues = collectModelCapabilityGuardrailIssues()
++
++    expect(issues).toEqual([])
++  })
++
++  test("requires built-in requirement models to stay unique and sorted", () => {
++    const modelIDs = getBuiltInRequirementModelIDs()
++
++    expect(modelIDs).toEqual([...modelIDs].sort())
++    expect(new Set(modelIDs).size).toBe(modelIDs.length)
++    expect(modelIDs).toContain("claude-opus-4-6")
++    expect(modelIDs).toContain("gpt-5.4")
++    expect(modelIDs).toContain("kimi-k2.5")
++  })
++
++  test("flags exact aliases whose canonical target disappears from the snapshot", () => {
++    const bundledSnapshot = getBundledModelCapabilitiesSnapshot()
++    const brokenSnapshot: ModelCapabilitiesSnapshot = {
++      ...bundledSnapshot,
++      models: Object.fromEntries(
++        Object.entries(bundledSnapshot.models).filter(([modelID]) => modelID !== "gemini-3.1-pro-preview"),
++      ),
++    }
++
++    const issues = collectModelCapabilityGuardrailIssues({
++      snapshot: brokenSnapshot,
++      requirementModelIDs: [],
++    })
++
++    expect(issues).toContainEqual(
++      expect.objectContaining({
++        kind: "alias-target-missing-from-snapshot",
++        aliasModelID: "gemini-3.1-pro-high",
++        canonicalModelID: "gemini-3.1-pro-preview",
++      }),
++    )
++  })
++
++  test("flags exact aliases when models.dev gains a canonical entry for the alias itself", () => {
++    const bundledSnapshot = getBundledModelCapabilitiesSnapshot()
++    const aliasCollisionSnapshot: ModelCapabilitiesSnapshot = {
++      ...bundledSnapshot,
++      models: {
++        ...bundledSnapshot.models,
++        "gemini-3.1-pro-high": {
++          id: "gemini-3.1-pro-high",
++          family: "gemini",
++          reasoning: true,
++        },
++      },
++    }
++
++    const issues = collectModelCapabilityGuardrailIssues({
++      snapshot: aliasCollisionSnapshot,
++      requirementModelIDs: [],
++    })
++
++    expect(issues).toContainEqual(
++      expect.objectContaining({
++        kind: "exact-alias-collides-with-snapshot",
++        aliasModelID: "gemini-3.1-pro-high",
++        canonicalModelID: "gemini-3.1-pro-preview",
++      }),
++    )
++  })
++
++  test("flags built-in requirement models that rely on aliases instead of canonical IDs", () => {
++    const issues = collectModelCapabilityGuardrailIssues({
++      requirementModelIDs: ["gemini-3.1-pro-high"],
++    })
++
++    expect(issues).toContainEqual(
++      expect.objectContaining({
++        kind: "built-in-model-relies-on-alias",
++        modelID: "gemini-3.1-pro-high",
++        canonicalModelID: "gemini-3.1-pro-preview",
++        ruleID: "gemini-3.1-pro-tier-alias",
++      }),
++    )
++  })
++})
+diff --git a/src/shared/model-capability-guardrails.ts b/src/shared/model-capability-guardrails.ts
+new file mode 100644
+index 00000000..b1c74fea
+--- /dev/null
++++ b/src/shared/model-capability-guardrails.ts
+@@ -0,0 +1,149 @@
++import type { ModelCapabilitiesSnapshot } from "./model-capabilities"
++import { getBundledModelCapabilitiesSnapshot } from "./model-capabilities"
++import {
++  getExactModelIDAliasRules,
++  getPatternModelIDAliasRules,
++  resolveModelIDAlias,
++} from "./model-capability-aliases"
++import { AGENT_MODEL_REQUIREMENTS, CATEGORY_MODEL_REQUIREMENTS } from "./model-requirements"
++
++export type ModelCapabilityGuardrailIssue =
++  | {
++      kind: "alias-target-missing-from-snapshot"
++      ruleID: string
++      aliasModelID: string
++      canonicalModelID: string
++      message: string
++    }
++  | {
++      kind: "exact-alias-collides-with-snapshot"
++      ruleID: string
++      aliasModelID: string
++      canonicalModelID: string
++      message: string
++    }
++  | {
++      kind: "pattern-alias-collides-with-snapshot"
++      ruleID: string
++      modelID: string
++      canonicalModelID: string
++      message: string
++    }
++  | {
++      kind: "built-in-model-relies-on-alias"
++      modelID: string
++      canonicalModelID: string
++      ruleID: string
++      message: string
++    }
++  | {
++      kind: "built-in-model-missing-from-snapshot"
++      modelID: string
++      canonicalModelID: string
++      message: string
++    }
++
++type CollectModelCapabilityGuardrailIssuesInput = {
++  snapshot?: ModelCapabilitiesSnapshot
++  requirementModelIDs?: Iterable<string>
++}
++
++function normalizeLookupModelID(modelID: string): string {
++  return modelID.trim().toLowerCase()
++}
++
++export function getBuiltInRequirementModelIDs(): string[] {
++  const modelIDs = new Set<string>()
++
++  for (const requirement of Object.values(AGENT_MODEL_REQUIREMENTS)) {
++    for (const entry of requirement.fallbackChain) {
++      modelIDs.add(entry.model)
++    }
++  }
++
++  for (const requirement of Object.values(CATEGORY_MODEL_REQUIREMENTS)) {
++    for (const entry of requirement.fallbackChain) {
++      modelIDs.add(entry.model)
++    }
++  }
++
++  return [...modelIDs].sort()
++}
++
++export function collectModelCapabilityGuardrailIssues(
++  input: CollectModelCapabilityGuardrailIssuesInput = {},
++): ModelCapabilityGuardrailIssue[] {
++  const snapshot = input.snapshot ?? getBundledModelCapabilitiesSnapshot()
++  const snapshotModelIDs = new Set(
++    Object.keys(snapshot.models).map((modelID) => normalizeLookupModelID(modelID)),
++  )
++  const requirementModelIDs = input.requirementModelIDs ?? getBuiltInRequirementModelIDs()
++  const issues: ModelCapabilityGuardrailIssue[] = []
++
++  for (const rule of getExactModelIDAliasRules()) {
++    if (!snapshotModelIDs.has(rule.canonicalModelID)) {
++      issues.push({
++        kind: "alias-target-missing-from-snapshot",
++        ruleID: rule.ruleID,
++        aliasModelID: rule.aliasModelID,
++        canonicalModelID: rule.canonicalModelID,
++        message: `Alias ${rule.aliasModelID} points to missing snapshot model ${rule.canonicalModelID}.`,
++      })
++    }
++
++    if (snapshotModelIDs.has(rule.aliasModelID)) {
++      issues.push({
++        kind: "exact-alias-collides-with-snapshot",
++        ruleID: rule.ruleID,
++        aliasModelID: rule.aliasModelID,
++        canonicalModelID: rule.canonicalModelID,
++        message: `Alias ${rule.aliasModelID} now exists in models.dev and should be reviewed instead of force-mapping to ${rule.canonicalModelID}.`,
++      })
++    }
++  }
++
++  for (const rule of getPatternModelIDAliasRules()) {
++    for (const modelID of snapshotModelIDs) {
++      if (!rule.match(modelID)) {
++        continue
++      }
++
++      const canonicalModelID = rule.canonicalize(modelID)
++      if (canonicalModelID === modelID) {
++        continue
++      }
++
++      issues.push({
++        kind: "pattern-alias-collides-with-snapshot",
++        ruleID: rule.ruleID,
++        modelID,
++        canonicalModelID,
++        message: `Pattern alias ${rule.ruleID} would rewrite canonical snapshot model ${modelID} to ${canonicalModelID}.`,
++      })
++    }
++  }
++
++  for (const modelID of requirementModelIDs) {
++    const aliasResolution = resolveModelIDAlias(modelID)
++    if (aliasResolution.source !== "canonical") {
++      issues.push({
++        kind: "built-in-model-relies-on-alias",
++        modelID: aliasResolution.requestedModelID,
++        canonicalModelID: aliasResolution.canonicalModelID,
++        ruleID: aliasResolution.ruleID ?? "unknown-alias-rule",
++        message: `Built-in requirement model ${aliasResolution.requestedModelID} should be canonical and not rely on alias rule ${aliasResolution.ruleID}.`,
++      })
++    }
++
++    if (!snapshotModelIDs.has(aliasResolution.canonicalModelID)) {
++      issues.push({
++        kind: "built-in-model-missing-from-snapshot",
++        modelID: aliasResolution.requestedModelID,
++        canonicalModelID: aliasResolution.canonicalModelID,
++        message: `Built-in requirement model ${aliasResolution.requestedModelID} resolves to ${aliasResolution.canonicalModelID}, which is missing from the bundled snapshot.`,
++      })
++    }
++  }
++
++  return issues
++}
+-- 
+2.39.2
+

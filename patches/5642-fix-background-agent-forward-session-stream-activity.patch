@@ -1,0 +1,177 @@
+From bd1a6e3d3bb0b6179f56cf7d5e340523882c5d0c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code-yeongyu@noreply.github.com>
+Date: Thu, 21 May 2026 15:49:58 +0900
+Subject: [PATCH 5642/5749] fix(background-agent): forward session stream
+ activity
+
+---
+ .../manager-session-activity.test.ts          | 61 +++++++++++++++++++
+ src/features/background-agent/manager.ts      |  2 +
+ .../session-stream-activity.ts                |  5 ++
+ .../background-notification/hook.test.ts      | 17 ++++++
+ src/hooks/background-notification/hook.ts     |  9 ++-
+ 5 files changed, 93 insertions(+), 1 deletion(-)
+
+diff --git a/src/features/background-agent/manager-session-activity.test.ts b/src/features/background-agent/manager-session-activity.test.ts
+index 229f38f1..1e8bc07b 100644
+--- a/src/features/background-agent/manager-session-activity.test.ts
++++ b/src/features/background-agent/manager-session-activity.test.ts
+@@ -204,6 +204,67 @@ describe("BackgroundManager persisted session activity stale checks", () => {
+     await manager.shutdown()
+   })
+ 
++  test("ignores nested message part activity from a different session", async () => {
++    //#given - live event progress is stale and a nested part belongs to another session
++    spyOn(globalThis.Date, "now").mockReturnValue(fixedTime)
++    const staleTime = fixedTime - 45 * 60 * 1000
++    let abortCallCount = 0
++    const client = {
++      session: {
++        status: async () => ({ data: { "ses-active": { type: "busy" } } }),
++        get: async () => ({
++          data: {
++            id: "ses-active",
++            time: { updated: staleTime },
++          },
++        }),
++        prompt: async () => ({}),
++        promptAsync: async () => ({}),
++        abort: async () => {
++          abortCallCount += 1
++          return {}
++        },
++        todo: async () => ({ data: [] }),
++        messages: async () => ({ data: [] }),
++      },
++    }
++    const manager = new BackgroundManager({
++      pluginContext: createPluginContext(client),
++      config: { staleTimeoutMs: 180_000 },
++      enableParentSessionNotifications: false,
++    })
++    const task = createRunningTask({
++      startedAt: new Date(staleTime),
++      progress: {
++        toolCalls: 3,
++        lastUpdate: new Date(staleTime),
++      },
++    })
++    const pollingManager = unsafeTestValue<PollingManager>(manager)
++    pollingManager.tasks.set(task.id, task)
++
++    //#when - an inconsistent event carries a fresh part for a different session
++    manager.handleEvent({
++      type: "message.part.updated",
++      properties: {
++        sessionID: "ses-active",
++        part: {
++          sessionID: "ses-other",
++          type: "text",
++          activityTime: new Date(fixedTime).toISOString(),
++        },
++      },
++    })
++    await pollingManager.pollRunningTasks()
++
++    //#then - the wrong-session part does not refresh activity or prevent stale cancellation
++    expect(task.status).toBe("cancelled")
++    expect(task.progress?.lastUpdate.getTime()).toBe(staleTime)
++    expect(abortCallCount).toBe(1)
++
++    await manager.shutdown()
++  })
++
+   test("counts session.next.tool.called as activity before stale timeout", async () => {
+     //#given - live event progress is stale and no tool call has been counted
+     spyOn(globalThis.Date, "now").mockReturnValue(fixedTime)
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index d1dbf7b1..d5fa9533 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -85,6 +85,7 @@ import {
+ import { handleSessionIdleBackgroundEvent } from "./session-idle-event-handler"
+ import {
+   hasOutputSignalFromPart,
++  isMessagePartForSession,
+   resolveMessagePartInfo,
+   resolveSessionNextPartInfo,
+   SESSION_NEXT_EVENT_PREFIX,
+@@ -1498,6 +1499,7 @@ The fallback retry session is now created and can be inspected directly.
+       const partInfo = resolveMessagePartInfo(props)
+       const sessionID = resolveMessageEventSessionID(props)
+       if (!sessionID) return
++      if (!isMessagePartForSession(partInfo, sessionID)) return
+       this.clearDispatchedParentWake(sessionID)
+       this.parentWakeNotifier.recordParentSessionActivity(sessionID)
+ 
+diff --git a/src/features/background-agent/session-stream-activity.ts b/src/features/background-agent/session-stream-activity.ts
+index 2334c4e7..ad6c1f0a 100644
+--- a/src/features/background-agent/session-stream-activity.ts
++++ b/src/features/background-agent/session-stream-activity.ts
+@@ -126,8 +126,13 @@ export function resolveSessionNextPartInfo(eventType: string, properties: unknow
+   }
+ }
+ 
++export function isMessagePartForSession(partInfo: MessagePartInfo | undefined, sessionID: string): boolean {
++  return !partInfo?.sessionID || partInfo.sessionID === sessionID
++}
++
+ export function hasOutputSignalFromPart(partInfo: MessagePartInfo | undefined, sessionID?: string): boolean {
+   if (!partInfo) return false
++  if (partInfo.sessionID && sessionID && partInfo.sessionID !== sessionID) return false
+   if (!partInfo.sessionID && !sessionID) return false
+   if (partInfo.tool) return true
+   if (partInfo.type === "tool" || partInfo.type === "tool_result") return true
+diff --git a/src/hooks/background-notification/hook.test.ts b/src/hooks/background-notification/hook.test.ts
+index f32ce14c..3887092e 100644
+--- a/src/hooks/background-notification/hook.test.ts
++++ b/src/hooks/background-notification/hook.test.ts
+@@ -35,6 +35,23 @@ describe("createBackgroundNotificationHook", () => {
+     expect(handleEvent).toHaveBeenCalledWith(event)
+   })
+ 
++  test("#given session.next stream event #when event handler runs #then it forwards to manager", async () => {
++    //#given
++    const handleEvent = mock(() => {})
++    const hook = createBackgroundNotificationHook({
++      handleEvent,
++      injectPendingNotificationsIntoChatMessage: () => {},
++    } as never)
++
++    const event = { type: "session.next.text.delta", properties: { sessionID: "ses-1", delta: "x" } }
++
++    //#when
++    await hook.event({ event })
++
++    //#then
++    expect(handleEvent).toHaveBeenCalledWith(event)
++  })
++
+   test("#given todo.updated event #when event handler runs #then it forwards to manager", async () => {
+     //#given
+     const handleEvent = mock(() => {})
+diff --git a/src/hooks/background-notification/hook.ts b/src/hooks/background-notification/hook.ts
+index d963fa4f..f8393975 100644
+--- a/src/hooks/background-notification/hook.ts
++++ b/src/hooks/background-notification/hook.ts
+@@ -28,9 +28,16 @@ const FORWARDED_EVENT_TYPES = new Set([
+   "session.status",
+ ])
+ 
++const FORWARDED_EVENT_PREFIXES = ["session.next."]
++
++function shouldForwardEvent(type: string): boolean {
++  return FORWARDED_EVENT_TYPES.has(type)
++    || FORWARDED_EVENT_PREFIXES.some((prefix) => type.startsWith(prefix))
++}
++
+ export function createBackgroundNotificationHook(manager: BackgroundManager) {
+   const eventHandler = async ({ event }: EventInput) => {
+-    if (!FORWARDED_EVENT_TYPES.has(event.type)) return
++    if (!shouldForwardEvent(event.type)) return
+     manager.handleEvent(event)
+   }
+ 
+-- 
+2.39.2
+

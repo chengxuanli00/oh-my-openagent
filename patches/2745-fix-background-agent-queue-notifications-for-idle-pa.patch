@@ -1,0 +1,289 @@
+From 840c612be8c9b44db08b21eb8ef1aaab97128b26 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 25 Feb 2026 16:26:31 +0900
+Subject: [PATCH 2745/5749] fix(background-agent): queue notifications for idle
+ parent sessions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a background task completes and the parent session is waiting for
+user input, promptAsync() fails with an aborted error. Previously the
+notification was silently dropped — lost forever.
+
+Fix: queue the notification text in-memory on the BackgroundManager
+when promptAsync fails with an aborted/idle error. On the user's next
+message to that session, the queued notifications are injected into the
+chat context before the agent sees the message.
+
+- BackgroundManager: add pendingNotifications map + queuePendingNotification()
+  and injectPendingNotificationsIntoChatMessage() methods
+- background-notification hook: add chat.message handler that calls injection
+- chat-message.ts: wire backgroundNotificationHook.chat.message into the
+  message processing chain
+- Add tests covering queue-on-abort and next-message delivery
+---
+ src/features/background-agent/manager.test.ts | 70 +++++++++++++++++++
+ src/features/background-agent/manager.ts      | 30 ++++++++
+ src/hooks/background-notification/hook.ts     | 16 +++++
+ src/plugin/chat-message.test.ts               | 27 +++++++
+ src/plugin/chat-message.ts                    |  1 +
+ 5 files changed, 144 insertions(+)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 7bd7709f..2e78f63f 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -191,6 +191,10 @@ function getPendingByParent(manager: BackgroundManager): Map<string, Set<string>
+   return (manager as unknown as { pendingByParent: Map<string, Set<string>> }).pendingByParent
+ }
+ 
++function getPendingNotifications(manager: BackgroundManager): Map<string, string[]> {
++  return (manager as unknown as { pendingNotifications: Map<string, string[]> }).pendingNotifications
++}
++
+ function getCompletionTimers(manager: BackgroundManager): Map<string, ReturnType<typeof setTimeout>> {
+   return (manager as unknown as { completionTimers: Map<string, ReturnType<typeof setTimeout>> }).completionTimers
+ }
+@@ -1057,6 +1061,49 @@ describe("BackgroundManager.notifyParentSession - aborted parent", () => {
+ 
+     manager.shutdown()
+   })
++
++  test("should queue notification when promptAsync aborts while parent is idle", async () => {
++    //#given
++    const promptMock = async () => {
++      const error = new Error("Request aborted while waiting for input")
++      error.name = "MessageAbortedError"
++      throw error
++    }
++    const client = {
++      session: {
++        prompt: promptMock,
++        promptAsync: promptMock,
++        abort: async () => ({}),
++        messages: async () => ({ data: [] }),
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    const task: BackgroundTask = {
++      id: "task-aborted-idle-queue",
++      sessionID: "session-child",
++      parentSessionID: "session-parent",
++      parentMessageID: "msg-parent",
++      description: "task idle queue",
++      prompt: "test",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(),
++      completedAt: new Date(),
++    }
++    getPendingByParent(manager).set("session-parent", new Set([task.id]))
++
++    //#when
++    await (manager as unknown as { notifyParentSession: (task: BackgroundTask) => Promise<void> })
++      .notifyParentSession(task)
++
++    //#then
++    const queuedNotifications = getPendingNotifications(manager).get("session-parent") ?? []
++    expect(queuedNotifications).toHaveLength(1)
++    expect(queuedNotifications[0]).toContain("<system-reminder>")
++    expect(queuedNotifications[0]).toContain("[ALL BACKGROUND TASKS COMPLETE]")
++
++    manager.shutdown()
++  })
+ })
+ 
+ describe("BackgroundManager.notifyParentSession - notifications toggle", () => {
+@@ -1105,6 +1152,29 @@ describe("BackgroundManager.notifyParentSession - notifications toggle", () => {
+   })
+ })
+ 
++describe("BackgroundManager.injectPendingNotificationsIntoChatMessage", () => {
++  test("should prepend queued notifications to first text part and clear queue", () => {
++    // given
++    const manager = createBackgroundManager()
++    manager.queuePendingNotification("session-parent", "<system-reminder>queued-one</system-reminder>")
++    manager.queuePendingNotification("session-parent", "<system-reminder>queued-two</system-reminder>")
++    const output = {
++      parts: [{ type: "text", text: "User prompt" }],
++    }
++
++    // when
++    manager.injectPendingNotificationsIntoChatMessage(output, "session-parent")
++
++    // then
++    expect(output.parts[0].text).toContain("<system-reminder>queued-one</system-reminder>")
++    expect(output.parts[0].text).toContain("<system-reminder>queued-two</system-reminder>")
++    expect(output.parts[0].text).toContain("User prompt")
++    expect(getPendingNotifications(manager).get("session-parent")).toBeUndefined()
++
++    manager.shutdown()
++  })
++})
++
+ function buildNotificationPromptBody(
+   task: BackgroundTask,
+   currentMessage: CurrentMessage | null
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 61e5d843..1bc9e2b4 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -93,6 +93,7 @@ export class BackgroundManager {
+ 
+   private tasks: Map<string, BackgroundTask>
+   private notifications: Map<string, BackgroundTask[]>
++  private pendingNotifications: Map<string, string[]>
+   private pendingByParent: Map<string, Set<string>>  // Track pending tasks per parent for batching
+   private client: OpencodeClient
+   private directory: string
+@@ -125,6 +126,7 @@ export class BackgroundManager {
+   ) {
+     this.tasks = new Map()
+     this.notifications = new Map()
++    this.pendingNotifications = new Map()
+     this.pendingByParent = new Map()
+     this.client = ctx.client
+     this.directory = ctx.directory
+@@ -917,6 +919,32 @@ export class BackgroundManager {
+     this.notifications.delete(sessionID)
+   }
+ 
++  queuePendingNotification(sessionID: string | undefined, notification: string): void {
++    if (!sessionID) return
++    const existingNotifications = this.pendingNotifications.get(sessionID) ?? []
++    existingNotifications.push(notification)
++    this.pendingNotifications.set(sessionID, existingNotifications)
++  }
++
++  injectPendingNotificationsIntoChatMessage(output: { parts: Array<{ type: string; text?: string; [key: string]: unknown }> }, sessionID: string): void {
++    const pendingNotifications = this.pendingNotifications.get(sessionID)
++    if (!pendingNotifications || pendingNotifications.length === 0) {
++      return
++    }
++
++    this.pendingNotifications.delete(sessionID)
++    const notificationContent = pendingNotifications.join("\n\n")
++    const firstTextPartIndex = output.parts.findIndex((part) => part.type === "text")
++
++    if (firstTextPartIndex === -1) {
++      output.parts.unshift(createInternalAgentTextPart(notificationContent))
++      return
++    }
++
++    const originalText = output.parts[firstTextPartIndex].text ?? ""
++    output.parts[firstTextPartIndex].text = `${notificationContent}\n\n---\n\n${originalText}`
++  }
++
+   /**
+    * Validates that a session has actual assistant/tool output before marking complete.
+    * Prevents premature completion when session.idle fires before agent responds.
+@@ -1340,6 +1368,7 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+               taskId: task.id,
+               parentSessionID: task.parentSessionID,
+             })
++            this.queuePendingNotification(task.parentSessionID, notification)
+           } else {
+             log("[background-agent] Failed to send notification:", error)
+           }
+@@ -1568,6 +1597,7 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+     this.concurrencyManager.clear()
+     this.tasks.clear()
+     this.notifications.clear()
++    this.pendingNotifications.clear()
+     this.pendingByParent.clear()
+     this.notificationQueueByParent.clear()
+     this.queuesByKey.clear()
+diff --git a/src/hooks/background-notification/hook.ts b/src/hooks/background-notification/hook.ts
+index f417bdba..3f40ffad 100644
+--- a/src/hooks/background-notification/hook.ts
++++ b/src/hooks/background-notification/hook.ts
+@@ -9,6 +9,14 @@ interface EventInput {
+   event: Event
+ }
+ 
++interface ChatMessageInput {
++  sessionID: string
++}
++
++interface ChatMessageOutput {
++  parts: Array<{ type: string; text?: string; [key: string]: unknown }>
++}
++
+ /**
+  * Background notification hook - handles event routing to BackgroundManager.
+  *
+@@ -20,7 +28,15 @@ export function createBackgroundNotificationHook(manager: BackgroundManager) {
+     manager.handleEvent(event)
+   }
+ 
++  const chatMessageHandler = async (
++    input: ChatMessageInput,
++    output: ChatMessageOutput,
++  ): Promise<void> => {
++    manager.injectPendingNotificationsIntoChatMessage(output, input.sessionID)
++  }
++
+   return {
++    "chat.message": chatMessageHandler,
+     event: eventHandler,
+   }
+ }
+diff --git a/src/plugin/chat-message.test.ts b/src/plugin/chat-message.test.ts
+index 8cebd6b4..a1096830 100644
+--- a/src/plugin/chat-message.test.ts
++++ b/src/plugin/chat-message.test.ts
+@@ -19,6 +19,7 @@ function createMockHandlerArgs(overrides?: {
+     },
+     hooks: {
+       stopContinuationGuard: null,
++      backgroundNotificationHook: null,
+       keywordDetector: null,
+       claudeCodeHooks: null,
+       autoSlashCommand: null,
+@@ -115,4 +116,30 @@ describe("createChatMessageHandler - TUI variant passthrough", () => {
+     //#then - gate should still be marked as applied
+     expect(args._appliedSessions).toContain("test-session")
+   })
++
++  test("injects queued background notifications through chat.message hook", async () => {
++    //#given
++    const args = createMockHandlerArgs()
++    args.hooks.backgroundNotificationHook = {
++      "chat.message": async (
++        _input: { sessionID: string },
++        output: ChatMessageHandlerOutput,
++      ): Promise<void> => {
++        output.parts.push({
++          type: "text",
++          text: "<system-reminder>[BACKGROUND TASK COMPLETED]</system-reminder>",
++        })
++      },
++    }
++    const handler = createChatMessageHandler(args)
++    const input = createMockInput("hephaestus", { providerID: "openai", modelID: "gpt-5.3-codex" })
++    const output = createMockOutput()
++
++    //#when
++    await handler(input, output)
++
++    //#then
++    expect(output.parts).toHaveLength(1)
++    expect(output.parts[0].text).toContain("[BACKGROUND TASK COMPLETED]")
++  })
+ })
+diff --git a/src/plugin/chat-message.ts b/src/plugin/chat-message.ts
+index f3c02297..3564c852 100644
+--- a/src/plugin/chat-message.ts
++++ b/src/plugin/chat-message.ts
+@@ -97,6 +97,7 @@ export function createChatMessageHandler(args: {
+       setSessionModel(input.sessionID, input.model)
+     }
+     await hooks.stopContinuationGuard?.["chat.message"]?.(input)
++    await hooks.backgroundNotificationHook?.["chat.message"]?.(input, output)
+     await hooks.runtimeFallback?.["chat.message"]?.(input, output)
+     await hooks.keywordDetector?.["chat.message"]?.(input, output)
+     await hooks.claudeCodeHooks?.["chat.message"]?.(input, output)
+-- 
+2.39.2
+

@@ -1,0 +1,373 @@
+From 4ea7562f503492b5e272df4554af497306bcabc4 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code-yeongyu@noreply.github.com>
+Date: Fri, 22 May 2026 20:39:52 +0900
+Subject: [PATCH 5679/5749] feat(shared): add Node-safe process stream reader
+ and search output collector
+
+Introduces:
+- src/shared/process-stream-reader.ts: Buffer-concat stream reader compatible with both Bun and Node ChildProcess stdout (replaces Web Response API usage)
+- src/tools/shared/search-process-output.ts: structured subprocess output collector with timeout, kill, and rejection cleanup
+- bun-spawn-shim hardened: Node path forces windowsHide: true; spawn errors no longer escape as unhandledRejection
+
+Foundation for #3919 fix.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/shared/bun-spawn-shim.test.ts         | 44 +++++++++-
+ src/shared/bun-spawn-shim.ts              | 98 ++++++++++++++++++-----
+ src/shared/process-stream-reader.ts       | 63 +++++++++++++++
+ src/tools/shared/search-process-output.ts | 46 +++++++++++
+ 4 files changed, 227 insertions(+), 24 deletions(-)
+ create mode 100644 src/shared/process-stream-reader.ts
+ create mode 100644 src/tools/shared/search-process-output.ts
+
+diff --git a/src/shared/bun-spawn-shim.test.ts b/src/shared/bun-spawn-shim.test.ts
+index 238cfb1b..5258ef1e 100644
+--- a/src/shared/bun-spawn-shim.test.ts
++++ b/src/shared/bun-spawn-shim.test.ts
+@@ -1,6 +1,8 @@
+ import { describe, expect, test } from "bun:test"
++import { Readable } from "node:stream"
+ 
+-import { spawn, spawnSync } from "./bun-spawn-shim"
++import { createNodeSpawnOptions, createNodeSpawnSyncOptions, spawn, spawnSync } from "./bun-spawn-shim"
++import { readProcessStream } from "./process-stream-reader"
+ 
+ describe("bun-spawn-shim", () => {
+   test("#given array command #when spawn exits successfully #then exited resolves to zero", async () => {
+@@ -17,7 +19,7 @@ describe("bun-spawn-shim", () => {
+ 
+     const [exitCode, stdout] = await Promise.all([
+       proc.exited,
+-      new Response(proc.stdout).text(),
++      readProcessStream(proc.stdout),
+     ])
+ 
+     expect(exitCode).toBe(0)
+@@ -48,7 +50,7 @@ describe("bun-spawn-shim", () => {
+     })
+ 
+     const exitCode = await proc.exited
+-    const stdout = await new Response(proc.stdout).text()
++    const stdout = await readProcessStream(proc.stdout)
+ 
+     expect(exitCode).toBe(0)
+     expect(stdout).toBe("")
+@@ -60,7 +62,7 @@ describe("bun-spawn-shim", () => {
+     expect(result.exitCode).toBe(0)
+     expect(result.success).toBe(true)
+     expect(result.stdout).toBeDefined()
+-    expect(Buffer.from(result.stdout!).toString().trim()).toBe("sync-ok")
++    expect(result.stdout?.toString().trim()).toBe("sync-ok")
+   })
+ 
+   test("#given spawnSync command #when it completes #then result.pid is a positive number", () => {
+@@ -88,4 +90,38 @@ describe("bun-spawn-shim", () => {
+ 
+     expect(observedError).toBeDefined()
+   })
++
++  test("#given Windows platform #when building Node spawn options #then windowsHide is enabled", () => {
++    const options = createNodeSpawnOptions({ stdout: "pipe", stderr: "pipe" }, "win32")
++
++    expect(options.windowsHide).toBe(true)
++    expect(options.shell).toBe(false)
++  })
++
++  test("#given Windows platform #when building Node spawnSync options #then windowsHide is enabled", () => {
++    const options = createNodeSpawnSyncOptions({ stdout: "pipe", stderr: "pipe" }, "win32")
++
++    expect(options.windowsHide).toBe(true)
++    expect(options.shell).toBe(false)
++  })
++
++  test("#given Node readable output #when reading in a non-Bun host shape #then Buffer-concat returns text", async () => {
++    const stream = Readable.from([Buffer.from("node-stream-ok\n")])
++
++    const output = await readProcessStream(stream)
++
++    expect(output).toBe("node-stream-ok\n")
++  })
++
++  test("#given empty process stream #when reading process output #then returns an empty string", async () => {
++    const stream = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.close()
++      },
++    })
++
++    const output = await readProcessStream(stream)
++
++    expect(output).toBe("")
++  })
+ })
+diff --git a/src/shared/bun-spawn-shim.ts b/src/shared/bun-spawn-shim.ts
+index d07a4816..36260135 100644
+--- a/src/shared/bun-spawn-shim.ts
++++ b/src/shared/bun-spawn-shim.ts
+@@ -1,4 +1,9 @@
+-import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from "node:child_process"
++import {
++  spawn as nodeSpawn,
++  spawnSync as nodeSpawnSync,
++  type SpawnOptions as NodeSpawnOptions,
++  type SpawnSyncOptions as NodeSpawnSyncOptions,
++} from "node:child_process"
+ import { Readable, Writable } from "node:stream"
+ 
+ type AnyRecord = Record<string, unknown>
+@@ -45,7 +50,10 @@ type BunSpawnRuntime = {
+ }
+ 
+ const runtime = globalThis as typeof globalThis & { Bun?: BunSpawnRuntime }
+-const IS_BUN = typeof runtime.Bun !== "undefined"
++
++function getBunRuntime(): BunSpawnRuntime | undefined {
++  return typeof Bun === "undefined" ? undefined : runtime.Bun
++}
+ 
+ function emptyReadableStream(): ReadableStream<Uint8Array> {
+   return new ReadableStream<Uint8Array>({
+@@ -85,6 +93,48 @@ function resolveStdio(options: SpawnOptions): StdioTuple {
+   return [options.stdin ?? "ignore", options.stdout ?? "pipe", options.stderr ?? "inherit"]
+ }
+ 
++export function createNodeSpawnOptions(
++  options: SpawnOptions,
++  platform: NodeJS.Platform = process.platform
++): NodeSpawnOptions {
++  const nodeOptions: NodeSpawnOptions = {
++    stdio: resolveStdio(options),
++    shell: false,
++  }
++
++  if (options.cwd !== undefined) nodeOptions.cwd = options.cwd
++  if (options.env !== undefined) nodeOptions.env = options.env
++  if (options.detached !== undefined) nodeOptions.detached = options.detached
++  if (options.signal !== undefined) nodeOptions.signal = options.signal
++
++  if (platform === "win32") {
++    // #3919: Windows Desktop utility processes must hide child consoles when spawning tools.
++    nodeOptions.windowsHide = true
++  }
++
++  return nodeOptions
++}
++
++export function createNodeSpawnSyncOptions(
++  options: SpawnOptions,
++  platform: NodeJS.Platform = process.platform
++): NodeSpawnSyncOptions {
++  const nodeOptions: NodeSpawnSyncOptions = {
++    stdio: resolveStdio(options),
++    shell: false,
++  }
++
++  if (options.cwd !== undefined) nodeOptions.cwd = options.cwd
++  if (options.env !== undefined) nodeOptions.env = options.env
++
++  if (platform === "win32") {
++    // #3919: Match async spawn so Windows sync probes do not surface a console window.
++    nodeOptions.windowsHide = true
++  }
++
++  return nodeOptions
++}
++
+ function wrapNodeProcess(proc: ReturnType<typeof nodeSpawn>): SpawnedProcess {
+   let exitCode: number | null = null
+   const exited = new Promise<number>((resolve, reject) => {
+@@ -127,20 +177,27 @@ function wrapNodeProcess(proc: ReturnType<typeof nodeSpawn>): SpawnedProcess {
+   }
+ }
+ 
++function toSpawnSyncBuffer(output: Buffer | string | null): Buffer | undefined {
++  if (output === null) {
++    return undefined
++  }
++
++  return Buffer.isBuffer(output) ? output : Buffer.from(output, "utf8")
++}
++
+ export function spawn(command: string[], options?: SpawnOptions): SpawnedProcess
+ export function spawn(options: SpawnOptions & { cmd: string[] }): SpawnedProcess
+ export function spawn(cmdOrOpts: unknown, opts?: unknown): SpawnedProcess {
+-  if (IS_BUN) return runtime.Bun!.spawn(cmdOrOpts as string[] & SpawnOptions & { cmd: string[] }, opts as SpawnOptions)
+-
+   const { cmd, opts: options } = resolveCommand(cmdOrOpts, opts)
++  const bun = getBunRuntime()
++  if (bun) return bun.spawn(cmd, options)
++
+   const [bin, ...args] = cmd
+-  const proc = nodeSpawn(bin, args, {
+-    cwd: options.cwd,
+-    env: options.env,
+-    stdio: resolveStdio(options),
+-    detached: options.detached,
+-    signal: options.signal,
+-  })
++  if (bin === undefined) {
++    throw new Error("Cannot spawn an empty command")
++  }
++
++  const proc = nodeSpawn(bin, args, createNodeSpawnOptions(options))
+ 
+   return wrapNodeProcess(proc)
+ }
+@@ -148,20 +205,21 @@ export function spawn(cmdOrOpts: unknown, opts?: unknown): SpawnedProcess {
+ export function spawnSync(command: string[], options?: SpawnOptions): SpawnSyncResult
+ export function spawnSync(options: SpawnOptions & { cmd: string[] }): SpawnSyncResult
+ export function spawnSync(cmdOrOpts: unknown, opts?: unknown): SpawnSyncResult {
+-  if (IS_BUN) return runtime.Bun!.spawnSync(cmdOrOpts as string[] & SpawnOptions & { cmd: string[] }, opts as SpawnOptions)
+-
+   const { cmd, opts: options } = resolveCommand(cmdOrOpts, opts)
++  const bun = getBunRuntime()
++  if (bun) return bun.spawnSync(cmd, options)
++
+   const [bin, ...args] = cmd
+-  const result = nodeSpawnSync(bin, args, {
+-    cwd: options.cwd,
+-    env: options.env,
+-    stdio: resolveStdio(options),
+-  })
++  if (bin === undefined) {
++    throw new Error("Cannot spawnSync an empty command")
++  }
++
++  const result = nodeSpawnSync(bin, args, createNodeSpawnSyncOptions(options))
+ 
+   return {
+     exitCode: result.status ?? 1,
+-    stdout: result.stdout ?? undefined,
+-    stderr: result.stderr ?? undefined,
++    stdout: toSpawnSyncBuffer(result.stdout),
++    stderr: toSpawnSyncBuffer(result.stderr),
+     success: (result.status ?? 1) === 0,
+     pid: result.pid ?? -1,
+   }
+diff --git a/src/shared/process-stream-reader.ts b/src/shared/process-stream-reader.ts
+new file mode 100644
+index 00000000..bec08fab
+--- /dev/null
++++ b/src/shared/process-stream-reader.ts
+@@ -0,0 +1,63 @@
++import { Readable } from "node:stream"
++
++export type ProcessReadableStream = ReadableStream<Uint8Array> | Readable | null | undefined
++
++function bufferFromChunk(chunk: unknown): Buffer {
++  if (Buffer.isBuffer(chunk)) {
++    return chunk
++  }
++
++  if (chunk instanceof Uint8Array) {
++    return Buffer.from(chunk)
++  }
++
++  if (typeof chunk === "string") {
++    return Buffer.from(chunk, "utf8")
++  }
++
++  throw new TypeError(`Unsupported process stream chunk type: ${typeof chunk}`)
++}
++
++async function readWebStream(stream: ReadableStream<Uint8Array>): Promise<Buffer[]> {
++  const reader = stream.getReader()
++  const chunks: Buffer[] = []
++
++  try {
++    while (true) {
++      const result = await reader.read()
++      if (result.done) {
++        return chunks
++      }
++      chunks.push(Buffer.from(result.value))
++    }
++  } finally {
++    reader.releaseLock()
++  }
++}
++
++async function readNodeStream(stream: Readable): Promise<Buffer[]> {
++  const chunks: Buffer[] = []
++
++  for await (const chunk of stream) {
++    chunks.push(bufferFromChunk(chunk))
++  }
++
++  return chunks
++}
++
++function isWebReadableStream(stream: ProcessReadableStream): stream is ReadableStream<Uint8Array> {
++  return typeof ReadableStream !== "undefined" && stream instanceof ReadableStream
++}
++
++export async function readProcessStream(stream: ProcessReadableStream): Promise<string> {
++  if (!stream) {
++    return ""
++  }
++
++  // #3919: Buffer-concat avoids Response(stream).text() crashes in Windows utility processes.
++  const chunks = isWebReadableStream(stream)
++    ? await readWebStream(stream)
++    : await readNodeStream(stream)
++
++  return Buffer.concat(chunks).toString("utf8")
++}
+diff --git a/src/tools/shared/search-process-output.ts b/src/tools/shared/search-process-output.ts
+new file mode 100644
+index 00000000..f6d5945d
+--- /dev/null
++++ b/src/tools/shared/search-process-output.ts
+@@ -0,0 +1,46 @@
++import type { SpawnedProcess } from "../../shared/bun-spawn-shim"
++import { readProcessStream } from "../../shared/process-stream-reader"
++
++export interface SearchProcessOutput {
++  readonly stdout: string
++  readonly stderr: string
++  readonly exitCode: number
++}
++
++function getErrorMessage(error: unknown): string {
++  return error instanceof Error ? error.message : String(error)
++}
++
++function createProcessTimeout(
++  proc: SpawnedProcess,
++  timeoutMs: number,
++  timeoutMessage: string
++): Promise<never> {
++  return new Promise<never>((_, reject) => {
++    const id = setTimeout(() => {
++      proc.kill()
++      reject(new Error(timeoutMessage))
++    }, timeoutMs)
++
++    // #3919: Handle rejected exits here so timeout cleanup cannot leak unhandled rejections.
++    void proc.exited.then(
++      () => clearTimeout(id),
++      () => clearTimeout(id)
++    )
++  })
++}
++
++export async function collectSearchProcessOutput(
++  proc: SpawnedProcess,
++  timeoutMs: number,
++  timeoutMessage: string
++): Promise<SearchProcessOutput> {
++  const stderrPromise = readProcessStream(proc.stderr).catch(getErrorMessage)
++  const stdout = await Promise.race([
++    readProcessStream(proc.stdout),
++    createProcessTimeout(proc, timeoutMs, timeoutMessage),
++  ])
++  const [exitCode, stderr] = await Promise.all([proc.exited, stderrPromise])
++
++  return { stdout, stderr, exitCode }
++}
+-- 
+2.39.2
+

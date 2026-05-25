@@ -1,0 +1,612 @@
+From f4b8e1c36502c16e541638e1786b2d791662cd7c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 1 Apr 2026 17:43:00 -0700
+Subject: [PATCH 3676/5749] fix(claude-code-hooks): cache idle hook config and
+ parent lookups
+
+Reduce repeated session.idle work by reusing hook config loads across a short TTL and by retrying parent session lookup instead of permanently caching transient failures.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../claude-code-hooks/config-loader.test.ts   | 110 ++++++++++++++++++
+ src/hooks/claude-code-hooks/config-loader.ts  |  41 +++++++
+ src/hooks/claude-code-hooks/config.test.ts    |  96 +++++++++++++++
+ src/hooks/claude-code-hooks/config.ts         |  44 ++++++-
+ .../session-event-handler-retry.test.ts       |  67 +++++++++++
+ .../handlers/session-event-handler.test.ts    |  66 +++++++++++
+ .../handlers/session-event-handler.ts         |  28 +++--
+ 7 files changed, 441 insertions(+), 11 deletions(-)
+ create mode 100644 src/hooks/claude-code-hooks/config-loader.test.ts
+ create mode 100644 src/hooks/claude-code-hooks/config.test.ts
+ create mode 100644 src/hooks/claude-code-hooks/handlers/session-event-handler-retry.test.ts
+
+diff --git a/src/hooks/claude-code-hooks/config-loader.test.ts b/src/hooks/claude-code-hooks/config-loader.test.ts
+new file mode 100644
+index 00000000..aaa30f6b
+--- /dev/null
++++ b/src/hooks/claude-code-hooks/config-loader.test.ts
+@@ -0,0 +1,110 @@
++const { afterEach, beforeEach, describe, expect, mock, test } = require("bun:test")
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { getOpenCodeConfigDir } from "../../shared"
++
++const { clearPluginExtendedConfigCache, loadPluginExtendedConfig } = await import("./config-loader")
++
++describe("loadPluginExtendedConfig", () => {
++  const originalDateNow = Date.now
++  let originalWorkingDirectory = ""
++  let tempDirectory = ""
++  let userConfigPath = ""
++  let projectConfigPath = ""
++  let originalUserConfig: string | null = null
++  let mockedNow = 0
++
++  beforeEach(() => {
++    //#given
++    originalWorkingDirectory = process.cwd()
++    tempDirectory = mkdtempSync(join(tmpdir(), "omo-cc-plugin-project-config-"))
++    userConfigPath = join(getOpenCodeConfigDir({ binary: "opencode" }), "opencode-cc-plugin.json")
++    projectConfigPath = join(tempDirectory, ".opencode", "opencode-cc-plugin.json")
++    mkdirSync(getOpenCodeConfigDir({ binary: "opencode" }), { recursive: true })
++    mkdirSync(join(tempDirectory, ".opencode"), { recursive: true })
++    originalUserConfig = existsSync(userConfigPath)
++      ? readFileSync(userConfigPath, "utf8")
++      : null
++    process.chdir(tempDirectory)
++    mockedNow = 1_000
++    Date.now = () => mockedNow
++    clearPluginExtendedConfigCache()
++  })
++
++  afterEach(() => {
++    clearPluginExtendedConfigCache()
++    Date.now = originalDateNow
++    process.chdir(originalWorkingDirectory)
++    rmSync(tempDirectory, { recursive: true, force: true })
++    if (originalUserConfig === null) {
++      rmSync(userConfigPath, { force: true })
++    } else {
++      writeFileSync(userConfigPath, originalUserConfig)
++    }
++  })
++
++  test("#given cached extended config #when files change within ttl #then cached config is reused", async () => {
++    //#given
++    writeConfigFile(userConfigPath, ["user-first"])
++    writeConfigFile(projectConfigPath, ["project-first"])
++
++    //#when
++    const firstResult = await loadPluginExtendedConfig()
++    writeConfigFile(userConfigPath, ["user-second"])
++    writeConfigFile(projectConfigPath, ["project-second"])
++    mockedNow += 5_000
++    const secondResult = await loadPluginExtendedConfig()
++
++    //#then
++    expect(firstResult).toEqual({
++      disabledHooks: {
++        Stop: ["project-first"],
++      },
++    })
++    expect(secondResult).toEqual(firstResult)
++  })
++
++  test("#given cached extended config #when ttl expires or cache clears #then updated config is reloaded", async () => {
++    //#given
++    writeConfigFile(userConfigPath, ["user-first"])
++    writeConfigFile(projectConfigPath, ["project-first"])
++    await loadPluginExtendedConfig()
++
++    //#when
++    writeConfigFile(userConfigPath, ["user-second"])
++    writeConfigFile(projectConfigPath, ["project-second"])
++    mockedNow += 31_000
++    const ttlReloaded = await loadPluginExtendedConfig()
++
++    writeConfigFile(userConfigPath, ["user-third"])
++    writeConfigFile(projectConfigPath, ["project-third"])
++    clearPluginExtendedConfigCache()
++    const manuallyReloaded = await loadPluginExtendedConfig()
++
++    //#then
++    expect(ttlReloaded).toEqual({
++      disabledHooks: {
++        Stop: ["project-second"],
++      },
++    })
++    expect(manuallyReloaded).toEqual({
++      disabledHooks: {
++        Stop: ["project-third"],
++      },
++    })
++  })
++})
++
++function writeConfigFile(filePath: string, stopPatterns: string[]): void {
++  writeFileSync(
++    filePath,
++    JSON.stringify({
++      disabledHooks: {
++        Stop: stopPatterns,
++      },
++    }),
++  )
++}
++
++export {}
+diff --git a/src/hooks/claude-code-hooks/config-loader.ts b/src/hooks/claude-code-hooks/config-loader.ts
+index 653a67ef..8f337538 100644
+--- a/src/hooks/claude-code-hooks/config-loader.ts
++++ b/src/hooks/claude-code-hooks/config-loader.ts
+@@ -4,6 +4,8 @@ import type { ClaudeHookEvent } from "./types"
+ import { log } from "../../shared/logger"
+ import { getOpenCodeConfigDir } from "../../shared"
+ 
++const CONFIG_CACHE_TTL_MS = 30_000
++
+ export interface DisabledHooksConfig {
+   Stop?: string[]
+   PreToolUse?: string[]
+@@ -16,12 +18,40 @@ export interface PluginExtendedConfig {
+   disabledHooks?: DisabledHooksConfig
+ }
+ 
++interface PluginExtendedConfigCacheEntry {
++  value: PluginExtendedConfig
++  cachedAt: number
++}
++
+ const USER_CONFIG_PATH = join(getOpenCodeConfigDir({ binary: "opencode" }), "opencode-cc-plugin.json")
++const configCache = new Map<string, PluginExtendedConfigCacheEntry>()
+ 
+ function getProjectConfigPath(): string {
+   return join(process.cwd(), ".opencode", "opencode-cc-plugin.json")
+ }
+ 
++function getCacheKey(): string {
++  return process.cwd()
++}
++
++function getCachedConfig(cacheKey: string): PluginExtendedConfig | undefined {
++  const cachedEntry = configCache.get(cacheKey)
++  if (!cachedEntry) {
++    return undefined
++  }
++
++  if (Date.now() - cachedEntry.cachedAt >= CONFIG_CACHE_TTL_MS) {
++    configCache.delete(cacheKey)
++    return undefined
++  }
++
++  return cachedEntry.value
++}
++
++export function clearPluginExtendedConfigCache(): void {
++  configCache.clear()
++}
++
+ async function loadConfigFromPath(path: string): Promise<PluginExtendedConfig | null> {
+   if (!existsSync(path)) {
+     return null
+@@ -53,6 +83,12 @@ function mergeDisabledHooks(
+ }
+ 
+ export async function loadPluginExtendedConfig(): Promise<PluginExtendedConfig> {
++  const cacheKey = getCacheKey()
++  const cachedConfig = getCachedConfig(cacheKey)
++  if (cachedConfig) {
++    return cachedConfig
++  }
++
+   const userConfig = await loadConfigFromPath(USER_CONFIG_PATH)
+   const projectConfig = await loadConfigFromPath(getProjectConfigPath())
+ 
+@@ -71,6 +107,11 @@ export async function loadPluginExtendedConfig(): Promise<PluginExtendedConfig>
+     })
+   }
+ 
++  configCache.set(cacheKey, {
++    value: merged,
++    cachedAt: Date.now(),
++  })
++
+   return merged
+ }
+ 
+diff --git a/src/hooks/claude-code-hooks/config.test.ts b/src/hooks/claude-code-hooks/config.test.ts
+new file mode 100644
+index 00000000..2fdaa9c7
+--- /dev/null
++++ b/src/hooks/claude-code-hooks/config.test.ts
+@@ -0,0 +1,96 @@
++const { afterEach, beforeEach, describe, expect, mock, test } = require("bun:test")
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++const { clearClaudeHooksConfigCache, loadClaudeHooksConfig } = await import("./config")
++
++describe("loadClaudeHooksConfig", () => {
++  const originalDateNow = Date.now
++  let originalWorkingDirectory = ""
++  let tempDirectory = ""
++  let customSettingsPath = ""
++  let mockedNow = 0
++
++  beforeEach(() => {
++    //#given
++    originalWorkingDirectory = process.cwd()
++    tempDirectory = mkdtempSync(join(tmpdir(), "omo-claude-hooks-config-"))
++    customSettingsPath = join(tempDirectory, "custom-settings.json")
++    mkdirSync(join(tempDirectory, ".claude"), { recursive: true })
++    process.chdir(tempDirectory)
++    mockedNow = 1_000
++    Date.now = () => mockedNow
++    clearClaudeHooksConfigCache()
++  })
++
++  afterEach(() => {
++    clearClaudeHooksConfigCache()
++    Date.now = originalDateNow
++    process.chdir(originalWorkingDirectory)
++    rmSync(tempDirectory, { recursive: true, force: true })
++  })
++
++  test("#given cached hook config #when file changes within ttl #then cached value is reused", async () => {
++    //#given
++    writeSettingsFile(customSettingsPath, "first-stop-command")
++
++    //#when
++    const firstResult = await loadClaudeHooksConfig(customSettingsPath)
++    writeSettingsFile(customSettingsPath, "second-stop-command")
++    mockedNow += 5_000
++    const secondResult = await loadClaudeHooksConfig(customSettingsPath)
++
++    //#then
++    expect(getStopCommands(firstResult)).toContain("first-stop-command")
++    expect(getStopCommands(secondResult)).toContain("first-stop-command")
++    expect(getStopCommands(secondResult)).not.toContain("second-stop-command")
++  })
++
++  test("#given cached hook config #when ttl expires or cache clears #then updated file contents are reloaded", async () => {
++    //#given
++    writeSettingsFile(customSettingsPath, "first-stop-command")
++    await loadClaudeHooksConfig(customSettingsPath)
++
++    //#when
++    writeSettingsFile(customSettingsPath, "second-stop-command")
++    mockedNow += 31_000
++    const ttlReloaded = await loadClaudeHooksConfig(customSettingsPath)
++
++    writeSettingsFile(customSettingsPath, "third-stop-command")
++    clearClaudeHooksConfigCache()
++    const manuallyReloaded = await loadClaudeHooksConfig(customSettingsPath)
++
++    //#then
++    expect(getStopCommands(ttlReloaded)).toContain("second-stop-command")
++    expect(getStopCommands(ttlReloaded)).not.toContain("first-stop-command")
++    expect(getStopCommands(manuallyReloaded)).toContain("third-stop-command")
++    expect(getStopCommands(manuallyReloaded)).not.toContain("second-stop-command")
++  })
++})
++
++function writeSettingsFile(filePath: string, command: string): void {
++  writeFileSync(
++    filePath,
++    JSON.stringify({
++      hooks: {
++        Stop: [
++          {
++            matcher: "*",
++            hooks: [{ command }],
++          },
++        ],
++      },
++    }),
++  )
++}
++
++function getStopCommands(config: Awaited<ReturnType<typeof loadClaudeHooksConfig>>): string[] {
++  return (config?.Stop ?? []).flatMap((matcher) =>
++    matcher.hooks.flatMap((hook) =>
++      "command" in hook && typeof hook.command === "string" ? [hook.command] : [],
++    ),
++  )
++}
++
++export {}
+diff --git a/src/hooks/claude-code-hooks/config.ts b/src/hooks/claude-code-hooks/config.ts
+index a2daf003..b302e20f 100644
+--- a/src/hooks/claude-code-hooks/config.ts
++++ b/src/hooks/claude-code-hooks/config.ts
+@@ -3,6 +3,15 @@ import { existsSync } from "fs"
+ import { getClaudeConfigDir } from "../../shared"
+ import type { ClaudeHooksConfig, HookMatcher, HookAction } from "./types"
+ 
++const CONFIG_CACHE_TTL_MS = 30_000
++
++interface ClaudeHooksConfigCacheEntry {
++  value: ClaudeHooksConfig | null
++  cachedAt: number
++}
++
++const configCache = new Map<string, ClaudeHooksConfigCacheEntry>()
++
+ interface RawHookMatcher {
+   matcher?: string
+   pattern?: string
+@@ -60,6 +69,28 @@ export function getClaudeSettingsPaths(customPath?: string): string[] {
+   return [...new Set(paths)]
+ }
+ 
++function getCacheKey(customSettingsPath?: string): string {
++  return `${process.cwd()}::${customSettingsPath ?? ""}`
++}
++
++function getCachedConfig(cacheKey: string): ClaudeHooksConfig | null | undefined {
++  const cachedEntry = configCache.get(cacheKey)
++  if (!cachedEntry) {
++    return undefined
++  }
++
++  if (Date.now() - cachedEntry.cachedAt >= CONFIG_CACHE_TTL_MS) {
++    configCache.delete(cacheKey)
++    return undefined
++  }
++
++  return cachedEntry.value
++}
++
++export function clearClaudeHooksConfigCache(): void {
++  configCache.clear()
++}
++
+ function mergeHooksConfig(
+   base: ClaudeHooksConfig,
+   override: ClaudeHooksConfig
+@@ -83,6 +114,12 @@ function mergeHooksConfig(
+ export async function loadClaudeHooksConfig(
+   customSettingsPath?: string
+ ): Promise<ClaudeHooksConfig | null> {
++  const cacheKey = getCacheKey(customSettingsPath)
++  const cachedConfig = getCachedConfig(cacheKey)
++  if (cachedConfig !== undefined) {
++    return cachedConfig
++  }
++
+   const paths = getClaudeSettingsPaths(customSettingsPath)
+   let mergedConfig: ClaudeHooksConfig = {}
+ 
+@@ -101,5 +138,10 @@ export async function loadClaudeHooksConfig(
+     }
+   }
+ 
+-  return Object.keys(mergedConfig).length > 0 ? mergedConfig : null
++  const resolvedConfig = Object.keys(mergedConfig).length > 0 ? mergedConfig : null
++  configCache.set(cacheKey, {
++    value: resolvedConfig,
++    cachedAt: Date.now(),
++  })
++  return resolvedConfig
+ }
+diff --git a/src/hooks/claude-code-hooks/handlers/session-event-handler-retry.test.ts b/src/hooks/claude-code-hooks/handlers/session-event-handler-retry.test.ts
+new file mode 100644
+index 00000000..093de492
+--- /dev/null
++++ b/src/hooks/claude-code-hooks/handlers/session-event-handler-retry.test.ts
+@@ -0,0 +1,67 @@
++const { beforeEach, describe, expect, mock, test } = require("bun:test")
++
++const executeStopHooks = mock(async (context: { parentSessionId?: string }) => ({
++  block: false,
++  observedParentSessionId: context.parentSessionId,
++}))
++
++mock.module("../config", () => ({
++  clearClaudeHooksConfigCache: () => {},
++  loadClaudeHooksConfig: async () => null,
++}))
++
++mock.module("../config-loader", () => ({
++  clearPluginExtendedConfigCache: () => {},
++  loadPluginExtendedConfig: async () => ({}),
++}))
++
++mock.module("../stop", () => ({
++  executeStopHooks,
++}))
++
++const { createSessionEventHandler } = await import("./session-event-handler")
++
++describe("createSessionEventHandler retry behavior", () => {
++  beforeEach(() => {
++    executeStopHooks.mockClear()
++  })
++
++  test("#given transient parent lookup failure #when the next idle succeeds #then stop hooks receive the later parent session id", async () => {
++    //#given
++    let getCallCount = 0
++    const handler = createSessionEventHandler(
++      {
++        directory: "/repo",
++        client: {
++          session: {
++            get: async () => {
++              getCallCount += 1
++              if (getCallCount === 1) {
++                throw new Error("temporary failure")
++              }
++              return { data: { parentID: "ses_parent" } }
++            },
++            prompt: async () => undefined,
++          },
++        },
++      } as never,
++      {},
++    )
++
++    //#when
++    await handler({ event: { type: "session.idle", properties: { sessionID: "ses_retry" } } })
++    await handler({ event: { type: "session.idle", properties: { sessionID: "ses_retry" } } })
++
++    //#then
++    expect(getCallCount).toBe(2)
++    expect(executeStopHooks).toHaveBeenLastCalledWith(
++      expect.objectContaining({
++        parentSessionId: "ses_parent",
++      }),
++      null,
++      {},
++    )
++  })
++})
++
++export {}
+diff --git a/src/hooks/claude-code-hooks/handlers/session-event-handler.test.ts b/src/hooks/claude-code-hooks/handlers/session-event-handler.test.ts
+index dc67b522..4bff25c6 100644
+--- a/src/hooks/claude-code-hooks/handlers/session-event-handler.test.ts
++++ b/src/hooks/claude-code-hooks/handlers/session-event-handler.test.ts
+@@ -70,4 +70,70 @@ describe("createSessionEventHandler", () => {
+ 
+     stopToolInputCacheCleanup()
+   })
++
++  test("#given repeated idle events for one session #when stop hook preparation runs #then parent session lookup is reused", async () => {
++    //#given
++    let getCallCount = 0
++    const handler = createSessionEventHandler(
++      {
++        client: {
++          session: {
++            get: async () => {
++              getCallCount += 1
++              return { data: { parentID: "ses_parent" } }
++            },
++            prompt: async () => undefined,
++            messages: async () => ({ data: [] }),
++          },
++        },
++      } as never,
++      {},
++    )
++
++    //#when
++    await handler({
++      event: { type: "session.idle", properties: { sessionID: "ses_reuse" } },
++    })
++    await handler({
++      event: { type: "session.idle", properties: { sessionID: "ses_reuse" } },
++    })
++
++    //#then
++    expect(getCallCount).toBe(1)
++  })
++
++  test("#given deleted session #when it idles again #then parent session lookup is fetched again", async () => {
++    //#given
++    let getCallCount = 0
++    const handler = createSessionEventHandler(
++      {
++        client: {
++          session: {
++            get: async () => {
++              getCallCount += 1
++              return { data: { parentID: "ses_parent" } }
++            },
++            prompt: async () => undefined,
++            messages: async () => ({ data: [] }),
++          },
++        },
++      } as never,
++      {},
++    )
++
++    await handler({
++      event: { type: "session.idle", properties: { sessionID: "ses_reset" } },
++    })
++    await handler({
++      event: { type: "session.deleted", properties: { info: { id: "ses_reset" } } },
++    })
++
++    //#when
++    await handler({
++      event: { type: "session.idle", properties: { sessionID: "ses_reset" } },
++    })
++
++    //#then
++    expect(getCallCount).toBe(2)
++  })
+ })
+diff --git a/src/hooks/claude-code-hooks/handlers/session-event-handler.ts b/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
+index 71d0374b..ca4556dd 100644
+--- a/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
++++ b/src/hooks/claude-code-hooks/handlers/session-event-handler.ts
+@@ -1,7 +1,7 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { ContextCollector } from "../../../features/context-injector"
+-import { loadClaudeHooksConfig } from "../config"
+-import { loadPluginExtendedConfig } from "../config-loader"
++import { clearClaudeHooksConfigCache, loadClaudeHooksConfig } from "../config"
++import { clearPluginExtendedConfigCache, loadPluginExtendedConfig } from "../config-loader"
+ import { executeStopHooks, type StopContext } from "../stop"
+ import { clearTranscriptCache } from "../transcript"
+ import { clearToolInputCache, stopToolInputCacheCleanup } from "../tool-input-cache"
+@@ -19,6 +19,8 @@ export function createSessionEventHandler(
+ 	config: PluginConfig,
+ 	contextCollector?: ContextCollector,
+ ) {
++	const parentSessionIdCache = new Map<string, string | undefined>()
++
+ 	return async (input: { event: { type: string; properties?: unknown } }) => {
+ 		const { event } = input
+ 
+@@ -38,6 +40,7 @@ export function createSessionEventHandler(
+ 			const props = event.properties as Record<string, unknown> | undefined
+ 			const sessionInfo = props?.info as { id?: string } | undefined
+ 			if (sessionInfo?.id) {
++				parentSessionIdCache.delete(sessionInfo.id)
+ 				clearTranscriptCache(sessionInfo.id)
+ 				clearToolInputCache(sessionInfo.id)
+ 				contextCollector?.clear(sessionInfo.id)
+@@ -62,14 +65,17 @@ export function createSessionEventHandler(
+ 		const interruptStateBefore = sessionInterruptState.get(sessionID)
+ 		const interruptedBefore = interruptStateBefore?.interrupted === true
+ 
+-		let parentSessionId: string | undefined
+-		try {
+-			const sessionInfo = await ctx.client.session.get({
+-				path: { id: sessionID },
+-			})
+-			parentSessionId = sessionInfo.data?.parentID
+-		} catch {
+-			parentSessionId = undefined
++		let parentSessionId = parentSessionIdCache.get(sessionID)
++		if (parentSessionId === undefined && !parentSessionIdCache.has(sessionID)) {
++			try {
++				const sessionInfo = await ctx.client.session.get({
++					path: { id: sessionID },
++				})
++				parentSessionId = sessionInfo.data?.parentID
++				parentSessionIdCache.set(sessionID, parentSessionId)
++			} catch {
++				parentSessionId = undefined
++			}
+ 		}
+ 
+ 		if (!isHookDisabled(config, "Stop")) {
+@@ -123,6 +129,8 @@ export function createSessionEventHandler(
+ 
+ export function disposeSessionEventHandler(contextCollector?: ContextCollector): void {
+ 	clearTranscriptCache()
++	clearClaudeHooksConfigCache()
++	clearPluginExtendedConfigCache()
+ 	stopToolInputCacheCleanup()
+ 	contextCollector?.clearAll()
+ 	clearAllSessionHookState()
+-- 
+2.39.2
+

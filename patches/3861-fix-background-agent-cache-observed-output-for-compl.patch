@@ -1,0 +1,246 @@
+From f9a9a60b82d31d8f6356569ed4b56b7e1ac3c52b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 4 Apr 2026 18:39:26 +0900
+Subject: [PATCH 3861/5749] fix(background-agent): cache observed output for
+ completion checks
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../background-agent/manager.polling.test.ts  | 39 +++++++++++-
+ src/features/background-agent/manager.test.ts | 60 +++++++++++++++++++
+ src/features/background-agent/manager.ts      | 40 ++++++++++++-
+ 3 files changed, 137 insertions(+), 2 deletions(-)
+
+diff --git a/src/features/background-agent/manager.polling.test.ts b/src/features/background-agent/manager.polling.test.ts
+index 3879f30a..3da72393 100644
+--- a/src/features/background-agent/manager.polling.test.ts
++++ b/src/features/background-agent/manager.polling.test.ts
+@@ -97,7 +97,11 @@ function createManagerWithClient(clientOverrides: Record<string, unknown> = {}):
+       ...clientOverrides,
+     },
+   }
+-  return new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++  return new BackgroundManager(
++    { client, directory: tmpdir() } as unknown as PluginInput,
++    undefined,
++    { enableParentSessionNotifications: false },
++  )
+ }
+ 
+ describe("BackgroundManager verifySessionExists", () => {
+@@ -201,6 +205,39 @@ describe("BackgroundManager pollRunningTasks", () => {
+       //#then
+       expect(task.status).toBe("completed")
+     })
++
++    test("#when output was already observed from events #then it completes without fetching messages", async () => {
++      //#given
++      let messagesCallCount = 0
++      const manager = createManagerWithClient({
++        status: async () => ({ data: { "ses-idle-cached": { type: "idle" } } }),
++        messages: async () => {
++          messagesCallCount += 1
++          return {
++            data: [{
++              info: { role: "assistant", finish: "end_turn", id: "msg-2" },
++              parts: [{ type: "text", text: "done" }],
++            }],
++          }
++        },
++      })
++      const task = createRunningTask("ses-idle-cached")
++      injectTask(manager, task)
++
++      manager.handleEvent({
++        type: "message.part.updated",
++        properties: { sessionID: "ses-idle-cached", type: "text" },
++      })
++
++      //#when
++      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      await poll.call(manager)
++      manager.shutdown()
++
++      //#then
++      expect(task.status).toBe("completed")
++      expect(messagesCallCount).toBe(0)
++    })
+   })
+ 
+   describe("#given a running task whose session status is busy", () => {
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index e83054d5..3acdcd70 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -5020,6 +5020,66 @@ describe("BackgroundManager.handleEvent - non-tool event lastUpdate", () => {
+     //#then - task should still be running (delta event refreshed lastUpdate)
+     expect(task.status).toBe("running")
+   })
++
++  test("should complete idle task without fetching messages after output event was observed", async () => {
++    //#given - a running task with observed output from message part events
++    let messagesCallCount = 0
++    let todoCallCount = 0
++    const sessionID = "session-output-cached-idle"
++    const client = {
++      session: {
++        prompt: async () => ({}),
++        promptAsync: async () => ({}),
++        abort: async () => ({}),
++        messages: async () => {
++          messagesCallCount += 1
++          return {
++            data: [
++              {
++                info: { role: "assistant" },
++                parts: [{ type: "text", text: "ok" }],
++              },
++            ],
++          }
++        },
++        todo: async () => {
++          todoCallCount += 1
++          return { data: [] }
++        },
++      },
++    }
++    const manager = new BackgroundManager({ client, directory: tmpdir() } as unknown as PluginInput)
++    stubNotifyParentSession(manager)
++
++    const task: BackgroundTask = {
++      id: "task-output-cached-idle",
++      sessionID,
++      parentSessionID: "parent-session",
++      parentMessageID: "msg-1",
++      description: "idle cached output task",
++      prompt: "test",
++      agent: "explore",
++      status: "running",
++      startedAt: new Date(Date.now() - (MIN_IDLE_TIME_MS + 10)),
++    }
++    getTaskMap(manager).set(task.id, task)
++
++    manager.handleEvent({
++      type: "message.part.updated",
++      properties: { sessionID, type: "text" },
++    })
++
++    //#when - session.idle fires after output event was already observed
++    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
++
++    //#then - task completes without refetching session.messages
++    await new Promise((resolve) => setTimeout(resolve, 10))
++    expect(task.status).toBe("completed")
++    expect(messagesCallCount).toBe(0)
++    expect(todoCallCount).toBe(1)
++
++    manager.shutdown()
++  })
+ })
+ 
+ describe("BackgroundManager regression fixes - resume and aborted notification", () => {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 743d7769..f9ec1715 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -159,6 +159,7 @@ export class BackgroundManager {
+   private completedTaskSummaries: Map<string, BackgroundTaskNotificationTask[]> = new Map()
+   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
++  private observedOutputSessions: Set<string> = new Set()
+   private rootDescendantCounts: Map<string, number>
+   private preStartDescendantReservations: Set<string>
+   private enableParentSessionNotifications: boolean
+@@ -901,6 +902,26 @@ export class BackgroundManager {
+     }
+   }
+ 
++  private markSessionOutputObserved(sessionID: string): void {
++    this.observedOutputSessions.add(sessionID)
++  }
++
++  private clearSessionOutputObserved(sessionID: string): void {
++    this.observedOutputSessions.delete(sessionID)
++  }
++
++  private hasOutputSignalFromPart(partInfo: MessagePartInfo | undefined): boolean {
++    if (!partInfo?.sessionID) return false
++    if (partInfo.tool) return true
++    if (partInfo.type === "tool" || partInfo.type === "tool_result") return true
++    if (partInfo.type === "text" || partInfo.type === "reasoning") return true
++
++    const field = typeof (partInfo as { field?: unknown }).field === "string"
++      ? (partInfo as { field?: string }).field
++      : undefined
++    return field === "text" || field === "reasoning"
++  }
++
+   handleEvent(event: Event): void {
+     const props = event.properties
+ 
+@@ -910,7 +931,13 @@ export class BackgroundManager {
+ 
+       const sessionID = (info as Record<string, unknown>)["sessionID"]
+       const role = (info as Record<string, unknown>)["role"]
+-      if (typeof sessionID !== "string" || role !== "assistant") return
++      if (typeof sessionID !== "string") return
++
++      if (role === "tool") {
++        this.markSessionOutputObserved(sessionID)
++      }
++
++      if (role !== "assistant") return
+ 
+       const task = this.findBySession(sessionID)
+       if (!task || task.status !== "running") return
+@@ -938,6 +965,10 @@ export class BackgroundManager {
+       const task = this.findBySession(sessionID)
+       if (!task) return
+ 
++      if (this.hasOutputSignalFromPart(partInfo)) {
++        this.markSessionOutputObserved(sessionID)
++      }
++
+       // Clear any pending idle deferral timer since the task is still active
+       const existingTimer = this.idleDeferralTimers.get(task.id)
+       if (existingTimer) {
+@@ -1059,6 +1090,7 @@ export class BackgroundManager {
+       const info = props?.info
+       if (!info || typeof info.id !== "string") return
+       const sessionID = info.id
++      this.clearSessionOutputObserved(sessionID)
+ 
+       const tasksToCancel = new Map<string, BackgroundTask>()
+       const directTask = this.findBySession(sessionID)
+@@ -1217,6 +1249,7 @@ export class BackgroundManager {
+     })
+     return result.then((retried) => {
+       if (retried && previousSessionID) {
++        this.clearSessionOutputObserved(previousSessionID)
+         subagentSessions.delete(previousSessionID)
+       }
+       return retried
+@@ -1268,6 +1301,10 @@ export class BackgroundManager {
+    * Prevents premature completion when session.idle fires before agent responds.
+    */
+   private async validateSessionHasOutput(sessionID: string): Promise<boolean> {
++    if (this.observedOutputSessions.has(sessionID)) {
++      return true
++    }
++
+     try {
+       const response = await this.client.session.messages({
+         path: { id: sessionID },
+@@ -1314,6 +1351,7 @@ export class BackgroundManager {
+         return false
+       }
+ 
++      this.markSessionOutputObserved(sessionID)
+       return true
+     } catch (error) {
+       log("[background-agent] Error validating session output:", error)
+-- 
+2.39.2
+

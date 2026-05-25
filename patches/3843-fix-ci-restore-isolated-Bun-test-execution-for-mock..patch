@@ -1,0 +1,246 @@
+From 2c081e19996fb86e67dfe4b9dcc53572c1cd09a1 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 4 Apr 2026 15:51:54 +0900
+Subject: [PATCH 3843/5749] fix(ci): restore isolated Bun test execution for
+ mock.module suites
+
+Running Linux CI in one Bun process still leaks mock.module registrations across files, so the workflows now use a CI-specific test runner that isolates mock-heavy targets before executing the remaining suite together.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .github/workflows/ci.yml        |   2 +-
+ .github/workflows/publish.yml   |   2 +-
+ package.json                    |   1 +
+ script/publish-workflow.test.ts |   8 +-
+ script/run-ci-tests.ts          | 128 ++++++++++++++++++++++++++++++++
+ script/tsconfig.json            |  14 ++++
+ 6 files changed, 149 insertions(+), 6 deletions(-)
+ create mode 100644 script/run-ci-tests.ts
+ create mode 100644 script/tsconfig.json
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index c3213b82..3b43bde6 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -47,7 +47,7 @@ jobs:
+           BUN_INSTALL_ALLOW_SCRIPTS: "@ast-grep/napi"
+ 
+       - name: Run tests
+-        run: bun test
++        run: bun run test:ci
+ 
+   typecheck:
+     runs-on: ubuntu-latest
+diff --git a/.github/workflows/publish.yml b/.github/workflows/publish.yml
+index 72252bac..37b3a7a3 100644
+--- a/.github/workflows/publish.yml
++++ b/.github/workflows/publish.yml
+@@ -46,7 +46,7 @@ jobs:
+           BUN_INSTALL_ALLOW_SCRIPTS: "@ast-grep/napi"
+ 
+       - name: Run tests
+-        run: bun test
++        run: bun run test:ci
+ 
+   typecheck:
+     runs-on: ubuntu-latest
+diff --git a/package.json b/package.json
+index d88d831e..692ec4c0 100644
+--- a/package.json
++++ b/package.json
+@@ -31,6 +31,7 @@
+     "postinstall": "node postinstall.mjs",
+     "prepublishOnly": "bun run clean && bun run build",
+     "test:model-capabilities": "bun test src/shared/model-capability-aliases.test.ts src/shared/model-capability-guardrails.test.ts src/shared/model-capabilities.test.ts src/cli/doctor/checks/model-resolution.test.ts --bail",
++    "test:ci": "bun run script/run-ci-tests.ts",
+     "typecheck": "tsc --noEmit",
+     "test": "bun test"
+   },
+diff --git a/script/publish-workflow.test.ts b/script/publish-workflow.test.ts
+index b690a856..18c667d6 100644
+--- a/script/publish-workflow.test.ts
++++ b/script/publish-workflow.test.ts
+@@ -1,3 +1,5 @@
++/// <reference types="bun-types" />
++
+ import { describe, expect, test } from "bun:test"
+ import { readFileSync } from "node:fs"
+ 
+@@ -7,16 +9,14 @@ const workflowPaths = [
+ ]
+ 
+ describe("test workflows", () => {
+-  test("use a single plain bun test step without isolated split hacks", () => {
++  test("use the CI-safe test runner for workflows", () => {
+     for (const workflowPath of workflowPaths) {
+       // given
+       const workflow = readFileSync(workflowPath, "utf8")
+ 
+       // then
+       expect(workflow).toContain("- name: Run tests")
+-      expect(workflow).toContain("run: bun test")
+-      expect(workflow).not.toContain("Run mock-heavy tests (isolated)")
+-      expect(workflow).not.toContain("Run remaining tests")
++      expect(workflow).toContain("run: bun run test:ci")
+     }
+   })
+ })
+diff --git a/script/run-ci-tests.ts b/script/run-ci-tests.ts
+new file mode 100644
+index 00000000..de07b907
+--- /dev/null
++++ b/script/run-ci-tests.ts
+@@ -0,0 +1,128 @@
++/// <reference types="bun-types" />
++
++type CiTestPlan = {
++  isolatedTestTargets: string[]
++  isolatedModuleMockFiles: string[]
++  sharedTestFiles: string[]
++}
++
++const TEST_ROOTS = ["script", "src"] as const
++const MODULE_MOCK_PATTERN = "mock.module("
++
++async function collectTestFiles(rootDirectory: string): Promise<string[]> {
++  const testFiles: string[] = []
++
++  for (const testRoot of TEST_ROOTS) {
++    const glob = new Bun.Glob("**/*.test.ts")
++
++    for await (const testFile of glob.scan({ cwd: `${rootDirectory}/${testRoot}` })) {
++      testFiles.push(`${testRoot}/${testFile}`)
++    }
++  }
++
++  return testFiles.sort((left, right) => left.localeCompare(right))
++}
++
++async function usesModuleMock(rootDirectory: string, testFile: string): Promise<boolean> {
++  const testContents = await Bun.file(`${rootDirectory}/${testFile}`).text()
++  return testContents.includes(MODULE_MOCK_PATTERN)
++}
++
++function toIsolatedTarget(testFile: string): string {
++  const pathSegments = testFile.split("/")
++
++  if (pathSegments.length <= 3) {
++    return testFile
++  }
++
++  return pathSegments.slice(0, -1).join("/")
++}
++
++function isCoveredByTarget(testFile: string, isolatedTarget: string): boolean {
++  return testFile === isolatedTarget || testFile.startsWith(`${isolatedTarget}/`)
++}
++
++function collapseNestedTargets(isolatedTargets: string[]): string[] {
++  return isolatedTargets.filter((isolatedTarget) => {
++    return !isolatedTargets.some((otherTarget) => {
++      return otherTarget !== isolatedTarget && isolatedTarget.startsWith(`${otherTarget}/`)
++    })
++  })
++}
++
++export async function createCiTestPlan(rootDirectory: string = process.cwd()): Promise<CiTestPlan> {
++  const allTestFiles = await collectTestFiles(rootDirectory)
++  const isolatedModuleMockFiles: string[] = []
++
++  for (const testFile of allTestFiles) {
++    if (await usesModuleMock(rootDirectory, testFile)) {
++      isolatedModuleMockFiles.push(testFile)
++    }
++  }
++
++  const isolatedTestTargets = collapseNestedTargets(
++    Array.from(new Set(isolatedModuleMockFiles.map((testFile) => toIsolatedTarget(testFile)))).sort((left, right) =>
++      left.localeCompare(right),
++    ),
++  )
++  const sharedTestFiles = allTestFiles.filter((testFile) => {
++    return !isolatedTestTargets.some((isolatedTarget) => isCoveredByTarget(testFile, isolatedTarget))
++  })
++
++  return {
++    isolatedTestTargets,
++    isolatedModuleMockFiles,
++    sharedTestFiles,
++  }
++}
++
++async function runBunTest(testFiles: string[], label: string): Promise<void> {
++  if (testFiles.length === 0) {
++    return
++  }
++
++  console.log(`::group::${label}`)
++  const command = ["bun", "test", ...testFiles]
++  const spawnedProcess = Bun.spawn(command, {
++    cwd: process.cwd(),
++    stdin: "inherit",
++    stdout: "inherit",
++    stderr: "inherit",
++  })
++  const exitCode = await spawnedProcess.exited
++  console.log("::endgroup::")
++
++  if (exitCode !== 0) {
++    throw new Error(`Command failed: ${command.join(" ")}`)
++  }
++}
++
++async function main(): Promise<void> {
++  const ciTestPlan = await createCiTestPlan()
++
++  console.log(
++    `Detected ${ciTestPlan.isolatedModuleMockFiles.length} mock.module() test files, ${ciTestPlan.isolatedTestTargets.length} isolated targets, and ${ciTestPlan.sharedTestFiles.length} shared test files.`,
++  )
++
++  for (const isolatedTestTarget of ciTestPlan.isolatedTestTargets) {
++    await runBunTest([isolatedTestTarget], `Isolated ${isolatedTestTarget}`)
++  }
++
++  await runBunTest(ciTestPlan.sharedTestFiles, "Shared Bun test suite")
++}
++
++export const moduleMockPattern = MODULE_MOCK_PATTERN
++export const testRoots = TEST_ROOTS
++
++if (process.argv.includes("--print-plan")) {
++  const ciTestPlan = await createCiTestPlan()
++  console.log(JSON.stringify(ciTestPlan, null, 2))
++} else if (import.meta.main) {
++  try {
++    await main()
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error)
++    console.error(message)
++    process.exit(1)
++  }
++}
+diff --git a/script/tsconfig.json b/script/tsconfig.json
+new file mode 100644
+index 00000000..330ebffc
+--- /dev/null
++++ b/script/tsconfig.json
+@@ -0,0 +1,14 @@
++{
++  "compilerOptions": {
++    "target": "ESNext",
++    "module": "ESNext",
++    "moduleResolution": "bundler",
++    "strict": true,
++    "resolveJsonModule": true,
++    "lib": ["ESNext"],
++    "types": ["bun-types"],
++    "allowImportingTsExtensions": true,
++    "noEmit": true
++  },
++  "include": ["./publish-workflow.test.ts", "./run-ci-tests.ts"]
++}
+-- 
+2.39.2
+

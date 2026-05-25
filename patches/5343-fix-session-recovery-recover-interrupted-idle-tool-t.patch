@@ -1,0 +1,819 @@
+From f43effb8428e3f3d1348b6b269eb72d847fea4e1 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 15:08:39 +0900
+Subject: [PATCH 5343/5749] fix(session-recovery): recover interrupted idle
+ tool turns
+
+---
+ .debugging                                    | 129 ++++++++++++++++++
+ .../background-agent/parent-wake-notifier.ts  |  13 ++
+ .../task-completion-cleanup.test.ts           |  40 +++++-
+ .../storage.test.ts                           |   3 +
+ src/hooks/session-recovery/hook.test.ts       | 103 +++++++++++++-
+ src/hooks/session-recovery/hook.ts            |  94 +++++++++++++
+ .../recover-tool-result-missing.test.ts       |  57 +++++++-
+ .../recover-tool-result-missing.ts            |  50 +++++--
+ src/hooks/session-recovery/types.ts           |  11 ++
+ src/plugin/event.test.ts                      |  35 +++++
+ src/plugin/event.ts                           |  10 ++
+ 11 files changed, 531 insertions(+), 14 deletions(-)
+
+diff --git a/.debugging b/.debugging
+index 6d37a836..6051974f 100644
+--- a/.debugging
++++ b/.debugging
+@@ -186,3 +186,132 @@ Goal: Debug and fix the prompt hang/race between sibling `opencode` and `omo` wi
+   - Busy/non-idle child sessions continue polling as before.
+   - Existing shared `promptAsync` gate and raw-prompt audit are unchanged and green.
+ - Remaining gates: commit, PR, GitHub CI, Cubic review, PR merge, final requested worktree cleanup.
++
++---
++
++# Debugging Journal - 2026-05-17 ses_1cb9c3013ffesUOy5H3QOIya4K Stale Tool Hang
++
++Started: 2026-05-17T15:18:00+09:00
++Goal: Read hanging OpenCode session `ses_1cb9c3013ffesUOy5H3QOIya4K`, compare against 3.17.x / sibling OpenCode behavior, fix the regression with failing-first tests, manual QA, clean PR, CI pass, and Cubic pass.
++
++## Environment Snapshot
++
++- OMO worktree: `/Users/yeongyu/local-workspaces/gpt 5.5 xhigh`
++- OMO branch: `code-yeongyu/fix-stale-tool-hang`
++- Base: `origin/dev` at `fbec112bc`
++- Sibling OpenCode repo: `/Users/yeongyu/local-workspaces/opencode`
++- Installed OpenCode version observed in the session DB: `1.15.3`
++- Hanging session: `ses_1cb9c3013ffesUOy5H3QOIya4K`
++- Prompt: `run /init-deep ultrafucking deep`
++- Agent/model: `Sisyphus - Ultraworker`, `anthropic/claude-opus-4-7`, variant `max`
++
++## Hypotheses
++
++1. [CONFIRMED] OpenCode emitted `session.idle` while the latest assistant message was still incomplete and still had pending/running tool parts, so OMO idle hooks treated a malformed live turn as safe to resume.
++2. [CONFIRMED] OMO background completion wake logic only checked `finish === "tool-calls"`, so an unfinished assistant with `finish: null` and running tool state could still receive a background wake prompt.
++3. [CONFIRMED] Existing tool-result recovery could recover missing tool results but only from storage readers and without a status filter, so it could not safely synthesize results for only interrupted `pending`/`running` parts from the latest idle message.
++4. [REFUTED AS COMPLETE FIX] Waiting for upstream OpenCode alone is enough. Sibling `../opencode` contains upstream commit `e76cf967e60995986a4dd99d818fc900fa82f904` (`fix(session): finalize interrupted assistant messages (#27254)`), but the installed CLI is still 1.15.3 and the plugin must defend against this malformed idle state.
++
++## Session Evidence
++
++- Latest assistant message: `msg_e3464412a001Yn9YfuPVQPOPPd`
++- Message state: `completed = null`, `finish = null`, no error.
++- Dangling tool parts:
++  - `prt_e3464c0fa001tWC3jqV5lBOeFi`: `tool = bash`, `callID = toolu_015rqEhGgnYKiB73hQbwGgwT`, `state.status = running`, description `Project scale metrics`
++  - `prt_e346506f5001SUD7EVA2kqL2Vb`: `tool = task`, `callID = toolu_01UPe3AyVwAoMebpGcuGPV4N`, `state.status = pending`
++- Log evidence from `/Users/yeongyu/.local/share/opencode/log/2026-05-17T052321.log`:
++  - `InstanceRef not provided rejection`
++  - child sessions cancelled with `Aborted process`
++  - main session emitted `session.idle` while the DB retained the unfinished assistant and dangling tools.
++
++## 3.17.x / OpenCode Comparison
++
++- OpenCode `prompt_async` was accept-only / fire-and-forget in both older and current routes, so prompt acceptance alone is not the distinguishing regression.
++- Sibling OpenCode already has `e76cf967e60995986a4dd99d818fc900fa82f904`, which finalizes interrupted assistant messages on interrupt.
++- The observed installed runtime lacks that protection: an idle event can coexist with unfinished assistant/tool state.
++- OMO must therefore treat idle-with-interrupted-tool-parts as a recoverable malformed state before any normal idle continuation/background/team wake hooks run.
++
++## Root Cause
++
++OpenCode 1.15.3 can publish `session.idle` after an interruption path without finalizing the latest assistant turn. The latest assistant message can remain `completed = null`, `finish = null`, and contain `pending` or `running` tool parts with valid call IDs. OMO then sees an idle edge and multiple hooks may try to resume or wake the same parent session, but the provider is still waiting for tool results that will never arrive. This creates the apparent forever hang.
++
++The fix is defensive and minimal: when a `session.idle` event arrives, OMO now checks the latest assistant message first. If it is unfinished and has interrupted tool parts, OMO injects synthetic error `tool_result` parts only for those pending/running call IDs, dedupes the recovery by assistant message id, and skips later idle hooks for that event. Background completion wake also refuses to fork a prompt into any latest assistant turn containing pending/running tool state, even when `finish` is null.
++
++## Red Phase
++
++- `src/features/background-agent/task-completion-cleanup.test.ts`
++  - Added: idle parent with latest assistant `finish: null` plus a running tool state must not receive background completion wake.
++  - Red output: expected `promptAsyncCalls` length `0`, received `1`.
++- `src/hooks/session-recovery/recover-tool-result-missing.test.ts`
++  - Added: `recoverStatuses` must recover only pending/running sqlite tool parts.
++  - Red output: completed tool result was recovered along with interrupted tool results.
++- `src/hooks/session-recovery/hook.test.ts`
++  - Added: idle recovery must inject only interrupted tool results once.
++  - Red output: `handleInterruptedToolResultsOnIdle` did not exist.
++- `src/plugin/event.test.ts`
++  - Added: when idle recovery handles an interrupted tool turn, later idle hooks are skipped for that event.
++
++## Green Phase
++
++- `src/features/background-agent/parent-wake-notifier.ts`
++  - Detects `pending` / `running` tool state in the latest assistant turn independent of `finish`.
++- `src/hooks/session-recovery/recover-tool-result-missing.ts`
++  - Can recover direct message parts, filter by status, and synthesize tool results for `tool_use` ids via `callID ?? id`.
++- `src/hooks/session-recovery/hook.ts`
++  - Uses the same `callID ?? id` check before idle recovery, so direct `tool_use` parts without `callID` are not skipped.
++- `src/hooks/session-recovery/hook.ts`
++  - Adds `handleInterruptedToolResultsOnIdle(sessionID)` with per-assistant-message dedupe and retry-on-dispatch-failure behavior.
++- `src/plugin/event.ts`
++  - Runs interrupted idle recovery before normal idle hook fanout and returns early when recovery dispatches.
++- `src/hooks/anthropic-context-window-limit-recovery/storage.test.ts`
++  - Test-only mock now exports all names required by the storage barrel during full one-process Bun suite runs.
++
++## Manual QA
++
++Scenario: recreate the exact stale shape from `ses_1cb9c3013ffesUOy5H3QOIya4K` with one completed tool plus the two bad call IDs.
++
++Observed output:
++
++```json
++{"recovered":true,"dispatched":1,"recoveredToolUseIds":["toolu_015rqEhGgnYKiB73hQbwGgwT","toolu_01UPe3AyVwAoMebpGcuGPV4N"],"text":"Tool execution was interrupted before producing a result.","agent":"Sisyphus - Ultraworker","model":{"providerID":"anthropic","modelID":"claude-opus-4-7"},"variant":"max"}
++```
++
++Expected: only interrupted `running` / `pending` call IDs are recovered, completed tool results are left alone, and session agent/model/variant are preserved.
++
++## Validation
++
++- Focused tests:
++  - `bun test src/features/background-agent/task-completion-cleanup.test.ts --test-name-pattern "running tool state without finish"`: pass.
++  - `bun test src/hooks/session-recovery/recover-tool-result-missing.test.ts --test-name-pattern "recoverStatuses"`: pass.
++  - `bun test src/hooks/session-recovery/hook.test.ts --test-name-pattern "interrupted idle recovery"`: pass.
++  - `bun test src/plugin/event.test.ts --test-name-pattern "idle recovery handles"`: pass.
++- Combined focused suite:
++  - `bun test src/hooks/session-recovery/recover-tool-result-missing.test.ts src/hooks/session-recovery/hook.test.ts src/features/background-agent/task-completion-cleanup.test.ts src/plugin/event.test.ts --bail`
++  - Result: 52 pass, 0 fail.
++- TypeScript no-excuse check:
++  - `bun --install=fallback /Users/yeongyu/.config/opencode/skills/typescript-programmer/scripts/check-no-excuse-rules.ts <changed TS paths>`
++  - Result: pass.
++- Typecheck:
++  - `bun run typecheck`
++  - Result: pass.
++- Build:
++  - `bun run build`
++  - Result: pass.
++- Full suite in required worktree path:
++  - `bun test`
++  - Result before test-only mock fix: failed with path-space encoded import issues and one storage mock export issue; storage mock was fixed and its file passes standalone.
++- Full suite in no-space validation worktree with the same patch after the final `tool_use.id` precheck adjustment:
++  - Validation worktree: `/tmp/omo-ci-validation.oAmv5M`
++  - Command: `bun test`
++  - Result: 7021 pass, 1 skip, 0 fail across 725 files.
++  - Cleanup: validation worktree removed.
++
++## Final Status Before PR
++
++- Product behavior change: only malformed idle events with unfinished latest assistant messages and `pending` / `running` tool parts get synthetic interrupted tool results.
++- Behavior preserved:
++  - Normal idle hook fanout remains unchanged when there is no interrupted latest assistant turn.
++  - Completed tool results are not re-emitted by the recovery filter.
++  - Background wakes still run when the latest assistant turn is finished or has no live tool state.
++  - Upstream OpenCode finalization remains compatible; this OMO defense becomes a no-op when OpenCode stores a finished/error assistant.
++- Remaining gates: commit, PR, GitHub CI, Cubic review, PR merge, final requested worktree cleanup.
+diff --git a/src/features/background-agent/parent-wake-notifier.ts b/src/features/background-agent/parent-wake-notifier.ts
+index 3787df21..62ce9469 100644
+--- a/src/features/background-agent/parent-wake-notifier.ts
++++ b/src/features/background-agent/parent-wake-notifier.ts
+@@ -34,6 +34,9 @@ type ParentWakeSessionMessage = {
+     type?: string
+     text?: string
+     content?: unknown
++    state?: {
++      status?: unknown
++    }
+   }>
+ }
+ 
+@@ -323,6 +326,15 @@ export class ParentWakeNotifier {
+     return undefined
+   }
+ 
++  private parentWakePartIsWaitingOnTool(part: NonNullable<ParentWakeSessionMessage["parts"]>[number]): boolean {
++    if (part.type !== "tool" && part.type !== "tool_use") {
++      return false
++    }
++
++    const status = part.state?.status
++    return status === "pending" || status === "running"
++  }
++
+   private latestAssistantTurnIsWaitingOnTools(messages: ParentWakeSessionMessage[]): boolean {
+     for (let index = messages.length - 1; index >= 0; index--) {
+       const message = messages[index]
+@@ -332,6 +344,7 @@ export class ParentWakeNotifier {
+       const role = this.getParentWakeMessageRole(message)
+       if (role === "assistant") {
+         return this.getParentWakeMessageFinish(message) === "tool-calls"
++          || message.parts?.some((part) => this.parentWakePartIsWaitingOnTool(part)) === true
+       }
+       if (role === "user") {
+         return false
+diff --git a/src/features/background-agent/task-completion-cleanup.test.ts b/src/features/background-agent/task-completion-cleanup.test.ts
+index 1f9224d7..3d361ed5 100644
+--- a/src/features/background-agent/task-completion-cleanup.test.ts
++++ b/src/features/background-agent/task-completion-cleanup.test.ts
+@@ -24,7 +24,7 @@ type SessionMessageForTest = {
+     finish?: string
+     time?: { created?: number }
+   }
+-  parts?: Array<{ type?: string }>
++  parts?: Array<{ type?: string; state?: { status?: string } }>
+ }
+ 
+ type FakeTimers = {
+@@ -508,6 +508,44 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+       expect(promptAsyncCalls).toHaveLength(0)
+     })
+ 
++    test("#when parent status is idle but latest assistant turn has running tool state without finish #then background completion does not fork a reply", async () => {
++      // given
++      const sessionStatuses: Record<string, { type: string }> = {
++        "parent-1": { type: "idle" },
++      }
++      const sessionMessages: SessionMessageForTest[] = [
++        {
++          info: { role: "user", time: { created: 1778819814009 } },
++          parts: [{ type: "text" }],
++        },
++        {
++          info: { role: "assistant", time: { created: 1778819997535 } },
++          parts: [
++            { type: "tool", state: { status: "running" } },
++            { type: "tool", state: { status: "pending" } },
++          ],
++        },
++      ]
++      const { manager, promptAsyncCalls } = createManager(true, sessionStatuses, undefined, sessionMessages)
++      managerUnderTest = manager
++      const task = createTask({
++        id: "task-a",
++        parentSessionId: "parent-1",
++        description: "task A",
++        status: "completed",
++        completedAt: new Date("2026-05-17T05:25:01.000Z"),
++      })
++      getTasks(manager).set(task.id, task)
++      getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++
++      // when
++      await notifyParentSessionForTest(manager, task)
++      await waitForCoalescedFlush()
++
++      // then
++      expect(promptAsyncCalls).toHaveLength(0)
++    })
++
+     test("#when stale tool-call history keeps blocking an all-complete wake #then completion eventually wakes the parent", async () => {
+       // given
+       const sessionStatuses: Record<string, { type: string }> = {
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/storage.test.ts b/src/hooks/anthropic-context-window-limit-recovery/storage.test.ts
+index 0e3507ee..e649a1bb 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/storage.test.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/storage.test.ts
+@@ -11,7 +11,10 @@ const findToolResultsBySize = mock<(_: string) => ToolResultInfo[]>(() => [])
+ const truncateToolResult = mock<(_: string) => TruncateToolResult>(() => ({ success: false }))
+ 
+ mock.module("./tool-result-storage", () => ({
++  countTruncatedResults: () => 0,
++  findLargestToolResult: () => null,
+   findToolResultsBySize,
++  getTotalToolOutputSize: () => 0,
+   truncateToolResult,
+ }))
+ 
+diff --git a/src/hooks/session-recovery/hook.test.ts b/src/hooks/session-recovery/hook.test.ts
+index 72056bcc..aa5fc980 100644
+--- a/src/hooks/session-recovery/hook.test.ts
++++ b/src/hooks/session-recovery/hook.test.ts
+@@ -1,8 +1,26 @@
+-import { describe, expect, test } from "bun:test"
++import { afterEach, describe, expect, test } from "bun:test"
+ import { createSessionRecoveryHook } from "./hook"
++import { releaseAllPromptAsyncReservationsForTesting } from "../../shared/prompt-async-gate"
+ 
+ type RecoverableInfo = Parameters<ReturnType<typeof createSessionRecoveryHook>["handleSessionRecovery"]>[0]
+ 
++type PromptAsyncCall = {
++  path: { id: string }
++  body: {
++    parts: Array<{
++      toolUseId?: string
++      content?: Array<{ text?: string }>
++    }>
++    agent?: string
++    model?: { providerID: string; modelID: string }
++    variant?: string
++  }
++}
++
++afterEach(() => {
++  releaseAllPromptAsyncReservationsForTesting()
++})
++
+ function createPrefillErrorInfo(): RecoverableInfo {
+   return {
+     id: "msg_failed_prefill",
+@@ -84,3 +102,86 @@ describe("session-recovery hook persistent dedupe", () => {
+     expect(counts.abort).toBe(1)
+   })
+ })
++
++describe("session-recovery hook interrupted idle recovery", () => {
++  test("#given idle session has an unfinished assistant turn with pending tool parts #when idle recovery runs #then it injects only interrupted tool results once", async () => {
++    // given
++    const promptAsyncCalls: PromptAsyncCall[] = []
++    const ctx = {
++      client: {
++        session: {
++          status: async () => ({ data: { ses_idle_interrupted: { type: "idle" } } }),
++          messages: async () => ({
++            data: [
++              {
++                info: {
++                  id: "msg_user",
++                  role: "user",
++                  agent: "Sisyphus",
++                  model: { providerID: "anthropic", modelID: "claude-opus-4-7", variant: "max" },
++                },
++                parts: [{ type: "text", text: "run /init-deep ultrafucking deep" }],
++              },
++              {
++                info: {
++                  id: "msg_assistant_unfinished",
++                  role: "assistant",
++                  sessionID: "ses_idle_interrupted",
++                  time: { created: 1778995446058 },
++                },
++                parts: [
++                  {
++                    type: "tool",
++                    callID: "call_completed",
++                    name: "bash",
++                    input: {},
++                    state: { status: "completed" },
++                  },
++                  {
++                    type: "tool_use",
++                    id: "toolu_running",
++                    name: "bash",
++                    input: {},
++                    state: { status: "running" },
++                  },
++                  {
++                    type: "tool_use",
++                    id: "toolu_pending",
++                    name: "task",
++                    input: {},
++                    state: { status: "pending" },
++                  },
++                ],
++              },
++            ],
++          }),
++          promptAsync: async (call: PromptAsyncCall) => {
++            promptAsyncCalls.push(call)
++            return {}
++          },
++        },
++      },
++      directory: "/tmp/session-recovery-idle-test",
++    }
++    const hook = createSessionRecoveryHook(ctx as never)
++
++    // when
++    const firstResult = await hook.handleInterruptedToolResultsOnIdle("ses_idle_interrupted")
++    const secondResult = await hook.handleInterruptedToolResultsOnIdle("ses_idle_interrupted")
++
++    // then
++    expect(firstResult).toBe(true)
++    expect(secondResult).toBe(false)
++    expect(promptAsyncCalls).toHaveLength(1)
++    expect(promptAsyncCalls[0]?.body.parts.map((part) => part.toolUseId)).toEqual([
++      "toolu_running",
++      "toolu_pending",
++    ])
++    expect(promptAsyncCalls[0]?.body.parts[0]?.content?.[0]?.text).toBe(
++      "Tool execution was interrupted before producing a result.",
++    )
++    expect(promptAsyncCalls[0]?.body.agent).toBe("Sisyphus")
++    expect(promptAsyncCalls[0]?.body.model).toEqual({ providerID: "anthropic", modelID: "claude-opus-4-7" })
++    expect(promptAsyncCalls[0]?.body.variant).toBe("max")
++  })
++})
+diff --git a/src/hooks/session-recovery/hook.ts b/src/hooks/session-recovery/hook.ts
+index ac734304..e64ea58e 100644
+--- a/src/hooks/session-recovery/hook.ts
++++ b/src/hooks/session-recovery/hook.ts
+@@ -4,6 +4,7 @@ import { log } from "../../shared/logger"
+ import { detectErrorType } from "./detect-error-type"
+ import type { RecoveryErrorType } from "./detect-error-type"
+ import type { MessageData } from "./types"
++import { normalizeSDKResponse } from "../../shared"
+ import { recoverToolResultMissing } from "./recover-tool-result-missing"
+ import { recoverUnavailableTool } from "./recover-unavailable-tool"
+ import { recoverThinkingBlockOrder } from "./recover-thinking-block-order"
+@@ -24,6 +25,7 @@ export interface SessionRecoveryOptions {
+ 
+ export interface SessionRecoveryHook {
+   handleSessionRecovery: (info: MessageInfo) => Promise<boolean>
++  handleInterruptedToolResultsOnIdle: (sessionID: string) => Promise<boolean>
+   isRecoverableError: (error: unknown) => boolean
+   setOnAbortCallback: (callback: (sessionID: string) => void) => void
+   setOnRecoveryCompleteCallback: (callback: (sessionID: string) => void) => void
+@@ -31,6 +33,7 @@ export interface SessionRecoveryHook {
+ 
+ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRecoveryOptions): SessionRecoveryHook {
+   const processingErrors = new Set<string>()
++  const processingInterruptedToolMessages = new Set<string>()
+   const experimental = options?.experimental
+   let onAbortCallback: ((sessionID: string) => void) | null = null
+   let onRecoveryCompleteCallback: ((sessionID: string) => void) | null = null
+@@ -47,6 +50,96 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
+     return detectErrorType(error) !== null
+   }
+ 
++  const assistantMessageIsFinished = (message: MessageData): boolean => {
++    if (message.info?.error) {
++      return true
++    }
++
++    const finish = message.info?.finish
++    if ((typeof finish === "string" && finish.length > 0) || finish === true) {
++      return true
++    }
++
++    const completed = message.info?.time?.completed
++    if (typeof completed === "number" && Number.isFinite(completed)) {
++      return true
++    }
++    return typeof completed === "string" && completed.length > 0
++  }
++
++  const messageHasInterruptedToolResults = (message: MessageData): boolean => {
++    return message.parts?.some((part) =>
++      (part.type === "tool" || part.type === "tool_use")
++      && (part.state?.status === "pending" || part.state?.status === "running")
++      && typeof (part.callID ?? part.id) === "string"
++      && /^(toolu_|call_)/.test(part.callID ?? part.id ?? "")
++    ) === true
++  }
++
++  const findLatestAssistantMessage = (messages: MessageData[]): MessageData | undefined => {
++    for (let index = messages.length - 1; index >= 0; index--) {
++      const message = messages[index]
++      if (message?.info?.role === "assistant") {
++        return message
++      }
++    }
++    return undefined
++  }
++
++  const handleInterruptedToolResultsOnIdle = async (sessionID: string): Promise<boolean> => {
++    let recoveryStarted = false
++    let assistantMessageIDForRecovery: string | undefined
++    try {
++      const messagesResp = await ctx.client.session.messages({
++        path: { id: sessionID },
++        query: { directory: ctx.directory },
++      })
++      const messages = normalizeSDKResponse(messagesResp, [] as MessageData[])
++      const latestAssistant = findLatestAssistantMessage(messages)
++      if (!latestAssistant?.info?.id) {
++        return false
++      }
++
++      if (assistantMessageIsFinished(latestAssistant) || !messageHasInterruptedToolResults(latestAssistant)) {
++        return false
++      }
++
++      const assistantMessageID = latestAssistant.info.id
++      if (processingInterruptedToolMessages.has(assistantMessageID)) {
++        return false
++      }
++      processingInterruptedToolMessages.add(assistantMessageID)
++      assistantMessageIDForRecovery = assistantMessageID
++
++      if (onAbortCallback) {
++        onAbortCallback(sessionID)
++      }
++      recoveryStarted = true
++
++      const lastUser = findLastUserMessage(messages)
++      const resumeConfig = extractResumeConfig(lastUser, sessionID)
++      const success = await recoverToolResultMissing(ctx.client, sessionID, latestAssistant, resumeConfig, {
++        recoverStatuses: new Set(["pending", "running"]),
++        resultText: "Tool execution was interrupted before producing a result.",
++        source: "session-recovery-interrupted-tool-results",
++      })
++      if (!success) {
++        processingInterruptedToolMessages.delete(assistantMessageID)
++      }
++      return success
++    } catch (err) {
++      if (assistantMessageIDForRecovery) {
++        processingInterruptedToolMessages.delete(assistantMessageIDForRecovery)
++      }
++      log("[session-recovery] Interrupted tool result recovery failed:", { sessionID, error: err })
++      return false
++    } finally {
++      if (recoveryStarted && onRecoveryCompleteCallback) {
++        onRecoveryCompleteCallback(sessionID)
++      }
++    }
++  }
++
+   const handleSessionRecovery = async (info: MessageInfo): Promise<boolean> => {
+     if (!info || info.role !== "assistant" || !info.error) return false
+ 
+@@ -175,6 +268,7 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
+ 
+   return {
+     handleSessionRecovery,
++    handleInterruptedToolResultsOnIdle,
+     isRecoverableError,
+     setOnAbortCallback,
+     setOnRecoveryCompleteCallback,
+diff --git a/src/hooks/session-recovery/recover-tool-result-missing.test.ts b/src/hooks/session-recovery/recover-tool-result-missing.test.ts
+index add36d9a..18a7755b 100644
+--- a/src/hooks/session-recovery/recover-tool-result-missing.test.ts
++++ b/src/hooks/session-recovery/recover-tool-result-missing.test.ts
+@@ -9,8 +9,9 @@ mock.module("../../shared/opencode-storage-detection", () => ({
+   isSqliteBackend: () => sqliteBackend,
+ }))
+ 
+-mock.module("./storage", () => ({
++mock.module("./storage/parts-reader", () => ({
+   readParts: () => storedParts,
++  readPartsFromSDK: () => storedParts,
+ }))
+ 
+ const { recoverToolResultMissing } = await import("./recover-tool-result-missing")
+@@ -91,6 +92,60 @@ describe("recoverToolResultMissing", () => {
+     })
+   })
+ 
++  it("sends only interrupted sqlite tool results when recoverStatuses is provided", async () => {
++    //#given
++    sqliteBackend = true
++    const { client, promptAsync } = createMockClient([
++      {
++        info: { id: "msg_failed", role: "assistant" },
++        parts: [
++          {
++            type: "tool",
++            id: "prt_completed_call",
++            callID: "call_completed",
++            name: "bash",
++            input: {},
++            state: { status: "completed" },
++          },
++          {
++            type: "tool",
++            id: "prt_running_call",
++            callID: "call_running",
++            name: "bash",
++            input: {},
++            state: { status: "running" },
++          },
++          {
++            type: "tool",
++            id: "prt_pending_call",
++            callID: "toolu_pending",
++            name: "task",
++            input: {},
++            state: { status: "pending" },
++          },
++        ],
++      },
++    ])
++
++    //#when
++    const result = await recoverToolResultMissing(client, "ses_1", failedAssistantMsg, undefined, {
++      recoverStatuses: new Set(["pending", "running"]),
++      resultText: "Tool execution was interrupted before producing a result.",
++      source: "session-recovery-interrupted-tool-results",
++    })
++
++    //#then
++    expect(result).toBe(true)
++    expect(promptAsync).toHaveBeenCalledTimes(1)
++    const call = promptAsync.mock.calls[0]?.[0] as {
++      body: {
++        parts: Array<{ toolUseId: string; content: Array<{ text: string }> }>
++      }
++    }
++    expect(call.body.parts.map((part) => part.toolUseId)).toEqual(["call_running", "toolu_pending"])
++    expect(call.body.parts[0]?.content[0]?.text).toBe("Tool execution was interrupted before producing a result.")
++  })
++
+   it("returns false for stored parts when tool part has no valid callID", async () => {
+     //#given
+     storedParts = [{ type: "tool", id: "prt_stored_missing_call", tool: "bash", state: { input: {} } }]
+diff --git a/src/hooks/session-recovery/recover-tool-result-missing.ts b/src/hooks/session-recovery/recover-tool-result-missing.ts
+index b01c926e..40e923b8 100644
+--- a/src/hooks/session-recovery/recover-tool-result-missing.ts
++++ b/src/hooks/session-recovery/recover-tool-result-missing.ts
+@@ -1,6 +1,6 @@
+ import type { createOpencodeClient } from "@opencode-ai/sdk"
+ import type { MessageData, ResumeConfig } from "./types"
+-import { readParts } from "./storage"
++import { readParts } from "./storage/parts-reader"
+ import { isSqliteBackend } from "../../shared/opencode-storage-detection"
+ import { normalizeSDKResponse } from "../../shared"
+ import { promptAsyncAfterSessionIdle } from "../shared/prompt-async-gate"
+@@ -21,6 +21,12 @@ type ClientWithPromptAsync = {
+   }
+ }
+ 
++export type RecoverToolResultMissingOptions = {
++  recoverStatuses?: ReadonlySet<string>
++  resultText?: string
++  source?: string
++}
++
+ function hasPromptAsync(client: Client): client is Client & ClientWithPromptAsync {
+   return "promptAsync" in client.session && typeof client.session.promptAsync === "function"
+ }
+@@ -36,21 +42,26 @@ interface ToolUsePart {
+ interface MessagePart {
+   type: string
+   id?: string
++  state?: {
++    status?: unknown
++  }
+ }
+ 
+ function isValidToolUseID(id: string | undefined): id is string {
+   return typeof id === "string" && /^(toolu_|call_)/.test(id)
+ }
+ 
+-function normalizeMessagePart(part: { type: string; id?: string; callID?: string }): MessagePart | null {
++function normalizeMessagePart(part: { type: string; id?: string; callID?: string; state?: { status?: unknown } }): MessagePart | null {
+   if (part.type === "tool" || part.type === "tool_use") {
+-    if (!isValidToolUseID(part.callID)) {
++    const toolUseID = part.callID ?? part.id
++    if (!isValidToolUseID(toolUseID)) {
+       return null
+     }
+ 
+     return {
+       type: "tool_use",
+-      id: part.callID,
++      id: toolUseID,
++      state: part.state,
+     }
+   }
+ 
+@@ -60,8 +71,21 @@ function normalizeMessagePart(part: { type: string; id?: string; callID?: string
+   }
+ }
+ 
+-function extractToolUseIds(parts: MessagePart[]): string[] {
+-  return parts.filter((part): part is ToolUsePart => part.type === "tool_use" && isValidToolUseID(part.id)).map((part) => part.id)
++function shouldRecoverToolUsePart(part: MessagePart, recoverStatuses: ReadonlySet<string> | undefined): boolean {
++  if (part.type !== "tool_use" || !isValidToolUseID(part.id)) {
++    return false
++  }
++  if (!recoverStatuses) {
++    return true
++  }
++  const status = part.state?.status
++  return typeof status === "string" && recoverStatuses.has(status)
++}
++
++function extractToolUseIds(parts: MessagePart[], recoverStatuses?: ReadonlySet<string>): string[] {
++  return parts
++    .filter((part): part is ToolUsePart => shouldRecoverToolUsePart(part, recoverStatuses))
++    .map((part) => part.id)
+ }
+ 
+ async function readPartsFromSDKFallback(
+@@ -85,9 +109,12 @@ export async function recoverToolResultMissing(
+   client: Client,
+   sessionID: string,
+   failedAssistantMsg: MessageData,
+-  resumeConfig?: ResumeConfig
++  resumeConfig?: ResumeConfig,
++  options?: RecoverToolResultMissingOptions,
+ ): Promise<boolean> {
+-  let parts = failedAssistantMsg.parts || []
++  let parts = (failedAssistantMsg.parts || [])
++    .map((part) => normalizeMessagePart(part))
++    .filter((part): part is MessagePart => part !== null)
+   if (parts.length === 0 && failedAssistantMsg.info?.id) {
+     if (isSqliteBackend()) {
+       parts = await readPartsFromSDKFallback(client, sessionID, failedAssistantMsg.info.id)
+@@ -97,17 +124,18 @@ export async function recoverToolResultMissing(
+     }
+   }
+ 
+-  const toolUseIds = extractToolUseIds(parts)
++  const toolUseIds = extractToolUseIds(parts, options?.recoverStatuses)
+   if (toolUseIds.length === 0) {
+     return false
+   }
++  const resultText = options?.resultText ?? "Operation cancelled by user (ESC pressed)"
+ 
+   const toolResultParts = toolUseIds.map((id) => ({
+     type: "tool_result" as const,
+     toolUseId: id,
+     tool_use_id: id,
+     isError: true,
+-    content: [{ type: "text" as const, text: "Operation cancelled by user (ESC pressed)" }],
++    content: [{ type: "text" as const, text: resultText }],
+   }))
+ 
+   const launchAgent = resumeConfig?.agent
+@@ -134,7 +162,7 @@ export async function recoverToolResultMissing(
+     const promptResult = await promptAsyncAfterSessionIdle({
+       client,
+       sessionID,
+-      source: "session-recovery-tool-result-missing",
++      source: options?.source ?? "session-recovery-tool-result-missing",
+       input: promptInput,
+     })
+ 
+diff --git a/src/hooks/session-recovery/types.ts b/src/hooks/session-recovery/types.ts
+index 6b4714b3..ebd137f4 100644
+--- a/src/hooks/session-recovery/types.ts
++++ b/src/hooks/session-recovery/types.ts
+@@ -69,6 +69,11 @@ export interface MessageData {
+     sessionID?: string
+     parentID?: string
+     error?: unknown
++    finish?: unknown
++    time?: {
++      created?: unknown
++      completed?: unknown
++    }
+     agent?: string
+     model?: {
+       providerID: string
+@@ -87,6 +92,12 @@ export interface MessageData {
+     name?: string
+     input?: Record<string, unknown>
+     callID?: string
++    state?: {
++      status?: unknown
++      input?: Record<string, unknown>
++      output?: unknown
++      error?: unknown
++    }
+   }>
+ }
+ 
+diff --git a/src/plugin/event.test.ts b/src/plugin/event.test.ts
+index a2a12189..d063a69c 100644
+--- a/src/plugin/event.test.ts
++++ b/src/plugin/event.test.ts
+@@ -373,6 +373,41 @@ describe("createEventHandler - idle deduplication", () => {
+ 		expect((dispatchCalls[1]?.event.properties as { sessionID?: string } | undefined)?.sessionID).toBe(sessionId)
+ 	})
+ 
++	it("#given idle recovery handles an interrupted tool turn #when session.idle arrives #then later idle hooks are skipped for that event", async () => {
++		const callOrder: string[] = []
++		const eventHandler = createEventHandler({
++			ctx: asEventHandlerContext({ directory: "/tmp" }),
++			pluginConfig: asPluginConfig({}),
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: createEventHandlerManagers(),
++			hooks: createEventHandlerHooks({
++				sessionRecovery: {
++					handleInterruptedToolResultsOnIdle: async () => {
++						callOrder.push("sessionRecovery")
++						return true
++					},
++				},
++				todoContinuationEnforcer: {
++					handler: async () => {
++						callOrder.push("todoContinuationEnforcer")
++					},
++				},
++			}),
++		})
++
++		await eventHandler(asEventHandlerInput({
++			event: {
++				type: "session.idle",
++				properties: { sessionID: "ses_interrupted_idle" },
++			},
++		}))
++
++		expect(callOrder).toEqual(["sessionRecovery"])
++	})
++
+ 	it("keeps other session dedup state untouched when bypassing synthetic-idle for current session", async () => {
+ 		//#given
+ 		const originalDateNow = Date.now
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 89f6fb66..a2d0dd0a 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -571,6 +571,16 @@ export function createEventHandler(args: {
+       }
+     }
+ 
++    if (input.event.type === "session.idle") {
++      const sessionID = getEventSessionID(input);
++      if (sessionID && hooks.sessionRecovery?.handleInterruptedToolResultsOnIdle) {
++        const recovered = await hooks.sessionRecovery.handleInterruptedToolResultsOnIdle(sessionID);
++        if (recovered) {
++          return;
++        }
++      }
++    }
++
+     await dispatchToHooks(input);
+ 
+     const syntheticIdle = normalizeSessionStatusToIdle(input);
+-- 
+2.39.2
+

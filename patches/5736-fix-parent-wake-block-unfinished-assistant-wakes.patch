@@ -1,0 +1,268 @@
+From 3d0b4c4aac0e6ac4f281d7965821a7bea1de76e7 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 24 May 2026 19:02:13 +0900
+Subject: [PATCH 5736/5749] fix(parent-wake): block unfinished assistant wakes
+
+---
+ .../parent-wake-assistant-blocking.test.ts    | 153 ++++++++++++++++++
+ .../background-agent/parent-wake-notifier.ts  |  22 ++-
+ .../prompt-async-gate/pending-tool-turn.ts    |   2 +-
+ 3 files changed, 170 insertions(+), 7 deletions(-)
+ create mode 100644 src/features/background-agent/parent-wake-assistant-blocking.test.ts
+
+diff --git a/src/features/background-agent/parent-wake-assistant-blocking.test.ts b/src/features/background-agent/parent-wake-assistant-blocking.test.ts
+new file mode 100644
+index 00000000..8651eef7
+--- /dev/null
++++ b/src/features/background-agent/parent-wake-assistant-blocking.test.ts
+@@ -0,0 +1,153 @@
++import { describe, expect, test } from "bun:test"
++import { releaseAllPromptAsyncReservationsForTesting } from "../../hooks/shared/prompt-async-gate"
++import { ParentWakeNotifier } from "./parent-wake-notifier"
++
++type PromptAsyncCall = {
++  path: { id: string }
++  body: {
++    noReply?: boolean
++    agent?: string
++    parts?: unknown[]
++  }
++  query?: {
++    directory: string
++  }
++}
++type ParentWakeClient = ConstructorParameters<typeof ParentWakeNotifier>[0]["client"]
++
++describe("ParentWakeNotifier — assistant turn blocking", () => {
++  test("#given stale unfinished assistant text turn blocks the parent #when flushing pending wake #then stale tool escape does not dispatch", async () => {
++    // given
++    const originalDateNow = Date.now
++    Date.now = () => 100_000
++    const promptAsyncCalls: PromptAsyncCall[] = []
++    const client: ParentWakeClient = {
++      session: {
++        messages: async () => ({
++          data: [
++            {
++              info: {
++                role: "assistant",
++                finish: "unknown",
++                time: { created: 90_000 },
++              },
++              parts: [{ type: "reasoning", text: "still streaming" }],
++            },
++          ],
++        }),
++        status: async () => ({ data: { "parent-unfinished-text": { type: "idle" } } }),
++        promptAsync: async (call: PromptAsyncCall) => {
++          promptAsyncCalls.push(call)
++          return { data: {} }
++        },
++      },
++    }
++    const notifier = new ParentWakeNotifier(
++      {
++        client,
++        directory: "/tmp/test-omo",
++        enqueueNotificationForParent: async (_sessionID, operation) => {
++          await operation()
++        },
++      },
++      {
++        pendingRetryMs: 1_000,
++        acceptedMessageSkewMs: 5_000,
++        toolCallDeferMaxMs: 5_000,
++        failureRequeueWindowMs: 5_000,
++        userMessageInProgressWindowMs: 2_000,
++      },
++    )
++    notifier.queuePendingParentWake(
++      "parent-unfinished-text",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++    const pendingWake = notifier.getPendingParentWakes().get("parent-unfinished-text")
++    expect(pendingWake).toBeDefined()
++    if (!pendingWake) {
++      throw new Error("Missing pending parent wake")
++    }
++    pendingWake.toolCallDeferralStartedAt = 90_000
++
++    try {
++      // when
++      await notifier.flushPendingParentWake("parent-unfinished-text")
++
++      // then
++      expect(promptAsyncCalls).toHaveLength(0)
++      expect(notifier.getPendingParentWakes().has("parent-unfinished-text")).toBe(true)
++    } finally {
++      Date.now = originalDateNow
++      notifier.shutdown()
++      releaseAllPromptAsyncReservationsForTesting()
++    }
++  })
++
++  test("#given notifier sees an unfinished assistant but prompt gate message fetch fails #when flushing pending wake #then the wake stays pending", async () => {
++    // given
++    const promptAsyncCalls: PromptAsyncCall[] = []
++    let messageReads = 0
++    const client: ParentWakeClient = {
++      session: {
++        messages: async () => {
++          messageReads += 1
++          if (messageReads > 1) {
++            throw new Error("message fetch failed")
++          }
++          return {
++            data: [
++              {
++                info: {
++                  role: "assistant",
++                  finish: "unknown",
++                  time: { created: Date.now() - 1_000 },
++                },
++                parts: [{ type: "reasoning", text: "still streaming" }],
++              },
++            ],
++          }
++        },
++        status: async () => ({ data: { "parent-local-unknown": { type: "idle" } } }),
++        promptAsync: async (call: PromptAsyncCall) => {
++          promptAsyncCalls.push(call)
++          return { data: {} }
++        },
++      },
++    }
++    const notifier = new ParentWakeNotifier(
++      {
++        client,
++        directory: "/tmp/test-omo",
++        enqueueNotificationForParent: async (_sessionID, operation) => {
++          await operation()
++        },
++      },
++      {
++        pendingRetryMs: 1_000,
++        acceptedMessageSkewMs: 5_000,
++        toolCallDeferMaxMs: 5_000,
++        failureRequeueWindowMs: 5_000,
++        userMessageInProgressWindowMs: 2_000,
++      },
++    )
++    notifier.queuePendingParentWake(
++      "parent-local-unknown",
++      "task complete",
++      { agent: "sisyphus" },
++      true,
++    )
++
++    // when
++    await notifier.flushPendingParentWake("parent-local-unknown")
++
++    // then
++    expect(promptAsyncCalls).toHaveLength(0)
++    expect(notifier.getPendingParentWakes().has("parent-local-unknown")).toBe(true)
++    expect(messageReads).toBe(1)
++
++    notifier.shutdown()
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++})
+diff --git a/src/features/background-agent/parent-wake-notifier.ts b/src/features/background-agent/parent-wake-notifier.ts
+index 0eefcff9..2cf97b41 100644
+--- a/src/features/background-agent/parent-wake-notifier.ts
++++ b/src/features/background-agent/parent-wake-notifier.ts
+@@ -3,11 +3,12 @@ import {
+   isAmbiguousPostDispatchPromptFailure,
+   isSyntheticOrInternalUserMessage,
+   log,
+-  messagesInDirectory,
+   normalizeSDKResponse,
+ } from "../../shared"
+ import { isSessionActive as isOpenCodeSessionActive, settleAfterSessionIdle } from "../../hooks/shared/session-idle-settle"
+ import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../hooks/shared/prompt-async-gate"
++import type { PromptDispatchClient } from "../../shared/prompt-async-gate/types"
++import { latestAssistantTurnBlocksInternalPrompt } from "../../shared/prompt-async-gate/pending-tool-turn"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import {
+   cloneParentWake,
+@@ -18,6 +19,12 @@ import {
+ } from "./parent-wake-dedupe"
+ 
+ type OpencodeClient = PluginInput["client"]
++type ParentWakeNotifierClient = PromptDispatchClient & {
++  readonly session: NonNullable<PromptDispatchClient["session"]> & {
++    readonly messages: OpencodeClient["session"]["messages"]
++    readonly promptAsync: OpencodeClient["session"]["promptAsync"]
++  }
++}
+ 
+ export type { ParentWakePromptContext, PendingParentWake } from "./parent-wake-dedupe"
+ 
+@@ -42,7 +49,7 @@ type ParentWakeSessionMessage = {
+ }
+ 
+ type ParentWakeNotifierDeps = {
+-  client: OpencodeClient
++  client: ParentWakeNotifierClient
+   directory: string
+   enqueueNotificationForParent: (parentSessionID: string | undefined, operation: () => Promise<void>) => Promise<void>
+ }
+@@ -385,9 +392,10 @@ export class ParentWakeNotifier {
+ 
+   private async loadParentWakeSessionMessages(sessionID: string): Promise<ParentWakeSessionMessage[]> {
+     try {
+-      const messagesResp = await messagesInDirectory(this.deps.client, {
++      const messagesResp = await this.deps.client.session.messages({
+         path: { id: sessionID },
+-      }, this.deps.directory)
++        query: { directory: this.deps.directory },
++      })
+       return normalizeSDKResponse(messagesResp, [] as ParentWakeSessionMessage[])
+     } catch (error) {
+       log("[background-agent] Failed to inspect parent session messages for wake safety:", {
+@@ -541,8 +549,9 @@ export class ParentWakeNotifier {
+     wake: PendingParentWake,
+   ): Promise<ToolWaitDeferralDecision> {
+     const messages = await this.loadParentWakeSessionMessages(sessionID)
++    const latestAssistantBlocksPrompt = latestAssistantTurnBlocksInternalPrompt(messages)
+     const toolWaitState = this.latestAssistantToolWaitState(messages)
+-    if (!toolWaitState.waiting) {
++    if (!latestAssistantBlocksPrompt) {
+       delete wake.toolCallDeferralStartedAt
+       return { defer: false, skipPromptGateToolStateCheck: false }
+     }
+@@ -553,6 +562,7 @@ export class ParentWakeNotifier {
+       : now - toolWaitState.createdAt
+     if (
+       wake.shouldReply
++      && toolWaitState.waiting
+       && now - wake.toolCallDeferralStartedAt >= this.options.toolCallDeferMaxMs
+       && latestToolWaitAgeMs >= this.options.toolCallDeferMaxMs
+     ) {
+@@ -561,7 +571,7 @@ export class ParentWakeNotifier {
+       })
+       return { defer: false, skipPromptGateToolStateCheck: true }
+     }
+-    log("[background-agent] Deferred parent wake because latest assistant turn is waiting on tool results:", {
++    log("[background-agent] Deferred parent wake because latest assistant turn blocks internal prompts:", {
+       sessionID,
+     })
+     return { defer: true, skipPromptGateToolStateCheck: false }
+diff --git a/src/shared/prompt-async-gate/pending-tool-turn.ts b/src/shared/prompt-async-gate/pending-tool-turn.ts
+index ddc36853..6d1d007b 100644
+--- a/src/shared/prompt-async-gate/pending-tool-turn.ts
++++ b/src/shared/prompt-async-gate/pending-tool-turn.ts
+@@ -141,7 +141,7 @@ function partIsWaitingOnTool(part: unknown): boolean {
+   return state.status === "pending" || state.status === "running"
+ }
+ 
+-function latestAssistantTurnBlocksInternalPrompt(messages: unknown[]): boolean {
++export function latestAssistantTurnBlocksInternalPrompt(messages: unknown[]): boolean {
+   for (let index = messages.length - 1; index >= 0; index--) {
+     const message = messages[index]
+     const role = messageRole(message)
+-- 
+2.39.2
+

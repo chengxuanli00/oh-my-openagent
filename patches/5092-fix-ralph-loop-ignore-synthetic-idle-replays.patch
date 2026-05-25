@@ -1,0 +1,230 @@
+From 9ffef79dbbf37d0e297ac623d74087a940237ed2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 12 May 2026 15:28:46 +0900
+Subject: [PATCH 5092/5749] fix(ralph-loop): ignore synthetic idle replays
+
+---
+ .../completion-promise-detector.test.ts       | 23 ++++++++
+ .../ralph-loop/completion-promise-detector.ts |  4 +-
+ src/hooks/ralph-loop/index.test.ts            | 58 ++++++++++++++++++-
+ .../ralph-loop/ralph-loop-event-handler.ts    | 20 +++++++
+ src/plugin/session-status-normalizer.test.ts  |  1 +
+ src/plugin/session-status-normalizer.ts       |  2 +-
+ 6 files changed, 104 insertions(+), 4 deletions(-)
+
+diff --git a/src/hooks/ralph-loop/completion-promise-detector.test.ts b/src/hooks/ralph-loop/completion-promise-detector.test.ts
+index 81468406..d59151a7 100644
+--- a/src/hooks/ralph-loop/completion-promise-detector.test.ts
++++ b/src/hooks/ralph-loop/completion-promise-detector.test.ts
+@@ -58,6 +58,29 @@ describe("detectCompletionInSessionMessages", () => {
+       // #then
+       expect(detected).toBe(true)
+     })
++
++    test("#when sinceMessageIndex equals current message count #then should NOT rescan old DONE", async () => {
++      // #given
++      const messages = [
++        {
++          info: { role: "assistant" },
++          parts: [{ type: "text", text: "Old completion <promise>DONE</promise>" }],
++        },
++      ]
++      const ctx = createPluginInput(messages)
++
++      // #when
++      const detected = await detectCompletionInSessionMessages(ctx, {
++        sessionID: "session-123",
++        promise: "DONE",
++        apiTimeoutMs: 1000,
++        directory: "/tmp",
++        sinceMessageIndex: messages.length,
++      })
++
++      // #then
++      expect(detected).toBe(false)
++    })
+   })
+ 
+   describe("#given no sinceMessageIndex (backward compat)", () => {
+diff --git a/src/hooks/ralph-loop/completion-promise-detector.ts b/src/hooks/ralph-loop/completion-promise-detector.ts
+index 65718e67..6c915a2c 100644
+--- a/src/hooks/ralph-loop/completion-promise-detector.ts
++++ b/src/hooks/ralph-loop/completion-promise-detector.ts
+@@ -130,8 +130,8 @@ export async function detectCompletionInSessionMessages(
+ 				: []
+ 
+ 		const scopedMessages =
+-			typeof options.sinceMessageIndex === "number" && options.sinceMessageIndex >= 0 && options.sinceMessageIndex < messageArray.length
+-				? messageArray.slice(options.sinceMessageIndex)
++			typeof options.sinceMessageIndex === "number" && options.sinceMessageIndex >= 0
++				? messageArray.slice(Math.min(options.sinceMessageIndex, messageArray.length))
+ 				: messageArray
+ 
+ 		const assistantMessages = (scopedMessages as OpenCodeSessionMessage[]).filter((msg) => msg.info?.role === "assistant")
+diff --git a/src/hooks/ralph-loop/index.test.ts b/src/hooks/ralph-loop/index.test.ts
+index 17236347..d131744b 100644
+--- a/src/hooks/ralph-loop/index.test.ts
++++ b/src/hooks/ralph-loop/index.test.ts
+@@ -288,7 +288,7 @@ describe("ralph-loop", () => {
+       await hook.event({
+         event: {
+           type: "session.idle",
+-          properties: { sessionID: "session-123" },
++          properties: { sessionID: "session-123", synthetic: true },
+         },
+       })
+ 
+@@ -304,6 +304,62 @@ describe("ralph-loop", () => {
+       expect(state?.iteration).toBe(2)
+     })
+ 
++    test("#given synthetic and real idle arrive back-to-back #then only one continuation is injected for the same iteration", async () => {
++      // given
++      const hook = createRalphLoopHook(createMockPluginInput(), { idleSettleMs: 0 })
++      hook.startLoop("session-123", "Build a feature", { maxIterations: 10 })
++
++      // when
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "session-123", synthetic: true },
++        },
++      })
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "session-123" },
++        },
++      })
++
++      // then
++      expect(promptCalls.length).toBe(1)
++      expect(promptCalls[0].sessionID).toBe("session-123")
++      expect(hook.getState()?.iteration).toBe(2)
++    })
++
++    test("#given new activity after an idle continuation #when session idles again #then next iteration can continue", async () => {
++      // given
++      const hook = createRalphLoopHook(createMockPluginInput(), { idleSettleMs: 0 })
++      hook.startLoop("session-123", "Build a feature", { maxIterations: 10 })
++
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "session-123" },
++        },
++      })
++
++      // when
++      await hook.event({
++        event: {
++          type: "message.part.updated",
++          properties: { sessionID: "session-123" },
++        },
++      })
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "session-123" },
++        },
++      })
++
++      // then
++      expect(promptCalls.length).toBe(2)
++      expect(hook.getState()?.iteration).toBe(3)
++    })
++
+     test("should inject continuation when idle event carries session id in info", async () => {
+       // given - active loop state and nested session event shape
+       const hook = createRalphLoopHook(createMockPluginInput())
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index c64cf2ef..ddbef7fe 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -12,6 +12,8 @@ import { continueIteration } from "./iteration-continuation"
+ import { handlePendingVerification } from "./pending-verification-handler"
+ import { handleDeletedLoopSession, handleErroredLoopSession } from "./session-event-handler"
+ 
++const RAPID_IDLE_DEDUP_MS = 500
++
+ type LoopStateController = {
+ 	getState: () => RalphLoopState | null
+ 	clear: () => boolean
+@@ -62,6 +64,10 @@ function getRuntimeRetryActivitySessionID(
+ 	return undefined
+ }
+ 
++function isSyntheticIdle(props: Record<string, unknown> | undefined): boolean {
++	return props?.synthetic === true
++}
++
+ function isAbortError(error: unknown): boolean {
+ 	return typeof error === "object"
+ 		&& error !== null
+@@ -183,17 +189,20 @@ export function createRalphLoopEventHandler(
+ ) {
+ 	const inFlightSessions = new Set<string>()
+ 	const runtimeErrorRetriedSessions = new Map<string, number>()
++	const recentHandledSyntheticIdleAt = new Map<string, number>()
+ 
+ 	return async ({ event }: { event: { type: string; properties?: unknown } }): Promise<void> => {
+ 		const props = event.properties as Record<string, unknown> | undefined
+ 		const runtimeRetryActivitySessionID = getRuntimeRetryActivitySessionID(event.type, props)
+ 		if (runtimeRetryActivitySessionID) {
+ 			runtimeErrorRetriedSessions.delete(runtimeRetryActivitySessionID)
++			recentHandledSyntheticIdleAt.delete(runtimeRetryActivitySessionID)
+ 		}
+ 
+ 		if (event.type === "session.idle") {
+ 			const sessionID = resolveSessionEventID(props)
+ 			if (!sessionID) return
++			const syntheticIdle = isSyntheticIdle(props)
+ 
+ 			if (inFlightSessions.has(sessionID)) {
+ 				log(`[${HOOK_NAME}] Skipped: handler in flight`, { sessionID })
+@@ -241,6 +250,17 @@ export function createRalphLoopEventHandler(
+ 					return
+ 				}
+ 
++				const lastHandledSyntheticIdleAt = recentHandledSyntheticIdleAt.get(sessionID)
++				const now = Date.now()
++				if (!syntheticIdle && lastHandledSyntheticIdleAt !== undefined && now - lastHandledSyntheticIdleAt < RAPID_IDLE_DEDUP_MS) {
++					recentHandledSyntheticIdleAt.delete(sessionID)
++					log(`[${HOOK_NAME}] Skipped: duplicate real idle after synthetic idle`, { sessionID })
++					return
++				}
++				if (syntheticIdle) {
++					recentHandledSyntheticIdleAt.set(sessionID, now)
++				}
++
+ 				if (await handleCompletionIfDetected(ctx, options, {
+ 					sessionID,
+ 					state,
+diff --git a/src/plugin/session-status-normalizer.test.ts b/src/plugin/session-status-normalizer.test.ts
+index cfb99ec6..043a85ce 100644
+--- a/src/plugin/session-status-normalizer.test.ts
++++ b/src/plugin/session-status-normalizer.test.ts
+@@ -25,6 +25,7 @@ describe("normalizeSessionStatusToIdle", () => {
+ 				type: "session.idle",
+ 				properties: {
+ 					sessionID: "ses_abc123",
++					synthetic: true,
+ 				},
+ 			},
+ 		})
+diff --git a/src/plugin/session-status-normalizer.ts b/src/plugin/session-status-normalizer.ts
+index 6089bf5c..79c3bdb8 100644
+--- a/src/plugin/session-status-normalizer.ts
++++ b/src/plugin/session-status-normalizer.ts
+@@ -18,7 +18,7 @@ export function normalizeSessionStatusToIdle(input: EventInput): EventInput | nu
+ 	return {
+ 		event: {
+ 			type: "session.idle",
+-			properties: { sessionID },
++			properties: { sessionID, synthetic: true },
+ 		},
+ 	}
+ }
+-- 
+2.39.2
+

@@ -1,0 +1,271 @@
+From 38462aa9d2557e13c847c62f417f76b72f2805c4 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 19 May 2026 13:48:39 +0900
+Subject: [PATCH 5503/5749] fix(recovery): avoid duplicate continuation prompts
+
+---
+ .../recovery.test.ts                          | 58 ++++++++++++-
+ .../compaction-context-injector/recovery.ts   |  7 +-
+ src/hooks/session-recovery/hook.test.ts       | 82 ++++++++++++++++++-
+ src/hooks/session-recovery/hook.ts            | 15 ++--
+ 4 files changed, 147 insertions(+), 15 deletions(-)
+
+diff --git a/src/hooks/compaction-context-injector/recovery.test.ts b/src/hooks/compaction-context-injector/recovery.test.ts
+index 0119fdfd..49cabe4b 100644
+--- a/src/hooks/compaction-context-injector/recovery.test.ts
++++ b/src/hooks/compaction-context-injector/recovery.test.ts
+@@ -196,7 +196,7 @@ describe("createCompactionContextInjector recovery", () => {
+     expect(recoveryPart?.metadata).toEqual({ compaction_continue: true })
+   })
+ 
+-  it("retries recovery when the recovered prompt config still mismatches expected model or tools", async () => {
++  it("does not immediately retry recovery when the recovered prompt config still mismatches expected model or tools", async () => {
+     //#given
+     const promptAsyncRecorder = createPromptAsyncRecorder()
+     const mismatchResponse = [
+@@ -247,7 +247,61 @@ describe("createCompactionContextInjector recovery", () => {
+     })
+ 
+     //#then
+-    expect(promptAsyncRecorder.calls.length).toBe(2)
++    expect(promptAsyncRecorder.calls.length).toBe(1)
++  })
++
++  it("#given post-dispatch config read is stale #when a second compaction event arrives immediately #then recovery prompt is not duplicated", async () => {
++    //#given
++    const promptAsyncRecorder = createPromptAsyncRecorder()
++    const checkpointedPromptConfig = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-5" },
++          tools: { bash: true },
++        },
++      },
++    ]
++    const incompletePromptConfig = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-5" },
++        },
++      },
++    ]
++    const ctx = createMockContext(
++      [
++        checkpointedPromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++        incompletePromptConfig,
++      ],
++      promptAsyncRecorder.promptAsync,
++    )
++    const injector = createCompactionContextInjector({ ctx })
++
++    //#when
++    await injector.capture("ses_stale_recovery_read")
++    await injector.event({
++      event: {
++        type: "session.compacted",
++        properties: { sessionID: "ses_stale_recovery_read" },
++      },
++    })
++    await injector.event({
++      event: {
++        type: "session.compacted",
++        properties: { sessionID: "ses_stale_recovery_read" },
++      },
++    })
++
++    //#then
++    expect(promptAsyncRecorder.calls.length).toBe(1)
+   })
+ 
+   it("does not treat reasoning-only assistant messages as a no-text tail", async () => {
+diff --git a/src/hooks/compaction-context-injector/recovery.ts b/src/hooks/compaction-context-injector/recovery.ts
+index e0cb37c1..e73a1158 100644
+--- a/src/hooks/compaction-context-injector/recovery.ts
++++ b/src/hooks/compaction-context-injector/recovery.ts
+@@ -21,7 +21,7 @@ import {
+ import { AGENT_RECOVERY_PROMPT, NO_TEXT_TAIL_THRESHOLD, RECOVERY_COOLDOWN_MS, RECENT_COMPACTION_WINDOW_MS } from "./constants"
+ import type { CompactionContextClient } from "./types"
+ import type { TailMonitorState } from "./tail-monitor"
+-import { dispatchInternalPrompt, releasePromptAsyncReservation } from "../shared/prompt-async-gate"
++import { dispatchInternalPrompt } from "../shared/prompt-async-gate"
+ 
+ export function createRecoveryLogic(
+   ctx: CompactionContextClient | undefined,
+@@ -107,6 +107,7 @@ export function createRecoveryLogic(
+         })
+         return false
+       }
++      tailState.lastRecoveryAt = now
+ 
+       const recoveredPromptConfig = await resolveLatestSessionPromptConfig(ctx, sessionID)
+       if (!isPromptConfigRecovered(recoveredPromptConfig, expectedPromptConfig)) {
+@@ -118,9 +119,6 @@ export function createRecoveryLogic(
+           hasTools: !!tools,
+           recoveredPromptConfig,
+         })
+-        releasePromptAsyncReservation(sessionID, "compaction-context-injector:incomplete-recovery", {
+-          reservedBy: "compaction-context-injector",
+-        })
+         return false
+       }
+ 
+@@ -132,7 +130,6 @@ export function createRecoveryLogic(
+         setSessionTools(sessionID, tools)
+       }
+ 
+-      tailState.lastRecoveryAt = now
+       tailState.consecutiveNoTextMessages = 0
+ 
+       log(`[compaction-context-injector] Re-injected checkpointed agent config`, {
+diff --git a/src/hooks/session-recovery/hook.test.ts b/src/hooks/session-recovery/hook.test.ts
+index 89fa03d9..1b76047b 100644
+--- a/src/hooks/session-recovery/hook.test.ts
++++ b/src/hooks/session-recovery/hook.test.ts
+@@ -1,7 +1,7 @@
+ import { afterEach, describe, expect, test } from "bun:test"
+ import { createSessionRecoveryHook } from "./hook"
+ import { _setInterruptedIdleMessagesFetchTimeoutMsForTesting } from "./interrupted-idle-message-fetch-timeout"
+-import { releaseAllPromptAsyncReservationsForTesting } from "../../shared/prompt-async-gate"
++import { dispatchInternalPrompt, releaseAllPromptAsyncReservationsForTesting } from "../../shared/prompt-async-gate"
+ 
+ type RecoverableInfo = Parameters<ReturnType<typeof createSessionRecoveryHook>["handleSessionRecovery"]>[0]
+ 
+@@ -103,6 +103,86 @@ describe("session-recovery hook persistent dedupe", () => {
+     expect(result).toBe(false)
+     expect(counts.abort).toBe(1)
+   })
++
++  test("#given recovery is blocked by a peer prompt reservation #when the same error is observed after the reservation clears #then recovery retries once", async () => {
++    // given
++    const sessionID = "ses_recovery_gate_block"
++    const promptAsyncCalls: PromptAsyncCall[] = []
++    let releasePeerPrompt: (() => void) | undefined
++    const peerPrompt = new Promise<void>((resolve) => {
++      releasePeerPrompt = resolve
++    })
++    const peerReservation = dispatchInternalPrompt({
++      mode: "async",
++      client: {
++        session: {
++          promptAsync: async () => {
++            await peerPrompt
++          },
++        },
++      },
++      sessionID,
++      input: { path: { id: sessionID }, body: { parts: [{ type: "text", text: "peer" }] } },
++      source: "test:peer-recovery-blocker",
++      settleMs: 0,
++    })
++    await Promise.resolve()
++
++    const info: RecoverableInfo = {
++      id: "msg_tool_missing",
++      role: "assistant",
++      sessionID,
++      error: { message: "messages.2 has tool_use without a matching tool_result" },
++    }
++    const ctx = {
++      client: {
++        session: {
++          abort: async () => ({}),
++          messages: async () => ({
++            data: [
++              {
++                info: {
++                  id: info.id,
++                  role: "assistant",
++                  error: info.error,
++                },
++                parts: [
++                  {
++                    type: "tool_use",
++                    id: "toolu_recovery_gate",
++                    name: "bash",
++                    input: {},
++                    state: { status: "running" },
++                  },
++                ],
++              },
++            ],
++          }),
++          promptAsync: async (call: PromptAsyncCall) => {
++            promptAsyncCalls.push(call)
++            return {}
++          },
++        },
++        tui: {
++          showToast: async () => ({}),
++        },
++      },
++      directory: "/tmp/session-recovery-gate-test",
++    }
++    const hook = createSessionRecoveryHook(ctx as never)
++
++    // when
++    const firstResult = await hook.handleSessionRecovery(info)
++    releasePeerPrompt?.()
++    await peerReservation
++    releaseAllPromptAsyncReservationsForTesting()
++    const secondResult = await hook.handleSessionRecovery(info)
++
++    // then
++    expect(firstResult).toBe(false)
++    expect(secondResult).toBe(true)
++    expect(promptAsyncCalls).toHaveLength(1)
++  })
+ })
+ 
+ describe("session-recovery hook interrupted idle recovery", () => {
+diff --git a/src/hooks/session-recovery/hook.ts b/src/hooks/session-recovery/hook.ts
+index 9c9c69c0..d9521f4b 100644
+--- a/src/hooks/session-recovery/hook.ts
++++ b/src/hooks/session-recovery/hook.ts
+@@ -191,6 +191,7 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
+     if (!assistantMsgID) return false
+     if (processingErrors.has(assistantMsgID)) return false
+     processingErrors.add(assistantMsgID)
++    let shouldKeepProcessingError = false
+ 
+     try {
+       if (onAbortCallback) {
+@@ -268,21 +269,21 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
+           await resumeSession(ctx.client, resumeConfig)
+         }
+       } else if (errorType === "assistant_prefill_unsupported") {
++        shouldKeepProcessingError = true
+         success = false
+       }
+ 
++      if (success) {
++        shouldKeepProcessingError = true
++      }
+       return success
+     } catch (err) {
+       log("[session-recovery] Recovery failed:", err)
+       return false
+     } finally {
+-      // Keep assistantMsgID in processingErrors permanently so that a
+-      // stale duplicate session.error for the SAME assistant message
+-      // does not retrigger recovery (and a second resumeSession
+-      // promptAsync injection) after the first attempt resolves.
+-      // Successful recovery starts a new assistant message on the next
+-      // turn with a different id, so this dedupe never blocks future
+-      // legitimate errors.
++      if (!shouldKeepProcessingError) {
++        processingErrors.delete(assistantMsgID)
++      }
+       if (sessionID && onRecoveryCompleteCallback) {
+         onRecoveryCompleteCallback(sessionID)
+       }
+-- 
+2.39.2
+

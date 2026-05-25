@@ -1,0 +1,267 @@
+From c2f22cd6e5494cada998fae809b468c167e044bb Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 16 Feb 2026 15:00:41 +0900
+Subject: [PATCH 2171/5749] fix: apply cooldown on injection failure and cap
+ retries
+
+---
+ .../todo-continuation-enforcer/constants.ts   |   1 +
+ .../continuation-injection.ts                 |   3 +
+ .../todo-continuation-enforcer/idle-event.ts  |  20 ++-
+ .../session-state.ts                          |   4 +-
+ .../todo-continuation-enforcer.test.ts        | 131 +++++++++++++++++-
+ src/hooks/todo-continuation-enforcer/types.ts |   1 +
+ 6 files changed, 156 insertions(+), 4 deletions(-)
+
+diff --git a/src/hooks/todo-continuation-enforcer/constants.ts b/src/hooks/todo-continuation-enforcer/constants.ts
+index b57a8164..0731f2ed 100644
+--- a/src/hooks/todo-continuation-enforcer/constants.ts
++++ b/src/hooks/todo-continuation-enforcer/constants.ts
+@@ -18,3 +18,4 @@ export const COUNTDOWN_GRACE_PERIOD_MS = 500
+ 
+ export const ABORT_WINDOW_MS = 3000
+ export const CONTINUATION_COOLDOWN_MS = 30_000
++export const MAX_CONSECUTIVE_FAILURES = 5
+diff --git a/src/hooks/todo-continuation-enforcer/continuation-injection.ts b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+index 2c67fa78..0db4156f 100644
+--- a/src/hooks/todo-continuation-enforcer/continuation-injection.ts
++++ b/src/hooks/todo-continuation-enforcer/continuation-injection.ts
+@@ -141,11 +141,14 @@ ${todoList}`
+     if (injectionState) {
+       injectionState.inFlight = false
+       injectionState.lastInjectedAt = Date.now()
++      injectionState.consecutiveFailures = 0
+     }
+   } catch (error) {
+     log(`[${HOOK_NAME}] Injection failed`, { sessionID, error: String(error) })
+     if (injectionState) {
+       injectionState.inFlight = false
++      injectionState.lastInjectedAt = Date.now()
++      injectionState.consecutiveFailures += 1
+     }
+   }
+ }
+diff --git a/src/hooks/todo-continuation-enforcer/idle-event.ts b/src/hooks/todo-continuation-enforcer/idle-event.ts
+index 2bfb96bf..52218e41 100644
+--- a/src/hooks/todo-continuation-enforcer/idle-event.ts
++++ b/src/hooks/todo-continuation-enforcer/idle-event.ts
+@@ -9,6 +9,7 @@ import {
+   CONTINUATION_COOLDOWN_MS,
+   DEFAULT_SKIP_AGENTS,
+   HOOK_NAME,
++  MAX_CONSECUTIVE_FAILURES,
+ } from "./constants"
+ import { isLastAssistantMessageAborted } from "./abort-detection"
+ import { getIncompleteCount } from "./todo"
+@@ -99,8 +100,23 @@ export async function handleSessionIdle(args: {
+     return
+   }
+ 
+-  if (state.lastInjectedAt && Date.now() - state.lastInjectedAt < CONTINUATION_COOLDOWN_MS) {
+-    log(`[${HOOK_NAME}] Skipped: cooldown active`, { sessionID })
++  if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
++    log(`[${HOOK_NAME}] Skipped: max consecutive failures reached`, {
++      sessionID,
++      consecutiveFailures: state.consecutiveFailures,
++      maxConsecutiveFailures: MAX_CONSECUTIVE_FAILURES,
++    })
++    return
++  }
++
++  const effectiveCooldown =
++    CONTINUATION_COOLDOWN_MS * Math.pow(2, Math.min(state.consecutiveFailures, 5))
++  if (state.lastInjectedAt && Date.now() - state.lastInjectedAt < effectiveCooldown) {
++    log(`[${HOOK_NAME}] Skipped: cooldown active`, {
++      sessionID,
++      effectiveCooldown,
++      consecutiveFailures: state.consecutiveFailures,
++    })
+     return
+   }
+ 
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.ts b/src/hooks/todo-continuation-enforcer/session-state.ts
+index 16cbb782..a02a5e5a 100644
+--- a/src/hooks/todo-continuation-enforcer/session-state.ts
++++ b/src/hooks/todo-continuation-enforcer/session-state.ts
+@@ -45,7 +45,9 @@ export function createSessionStateStore(): SessionStateStore {
+       return existing.state
+     }
+ 
+-    const state: SessionState = {}
++    const state: SessionState = {
++      consecutiveFailures: 0,
++    }
+     sessions.set(sessionID, { state, lastAccessedAt: Date.now() })
+     return state
+   }
+diff --git a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+index 52343fb3..765556b6 100644
+--- a/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
++++ b/src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+ import type { BackgroundManager } from "../../features/background-agent"
+ import { setMainSession, subagentSessions, _resetForTesting } from "../../features/claude-code-session-state"
+ import { createTodoContinuationEnforcer } from "."
+-import { CONTINUATION_COOLDOWN_MS } from "./constants"
++import { CONTINUATION_COOLDOWN_MS, MAX_CONSECUTIVE_FAILURES } from "./constants"
+ 
+ type TimerCallback = (...args: any[]) => void
+ 
+@@ -164,6 +164,15 @@ describe("todo-continuation-enforcer", () => {
+     }
+   }
+ 
++  interface PromptRequestOptions {
++    path: { id: string }
++    body: {
++      agent?: string
++      model?: { providerID?: string; modelID?: string }
++      parts: Array<{ text: string }>
++    }
++  }
++
+   let mockMessages: MockMessage[] = []
+ 
+   function createMockPluginInput() {
+@@ -551,6 +560,126 @@ describe("todo-continuation-enforcer", () => {
+     expect(promptCalls).toHaveLength(2)
+   }, { timeout: 15000 })
+ 
++  test("should apply cooldown even after injection failure", async () => {
++    //#given
++    const sessionID = "main-failure-cooldown"
++    setMainSession(sessionID)
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.promptAsync = async (opts: PromptRequestOptions) => {
++      promptCalls.push({
++        sessionID: opts.path.id,
++        agent: opts.body.agent,
++        model: opts.body.model,
++        text: opts.body.parts[0].text,
++      })
++      throw new Error("simulated auth failure")
++    }
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    //#when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(1)
++  })
++
++  test("should stop retries after max consecutive failures", async () => {
++    //#given
++    const sessionID = "main-max-consecutive-failures"
++    setMainSession(sessionID)
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.promptAsync = async (opts: PromptRequestOptions) => {
++      promptCalls.push({
++        sessionID: opts.path.id,
++        agent: opts.body.agent,
++        model: opts.body.model,
++        text: opts.body.parts[0].text,
++      })
++      throw new Error("simulated auth failure")
++    }
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    //#when
++    for (let index = 0; index < MAX_CONSECUTIVE_FAILURES; index++) {
++      await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++      await fakeTimers.advanceBy(2500, true)
++      await fakeTimers.advanceClockBy(1_000_000)
++    }
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(MAX_CONSECUTIVE_FAILURES)
++  }, { timeout: 30000 })
++
++  test("should increase cooldown exponentially after consecutive failures", async () => {
++    //#given
++    const sessionID = "main-exponential-backoff"
++    setMainSession(sessionID)
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.promptAsync = async (opts: PromptRequestOptions) => {
++      promptCalls.push({
++        sessionID: opts.path.id,
++        agent: opts.body.agent,
++        model: opts.body.model,
++        text: opts.body.parts[0].text,
++      })
++      throw new Error("simulated auth failure")
++    }
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    //#when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceClockBy(CONTINUATION_COOLDOWN_MS)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceClockBy(CONTINUATION_COOLDOWN_MS)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(2)
++  }, { timeout: 30000 })
++
++  test("should reset consecutive failure count after successful injection", async () => {
++    //#given
++    const sessionID = "main-reset-consecutive-failures"
++    setMainSession(sessionID)
++    let shouldFail = true
++    const mockInput = createMockPluginInput()
++    mockInput.client.session.promptAsync = async (opts: PromptRequestOptions) => {
++      promptCalls.push({
++        sessionID: opts.path.id,
++        agent: opts.body.agent,
++        model: opts.body.model,
++        text: opts.body.parts[0].text,
++      })
++      if (shouldFail) {
++        shouldFail = false
++        throw new Error("simulated auth failure")
++      }
++      return {}
++    }
++    const hook = createTodoContinuationEnforcer(mockInput, {})
++
++    //#when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceClockBy(CONTINUATION_COOLDOWN_MS * 2)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++    await fakeTimers.advanceClockBy(CONTINUATION_COOLDOWN_MS)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++    await fakeTimers.advanceBy(2500, true)
++
++    //#then
++    expect(promptCalls).toHaveLength(3)
++  }, { timeout: 30000 })
++
+   test("should keep injecting even when todos remain unchanged across cycles", async () => {
+     //#given
+     const sessionID = "main-no-stagnation-cap"
+diff --git a/src/hooks/todo-continuation-enforcer/types.ts b/src/hooks/todo-continuation-enforcer/types.ts
+index 7d702b0e..3b9d881c 100644
+--- a/src/hooks/todo-continuation-enforcer/types.ts
++++ b/src/hooks/todo-continuation-enforcer/types.ts
+@@ -29,6 +29,7 @@ export interface SessionState {
+   abortDetectedAt?: number
+   lastInjectedAt?: number
+   inFlight?: boolean
++  consecutiveFailures: number
+ }
+ 
+ export interface MessageInfo {
+-- 
+2.39.2
+

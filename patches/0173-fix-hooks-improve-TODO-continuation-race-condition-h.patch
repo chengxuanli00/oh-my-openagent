@@ -1,0 +1,182 @@
+From e8f59cbbf8854e3b936fe2ae9978508465e9c88b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 10 Dec 2025 10:35:41 +0900
+Subject: [PATCH 0173/5749] fix(hooks): improve TODO continuation race
+ condition handling with state machine pattern
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Replace multiple Set-based tracking with explicit SessionStatus state machine
+- Implement setTimeout+clearTimeout pattern for robust race condition handling
+- SessionStatus tracks: idle → continuation-sent or aborted states
+- Increase grace period to 500ms to accommodate event ordering delays
+- Add cleanupSession utility for proper resource cleanup
+
+This addresses ESC abort not canceling continuation prompts when session.idle
+arrives before session.error event, which can occur due to async event processing
+in OpenCode plugin system
+---
+ src/hooks/todo-continuation-enforcer.ts | 99 ++++++++++++++-----------
+ 1 file changed, 56 insertions(+), 43 deletions(-)
+
+diff --git a/src/hooks/todo-continuation-enforcer.ts b/src/hooks/todo-continuation-enforcer.ts
+index 9c6f9c97..b542cde0 100644
+--- a/src/hooks/todo-continuation-enforcer.ts
++++ b/src/hooks/todo-continuation-enforcer.ts
+@@ -7,6 +7,8 @@ interface Todo {
+   id: string
+ }
+ 
++type SessionStatus = "idle" | "aborted" | "continuation-sent"
++
+ const CONTINUATION_PROMPT = `[SYSTEM REMINDER - TODO CONTINUATION]
+ 
+ Incomplete tasks remain in your todo list. Continue working on the next pending task.
+@@ -15,6 +17,8 @@ Incomplete tasks remain in your todo list. Continue working on the next pending
+ - Mark each task complete when finished
+ - Do not stop until all tasks are done`
+ 
++const CONTINUATION_DELAY_MS = 500
++
+ function detectInterrupt(error: unknown): boolean {
+   if (!error) return false
+   if (typeof error === "object") {
+@@ -33,43 +37,36 @@ function detectInterrupt(error: unknown): boolean {
+ }
+ 
+ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+-  const remindedSessions = new Set<string>()
+-  const interruptedSessions = new Set<string>()
+-  const errorSessions = new Set<string>()
+-
+-  return async ({ event }: { event: { type: string; properties?: unknown } }) => {
+-    const props = event.properties as Record<string, unknown> | undefined
++  const sessionStates = new Map<string, SessionStatus>()
++  const pendingContinuations = new Map<string, Timer>()
++
++  const cleanupSession = (sessionID: string) => {
++    const timer = pendingContinuations.get(sessionID)
++    if (timer) clearTimeout(timer)
++    pendingContinuations.delete(sessionID)
++    sessionStates.delete(sessionID)
++  }
+ 
+-    if (event.type === "session.error") {
+-      const sessionID = props?.sessionID as string | undefined
+-      if (sessionID) {
+-        errorSessions.add(sessionID)
+-        if (detectInterrupt(props?.error)) {
+-          interruptedSessions.add(sessionID)
+-        }
+-      }
+-      return
++  const cancelPendingContinuation = (sessionID: string) => {
++    const timer = pendingContinuations.get(sessionID)
++    if (timer) {
++      clearTimeout(timer)
++      pendingContinuations.delete(sessionID)
+     }
++    sessionStates.set(sessionID, "aborted")
++  }
+ 
+-    if (event.type === "session.idle") {
+-      const sessionID = props?.sessionID as string | undefined
+-      if (!sessionID) return
+-
+-      // Wait for potential session.error events to be processed first
+-      await new Promise(resolve => setTimeout(resolve, 150))
++  const scheduleContinuation = (sessionID: string) => {
++    const prev = pendingContinuations.get(sessionID)
++    if (prev) clearTimeout(prev)
+ 
+-      const shouldBypass = interruptedSessions.has(sessionID) || errorSessions.has(sessionID)
+-      
+-      interruptedSessions.delete(sessionID)
+-      errorSessions.delete(sessionID)
++    sessionStates.set(sessionID, "idle")
+ 
+-      if (shouldBypass) {
+-        return
+-      }
++    const timer = setTimeout(async () => {
++      pendingContinuations.delete(sessionID)
+ 
+-      if (remindedSessions.has(sessionID)) {
+-        return
+-      }
++      const state = sessionStates.get(sessionID)
++      if (state !== "idle") return
+ 
+       let todos: Todo[] = []
+       try {
+@@ -93,13 +90,7 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+         return
+       }
+ 
+-      remindedSessions.add(sessionID)
+-
+-      // Re-check if abort occurred during the delay
+-      if (interruptedSessions.has(sessionID) || errorSessions.has(sessionID)) {
+-        remindedSessions.delete(sessionID)
+-        return
+-      }
++      sessionStates.set(sessionID, "continuation-sent")
+ 
+       try {
+         await ctx.client.session.prompt({
+@@ -115,24 +106,46 @@ export function createTodoContinuationEnforcer(ctx: PluginInput) {
+           query: { directory: ctx.directory },
+         })
+       } catch {
+-        remindedSessions.delete(sessionID)
++        sessionStates.delete(sessionID)
+       }
++    }, CONTINUATION_DELAY_MS)
++
++    pendingContinuations.set(sessionID, timer)
++  }
++
++  return async ({ event }: { event: { type: string; properties?: unknown } }) => {
++    const props = event.properties as Record<string, unknown> | undefined
++
++    if (event.type === "session.error") {
++      const sessionID = props?.sessionID as string | undefined
++      if (sessionID && detectInterrupt(props?.error)) {
++        cancelPendingContinuation(sessionID)
++      }
++      return
++    }
++
++    if (event.type === "session.idle") {
++      const sessionID = props?.sessionID as string | undefined
++      if (!sessionID) return
++
++      const state = sessionStates.get(sessionID)
++      if (state === "continuation-sent") return
++
++      scheduleContinuation(sessionID)
+     }
+ 
+     if (event.type === "message.updated") {
+       const info = props?.info as Record<string, unknown> | undefined
+       const sessionID = info?.sessionID as string | undefined
+       if (sessionID && info?.role === "user") {
+-        remindedSessions.delete(sessionID)
++        sessionStates.delete(sessionID)
+       }
+     }
+ 
+     if (event.type === "session.deleted") {
+       const sessionInfo = props?.info as { id?: string } | undefined
+       if (sessionInfo?.id) {
+-        remindedSessions.delete(sessionInfo.id)
+-        interruptedSessions.delete(sessionInfo.id)
+-        errorSessions.delete(sessionInfo.id)
++        cleanupSession(sessionInfo.id)
+       }
+     }
+   }
+-- 
+2.39.2
+

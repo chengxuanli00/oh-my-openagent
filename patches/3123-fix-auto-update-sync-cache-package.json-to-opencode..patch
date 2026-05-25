@@ -1,0 +1,721 @@
+From 0764f0e5637851b83b245f41353b63bbc2118b98 Mon Sep 17 00:00:00 2001
+From: acamq <179265037+acamq@users.noreply.github.com>
+Date: Wed, 11 Mar 2026 07:42:08 -0600
+Subject: [PATCH 3123/5749] fix(auto-update): sync cache package.json to
+ opencode.json intent
+
+When users switch from pinned version to tag in opencode.json (e.g.,
+3.10.0 -> @latest), the cache package.json still contains the resolved
+version. This causes bun install to reinstall the old version instead
+of resolving the new tag.
+
+This adds syncCachePackageJsonToIntent() which updates the cache
+package.json to match user intent before running bun install. Uses
+atomic writes (temp file + rename) with UUID-based temp names for
+concurrent safety.
+
+Critical changes:
+- Treat all sync errors as abort conditions (file_not_found,
+  plugin_not_in_deps, parse_error, write_error) to prevent corrupting
+  a bad cache state further
+- Remove dead code (unreachable revert branch for pinned versions)
+- Add tests for all error paths and atomic write cleanup
+---
+ src/hooks/auto-update-checker/checker.ts      |   2 +
+ .../checker/plugin-entry.ts                   |   6 +-
+ .../checker/sync-package-json.test.ts         | 315 ++++++++++++++++++
+ .../checker/sync-package-json.ts              | 126 +++++++
+ .../hook/background-update-check.test.ts      | 104 +++++-
+ .../hook/background-update-check.ts           |  18 +-
+ 6 files changed, 560 insertions(+), 11 deletions(-)
+ create mode 100644 src/hooks/auto-update-checker/checker/sync-package-json.test.ts
+ create mode 100644 src/hooks/auto-update-checker/checker/sync-package-json.ts
+
+diff --git a/src/hooks/auto-update-checker/checker.ts b/src/hooks/auto-update-checker/checker.ts
+index 014821db..cad48b93 100644
+--- a/src/hooks/auto-update-checker/checker.ts
++++ b/src/hooks/auto-update-checker/checker.ts
+@@ -6,3 +6,5 @@ export { getCachedVersion } from "./checker/cached-version"
+ export { updatePinnedVersion, revertPinnedVersion } from "./checker/pinned-version-updater"
+ export { getLatestVersion } from "./checker/latest-version"
+ export { checkForUpdate } from "./checker/check-for-update"
++export { syncCachePackageJsonToIntent } from "./checker/sync-package-json"
++export type { SyncResult } from "./checker/sync-package-json"
+diff --git a/src/hooks/auto-update-checker/checker/plugin-entry.ts b/src/hooks/auto-update-checker/checker/plugin-entry.ts
+index 7aa79cc1..61c7a65b 100644
+--- a/src/hooks/auto-update-checker/checker/plugin-entry.ts
++++ b/src/hooks/auto-update-checker/checker/plugin-entry.ts
+@@ -11,9 +11,7 @@ export interface PluginEntryInfo {
+   configPath: string
+ }
+ 
+-function isExplicitVersionPin(pinnedVersion: string): boolean {
+-  return /^\d+\.\d+\.\d+/.test(pinnedVersion)
+-}
++const EXACT_SEMVER_REGEX = /^\d+\.\d+\.\d+(-[\w.]+)?$/
+ 
+ export function findPluginEntry(directory: string): PluginEntryInfo | null {
+   for (const configPath of getConfigPaths(directory)) {
+@@ -29,7 +27,7 @@ export function findPluginEntry(directory: string): PluginEntryInfo | null {
+         }
+         if (entry.startsWith(`${PACKAGE_NAME}@`)) {
+           const pinnedVersion = entry.slice(PACKAGE_NAME.length + 1)
+-          const isPinned = isExplicitVersionPin(pinnedVersion)
++          const isPinned = EXACT_SEMVER_REGEX.test(pinnedVersion.trim())
+           return { entry, isPinned, pinnedVersion, configPath }
+         }
+       }
+diff --git a/src/hooks/auto-update-checker/checker/sync-package-json.test.ts b/src/hooks/auto-update-checker/checker/sync-package-json.test.ts
+new file mode 100644
+index 00000000..a854e939
+--- /dev/null
++++ b/src/hooks/auto-update-checker/checker/sync-package-json.test.ts
+@@ -0,0 +1,315 @@
++import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
++import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
++import { join } from "node:path"
++import type { PluginEntryInfo } from "./plugin-entry"
++
++const TEST_CACHE_DIR = join(import.meta.dir, "__test-sync-cache__")
++
++mock.module("../constants", () => ({
++  CACHE_DIR: TEST_CACHE_DIR,
++  PACKAGE_NAME: "oh-my-opencode",
++  NPM_REGISTRY_URL: "https://registry.npmjs.org/-/package/oh-my-opencode/dist-tags",
++  NPM_FETCH_TIMEOUT: 5000,
++  VERSION_FILE: join(TEST_CACHE_DIR, "version"),
++  USER_CONFIG_DIR: "/tmp/opencode-config",
++  USER_OPENCODE_CONFIG: "/tmp/opencode-config/opencode.json",
++  USER_OPENCODE_CONFIG_JSONC: "/tmp/opencode-config/opencode.jsonc",
++  INSTALLED_PACKAGE_JSON: join(TEST_CACHE_DIR, "node_modules", "oh-my-opencode", "package.json"),
++  getWindowsAppdataDir: () => null,
++}))
++
++mock.module("../../../shared/logger", () => ({
++  log: () => {},
++}))
++
++function resetTestCache(currentVersion = "3.10.0"): void {
++  if (existsSync(TEST_CACHE_DIR)) {
++    rmSync(TEST_CACHE_DIR, { recursive: true, force: true })
++  }
++
++  mkdirSync(TEST_CACHE_DIR, { recursive: true })
++  writeFileSync(
++    join(TEST_CACHE_DIR, "package.json"),
++    JSON.stringify({ dependencies: { "oh-my-opencode": currentVersion, other: "1.0.0" } }, null, 2)
++  )
++}
++
++function cleanupTestCache(): void {
++  if (existsSync(TEST_CACHE_DIR)) {
++    rmSync(TEST_CACHE_DIR, { recursive: true, force: true })
++  }
++}
++
++function readCachePackageJsonVersion(): string | undefined {
++  const content = readFileSync(join(TEST_CACHE_DIR, "package.json"), "utf-8")
++  const pkg = JSON.parse(content) as { dependencies?: Record<string, string> }
++  return pkg.dependencies?.["oh-my-opencode"]
++}
++
++describe("syncCachePackageJsonToIntent", () => {
++  beforeEach(() => {
++    resetTestCache()
++  })
++
++  afterEach(() => {
++    cleanupTestCache()
++  })
++
++  describe("#given cache package.json with pinned semver version", () => {
++    describe("#when opencode.json intent is latest tag", () => {
++      it("#then updates package.json to use latest", async () => {
++        const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++        const pluginInfo: PluginEntryInfo = {
++          entry: "oh-my-opencode@latest",
++          isPinned: false,
++          pinnedVersion: "latest",
++          configPath: "/tmp/opencode.json",
++        }
++
++        const result = syncCachePackageJsonToIntent(pluginInfo)
++
++        expect(result.synced).toBe(true)
++        expect(result.error).toBeNull()
++        expect(readCachePackageJsonVersion()).toBe("latest")
++      })
++    })
++
++    describe("#when opencode.json intent is next tag", () => {
++      it("#then updates package.json to use next", async () => {
++        const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++        const pluginInfo: PluginEntryInfo = {
++          entry: "oh-my-opencode@next",
++          isPinned: false,
++          pinnedVersion: "next",
++          configPath: "/tmp/opencode.json",
++        }
++
++        const result = syncCachePackageJsonToIntent(pluginInfo)
++
++        expect(result.synced).toBe(true)
++        expect(result.error).toBeNull()
++        expect(readCachePackageJsonVersion()).toBe("next")
++      })
++    })
++
++    describe("#when opencode.json has no version (implies latest)", () => {
++      it("#then updates package.json to use latest", async () => {
++        const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++        const pluginInfo: PluginEntryInfo = {
++          entry: "oh-my-opencode",
++          isPinned: false,
++          pinnedVersion: null,
++          configPath: "/tmp/opencode.json",
++        }
++
++        const result = syncCachePackageJsonToIntent(pluginInfo)
++
++        expect(result.synced).toBe(true)
++        expect(result.error).toBeNull()
++        expect(readCachePackageJsonVersion()).toBe("latest")
++      })
++    })
++  })
++
++  describe("#given cache package.json already matches intent", () => {
++    it("#then returns synced false with no error", async () => {
++      resetTestCache("latest")
++      const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++      const pluginInfo: PluginEntryInfo = {
++        entry: "oh-my-opencode@latest",
++        isPinned: false,
++        pinnedVersion: "latest",
++        configPath: "/tmp/opencode.json",
++      }
++
++      const result = syncCachePackageJsonToIntent(pluginInfo)
++
++      expect(result.synced).toBe(false)
++      expect(result.error).toBeNull()
++      expect(readCachePackageJsonVersion()).toBe("latest")
++    })
++  })
++
++  describe("#given cache package.json does not exist", () => {
++    it("#then returns file_not_found error", async () => {
++      cleanupTestCache()
++      const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++      const pluginInfo: PluginEntryInfo = {
++        entry: "oh-my-opencode@latest",
++        isPinned: false,
++        pinnedVersion: "latest",
++        configPath: "/tmp/opencode.json",
++      }
++
++      const result = syncCachePackageJsonToIntent(pluginInfo)
++
++      expect(result.synced).toBe(false)
++      expect(result.error).toBe("file_not_found")
++    })
++  })
++
++  describe("#given plugin not in cache package.json dependencies", () => {
++    it("#then returns plugin_not_in_deps error", async () => {
++      cleanupTestCache()
++      mkdirSync(TEST_CACHE_DIR, { recursive: true })
++      writeFileSync(
++        join(TEST_CACHE_DIR, "package.json"),
++        JSON.stringify({ dependencies: { other: "1.0.0" } }, null, 2)
++      )
++
++      const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++      const pluginInfo: PluginEntryInfo = {
++        entry: "oh-my-opencode@latest",
++        isPinned: false,
++        pinnedVersion: "latest",
++        configPath: "/tmp/opencode.json",
++      }
++
++      const result = syncCachePackageJsonToIntent(pluginInfo)
++
++      expect(result.synced).toBe(false)
++      expect(result.error).toBe("plugin_not_in_deps")
++    })
++  })
++
++  describe("#given user explicitly changed from one semver to another", () => {
++    it("#then updates package.json to new version", async () => {
++      resetTestCache("3.9.0")
++      const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++      const pluginInfo: PluginEntryInfo = {
++        entry: "oh-my-opencode@3.10.0",
++        isPinned: true,
++        pinnedVersion: "3.10.0",
++        configPath: "/tmp/opencode.json",
++      }
++
++      const result = syncCachePackageJsonToIntent(pluginInfo)
++
++      expect(result.synced).toBe(true)
++      expect(result.error).toBeNull()
++      expect(readCachePackageJsonVersion()).toBe("3.10.0")
++    })
++  })
++
++  describe("#given malformed JSON in cache package.json", () => {
++    it("#then returns parse_error", async () => {
++      cleanupTestCache()
++      mkdirSync(TEST_CACHE_DIR, { recursive: true })
++      writeFileSync(join(TEST_CACHE_DIR, "package.json"), "{ invalid json }")
++
++      const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++      const pluginInfo: PluginEntryInfo = {
++        entry: "oh-my-opencode@latest",
++        isPinned: false,
++        pinnedVersion: "latest",
++        configPath: "/tmp/opencode.json",
++      }
++
++      const result = syncCachePackageJsonToIntent(pluginInfo)
++
++      expect(result.synced).toBe(false)
++      expect(result.error).toBe("parse_error")
++    })
++  })
++
++  describe("#given write permission denied", () => {
++    it("#then returns write_error", async () => {
++      cleanupTestCache()
++      mkdirSync(TEST_CACHE_DIR, { recursive: true })
++      writeFileSync(
++        join(TEST_CACHE_DIR, "package.json"),
++        JSON.stringify({ dependencies: { "oh-my-opencode": "3.10.0" } }, null, 2)
++      )
++
++      const fs = await import("node:fs")
++      const originalWriteFileSync = fs.writeFileSync
++      const originalRenameSync = fs.renameSync
++
++      mock.module("node:fs", () => ({
++        ...fs,
++        writeFileSync: mock(() => {
++          throw new Error("EACCES: permission denied")
++        }),
++        renameSync: fs.renameSync,
++      }))
++
++      const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++      const pluginInfo: PluginEntryInfo = {
++        entry: "oh-my-opencode@latest",
++        isPinned: false,
++        pinnedVersion: "latest",
++        configPath: "/tmp/opencode.json",
++      }
++
++      const result = syncCachePackageJsonToIntent(pluginInfo)
++
++      expect(result.synced).toBe(false)
++      expect(result.error).toBe("write_error")
++
++      mock.module("node:fs", () => ({
++        ...fs,
++        writeFileSync: originalWriteFileSync,
++        renameSync: originalRenameSync,
++      }))
++    })
++  })
++
++  describe("#given rename fails after successful write", () => {
++    it("#then returns write_error and cleans up temp file", async () => {
++      cleanupTestCache()
++      mkdirSync(TEST_CACHE_DIR, { recursive: true })
++      writeFileSync(
++        join(TEST_CACHE_DIR, "package.json"),
++        JSON.stringify({ dependencies: { "oh-my-opencode": "3.10.0" } }, null, 2)
++      )
++
++      const fs = await import("node:fs")
++      const originalWriteFileSync = fs.writeFileSync
++      const originalRenameSync = fs.renameSync
++
++      let tempFilePath: string | null = null
++
++      mock.module("node:fs", () => ({
++        ...fs,
++        writeFileSync: mock((path: string, data: string) => {
++          tempFilePath = path
++          return originalWriteFileSync(path, data)
++        }),
++        renameSync: mock(() => {
++          throw new Error("EXDEV: cross-device link not permitted")
++        }),
++      }))
++
++      const { syncCachePackageJsonToIntent } = await import("./sync-package-json")
++
++      const pluginInfo: PluginEntryInfo = {
++        entry: "oh-my-opencode@latest",
++        isPinned: false,
++        pinnedVersion: "latest",
++        configPath: "/tmp/opencode.json",
++      }
++
++      const result = syncCachePackageJsonToIntent(pluginInfo)
++
++      expect(result.synced).toBe(false)
++      expect(result.error).toBe("write_error")
++      expect(tempFilePath).not.toBeNull()
++      expect(existsSync(tempFilePath!)).toBe(false)
++
++      mock.module("node:fs", () => ({
++        ...fs,
++        writeFileSync: originalWriteFileSync,
++        renameSync: originalRenameSync,
++      }))
++    })
++  })
++})
+diff --git a/src/hooks/auto-update-checker/checker/sync-package-json.ts b/src/hooks/auto-update-checker/checker/sync-package-json.ts
+new file mode 100644
+index 00000000..c4a1f2af
+--- /dev/null
++++ b/src/hooks/auto-update-checker/checker/sync-package-json.ts
+@@ -0,0 +1,126 @@
++import * as crypto from "node:crypto"
++import * as fs from "node:fs"
++import * as path from "node:path"
++import { CACHE_DIR, PACKAGE_NAME } from "../constants"
++import { log } from "../../../shared/logger"
++import type { PluginEntryInfo } from "./plugin-entry"
++
++interface CachePackageJson {
++  dependencies?: Record<string, string>
++}
++
++export interface SyncResult {
++  /** Whether the package.json was successfully synced/updated */
++  synced: boolean
++  /** Whether there was an error during sync (null if no error) */
++  error: "file_not_found" | "plugin_not_in_deps" | "parse_error" | "write_error" | null
++  /** Human-readable message describing what happened */
++  message?: string
++}
++
++const EXACT_SEMVER_REGEX = /^\d+\.\d+\.\d+(-[\w.]+)?$/
++
++function safeUnlink(filePath: string): void {
++  try {
++    fs.unlinkSync(filePath)
++  } catch (err) {
++    log(`[auto-update-checker] Failed to cleanup temp file: ${filePath}`, err)
++  }
++}
++
++/**
++ * Determine the version specifier to use in cache package.json based on opencode.json intent.
++ *
++ * - "oh-my-opencode" (no version) → "latest"
++ * - "oh-my-opencode@latest" → "latest"
++ * - "oh-my-opencode@next" → "next"
++ * - "oh-my-opencode@3.10.0" → "3.10.0" (pinned, use as-is)
++ */
++function getIntentVersion(pluginInfo: PluginEntryInfo): string {
++  if (!pluginInfo.pinnedVersion) {
++    // No version specified in opencode.json, default to latest
++    return "latest"
++  }
++  return pluginInfo.pinnedVersion
++}
++
++/**
++ * Sync the cache package.json to match the opencode.json plugin intent.
++ *
++ * OpenCode pins resolved versions in cache package.json (e.g., "3.11.0" instead of "latest").
++ * This causes issues when users switch from pinned to tag in opencode.json:
++ * - User changes opencode.json from "oh-my-opencode@3.10.0" to "oh-my-opencode@latest"
++ * - Cache package.json still has "3.10.0"
++ * - bun install reinstalls 3.10.0 instead of resolving @latest
++ *
++ * This function updates cache package.json to match the user's intent before bun install.
++ *
++ * @returns SyncResult with synced status and any error information
++ */
++export function syncCachePackageJsonToIntent(pluginInfo: PluginEntryInfo): SyncResult {
++  const cachePackageJsonPath = path.join(CACHE_DIR, "package.json")
++
++  if (!fs.existsSync(cachePackageJsonPath)) {
++    log("[auto-update-checker] Cache package.json not found, nothing to sync")
++    return { synced: false, error: "file_not_found", message: "Cache package.json not found" }
++  }
++
++  let content: string
++  let pkgJson: CachePackageJson
++
++  try {
++    content = fs.readFileSync(cachePackageJsonPath, "utf-8")
++  } catch (err) {
++    log("[auto-update-checker] Failed to read cache package.json:", err)
++    return { synced: false, error: "parse_error", message: "Failed to read cache package.json" }
++  }
++
++  try {
++    pkgJson = JSON.parse(content) as CachePackageJson
++  } catch (err) {
++    log("[auto-update-checker] Failed to parse cache package.json:", err)
++    return { synced: false, error: "parse_error", message: "Failed to parse cache package.json (malformed JSON)" }
++  }
++
++  if (!pkgJson.dependencies?.[PACKAGE_NAME]) {
++    log("[auto-update-checker] Plugin not in cache package.json dependencies, nothing to sync")
++    return { synced: false, error: "plugin_not_in_deps", message: "Plugin not in cache package.json dependencies" }
++  }
++
++  const currentVersion = pkgJson.dependencies[PACKAGE_NAME]
++  const intentVersion = getIntentVersion(pluginInfo)
++
++  if (currentVersion === intentVersion) {
++    log("[auto-update-checker] Cache package.json already matches intent:", intentVersion)
++    return { synced: false, error: null, message: `Already matches intent: ${intentVersion}` }
++  }
++
++  // Check if this is a meaningful change:
++  // - If intent is a tag (latest, next, beta) and current is semver, we need to update
++  // - If both are semver but different, user explicitly changed versions
++  const intentIsTag = !EXACT_SEMVER_REGEX.test(intentVersion.trim())
++  const currentIsSemver = EXACT_SEMVER_REGEX.test(currentVersion.trim())
++
++  if (intentIsTag && currentIsSemver) {
++    log(
++      `[auto-update-checker] Syncing cache package.json: "${currentVersion}" → "${intentVersion}" (opencode.json intent)`
++    )
++  } else {
++    log(
++      `[auto-update-checker] Updating cache package.json: "${currentVersion}" → "${intentVersion}"`
++    )
++  }
++
++  pkgJson.dependencies[PACKAGE_NAME] = intentVersion
++
++  const tmpPath = `${cachePackageJsonPath}.${crypto.randomUUID()}`
++  try {
++    fs.writeFileSync(tmpPath, JSON.stringify(pkgJson, null, 2))
++    fs.renameSync(tmpPath, cachePackageJsonPath)
++    return { synced: true, error: null, message: `Updated: "${currentVersion}" → "${intentVersion}"` }
++  } catch (err) {
++    log("[auto-update-checker] Failed to write cache package.json:", err)
++    safeUnlink(tmpPath)
++    return { synced: false, error: "write_error", message: "Failed to write cache package.json" }
++  }
++}
+diff --git a/src/hooks/auto-update-checker/hook/background-update-check.test.ts b/src/hooks/auto-update-checker/hook/background-update-check.test.ts
+index 0c7cbbf4..7ad291a8 100644
+--- a/src/hooks/auto-update-checker/hook/background-update-check.test.ts
++++ b/src/hooks/auto-update-checker/hook/background-update-check.test.ts
+@@ -33,11 +33,14 @@ const mockShowAutoUpdatedToast = mock(
+   async (_ctx: PluginInput, _fromVersion: string, _toVersion: string): Promise<void> => {}
+ )
+ 
++const mockSyncCachePackageJsonToIntent = mock(() => false)
++
+ mock.module("../checker", () => ({
+   findPluginEntry: mockFindPluginEntry,
+   getCachedVersion: mockGetCachedVersion,
+   getLatestVersion: mockGetLatestVersion,
+   revertPinnedVersion: mock(() => false),
++  syncCachePackageJsonToIntent: mockSyncCachePackageJsonToIntent,
+ }))
+ mock.module("../version-channel", () => ({ extractChannel: mockExtractChannel }))
+ mock.module("../cache", () => ({ invalidatePackage: mockInvalidatePackage }))
+@@ -65,12 +68,14 @@ describe("runBackgroundUpdateCheck", () => {
+     mockRunBunInstall.mockReset()
+     mockShowUpdateAvailableToast.mockReset()
+     mockShowAutoUpdatedToast.mockReset()
++    mockSyncCachePackageJsonToIntent.mockReset()
+ 
+     mockFindPluginEntry.mockReturnValue(createPluginEntry())
+     mockGetCachedVersion.mockReturnValue("3.4.0")
+     mockGetLatestVersion.mockResolvedValue("3.5.0")
+     mockExtractChannel.mockReturnValue("latest")
+     mockRunBunInstall.mockResolvedValue(true)
++    mockSyncCachePackageJsonToIntent.mockReturnValue({ synced: true, error: null })
+   })
+ 
+   describe("#given no plugin entry found", () => {
+@@ -180,17 +185,38 @@ describe("runBackgroundUpdateCheck", () => {
+   })
+ 
+   describe("#given unpinned with auto-update and install succeeds", () => {
+-    it("invalidates cache, installs, and shows auto-updated toast", async () => {
++    it("syncs cache, invalidates, installs, and shows auto-updated toast", async () => {
+       //#given
+       mockRunBunInstall.mockResolvedValue(true)
+       //#when
+       await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
+       //#then
++      expect(mockSyncCachePackageJsonToIntent).toHaveBeenCalledTimes(1)
+       expect(mockInvalidatePackage).toHaveBeenCalledTimes(1)
+       expect(mockRunBunInstall).toHaveBeenCalledTimes(1)
+       expect(mockShowAutoUpdatedToast).toHaveBeenCalledWith(mockCtx, "3.4.0", "3.5.0")
+       expect(mockShowUpdateAvailableToast).not.toHaveBeenCalled()
+     })
++
++    it("syncs before invalidate and install (correct order)", async () => {
++      //#given
++      const callOrder: string[] = []
++      mockSyncCachePackageJsonToIntent.mockImplementation(() => {
++        callOrder.push("sync")
++        return { synced: true, error: null }
++      })
++      mockInvalidatePackage.mockImplementation(() => {
++        callOrder.push("invalidate")
++      })
++      mockRunBunInstall.mockImplementation(async () => {
++        callOrder.push("install")
++        return true
++      })
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++      //#then
++      expect(callOrder).toEqual(["sync", "invalidate", "install"])
++    })
+   })
+ 
+   describe("#given unpinned with auto-update and install fails", () => {
+@@ -205,4 +231,80 @@ describe("runBackgroundUpdateCheck", () => {
+       expect(mockShowAutoUpdatedToast).not.toHaveBeenCalled()
+     })
+   })
++
++  describe("#given sync fails with file_not_found", () => {
++    it("aborts update and shows notification-only toast", async () => {
++      //#given
++      mockSyncCachePackageJsonToIntent.mockReturnValue({
++        synced: false,
++        error: "file_not_found",
++        message: "Cache package.json not found",
++      })
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++      //#then
++      expect(mockSyncCachePackageJsonToIntent).toHaveBeenCalledTimes(1)
++      expect(mockInvalidatePackage).not.toHaveBeenCalled()
++      expect(mockRunBunInstall).not.toHaveBeenCalled()
++      expect(mockShowUpdateAvailableToast).toHaveBeenCalledWith(mockCtx, "3.5.0", getToastMessage)
++      expect(mockShowAutoUpdatedToast).not.toHaveBeenCalled()
++    })
++  })
++
++  describe("#given sync fails with plugin_not_in_deps", () => {
++    it("aborts update and shows notification-only toast", async () => {
++      //#given
++      mockSyncCachePackageJsonToIntent.mockReturnValue({
++        synced: false,
++        error: "plugin_not_in_deps",
++        message: "Plugin not in cache package.json dependencies",
++      })
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++      //#then
++      expect(mockSyncCachePackageJsonToIntent).toHaveBeenCalledTimes(1)
++      expect(mockInvalidatePackage).not.toHaveBeenCalled()
++      expect(mockRunBunInstall).not.toHaveBeenCalled()
++      expect(mockShowUpdateAvailableToast).toHaveBeenCalledWith(mockCtx, "3.5.0", getToastMessage)
++      expect(mockShowAutoUpdatedToast).not.toHaveBeenCalled()
++    })
++  })
++
++  describe("#given sync fails with parse_error", () => {
++    it("aborts update and shows notification-only toast", async () => {
++      //#given
++      mockSyncCachePackageJsonToIntent.mockReturnValue({
++        synced: false,
++        error: "parse_error",
++        message: "Failed to parse cache package.json (malformed JSON)",
++      })
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++      //#then
++      expect(mockSyncCachePackageJsonToIntent).toHaveBeenCalledTimes(1)
++      expect(mockInvalidatePackage).not.toHaveBeenCalled()
++      expect(mockRunBunInstall).not.toHaveBeenCalled()
++      expect(mockShowUpdateAvailableToast).toHaveBeenCalledWith(mockCtx, "3.5.0", getToastMessage)
++      expect(mockShowAutoUpdatedToast).not.toHaveBeenCalled()
++    })
++  })
++
++  describe("#given sync fails with write_error", () => {
++    it("aborts update and shows notification-only toast", async () => {
++      //#given
++      mockSyncCachePackageJsonToIntent.mockReturnValue({
++        synced: false,
++        error: "write_error",
++        message: "Failed to write cache package.json",
++      })
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++      //#then
++      expect(mockSyncCachePackageJsonToIntent).toHaveBeenCalledTimes(1)
++      expect(mockInvalidatePackage).not.toHaveBeenCalled()
++      expect(mockRunBunInstall).not.toHaveBeenCalled()
++      expect(mockShowUpdateAvailableToast).toHaveBeenCalledWith(mockCtx, "3.5.0", getToastMessage)
++      expect(mockShowAutoUpdatedToast).not.toHaveBeenCalled()
++    })
++  })
+ })
+diff --git a/src/hooks/auto-update-checker/hook/background-update-check.ts b/src/hooks/auto-update-checker/hook/background-update-check.ts
+index 16103183..692b2b81 100644
+--- a/src/hooks/auto-update-checker/hook/background-update-check.ts
++++ b/src/hooks/auto-update-checker/hook/background-update-check.ts
+@@ -4,7 +4,7 @@ import { log } from "../../../shared/logger"
+ import { invalidatePackage } from "../cache"
+ import { PACKAGE_NAME } from "../constants"
+ import { extractChannel } from "../version-channel"
+-import { findPluginEntry, getCachedVersion, getLatestVersion, revertPinnedVersion } from "../checker"
++import { findPluginEntry, getCachedVersion, getLatestVersion, syncCachePackageJsonToIntent } from "../checker"
+ import { showAutoUpdatedToast, showUpdateAvailableToast } from "./update-toasts"
+ 
+ function getPinnedVersionToastMessage(latestVersion: string): string {
+@@ -65,6 +65,17 @@ export async function runBackgroundUpdateCheck(
+     return
+   }
+ 
++  // Sync cache package.json to match opencode.json intent before updating
++  // This handles the case where user switched from pinned version to tag (e.g., 3.10.0 -> @latest)
++  const syncResult = syncCachePackageJsonToIntent(pluginInfo)
++
++  // Abort on ANY sync error to prevent corrupting a bad state further
++  if (syncResult.error) {
++    log(`[auto-update-checker] Sync failed with error: ${syncResult.error}`, syncResult.message)
++    await showUpdateAvailableToast(ctx, latestVersion, getToastMessage)
++    return
++  }
++
+   invalidatePackage(PACKAGE_NAME)
+ 
+   const installSuccess = await runBunInstallSafe()
+@@ -75,11 +86,6 @@ export async function runBackgroundUpdateCheck(
+     return
+   }
+ 
+-  if (pluginInfo.isPinned) {
+-    revertPinnedVersion(pluginInfo.configPath, latestVersion, pluginInfo.entry)
+-    log("[auto-update-checker] Config reverted due to install failure")
+-  }
+-
+   await showUpdateAvailableToast(ctx, latestVersion, getToastMessage)
+   log("[auto-update-checker] bun install failed; update not installed (falling back to notification-only)")
+ }
+-- 
+2.39.2
+

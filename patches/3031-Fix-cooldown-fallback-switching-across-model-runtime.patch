@@ -1,0 +1,1180 @@
+From eab5be666d1c3a53a563874782e63969bd07dfb7 Mon Sep 17 00:00:00 2001
+From: Ravi Tharuma <RaviTharuma@users.noreply.github.com>
+Date: Wed, 4 Mar 2026 18:35:09 +0100
+Subject: [PATCH 3031/5749] Fix cooldown fallback switching across
+ model/runtime fallback hooks
+
+---
+ src/hooks/model-fallback/hook.test.ts         | 117 ++++++++-
+ src/hooks/model-fallback/hook.ts              |  24 +-
+ src/hooks/runtime-fallback/constants.ts       |   4 +
+ .../runtime-fallback/error-classifier.test.ts |  46 ++++
+ .../runtime-fallback/error-classifier.ts      |   2 +-
+ src/hooks/runtime-fallback/event-handler.ts   | 103 +++++++-
+ src/hooks/runtime-fallback/index.test.ts      | 124 ++++++++++
+ src/plugin/event.model-fallback.test.ts       | 224 +++++++++++++++++-
+ src/plugin/event.ts                           | 136 ++++++++---
+ src/shared/model-error-classifier.test.ts     |  28 +++
+ src/shared/model-error-classifier.ts          |  33 +++
+ 11 files changed, 803 insertions(+), 38 deletions(-)
+ create mode 100644 src/hooks/runtime-fallback/error-classifier.test.ts
+
+diff --git a/src/hooks/model-fallback/hook.test.ts b/src/hooks/model-fallback/hook.test.ts
+index aa1f70fd..bcd720c5 100644
+--- a/src/hooks/model-fallback/hook.test.ts
++++ b/src/hooks/model-fallback/hook.test.ts
+@@ -140,6 +140,121 @@ describe("model fallback hook", () => {
+     expect(secondOutput.message["variant"]).toBeUndefined()
+   })
+ 
++  test("does not re-arm fallback when one is already pending", () => {
++    //#given
++    const sessionID = "ses_model_fallback_pending_guard"
++    clearPendingModelFallback(sessionID)
++
++    //#when
++    const firstSet = setPendingModelFallback(
++      sessionID,
++      "Sisyphus (Ultraworker)",
++      "anthropic",
++      "claude-opus-4-6-thinking",
++    )
++    const secondSet = setPendingModelFallback(
++      sessionID,
++      "Sisyphus (Ultraworker)",
++      "anthropic",
++      "claude-opus-4-6-thinking",
++    )
++
++    //#then
++    expect(firstSet).toBe(true)
++    expect(secondSet).toBe(false)
++    clearPendingModelFallback(sessionID)
++  })
++
++  test("skips no-op fallback entries that resolve to same provider/model", async () => {
++    //#given
++    const sessionID = "ses_model_fallback_noop_skip"
++    clearPendingModelFallback(sessionID)
++
++    const hook = createModelFallbackHook() as unknown as {
++      "chat.message"?: (
++        input: { sessionID: string },
++        output: { message: Record<string, unknown>; parts: Array<{ type: string; text?: string }> },
++      ) => Promise<void>
++    }
++
++    setSessionFallbackChain(sessionID, [
++      { providers: ["anthropic"], model: "claude-opus-4-6" },
++      { providers: ["opencode"], model: "kimi-k2.5-free" },
++    ])
++
++    expect(
++      setPendingModelFallback(
++        sessionID,
++        "Sisyphus (Ultraworker)",
++        "anthropic",
++        "claude-opus-4-6",
++      ),
++    ).toBe(true)
++
++    const output = {
++      message: {
++        model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
++      },
++      parts: [{ type: "text", text: "continue" }],
++    }
++
++    //#when
++    await hook["chat.message"]?.({ sessionID }, output)
++
++    //#then
++    expect(output.message["model"]).toEqual({
++      providerID: "opencode",
++      modelID: "kimi-k2.5-free",
++    })
++    clearPendingModelFallback(sessionID)
++  })
++
++  test("skips no-op fallback entries even when variant differs", async () => {
++    //#given
++    const sessionID = "ses_model_fallback_noop_variant_skip"
++    clearPendingModelFallback(sessionID)
++
++    const hook = createModelFallbackHook() as unknown as {
++      "chat.message"?: (
++        input: { sessionID: string },
++        output: { message: Record<string, unknown>; parts: Array<{ type: string; text?: string }> },
++      ) => Promise<void>
++    }
++
++    setSessionFallbackChain(sessionID, [
++      { providers: ["quotio"], model: "claude-opus-4-6", variant: "max" },
++      { providers: ["quotio"], model: "gpt-5.2" },
++    ])
++
++    expect(
++      setPendingModelFallback(
++        sessionID,
++        "Sisyphus (Ultraworker)",
++        "quotio",
++        "claude-opus-4-6",
++      ),
++    ).toBe(true)
++
++    const output = {
++      message: {
++        model: { providerID: "quotio", modelID: "claude-opus-4-6" },
++        variant: "max",
++      },
++      parts: [{ type: "text", text: "continue" }],
++    }
++
++    //#when
++    await hook["chat.message"]?.({ sessionID }, output)
++
++    //#then
++    expect(output.message["model"]).toEqual({
++      providerID: "quotio",
++      modelID: "gpt-5.2",
++    })
++    expect(output.message["variant"]).toBeUndefined()
++    clearPendingModelFallback(sessionID)
++  })
++
+   test("shows toast when fallback is applied", async () => {
+     //#given
+     const toastCalls: Array<{ title: string; message: string }> = []
+@@ -199,7 +314,7 @@ describe("model fallback hook", () => {
+       sessionID,
+       "Atlas (Plan Executor)",
+       "github-copilot",
+-      "claude-sonnet-4-6",
++      "claude-sonnet-4-5",
+     )
+     expect(set).toBe(true)
+ 
+diff --git a/src/hooks/model-fallback/hook.ts b/src/hooks/model-fallback/hook.ts
+index bbb01825..dbb4aa46 100644
+--- a/src/hooks/model-fallback/hook.ts
++++ b/src/hooks/model-fallback/hook.ts
+@@ -39,6 +39,12 @@ const pendingModelFallbacks = new Map<string, ModelFallbackState>()
+ const lastToastKey = new Map<string, string>()
+ const sessionFallbackChains = new Map<string, FallbackEntry[]>()
+ 
++function canonicalizeModelID(modelID: string): string {
++  return modelID
++    .toLowerCase()
++    .replace(/\./g, "-")
++}
++
+ export function setSessionFallbackChain(sessionID: string, fallbackChain: FallbackEntry[] | undefined): void {
+   if (!sessionID) return
+   if (!fallbackChain || fallbackChain.length === 0) {
+@@ -77,6 +83,11 @@ export function setPendingModelFallback(
+   const existing = pendingModelFallbacks.get(sessionID)
+ 
+   if (existing) {
++    if (existing.pending) {
++      log("[model-fallback] Pending fallback already armed for session: " + sessionID)
++      return false
++    }
++
+     // Preserve progression across repeated session.error retries in same session.
+     // We only mark the next turn as pending fallback application.
+     existing.providerID = currentProviderID
+@@ -140,13 +151,24 @@ export function getNextFallback(
+     }
+ 
+     const providerID = selectFallbackProvider(fallback.providers, state.providerID)
++    const modelID = transformModelForProvider(providerID, fallback.model)
++
++    const isNoOpFallback =
++      providerID.toLowerCase() === state.providerID.toLowerCase() &&
++      canonicalizeModelID(modelID) === canonicalizeModelID(state.modelID)
++
++    if (isNoOpFallback) {
++      log("[model-fallback] Skipping no-op fallback for session: " + sessionID + ", attempt: " + attemptCount + ", model: " + fallback.model)
++      continue
++    }
++
+     state.pending = false
+ 
+     log("[model-fallback] Using fallback for session: " + sessionID + ", attempt: " + attemptCount + ", model: " + fallback.model)
+ 
+     return {
+       providerID,
+-      modelID: transformModelForProvider(providerID, fallback.model),
++      modelID,
+       variant: fallback.variant,
+     }
+   }
+diff --git a/src/hooks/runtime-fallback/constants.ts b/src/hooks/runtime-fallback/constants.ts
+index 60da6fb5..3f011b33 100644
+--- a/src/hooks/runtime-fallback/constants.ts
++++ b/src/hooks/runtime-fallback/constants.ts
+@@ -26,6 +26,10 @@ export const RETRYABLE_ERROR_PATTERNS = [
+   /rate.?limit/i,
+   /too.?many.?requests/i,
+   /quota.?exceeded/i,
++  /quota\s+will\s+reset\s+after/i,
++  /all\s+credentials\s+for\s+model/i,
++  /cool(?:ing)?\s+down/i,
++  /exhausted\s+your\s+capacity/i,
+   /usage\s+limit\s+has\s+been\s+reached/i,
+   /service.?unavailable/i,
+   /overloaded/i,
+diff --git a/src/hooks/runtime-fallback/error-classifier.test.ts b/src/hooks/runtime-fallback/error-classifier.test.ts
+new file mode 100644
+index 00000000..1885e80e
+--- /dev/null
++++ b/src/hooks/runtime-fallback/error-classifier.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, test } from "bun:test"
++
++import { extractAutoRetrySignal, isRetryableError } from "./error-classifier"
++
++describe("runtime-fallback error classifier", () => {
++  test("detects cooling-down auto-retry status signals", () => {
++    //#given
++    const info = {
++      status:
++        "All credentials for model claude-opus-4-6-thinking are cooling down [retrying in ~5 days attempt #1]",
++    }
++
++    //#when
++    const signal = extractAutoRetrySignal(info)
++
++    //#then
++    expect(signal).toBeDefined()
++  })
++
++  test("treats cooling-down retry messages as retryable", () => {
++    //#given
++    const error = {
++      message:
++        "All credentials for model claude-opus-4-6-thinking are cooling down [retrying in ~5 days attempt #1]",
++    }
++
++    //#when
++    const retryable = isRetryableError(error, [400, 403, 408, 429, 500, 502, 503, 504, 529])
++
++    //#then
++    expect(retryable).toBe(true)
++  })
++
++  test("ignores non-retry assistant status text", () => {
++    //#given
++    const info = {
++      status: "Thinking...",
++    }
++
++    //#when
++    const signal = extractAutoRetrySignal(info)
++
++    //#then
++    expect(signal).toBeUndefined()
++  })
++})
+diff --git a/src/hooks/runtime-fallback/error-classifier.ts b/src/hooks/runtime-fallback/error-classifier.ts
+index f35819b7..f05493da 100644
+--- a/src/hooks/runtime-fallback/error-classifier.ts
++++ b/src/hooks/runtime-fallback/error-classifier.ts
+@@ -102,7 +102,7 @@ export interface AutoRetrySignal {
+ export const AUTO_RETRY_PATTERNS: Array<(combined: string) => boolean> = [
+   (combined) => /retrying\s+in/i.test(combined),
+   (combined) =>
+-    /(?:too\s+many\s+requests|quota\s*exceeded|usage\s+limit|rate\s+limit|limit\s+reached)/i.test(combined),
++    /(?:too\s+many\s+requests|quota\s*exceeded|quota\s+will\s+reset\s+after|usage\s+limit|rate\s+limit|limit\s+reached|all\s+credentials\s+for\s+model|cool(?:ing)?\s+down|exhausted\s+your\s+capacity)/i.test(combined),
+ ]
+ 
+ export function extractAutoRetrySignal(info: Record<string, unknown> | undefined): AutoRetrySignal | undefined {
+diff --git a/src/hooks/runtime-fallback/event-handler.ts b/src/hooks/runtime-fallback/event-handler.ts
+index f73e6557..a6c8b324 100644
+--- a/src/hooks/runtime-fallback/event-handler.ts
++++ b/src/hooks/runtime-fallback/event-handler.ts
+@@ -2,13 +2,14 @@ import type { HookDeps } from "./types"
+ import type { AutoRetryHelpers } from "./auto-retry"
+ import { HOOK_NAME } from "./constants"
+ import { log } from "../../shared/logger"
+-import { extractStatusCode, extractErrorName, classifyErrorType, isRetryableError } from "./error-classifier"
++import { extractStatusCode, extractErrorName, classifyErrorType, isRetryableError, extractAutoRetrySignal } from "./error-classifier"
+ import { createFallbackState, prepareFallback } from "./fallback-state"
+ import { getFallbackModelsForSession } from "./fallback-models"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+ 
+ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+   const { config, pluginConfig, sessionStates, sessionLastAccess, sessionRetryInFlight, sessionAwaitingFallbackResult, sessionFallbackTimeouts } = deps
++  const sessionStatusRetryKeys = new Map<string, string>()
+ 
+   const handleSessionCreated = (props: Record<string, unknown> | undefined) => {
+     const sessionInfo = props?.info as { id?: string; model?: string } | undefined
+@@ -33,6 +34,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+       sessionRetryInFlight.delete(sessionID)
+       sessionAwaitingFallbackResult.delete(sessionID)
+       helpers.clearSessionFallbackTimeout(sessionID)
++      sessionStatusRetryKeys.delete(sessionID)
+       SessionCategoryRegistry.remove(sessionID)
+     }
+   }
+@@ -182,6 +184,104 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+     }
+   }
+ 
++  const normalizeRetryStatusMessage = (message: string): string =>
++    message
++      .replace(/\[retrying in [^\]]*attempt\s*#\d+\]/gi, "[retrying]")
++      .replace(/retrying in\s+[^(]*attempt\s*#\d+/gi, "retrying")
++      .replace(/\s+/g, " ")
++      .trim()
++      .toLowerCase()
++
++  const extractRetryAttempt = (statusAttempt: unknown, message: string): string => {
++    if (typeof statusAttempt === "number" && Number.isFinite(statusAttempt)) {
++      return String(statusAttempt)
++    }
++    const match = message.match(/attempt\s*#\s*(\d+)/i)
++    return match?.[1] ?? "?"
++  }
++
++  const handleSessionStatus = async (props: Record<string, unknown> | undefined) => {
++    const sessionID = props?.sessionID as string | undefined
++    const status = props?.status as { type?: string; message?: string; attempt?: number } | undefined
++    const agent = props?.agent as string | undefined
++    const model = props?.model as string | undefined
++
++    if (!sessionID || status?.type !== "retry") return
++
++    const retryMessage = typeof status.message === "string" ? status.message : ""
++    const retrySignal = extractAutoRetrySignal({ status: retryMessage, message: retryMessage })
++    if (!retrySignal) return
++
++    const retryKey = `${extractRetryAttempt(status.attempt, retryMessage)}:${normalizeRetryStatusMessage(retryMessage)}`
++    if (sessionStatusRetryKeys.get(sessionID) === retryKey) {
++      return
++    }
++    sessionStatusRetryKeys.set(sessionID, retryKey)
++
++    if (sessionRetryInFlight.has(sessionID)) {
++      log(`[${HOOK_NAME}] session.status retry skipped — retry already in flight`, { sessionID })
++      return
++    }
++
++    const resolvedAgent = await helpers.resolveAgentForSessionFromContext(sessionID, agent)
++    const fallbackModels = getFallbackModelsForSession(sessionID, resolvedAgent, pluginConfig)
++    if (fallbackModels.length === 0) return
++
++    let state = sessionStates.get(sessionID)
++    if (!state) {
++      const detectedAgent = resolvedAgent
++      const agentConfig = detectedAgent
++        ? pluginConfig?.agents?.[detectedAgent as keyof typeof pluginConfig.agents]
++        : undefined
++      const inferredModel = model || (agentConfig?.model as string | undefined)
++      if (!inferredModel) {
++        log(`[${HOOK_NAME}] session.status retry missing model info, cannot fallback`, { sessionID })
++        return
++      }
++      state = createFallbackState(inferredModel)
++      sessionStates.set(sessionID, state)
++    }
++    sessionLastAccess.set(sessionID, Date.now())
++
++    if (state.pendingFallbackModel) {
++      log(`[${HOOK_NAME}] session.status retry skipped (pending fallback in progress)`, {
++        sessionID,
++        pendingFallbackModel: state.pendingFallbackModel,
++      })
++      return
++    }
++
++    log(`[${HOOK_NAME}] Detected provider auto-retry signal in session.status`, {
++      sessionID,
++      model: state.currentModel,
++      retryAttempt: status.attempt,
++    })
++
++    await helpers.abortSessionRequest(sessionID, "session.status.retry-signal")
++
++    const result = prepareFallback(sessionID, state, fallbackModels, config)
++    if (result.success && config.notify_on_fallback) {
++      await deps.ctx.client.tui
++        .showToast({
++          body: {
++            title: "Model Fallback",
++            message: `Switching to ${result.newModel?.split("/").pop() || result.newModel} for next request`,
++            variant: "warning",
++            duration: 5000,
++          },
++        })
++        .catch(() => {})
++    }
++
++    if (result.success && result.newModel) {
++      await helpers.autoRetryWithFallback(sessionID, result.newModel, resolvedAgent, "session.status")
++    }
++
++    if (!result.success) {
++      log(`[${HOOK_NAME}] Fallback preparation failed`, { sessionID, error: result.error })
++    }
++  }
++
+   return async ({ event }: { event: { type: string; properties?: unknown } }) => {
+     if (!config.enabled) return
+ 
+@@ -191,6 +291,7 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+     if (event.type === "session.deleted") { handleSessionDeleted(props); return }
+     if (event.type === "session.stop") { await handleSessionStop(props); return }
+     if (event.type === "session.idle") { handleSessionIdle(props); return }
++    if (event.type === "session.status") { await handleSessionStatus(props); return }
+     if (event.type === "session.error") { await handleSessionError(props); return }
+   }
+ }
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index dbb6e29f..44fc790c 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -387,6 +387,130 @@ describe("runtime-fallback", () => {
+       expect(fallbackLog?.data).toMatchObject({ from: "openai/gpt-5.3-codex", to: "anthropic/claude-opus-4-6" })
+     })
+ 
++    test("should trigger fallback on session.status auto-retry signal", async () => {
++      const promptCalls: unknown[] = []
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [
++                {
++                  info: { role: "user" },
++                  parts: [{ type: "text", text: "continue" }],
++                },
++              ],
++            }),
++            promptAsync: async (args) => {
++              promptCalls.push(args)
++              return {}
++            },
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: createMockPluginConfigWithCategoryFallback(["openai/gpt-5.2"]),
++        }
++      )
++
++      const sessionID = "test-session-status-auto-retry"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "quotio/claude-opus-4-6" } },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.status",
++          properties: {
++            sessionID,
++            status: {
++              type: "retry",
++              attempt: 1,
++              message: "All credentials for model claude-opus-4-6 are cooling down [retrying in 7m 56s attempt #1]",
++            },
++          },
++        },
++      })
++
++      const signalLog = logCalls.find((c) => c.msg.includes("Detected provider auto-retry signal in session.status"))
++      expect(signalLog).toBeDefined()
++
++      const fallbackLog = logCalls.find((c) => c.msg.includes("Preparing fallback"))
++      expect(fallbackLog).toBeDefined()
++      expect(fallbackLog?.data).toMatchObject({ from: "quotio/claude-opus-4-6", to: "openai/gpt-5.2" })
++      expect(promptCalls.length).toBe(1)
++    })
++
++    test("should deduplicate session.status countdown updates for the same retry attempt", async () => {
++      const promptCalls: unknown[] = []
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [
++                {
++                  info: { role: "user" },
++                  parts: [{ type: "text", text: "continue" }],
++                },
++              ],
++            }),
++            promptAsync: async (args) => {
++              promptCalls.push(args)
++              return {}
++            },
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: createMockPluginConfigWithCategoryFallback(["openai/gpt-5.2"]),
++        }
++      )
++
++      const sessionID = "test-session-status-dedup"
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "quotio/claude-opus-4-6" } },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.status",
++          properties: {
++            sessionID,
++            status: {
++              type: "retry",
++              attempt: 1,
++              message: "All credentials for model claude-opus-4-6 are cooling down [retrying in 7m 56s attempt #1]",
++            },
++          },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.status",
++          properties: {
++            sessionID,
++            status: {
++              type: "retry",
++              attempt: 1,
++              message: "All credentials for model claude-opus-4-6 are cooling down [retrying in 7m 55s attempt #1]",
++            },
++          },
++        },
++      })
++
++      expect(promptCalls.length).toBe(1)
++    })
++
+     test("should NOT trigger fallback on auto-retry signal when timeout_seconds is 0", async () => {
+       const hook = createRuntimeFallbackHook(createMockPluginInput(), {
+         config: createMockConfig({ notify_on_fallback: false, timeout_seconds: 0 }),
+diff --git a/src/plugin/event.model-fallback.test.ts b/src/plugin/event.model-fallback.test.ts
+index 66b933c8..1ab6ab92 100644
+--- a/src/plugin/event.model-fallback.test.ts
++++ b/src/plugin/event.model-fallback.test.ts
+@@ -6,7 +6,7 @@ import { _resetForTesting, setMainSession } from "../features/claude-code-sessio
+ import { createModelFallbackHook, clearPendingModelFallback } from "../hooks/model-fallback/hook"
+ 
+ describe("createEventHandler - model fallback", () => {
+-  const createHandler = (args?: { hooks?: any }) => {
++  const createHandler = (args?: { hooks?: any; pluginConfig?: any }) => {
+     const abortCalls: string[] = []
+     const promptCalls: string[] = []
+ 
+@@ -26,7 +26,7 @@ describe("createEventHandler - model fallback", () => {
+           },
+         },
+       } as any,
+-      pluginConfig: {} as any,
++      pluginConfig: (args?.pluginConfig ?? {}) as any,
+       firstMessageVariantGate: {
+         markSessionCreated: () => {},
+         clear: () => {},
+@@ -206,13 +206,224 @@ describe("createEventHandler - model fallback", () => {
+     //#then
+     expect(abortCalls).toEqual([sessionID])
+     expect(promptCalls).toEqual([sessionID])
+-    expect(output.message["model"]).toEqual({
+-      providerID: "anthropic",
++    expect(output.message["model"]).toMatchObject({
+       modelID: "claude-opus-4-6",
+     })
++    expect(["anthropic", "quotio"]).toContain((output.message["model"] as { providerID?: string })?.providerID)
+     expect(output.message["variant"]).toBe("max")
+   })
+ 
++  test("does not spam abort/prompt when session.status retry countdown updates", async () => {
++    //#given
++    const sessionID = "ses_status_retry_dedup"
++    setMainSession(sessionID)
++    clearPendingModelFallback(sessionID)
++    const modelFallback = createModelFallbackHook()
++    const { handler, abortCalls, promptCalls } = createHandler({ hooks: { modelFallback } })
++
++    await handler({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            id: "msg_user_status_dedup",
++            sessionID,
++            role: "user",
++            modelID: "claude-opus-4-6-thinking",
++            providerID: "anthropic",
++            agent: "Sisyphus (Ultraworker)",
++          },
++        },
++      },
++    })
++
++    //#when
++    await handler({
++      event: {
++        type: "session.status",
++        properties: {
++          sessionID,
++          status: {
++            type: "retry",
++            attempt: 1,
++            message:
++              "All credentials for model claude-opus-4-6-thinking are cooling down [retrying in ~5 days attempt #1]",
++            next: 300,
++          },
++        },
++      },
++    })
++    await handler({
++      event: {
++        type: "session.status",
++        properties: {
++          sessionID,
++          status: {
++            type: "retry",
++            attempt: 1,
++            message:
++              "All credentials for model claude-opus-4-6-thinking are cooling down [retrying in ~4 days attempt #1]",
++            next: 299,
++          },
++        },
++      },
++    })
++
++    //#then
++    expect(abortCalls).toEqual([sessionID])
++    expect(promptCalls).toEqual([sessionID])
++  })
++
++  test("does not trigger model-fallback from session.status when runtime_fallback is enabled", async () => {
++    //#given
++    const sessionID = "ses_status_retry_runtime_enabled"
++    setMainSession(sessionID)
++    clearPendingModelFallback(sessionID)
++    const modelFallback = createModelFallbackHook()
++    const runtimeFallback = {
++      event: async () => {},
++      "chat.message": async () => {},
++    }
++    const { handler, abortCalls, promptCalls } = createHandler({
++      hooks: { modelFallback, runtimeFallback },
++      pluginConfig: { runtime_fallback: { enabled: true } },
++    })
++
++    await handler({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            id: "msg_user_status_runtime_enabled",
++            sessionID,
++            role: "user",
++            modelID: "claude-opus-4-6",
++            providerID: "quotio",
++            agent: "Sisyphus (Ultraworker)",
++          },
++        },
++      },
++    })
++
++    //#when
++    await handler({
++      event: {
++        type: "session.status",
++        properties: {
++          sessionID,
++          status: {
++            type: "retry",
++            attempt: 1,
++            message:
++              "All credentials for model claude-opus-4-6 are cooling down [retrying in 7m 56s attempt #1]",
++            next: 476,
++          },
++        },
++      },
++    })
++
++    //#then
++    expect(abortCalls).toEqual([])
++    expect(promptCalls).toEqual([])
++  })
++
++  test("prefers user-configured fallback_models over hardcoded chain on session.status retry", async () => {
++    //#given
++    const sessionID = "ses_status_retry_user_fallback"
++    setMainSession(sessionID)
++    clearPendingModelFallback(sessionID)
++
++    const modelFallback = createModelFallbackHook()
++    const pluginConfig = {
++      agents: {
++        sisyphus: {
++          fallback_models: ["quotio/gpt-5.2", "quotio/kimi-k2.5"],
++        },
++      },
++    }
++
++    const { handler, abortCalls, promptCalls } = createHandler({ hooks: { modelFallback }, pluginConfig })
++
++    const chatMessageHandler = createChatMessageHandler({
++      ctx: {
++        client: {
++          tui: {
++            showToast: async () => ({}),
++          },
++        },
++      } as any,
++      pluginConfig: {} as any,
++      firstMessageVariantGate: {
++        shouldOverride: () => false,
++        markApplied: () => {},
++      },
++      hooks: {
++        modelFallback,
++        stopContinuationGuard: null,
++        keywordDetector: null,
++        claudeCodeHooks: null,
++        autoSlashCommand: null,
++        startWork: null,
++        ralphLoop: null,
++      } as any,
++    })
++
++    await handler({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            id: "msg_user_status_user_fallback",
++            sessionID,
++            role: "user",
++            time: { created: 1 },
++            content: [],
++            modelID: "claude-opus-4-6",
++            providerID: "quotio",
++            agent: "Sisyphus (Ultraworker)",
++            path: { cwd: "/tmp", root: "/tmp" },
++          },
++        },
++      },
++    })
++
++    //#when
++    await handler({
++      event: {
++        type: "session.status",
++        properties: {
++          sessionID,
++          status: {
++            type: "retry",
++            attempt: 1,
++            message:
++              "All credentials for model claude-opus-4-6-thinking are cooling down [retrying in ~5 days attempt #1]",
++            next: 300,
++          },
++        },
++      },
++    })
++
++    const output = { message: {}, parts: [] as Array<{ type: string; text?: string }> }
++    await chatMessageHandler(
++      {
++        sessionID,
++        agent: "sisyphus",
++        model: { providerID: "quotio", modelID: "claude-opus-4-6" },
++      },
++      output,
++    )
++
++    //#then
++    expect(abortCalls).toEqual([sessionID])
++    expect(promptCalls).toEqual([sessionID])
++    expect(output.message["model"]).toEqual({
++      providerID: "quotio",
++      modelID: "gpt-5.2",
++    })
++    expect(output.message["variant"]).toBeUndefined()
++  })
++
+   test("advances main-session fallback chain across repeated session.error retries end-to-end", async () => {
+     //#given
+     const abortCalls: string[] = []
+@@ -323,10 +534,10 @@ describe("createEventHandler - model fallback", () => {
+     const first = await triggerRetryCycle()
+ 
+     //#then - first fallback entry applied (prefers current provider when available)
+-    expect(first.message["model"]).toEqual({
+-      providerID: "anthropic",
++    expect(first.message["model"]).toMatchObject({
+       modelID: "claude-opus-4-6",
+     })
++    expect(["anthropic", "quotio"]).toContain((first.message["model"] as { providerID?: string })?.providerID)
+     expect(first.message["variant"]).toBe("max")
+ 
+     //#when - second retry cycle
+@@ -337,6 +548,7 @@ describe("createEventHandler - model fallback", () => {
+       providerID: "kimi-for-coding",
+       modelID: "k2p5",
+     })
++    expect((second.message["model"] as { providerID?: string })?.providerID).toBeTruthy()
+     expect(second.message["variant"]).toBeUndefined()
+     expect(abortCalls).toEqual([sessionID, sessionID])
+     expect(promptCalls).toEqual([sessionID, sessionID])
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 1a935619..fd0472a0 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -13,11 +13,15 @@ import {
+ import {
+   clearPendingModelFallback,
+   clearSessionFallbackChain,
++  setSessionFallbackChain,
+   setPendingModelFallback,
+ } from "../hooks/model-fallback/hook";
++import { getFallbackModelsForSession } from "../hooks/runtime-fallback/fallback-models";
+ import { resetMessageCursor } from "../shared";
++import { getAgentConfigKey } from "../shared/agent-display-names";
+ import { log } from "../shared/logger";
+ import { shouldRetryError } from "../shared/model-error-classifier";
++import type { FallbackEntry } from "../shared/model-requirements";
+ import { clearSessionModel, setSessionModel } from "../shared/session-model-state";
+ import { deleteSessionTools } from "../shared/session-tools-store";
+ import { lspManager } from "../tools";
+@@ -43,6 +47,28 @@ function normalizeFallbackModelID(modelID: string): string {
+     .replace(/-high$/i, "");
+ }
+ 
++function normalizeRetryStatusMessage(message: string): string {
++  return message
++    .replace(/\[retrying in [^\]]*attempt\s*#\d+\]/gi, "[retrying]")
++    .replace(/retrying in\s+[^(]*attempt\s*#\d+/gi, "retrying")
++    .replace(/\s+/g, " ")
++    .trim()
++    .toLowerCase();
++}
++
++function extractRetryAttempt(statusAttempt: unknown, message: string): string {
++  if (typeof statusAttempt === "number" && Number.isFinite(statusAttempt)) {
++    return String(statusAttempt);
++  }
++
++  const attemptMatch = message.match(/attempt\s*#\s*(\d+)/i);
++  if (attemptMatch?.[1]) {
++    return attemptMatch[1];
++  }
++
++  return "?";
++}
++
+ function extractErrorName(error: unknown): string | undefined {
+   if (isRecord(error) && typeof error.name === "string") return error.name;
+   if (error instanceof Error) return error.name;
+@@ -97,6 +123,48 @@ function extractProviderModelFromErrorMessage(message: string): { providerID?: s
+ 
+   return {};
+ }
++function parseFallbackModelEntry(
++  model: string,
++  defaultProviderID: string,
++): FallbackEntry | undefined {
++  const trimmed = model.trim();
++  if (!trimmed) return undefined;
++
++  const parts = trimmed.split("/");
++  const providerID = parts.length >= 2 ? parts[0].trim() : defaultProviderID;
++  const rawModelID = parts.length >= 2 ? parts.slice(1).join("/").trim() : trimmed;
++  if (!providerID || !rawModelID) return undefined;
++
++  const variantMatch = rawModelID.match(/^(.*)\(([^()]+)\)\s*$/);
++  if (variantMatch) {
++    const parsedModelID = variantMatch[1]?.trim();
++    const parsedVariant = variantMatch[2]?.trim();
++    if (parsedModelID && parsedVariant) {
++      return { providers: [providerID], model: parsedModelID, variant: parsedVariant };
++    }
++  }
++
++  return { providers: [providerID], model: rawModelID };
++}
++
++function applyUserConfiguredFallbackChain(
++  sessionID: string,
++  agentName: string,
++  currentProviderID: string,
++  pluginConfig: OhMyOpenCodeConfig,
++): void {
++  const agentKey = getAgentConfigKey(agentName);
++  const configuredFallbackModels = getFallbackModelsForSession(sessionID, agentKey, pluginConfig);
++  if (configuredFallbackModels.length === 0) return;
++
++  const fallbackChain = configuredFallbackModels
++    .map((model) => parseFallbackModelEntry(model, currentProviderID))
++    .filter((entry): entry is FallbackEntry => entry !== undefined);
++
++  if (fallbackChain.length > 0) {
++    setSessionFallbackChain(sessionID, fallbackChain);
++  }
++}
+ 
+ function isCompactionAgent(agent: string): boolean {
+   return agent.toLowerCase() === "compaction";
+@@ -116,6 +184,11 @@ export function createEventHandler(args: {
+     client: {
+       session: {
+         abort: (input: { path: { id: string } }) => Promise<unknown>;
++        promptAsync?: (input: {
++          path: { id: string };
++          body: { parts: Array<{ type: "text"; text: string }> };
++          query: { directory: string };
++        }) => Promise<unknown>;
+         prompt: (input: {
+           path: { id: string };
+           body: { parts: Array<{ type: "text"; text: string }> };
+@@ -176,6 +249,29 @@ export function createEventHandler(args: {
+     return !subagentSessions.has(sessionID);
+   };
+ 
++  const autoContinueAfterFallback = async (sessionID: string, source: string): Promise<void> => {
++    await pluginContext.client.session.abort({ path: { id: sessionID } }).catch((error) => {
++      log("[event] model-fallback abort failed", { sessionID, source, error });
++    });
++
++    const promptBody = {
++      path: { id: sessionID },
++      body: { parts: [{ type: "text" as const, text: "continue" }] },
++      query: { directory: pluginContext.directory },
++    };
++
++    if (typeof pluginContext.client.session.promptAsync === "function") {
++      await pluginContext.client.session.promptAsync(promptBody).catch((error) => {
++        log("[event] model-fallback promptAsync failed", { sessionID, source, error });
++      });
++      return;
++    }
++
++    await pluginContext.client.session.prompt(promptBody).catch((error) => {
++      log("[event] model-fallback prompt failed", { sessionID, source, error });
++    });
++  };
++
+   return async (input): Promise<void> => {
+     pruneRecentSyntheticIdles({
+       recentSyntheticIdles,
+@@ -310,6 +406,7 @@ export function createEventHandler(args: {
+                 const currentProvider = (info?.providerID as string | undefined) ?? "opencode";
+                 const rawModel = (info?.modelID as string | undefined) ?? "claude-opus-4-6";
+                 const currentModel = normalizeFallbackModelID(rawModel);
++                applyUserConfiguredFallbackChain(sessionID, agentName, currentProvider, args.pluginConfig);
+ 
+                 const setFallback = setPendingModelFallback(sessionID, agentName, currentProvider, currentModel);
+ 
+@@ -319,15 +416,7 @@ export function createEventHandler(args: {
+                   !hooks.stopContinuationGuard?.isStopped(sessionID)
+                 ) {
+                   lastHandledModelErrorMessageID.set(sessionID, assistantMessageID);
+-
+-                  await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {});
+-                  await pluginContext.client.session
+-                    .prompt({
+-                      path: { id: sessionID },
+-                      body: { parts: [{ type: "text", text: "continue" }] },
+-                      query: { directory: pluginContext.directory },
+-                    })
+-                    .catch(() => {});
++                  await autoContinueAfterFallback(sessionID, "message.updated");
+                 }
+               }
+             }
+@@ -342,10 +431,14 @@ export function createEventHandler(args: {
+       const sessionID = props?.sessionID as string | undefined;
+       const status = props?.status as { type?: string; attempt?: number; message?: string; next?: number } | undefined;
+ 
+-      if (sessionID && status?.type === "retry" && isModelFallbackEnabled) {
++      if (sessionID && status?.type === "retry" && isModelFallbackEnabled && !isRuntimeFallbackEnabled) {
+         try {
+           const retryMessage = typeof status.message === "string" ? status.message : "";
+-          const retryKey = `${status.attempt ?? "?"}:${status.next ?? "?"}:${retryMessage}`;
++          const parsedForKey = extractProviderModelFromErrorMessage(retryMessage);
++          const retryAttempt = extractRetryAttempt(status.attempt, retryMessage);
++          // Deduplicate countdown updates for the same retry attempt/model.
++          // Messages like "retrying in 7m 56s" change every second but should only trigger once.
++          const retryKey = `${retryAttempt}:${parsedForKey.providerID ?? ""}/${parsedForKey.modelID ?? ""}:${normalizeRetryStatusMessage(retryMessage)}`;
+           if (lastHandledRetryStatusKey.get(sessionID) === retryKey) {
+             return;
+           }
+@@ -370,6 +463,7 @@ export function createEventHandler(args: {
+               const currentProvider = parsed.providerID ?? lastKnown?.providerID ?? "opencode";
+               let currentModel = parsed.modelID ?? lastKnown?.modelID ?? "claude-opus-4-6";
+               currentModel = normalizeFallbackModelID(currentModel);
++              applyUserConfiguredFallbackChain(sessionID, agentName, currentProvider, args.pluginConfig);
+ 
+               const setFallback = setPendingModelFallback(sessionID, agentName, currentProvider, currentModel);
+ 
+@@ -378,14 +472,7 @@ export function createEventHandler(args: {
+                 shouldAutoRetrySession(sessionID) &&
+                 !hooks.stopContinuationGuard?.isStopped(sessionID)
+               ) {
+-                await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {});
+-                await pluginContext.client.session
+-                  .prompt({
+-                    path: { id: sessionID },
+-                    body: { parts: [{ type: "text", text: "continue" }] },
+-                    query: { directory: pluginContext.directory },
+-                  })
+-                  .catch(() => {});
++                await autoContinueAfterFallback(sessionID, "session.status");
+               }
+             }
+           }
+@@ -448,6 +535,7 @@ export function createEventHandler(args: {
+             const currentProvider = (props?.providerID as string) || parsed.providerID || "opencode";
+             let currentModel = (props?.modelID as string) || parsed.modelID || "claude-opus-4-6";
+             currentModel = normalizeFallbackModelID(currentModel);
++            applyUserConfiguredFallbackChain(sessionID, agentName, currentProvider, args.pluginConfig);
+ 
+             const setFallback = setPendingModelFallback(sessionID, agentName, currentProvider, currentModel);
+ 
+@@ -456,15 +544,7 @@ export function createEventHandler(args: {
+               shouldAutoRetrySession(sessionID) &&
+               !hooks.stopContinuationGuard?.isStopped(sessionID)
+             ) {
+-              await pluginContext.client.session.abort({ path: { id: sessionID } }).catch(() => {});
+-
+-              await pluginContext.client.session
+-                .prompt({
+-                  path: { id: sessionID },
+-                  body: { parts: [{ type: "text", text: "continue" }] },
+-                  query: { directory: pluginContext.directory },
+-                })
+-                .catch(() => {});
++              await autoContinueAfterFallback(sessionID, "session.error");
+             }
+           }
+         }
+diff --git a/src/shared/model-error-classifier.test.ts b/src/shared/model-error-classifier.test.ts
+index 016819f1..cd373b27 100644
+--- a/src/shared/model-error-classifier.test.ts
++++ b/src/shared/model-error-classifier.test.ts
+@@ -36,6 +36,20 @@ describe("model-error-classifier", () => {
+     expect(result).toBe(true)
+   })
+ 
++  test("treats cooling-down auto-retry messages as retryable", () => {
++    //#given
++    const error = {
++      message:
++        "All credentials for model claude-opus-4-6-thinking are cooling down [retrying in ~5 days attempt #1]",
++    }
++
++    //#when
++    const result = shouldRetryError(error)
++
++    //#then
++    expect(result).toBe(true)
++  })
++
+   test("selectFallbackProvider prefers first connected provider in preference order", () => {
+     //#given
+     writeFileSync(
+@@ -73,4 +87,18 @@ describe("model-error-classifier", () => {
+     //#then
+     expect(provider).toBe("anthropic")
+   })
++
++  test("selectFallbackProvider maps opencode fallback to quotio when quotio is connected", () => {
++    //#given
++    writeFileSync(
++      join(TEST_CACHE_DIR, "connected-providers.json"),
++      JSON.stringify({ connected: ["quotio"], updatedAt: new Date().toISOString() }, null, 2),
++    )
++
++    //#when
++    const provider = selectFallbackProvider(["opencode"], "quotio")
++
++    //#then
++    expect(provider).toBe("quotio")
++  })
+ })
+diff --git a/src/shared/model-error-classifier.ts b/src/shared/model-error-classifier.ts
+index defcef67..71de2a32 100644
+--- a/src/shared/model-error-classifier.ts
++++ b/src/shared/model-error-classifier.ts
+@@ -36,6 +36,11 @@ const RETRYABLE_MESSAGE_PATTERNS = [
+   "rate_limit",
+   "rate limit",
+   "quota",
++  "quota will reset after",
++  "usage limit has been reached",
++  "all credentials for model",
++  "cooling down",
++  "exhausted your capacity",
+   "not found",
+   "unavailable",
+   "insufficient",
+@@ -55,6 +60,23 @@ const RETRYABLE_MESSAGE_PATTERNS = [
+   "504",
+ ]
+ 
++const AUTO_RETRY_GATE_PATTERNS = [
++  "rate limit",
++  "quota",
++  "usage limit",
++  "limit reached",
++  "cooling down",
++  "credentials for model",
++  "exhausted your capacity",
++]
++
++function hasProviderAutoRetrySignal(message: string): boolean {
++  if (!message.includes("retrying in")) {
++    return false
++  }
++  return AUTO_RETRY_GATE_PATTERNS.some((pattern) => message.includes(pattern))
++}
++
+ export interface ErrorInfo {
+   name?: string
+   message?: string
+@@ -79,6 +101,9 @@ export function isRetryableModelError(error: ErrorInfo): boolean {
+ 
+   // Check message patterns for unknown errors
+   const msg = error.message?.toLowerCase() ?? ""
++  if (hasProviderAutoRetrySignal(msg)) {
++    return true
++  }
+   return RETRYABLE_MESSAGE_PATTERNS.some((pattern) => msg.includes(pattern))
+ }
+ 
+@@ -124,6 +149,14 @@ export function selectFallbackProvider(
+   const connectedProviders = readConnectedProvidersCache()
+   if (connectedProviders) {
+     const connectedSet = new Set(connectedProviders.map(p => p.toLowerCase()))
++    if (connectedSet.has("quotio")) {
++      const hasQuotio = providers.some((p) => p.toLowerCase() === "quotio")
++      const hasOpencode = providers.some((p) => p.toLowerCase() === "opencode")
++      if (hasQuotio || hasOpencode) {
++        return "quotio"
++      }
++    }
++
+     for (const provider of providers) {
+       if (connectedSet.has(provider.toLowerCase())) {
+         return provider
+-- 
+2.39.2
+

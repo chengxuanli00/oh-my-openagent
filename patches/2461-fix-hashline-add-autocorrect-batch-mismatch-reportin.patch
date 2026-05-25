@@ -1,0 +1,2135 @@
+From 40dccd61189b5ec4a90fec974852709a63ebb02c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 20 Feb 2026 11:02:07 +0900
+Subject: [PATCH 2461/5749] fix(hashline): add autocorrect, batch mismatch
+ reporting, and write anchors
+
+---
+ src/hooks/hashline-read-enhancer/hook.ts      |  77 ++-
+ .../hashline-read-enhancer/index.test.ts      | 472 +++--------------
+ .../hashline-edit/edit-operations.test.ts     | 303 ++---------
+ src/tools/hashline-edit/edit-operations.ts    | 159 ++++--
+ src/tools/hashline-edit/tools.test.ts         | 475 ++++--------------
+ src/tools/hashline-edit/tools.ts              |  79 +--
+ src/tools/hashline-edit/validation.test.ts    |  92 +---
+ src/tools/hashline-edit/validation.ts         |  47 +-
+ 8 files changed, 527 insertions(+), 1177 deletions(-)
+
+diff --git a/src/hooks/hashline-read-enhancer/hook.ts b/src/hooks/hashline-read-enhancer/hook.ts
+index d41b0447..63a88035 100644
+--- a/src/hooks/hashline-read-enhancer/hook.ts
++++ b/src/hooks/hashline-read-enhancer/hook.ts
+@@ -1,15 +1,21 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { computeLineHash } from "../../tools/hashline-edit/hash-computation"
++import { toHashlineContent } from "../../tools/hashline-edit/diff-utils"
+ 
+ interface HashlineReadEnhancerConfig {
+   hashline_edit?: { enabled: boolean }
+ }
+ 
+ const READ_LINE_PATTERN = /^(\d+): (.*)$/
++const CONTENT_OPEN_TAG = "<content>"
++const CONTENT_CLOSE_TAG = "</content>"
+ 
+ function isReadTool(toolName: string): boolean {
+-  const lower = toolName.toLowerCase()
+-  return lower === "read" || lower === "write"
++  return toolName.toLowerCase() === "read"
++}
++
++function isWriteTool(toolName: string): boolean {
++  return toolName.toLowerCase() === "write"
+ }
+ 
+ function shouldProcess(config: HashlineReadEnhancerConfig): boolean {
+@@ -29,35 +35,73 @@ function transformLine(line: string): string {
+   const lineNumber = parseInt(match[1], 10)
+   const content = match[2]
+   const hash = computeLineHash(lineNumber, content)
+-  return `${lineNumber}:${hash}|${content}`
++  return `${lineNumber}#${hash}:${content}`
+ }
+ 
+ function transformOutput(output: string): string {
+   if (!output) {
+     return output
+   }
+-  if (!isTextFile(output)) {
++
++  const lines = output.split("\n")
++  const contentStart = lines.indexOf(CONTENT_OPEN_TAG)
++  const contentEnd = lines.indexOf(CONTENT_CLOSE_TAG)
++
++  if (contentStart === -1 || contentEnd === -1 || contentEnd <= contentStart + 1) {
+     return output
+   }
+-  const lines = output.split("\n")
++
++  const fileLines = lines.slice(contentStart + 1, contentEnd)
++  if (!isTextFile(fileLines[0] ?? "")) {
++    return output
++  }
++
+   const result: string[] = []
+-  for (const line of lines) {
++  for (const line of fileLines) {
+     if (!READ_LINE_PATTERN.test(line)) {
+-      result.push(line)
+-      result.push(...lines.slice(result.length))
++      result.push(...fileLines.slice(result.length))
+       break
+     }
+     result.push(transformLine(line))
+   }
+-  return result.join("\n")
++
++  return [...lines.slice(0, contentStart + 1), ...result, ...lines.slice(contentEnd)].join("\n")
+ }
+ 
+-function transformWriteOutput(output: string): string {
+-  if (!output) {
+-    return output
++function extractFilePath(metadata: unknown): string | undefined {
++  if (!metadata || typeof metadata !== "object") {
++    return undefined
+   }
+-  const lines = output.split("\n")
+-  return lines.map((line) => (READ_LINE_PATTERN.test(line) ? transformLine(line) : line)).join("\n")
++
++  const objectMeta = metadata as Record<string, unknown>
++  const candidates = [objectMeta.filepath, objectMeta.filePath, objectMeta.path, objectMeta.file]
++  for (const candidate of candidates) {
++    if (typeof candidate === "string" && candidate.length > 0) {
++      return candidate
++    }
++  }
++
++  return undefined
++}
++
++async function appendWriteHashlineOutput(output: { output: string; metadata: unknown }): Promise<void> {
++  if (output.output.includes("Updated file (LINE#ID:content):")) {
++    return
++  }
++
++  const filePath = extractFilePath(output.metadata)
++  if (!filePath) {
++    return
++  }
++
++  const file = Bun.file(filePath)
++  if (!(await file.exists())) {
++    return
++  }
++
++  const content = await file.text()
++  const hashlined = toHashlineContent(content)
++  output.output = `${output.output}\n\nUpdated file (LINE#ID:content):\n${hashlined}`
+ }
+ 
+ export function createHashlineReadEnhancerHook(
+@@ -70,6 +114,9 @@ export function createHashlineReadEnhancerHook(
+       output: { title: string; output: string; metadata: unknown }
+     ) => {
+       if (!isReadTool(input.tool)) {
++        if (isWriteTool(input.tool) && typeof output.output === "string" && shouldProcess(config)) {
++          await appendWriteHashlineOutput(output)
++        }
+         return
+       }
+       if (typeof output.output !== "string") {
+@@ -78,7 +125,7 @@ export function createHashlineReadEnhancerHook(
+       if (!shouldProcess(config)) {
+         return
+       }
+-      output.output = input.tool.toLowerCase() === "write" ? transformWriteOutput(output.output) : transformOutput(output.output)
++      output.output = transformOutput(output.output)
+     },
+   }
+ }
+diff --git a/src/hooks/hashline-read-enhancer/index.test.ts b/src/hooks/hashline-read-enhancer/index.test.ts
+index 1cd713bc..7486132d 100644
+--- a/src/hooks/hashline-read-enhancer/index.test.ts
++++ b/src/hooks/hashline-read-enhancer/index.test.ts
+@@ -1,405 +1,93 @@
+-import { describe, it, expect, beforeEach } from "bun:test"
+-import { createHashlineReadEnhancerHook } from "./hook"
+-import { computeLineHash } from "../../tools/hashline-edit/hash-computation"
+-import { validateLineRef } from "../../tools/hashline-edit/validation"
++import { describe, it, expect } from "bun:test"
+ import type { PluginInput } from "@opencode-ai/plugin"
++import { createHashlineReadEnhancerHook } from "./hook"
++import * as fs from "node:fs"
++import * as os from "node:os"
++import * as path from "node:path"
+ 
+-//#given - Test setup helpers
+-function createMockContext(): PluginInput {
++function mockCtx(): PluginInput {
+   return {
+-    client: {} as unknown as PluginInput["client"],
++    client: {} as PluginInput["client"],
+     directory: "/test",
++    project: "/test" as unknown as PluginInput["project"],
++    worktree: "/test",
++    serverUrl: "http://localhost" as unknown as PluginInput["serverUrl"],
++    $: {} as PluginInput["$"],
+   }
+ }
+ 
+-interface TestConfig {
+-  hashline_edit?: { enabled: boolean }
+-}
+-
+-function createMockConfig(enabled: boolean): TestConfig {
+-  return {
+-    hashline_edit: { enabled },
+-  }
+-}
+-
+-describe("createHashlineReadEnhancerHook", () => {
+-  let mockCtx: PluginInput
+-  const sessionID = "test-session-123"
+-
+-  beforeEach(() => {
+-    mockCtx = createMockContext()
+-  })
+-
+-  describe("tool name matching", () => {
+-    it("should process 'read' tool (lowercase)", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "1: hello\n2: world", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toContain("1:")
+-      expect(output.output).toContain("|")
+-    })
+-
+-    it("should process 'Read' tool (mixed case)", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "Read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "1: hello\n2: world", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toContain("|")
+-    })
+-
+-    it("should process 'READ' tool (uppercase)", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "READ", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "1: hello\n2: world", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toContain("|")
+-    })
+-
+-
+-    it("should process 'write' tool (lowercase)", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "write", sessionID, callID: "call-1" }
+-      const output = { title: "Write", output: "1: hello\n2: world", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toContain("|")
+-    })
+-
+-    it("should process 'Write' tool (mixed case)", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "Write", sessionID, callID: "call-1" }
+-      const output = { title: "Write", output: "1: hello\n2: world", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toContain("|")
+-    })
+-
+-    it("should transform write tool output to LINE:HASH|content format", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "write", sessionID, callID: "call-1" }
+-      const output = { title: "Write", output: "1: const x = 1\n2: const y = 2", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      const lines = output.output.split("\n")
+-      expect(lines[0]).toMatch(/^1:[a-f0-9]{2}\|const x = 1$/)
+-      expect(lines[1]).toMatch(/^2:[a-f0-9]{2}\|const y = 2$/)
+-    })
+-
+-    it("should transform numbered write lines even when header lines come first", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "write", sessionID, callID: "call-1" }
+-      const output = {
+-        title: "Write",
+-        output: ["# Wrote /tmp/demo-edit.txt", "1: This is line one", "2: This is line two"].join("\n"),
+-        metadata: {},
+-      }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      const lines = output.output.split("\n")
+-      expect(lines[0]).toBe("# Wrote /tmp/demo-edit.txt")
+-      expect(lines[1]).toMatch(/^1:[a-f0-9]{2}\|This is line one$/)
+-      expect(lines[2]).toMatch(/^2:[a-f0-9]{2}\|This is line two$/)
+-    })
+-
+-    it("should skip non-read tools", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "edit", sessionID, callID: "call-1" }
+-      const originalOutput = "1: hello\n2: world"
+-      const output = { title: "Edit", output: originalOutput, metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toBe(originalOutput)
+-    })
+-  })
+-
+-  describe("config flag check", () => {
+-    it("should skip when hashline_edit is disabled", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(false))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const originalOutput = "1: hello\n2: world"
+-      const output = { title: "Read", output: originalOutput, metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toBe(originalOutput)
+-    })
+-
+-    it("should skip when hashline_edit config is missing", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, {})
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const originalOutput = "1: hello\n2: world"
+-      const output = { title: "Read", output: originalOutput, metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toBe(originalOutput)
+-    })
++describe("hashline-read-enhancer", () => {
++  it("hashifies only file content lines in read output", async () => {
++    //#given
++    const hook = createHashlineReadEnhancerHook(mockCtx(), { hashline_edit: { enabled: true } })
++    const input = { tool: "read", sessionID: "s", callID: "c" }
++    const output = {
++      title: "demo.ts",
++      output: [
++        "<path>/tmp/demo.ts</path>",
++        "<type>file</type>",
++        "<content>",
++        "1: const x = 1",
++        "2: const y = 2",
++        "",
++        "(End of file - total 2 lines)",
++        "</content>",
++        "",
++        "<system-reminder>",
++        "1: keep this unchanged",
++        "</system-reminder>",
++      ].join("\n"),
++      metadata: {},
++    }
++
++    //#when
++    await hook["tool.execute.after"](input, output)
++
++    //#then
++    const lines = output.output.split("\n")
++    expect(lines[3]).toMatch(/^1#[ZPMQVRWSNKTXJBYH]{2}:const x = 1$/)
++    expect(lines[4]).toMatch(/^2#[ZPMQVRWSNKTXJBYH]{2}:const y = 2$/)
++    expect(lines[10]).toBe("1: keep this unchanged")
+   })
+ 
+-  describe("output transformation", () => {
+-    it("should transform 'N: content' format to 'N:HASH|content'", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "1: function hello() {\n2:   console.log('world')\n3: }", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      const lines = output.output.split("\n")
+-      expect(lines[0]).toMatch(/^1:[a-f0-9]{2}\|function hello\(\) \{$/)
+-      expect(lines[1]).toMatch(/^2:[a-f0-9]{2}\|  console\.log\('world'\)$/)
+-      expect(lines[2]).toMatch(/^3:[a-f0-9]{2}\|\}$/)
+-    })
+-
+-    it("should handle empty output", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toBe("")
+-    })
+-
+-    it("should handle single line", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "1: const x = 1", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toMatch(/^1:[a-f0-9]{2}\|const x = 1$/)
+-    })
++  it("appends LINE#ID output for write tool using metadata filepath", async () => {
++    //#given
++    const hook = createHashlineReadEnhancerHook(mockCtx(), { hashline_edit: { enabled: true } })
++    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "hashline-write-"))
++    const filePath = path.join(tempDir, "demo.ts")
++    fs.writeFileSync(filePath, "const x = 1\nconst y = 2")
++    const input = { tool: "write", sessionID: "s", callID: "c" }
++    const output = {
++      title: "write",
++      output: "Wrote file successfully.",
++      metadata: { filepath: filePath },
++    }
++
++    //#when
++    await hook["tool.execute.after"](input, output)
++
++    //#then
++    expect(output.output).toContain("Updated file (LINE#ID:content):")
++    expect(output.output).toMatch(/1#[ZPMQVRWSNKTXJBYH]{2}:const x = 1/)
++    expect(output.output).toMatch(/2#[ZPMQVRWSNKTXJBYH]{2}:const y = 2/)
++
++    fs.rmSync(tempDir, { recursive: true, force: true })
+   })
+ 
+-  describe("binary file detection", () => {
+-    it("should skip binary files (no line number prefix)", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const originalOutput = "PNG\x89\x50\x4E\x47\x0D\x0A\x1A\x0A"
+-      const output = { title: "Read", output: originalOutput, metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toBe(originalOutput)
+-    })
+-
+-    it("should skip if first line doesn't match pattern", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const originalOutput = "some binary data\nmore data"
+-      const output = { title: "Read", output: originalOutput, metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toBe(originalOutput)
+-    })
+-
+-    it("should process if first line matches 'N: ' pattern", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "1: valid line\n2: another line", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toContain("|")
+-    })
+-  })
+-
+-  describe("hash consistency with Edit tool validation", () => {
+-    it("hash in Read output matches what validateLineRef expects for the same file content", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const fileLines = ["import { foo } from './bar'", "  const x = 1", "", "export default x"]
+-      const readOutput = fileLines.map((line, i) => `${i + 1}: ${line}`).join("\n")
+-      const output = { title: "Read", output: readOutput, metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then - each hash in Read output must satisfy validateLineRef
+-      const transformedLines = output.output.split("\n")
+-      for (let i = 0; i < fileLines.length; i++) {
+-        const lineNum = i + 1
+-        const expectedHash = computeLineHash(lineNum, fileLines[i])
+-        expect(transformedLines[i]).toBe(`${lineNum}:${expectedHash}|${fileLines[i]}`)
+-        // Must not throw when used with validateLineRef
+-        expect(() => validateLineRef(fileLines, `${lineNum}:${expectedHash}`)).not.toThrow()
+-      }
+-    })
+-  })
+-
+-  describe("injected content isolation", () => {
+-    it("should NOT hashify lines appended by other hooks that happen to match the numbered pattern", async () => {
+-      //#given - file content followed by injected README with numbered items
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = {
+-        title: "Read",
+-        output: ["1: const x = 1", "2: const y = 2", "[Project README]", "1: First item", "2: Second item"].join("\n"),
+-        metadata: {},
+-      }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then - only original file content gets hashified
+-      const lines = output.output.split("\n")
+-      expect(lines[0]).toMatch(/^1:[a-f0-9]{2}\|const x = 1$/)
+-      expect(lines[1]).toMatch(/^2:[a-f0-9]{2}\|const y = 2$/)
+-      expect(lines[2]).toBe("[Project README]")
+-      expect(lines[3]).toBe("1: First item")
+-      expect(lines[4]).toBe("2: Second item")
+-    })
+-
+-    it("should NOT hashify Read tool footer messages after file content", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = {
+-        title: "Read",
+-        output: ["1: const x = 1", "2: const y = 2", "", "(File has more lines. Use 'offset' parameter to read beyond line 2)"].join("\n"),
+-        metadata: {},
+-      }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then - footer passes through unchanged
+-      const lines = output.output.split("\n")
+-      expect(lines[0]).toMatch(/^1:[a-f0-9]{2}\|const x = 1$/)
+-      expect(lines[1]).toMatch(/^2:[a-f0-9]{2}\|const y = 2$/)
+-      expect(lines[2]).toBe("")
+-      expect(lines[3]).toBe("(File has more lines. Use 'offset' parameter to read beyond line 2)")
+-    })
+-
+-    it("should NOT hashify system reminder content appended after file content", async () => {
+-      //#given - other hooks append system reminders to output
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = {
+-        title: "Read",
+-        output: ["1: export function hello() {", "2:   return 42", "3: }", "", "[System Reminder]", "1: Do not forget X", "2: Always do Y"].join("\n"),
+-        metadata: {},
+-      }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      const lines = output.output.split("\n")
+-      expect(lines[0]).toMatch(/^1:[a-f0-9]{2}\|export function hello\(\) \{$/)
+-      expect(lines[1]).toMatch(/^2:[a-f0-9]{2}\|  return 42$/)
+-      expect(lines[2]).toMatch(/^3:[a-f0-9]{2}\|}$/)
+-      expect(lines[3]).toBe("")
+-      expect(lines[4]).toBe("[System Reminder]")
+-      expect(lines[5]).toBe("1: Do not forget X")
+-      expect(lines[6]).toBe("2: Always do Y")
+-    })
+-  })
+-
+-  describe("edge cases", () => {
+-    it("should handle non-string output gracefully", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: null as unknown as string, metadata: {} }
+-
+-      //#when - should not throw
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toBeNull()
+-    })
+-
+-    it("should handle lines with no content after colon", async () => {
+-      //#given
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: "1: hello\n2: \n3: world", metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      const lines = output.output.split("\n")
+-      expect(lines[0]).toMatch(/^1:[a-f0-9]{2}\|hello$/)
+-      expect(lines[1]).toMatch(/^2:[a-f0-9]{2}\|$/)
+-      expect(lines[2]).toMatch(/^3:[a-f0-9]{2}\|world$/)
+-    })
+-
+-    it("should handle very long lines", async () => {
+-      //#given
+-      const longContent = "a".repeat(1000)
+-      const hook = createHashlineReadEnhancerHook(mockCtx, createMockConfig(true))
+-      const input = { tool: "read", sessionID, callID: "call-1" }
+-      const output = { title: "Read", output: `1: ${longContent}`, metadata: {} }
+-
+-      //#when
+-      await hook["tool.execute.after"](input, output)
+-
+-      //#then
+-      expect(output.output).toMatch(/^1:[a-f0-9]{2}\|a+$/)
+-    })
++  it("skips when feature is disabled", async () => {
++    //#given
++    const hook = createHashlineReadEnhancerHook(mockCtx(), { hashline_edit: { enabled: false } })
++    const input = { tool: "read", sessionID: "s", callID: "c" }
++    const output = {
++      title: "demo.ts",
++      output: "<content>\n1: const x = 1\n</content>",
++      metadata: {},
++    }
++
++    //#when
++    await hook["tool.execute.after"](input, output)
++
++    //#then
++    expect(output.output).toBe("<content>\n1: const x = 1\n</content>")
+   })
+ })
+diff --git a/src/tools/hashline-edit/edit-operations.test.ts b/src/tools/hashline-edit/edit-operations.test.ts
+index 754dff41..45abaa4c 100644
+--- a/src/tools/hashline-edit/edit-operations.test.ts
++++ b/src/tools/hashline-edit/edit-operations.test.ts
+@@ -1,335 +1,130 @@
+ import { describe, expect, it } from "bun:test"
+-import {
+-  applyHashlineEdits,
+-  applyInsertAfter,
+-  applyReplace,
+-  applyReplaceLines,
+-  applySetLine,
+-} from "./edit-operations"
++import { applyHashlineEdits, applyInsertAfter, applyReplace, applyReplaceLines, applySetLine } from "./edit-operations"
+ import { computeLineHash } from "./hash-computation"
+-import type { HashlineEdit, InsertAfter, Replace, ReplaceLines, SetLine } from "./types"
++import type { HashlineEdit } from "./types"
+ 
+-describe("applySetLine", () => {
+-  function anchorFor(lines: string[], line: number): string {
+-    return `${line}:${computeLineHash(line, lines[line - 1])}`
+-  }
++function anchorFor(lines: string[], line: number): string {
++  return `${line}#${computeLineHash(line, lines[line - 1])}`
++}
+ 
+-  it("replaces a single line at the specified anchor", () => {
++describe("hashline edit operations", () => {
++  it("applies set_line with LINE#ID anchor", () => {
+     //#given
+     const lines = ["line 1", "line 2", "line 3"]
+-    const anchor = anchorFor(lines, 2)
+ 
+     //#when
+-    const result = applySetLine(lines, anchor, "new line 2")
++    const result = applySetLine(lines, anchorFor(lines, 2), "new line 2")
+ 
+     //#then
+     expect(result).toEqual(["line 1", "new line 2", "line 3"])
+   })
+ 
+-  it("handles newline escapes in replacement text", () => {
++  it("applies replace_lines with LINE#ID anchors", () => {
+     //#given
+-    const lines = ["line 1", "line 2", "line 3"]
+-    const anchor = anchorFor(lines, 2)
++    const lines = ["line 1", "line 2", "line 3", "line 4"]
+ 
+     //#when
+-    const result = applySetLine(lines, anchor, "new\\nline")
++    const result = applyReplaceLines(lines, anchorFor(lines, 2), anchorFor(lines, 3), "replaced")
+ 
+     //#then
+-    expect(result).toEqual(["line 1", "new\nline", "line 3"])
++    expect(result).toEqual(["line 1", "replaced", "line 4"])
+   })
+ 
+-  it("throws on hash mismatch", () => {
++  it("applies insert_after with LINE#ID anchor", () => {
+     //#given
+     const lines = ["line 1", "line 2", "line 3"]
+-    const anchor = "2:ff" // wrong hash
+-
+-    //#when / #then
+-    expect(() => applySetLine(lines, anchor, "new")).toThrow("Hash mismatch")
+-  })
+-
+-  it("throws on out of bounds line", () => {
+-    //#given
+-    const lines = ["line 1", "line 2"]
+-    const anchor = "5:00"
+-
+-    //#when / #then
+-    expect(() => applySetLine(lines, anchor, "new")).toThrow("out of bounds")
+-  })
+-})
+-
+-describe("applyReplaceLines", () => {
+-  it("replaces a range of lines", () => {
+-    //#given
+-    const lines = ["line 1", "line 2", "line 3", "line 4", "line 5"]
+-    const startAnchor = `${2}:${computeLineHash(2, lines[1])}`
+-    const endAnchor = `${4}:${computeLineHash(4, lines[3])}`
+ 
+     //#when
+-    const result = applyReplaceLines(lines, startAnchor, endAnchor, "replacement")
+-
+-    //#then
+-    expect(result).toEqual(["line 1", "replacement", "line 5"])
+-  })
+-
+-  it("handles newline escapes in replacement text", () => {
+-    //#given
+-    const lines = ["line 1", "line 2", "line 3"]
+-    const startAnchor = `${2}:${computeLineHash(2, lines[1])}`
+-    const endAnchor = `${2}:${computeLineHash(2, lines[1])}`
+-
+-    //#when
+-    const result = applyReplaceLines(lines, startAnchor, endAnchor, "a\\nb")
+-
+-    //#then
+-    expect(result).toEqual(["line 1", "a", "b", "line 3"])
+-  })
+-
+-  it("throws on start hash mismatch", () => {
+-    //#given
+-    const lines = ["line 1", "line 2", "line 3"]
+-    const startAnchor = "2:ff"
+-    const endAnchor = `${3}:${computeLineHash(3, lines[2])}`
+-
+-    //#when / #then
+-    expect(() => applyReplaceLines(lines, startAnchor, endAnchor, "new")).toThrow(
+-      "Hash mismatch"
+-    )
+-  })
+-
+-  it("throws on end hash mismatch", () => {
+-    //#given
+-    const lines = ["line 1", "line 2", "line 3"]
+-    const startAnchor = `${2}:${computeLineHash(2, lines[1])}`
+-    const endAnchor = "3:ff"
+-
+-    //#when / #then
+-    expect(() => applyReplaceLines(lines, startAnchor, endAnchor, "new")).toThrow(
+-      "Hash mismatch"
+-    )
+-  })
+-
+-  it("throws when start > end", () => {
+-    //#given
+-    const lines = ["line 1", "line 2", "line 3"]
+-    const startAnchor = `${3}:${computeLineHash(3, lines[2])}`
+-    const endAnchor = `${2}:${computeLineHash(2, lines[1])}`
+-
+-    //#when / #then
+-    expect(() => applyReplaceLines(lines, startAnchor, endAnchor, "new")).toThrow(
+-      "start line 3 cannot be greater than end line 2"
+-    )
+-  })
+-})
+-
+-describe("applyInsertAfter", () => {
+-  it("inserts text after the specified line", () => {
+-    //#given
+-    const lines = ["line 1", "line 2", "line 3"]
+-    const anchor = `${2}:${computeLineHash(2, lines[1])}`
+-
+-    //#when
+-    const result = applyInsertAfter(lines, anchor, "inserted")
++    const result = applyInsertAfter(lines, anchorFor(lines, 2), "inserted")
+ 
+     //#then
+     expect(result).toEqual(["line 1", "line 2", "inserted", "line 3"])
+   })
+ 
+-  it("handles newline escapes to insert multiple lines", () => {
++  it("applies replace operation", () => {
+     //#given
+-    const lines = ["line 1", "line 2", "line 3"]
+-    const anchor = `${2}:${computeLineHash(2, lines[1])}`
+-
+-    //#when
+-    const result = applyInsertAfter(lines, anchor, "a\\nb\\nc")
+-
+-    //#then
+-    expect(result).toEqual(["line 1", "line 2", "a", "b", "c", "line 3"])
+-  })
+-
+-  it("inserts at end when anchor is last line", () => {
+-    //#given
+-    const lines = ["line 1", "line 2"]
+-    const anchor = `${2}:${computeLineHash(2, lines[1])}`
+-
+-    //#when
+-    const result = applyInsertAfter(lines, anchor, "inserted")
+-
+-    //#then
+-    expect(result).toEqual(["line 1", "line 2", "inserted"])
+-  })
+-
+-  it("throws on hash mismatch", () => {
+-    //#given
+-    const lines = ["line 1", "line 2"]
+-    const anchor = "2:ff"
+-
+-    //#when / #then
+-    expect(() => applyInsertAfter(lines, anchor, "new")).toThrow("Hash mismatch")
+-  })
+-})
+-
+-describe("applyReplace", () => {
+-  it("replaces exact text match", () => {
+-    //#given
+-    const content = "hello world foo bar"
+-    const oldText = "world"
+-    const newText = "universe"
+-
+-    //#when
+-    const result = applyReplace(content, oldText, newText)
+-
+-    //#then
+-    expect(result).toEqual("hello universe foo bar")
+-  })
+-
+-  it("replaces all occurrences", () => {
+-    //#given
+-    const content = "foo bar foo baz foo"
+-    const oldText = "foo"
+-    const newText = "qux"
+-
+-    //#when
+-    const result = applyReplace(content, oldText, newText)
+-
+-    //#then
+-    expect(result).toEqual("qux bar qux baz qux")
+-  })
+-
+-  it("handles newline escapes in newText", () => {
+-    //#given
+-    const content = "hello world"
+-    const oldText = "world"
+-    const newText = "new\\nline"
++    const content = "hello world foo"
+ 
+     //#when
+-    const result = applyReplace(content, oldText, newText)
++    const result = applyReplace(content, "world", "universe")
+ 
+     //#then
+-    expect(result).toEqual("hello new\nline")
+-  })
+-
+-  it("throws when oldText not found", () => {
+-    //#given
+-    const content = "hello world"
+-    const oldText = "notfound"
+-    const newText = "replacement"
+-
+-    //#when / #then
+-    expect(() => applyReplace(content, oldText, newText)).toThrow("Text not found")
++    expect(result).toEqual("hello universe foo")
+   })
+-})
+ 
+-describe("applyHashlineEdits", () => {
+-  it("applies single set_line edit", () => {
++  it("applies mixed edits in one pass", () => {
+     //#given
+     const content = "line 1\nline 2\nline 3"
+-    const line2Hash = computeLineHash(2, "line 2")
+-    const edits: SetLine[] = [{ type: "set_line", line: `2:${line2Hash}`, text: "new line 2" }]
+-
+-    //#when
+-    const result = applyHashlineEdits(content, edits)
+-
+-    //#then
+-    expect(result).toEqual("line 1\nnew line 2\nline 3")
+-  })
+-
+-  it("applies multiple edits bottom-up (descending line order)", () => {
+-    //#given
+-    const content = "line 1\nline 2\nline 3\nline 4\nline 5"
+-    const line2Hash = computeLineHash(2, "line 2")
+-    const line4Hash = computeLineHash(4, "line 4")
+-    const edits: SetLine[] = [
+-      { type: "set_line", line: `2:${line2Hash}`, text: "new 2" },
+-      { type: "set_line", line: `4:${line4Hash}`, text: "new 4" },
++    const lines = content.split("\n")
++    const edits: HashlineEdit[] = [
++      { type: "insert_after", line: anchorFor(lines, 1), text: "inserted" },
++      { type: "set_line", line: anchorFor(lines, 3), text: "modified" },
+     ]
+ 
+     //#when
+     const result = applyHashlineEdits(content, edits)
+ 
+     //#then
+-    expect(result).toEqual("line 1\nnew 2\nline 3\nnew 4\nline 5")
++    expect(result).toEqual("line 1\ninserted\nline 2\nmodified")
+   })
+ 
+-  it("applies mixed edit types", () => {
++  it("keeps literal backslash-n in plain string text", () => {
+     //#given
+-    const content = "line 1\nline 2\nline 3"
+-    const line1Hash = computeLineHash(1, "line 1")
+-    const line3Hash = computeLineHash(3, "line 3")
+-    const edits: HashlineEdit[] = [
+-      { type: "insert_after", line: `1:${line1Hash}`, text: "inserted" },
+-      { type: "set_line", line: `3:${line3Hash}`, text: "modified" },
+-    ]
++    const lines = ["line 1", "line 2", "line 3"]
+ 
+     //#when
+-    const result = applyHashlineEdits(content, edits)
++    const result = applySetLine(lines, anchorFor(lines, 2), "join(\\n)")
+ 
+     //#then
+-    expect(result).toEqual("line 1\ninserted\nline 2\nmodified")
++    expect(result).toEqual(["line 1", "join(\\n)", "line 3"])
+   })
+ 
+-  it("applies replace_lines edit", () => {
++  it("strips copied hashline prefixes from multiline text", () => {
+     //#given
+-    const content = "line 1\nline 2\nline 3\nline 4"
+-    const line2Hash = computeLineHash(2, "line 2")
+-    const line3Hash = computeLineHash(3, "line 3")
+-    const edits: ReplaceLines[] = [
+-      { type: "replace_lines", start_line: `2:${line2Hash}`, end_line: `3:${line3Hash}`, text: "replaced" },
+-    ]
++    const lines = ["line 1", "line 2", "line 3"]
+ 
+     //#when
+-    const result = applyHashlineEdits(content, edits)
++    const result = applySetLine(lines, anchorFor(lines, 2), "1#VK:first\n2#NP:second")
+ 
+     //#then
+-    expect(result).toEqual("line 1\nreplaced\nline 4")
++    expect(result).toEqual(["line 1", "first", "second", "line 3"])
+   })
+ 
+-  it("applies replace fallback edit", () => {
++  it("autocorrects anchor echo for insert_after payload", () => {
+     //#given
+-    const content = "hello world foo"
+-    const edits: Replace[] = [{ type: "replace", old_text: "world", new_text: "universe" }]
++    const lines = ["line 1", "line 2"]
+ 
+     //#when
+-    const result = applyHashlineEdits(content, edits)
++    const result = applyInsertAfter(lines, anchorFor(lines, 1), ["line 1", "inserted"])
+ 
+     //#then
+-    expect(result).toEqual("hello universe foo")
++    expect(result).toEqual(["line 1", "inserted", "line 2"])
+   })
+ 
+-  it("handles empty edits array", () => {
++  it("restores indentation for paired single-line replacement", () => {
+     //#given
+-    const content = "line 1\nline 2"
+-    const edits: HashlineEdit[] = []
++    const lines = ["if (x) {", "  return 1", "}"]
+ 
+     //#when
+-    const result = applyHashlineEdits(content, edits)
++    const result = applySetLine(lines, anchorFor(lines, 2), "return 2")
+ 
+     //#then
+-    expect(result).toEqual("line 1\nline 2")
++    expect(result).toEqual(["if (x) {", "  return 2", "}"])
+   })
+ 
+-  it("throws on hash mismatch with descriptive error", () => {
++  it("strips boundary echo around replace_lines content", () => {
+     //#given
+-    const content = "line 1\nline 2\nline 3"
+-    const edits: SetLine[] = [{ type: "set_line", line: "2:ff", text: "new" }]
+-
+-    //#when / #then
+-    expect(() => applyHashlineEdits(content, edits)).toThrow("Hash mismatch")
+-  })
+-
+-  it("correctly handles index shifting with multiple edits", () => {
+-    //#given
+-    const content = "a\nb\nc\nd\ne"
+-    const line2Hash = computeLineHash(2, "b")
+-    const line4Hash = computeLineHash(4, "d")
+-    const edits: InsertAfter[] = [
+-      { type: "insert_after", line: `2:${line2Hash}`, text: "x" },
+-      { type: "insert_after", line: `4:${line4Hash}`, text: "y" },
+-    ]
++    const lines = ["before", "old 1", "old 2", "after"]
+ 
+     //#when
+-    const result = applyHashlineEdits(content, edits)
++    const result = applyReplaceLines(
++      lines,
++      anchorFor(lines, 2),
++      anchorFor(lines, 3),
++      ["before", "new 1", "new 2", "after"]
++    )
+ 
+     //#then
+-    expect(result).toEqual("a\nb\nx\nc\nd\ny\ne")
++    expect(result).toEqual(["before", "new 1", "new 2", "after"])
+   })
+ })
+diff --git a/src/tools/hashline-edit/edit-operations.ts b/src/tools/hashline-edit/edit-operations.ts
+index 7a6340db..9929e9ac 100644
+--- a/src/tools/hashline-edit/edit-operations.ts
++++ b/src/tools/hashline-edit/edit-operations.ts
+@@ -1,15 +1,106 @@
+-import { parseLineRef, validateLineRef } from "./validation"
++import { parseLineRef, validateLineRef, validateLineRefs } from "./validation"
+ import type { HashlineEdit } from "./types"
+ 
+-function unescapeNewlines(text: string): string {
+-  return text.replace(/\\n/g, "\n")
++const HASHLINE_PREFIX_RE = /^\s*(?:>>>|>>)?\s*\d+#[A-Z]{2}:/
++const DIFF_PLUS_RE = /^[+-](?![+-])/
++
++function stripLinePrefixes(lines: string[]): string[] {
++  let hashPrefixCount = 0
++  let diffPlusCount = 0
++  let nonEmpty = 0
++
++  for (const line of lines) {
++    if (line.length === 0) continue
++    nonEmpty += 1
++    if (HASHLINE_PREFIX_RE.test(line)) hashPrefixCount += 1
++    if (DIFF_PLUS_RE.test(line)) diffPlusCount += 1
++  }
++
++  if (nonEmpty === 0) {
++    return lines
++  }
++
++  const stripHash = hashPrefixCount > 0 && hashPrefixCount >= nonEmpty * 0.5
++  const stripPlus = !stripHash && diffPlusCount > 0 && diffPlusCount >= nonEmpty * 0.5
++
++  if (!stripHash && !stripPlus) {
++    return lines
++  }
++
++  return lines.map((line) => {
++    if (stripHash) return line.replace(HASHLINE_PREFIX_RE, "")
++    if (stripPlus) return line.replace(DIFF_PLUS_RE, "")
++    return line
++  })
++}
++
++function equalsIgnoringWhitespace(a: string, b: string): boolean {
++  if (a === b) return true
++  return a.replace(/\s+/g, "") === b.replace(/\s+/g, "")
++}
++
++function leadingWhitespace(text: string): string {
++  const match = text.match(/^\s*/)
++  return match ? match[0] : ""
++}
++
++function restoreLeadingIndent(templateLine: string, line: string): string {
++  if (line.length === 0) return line
++  const templateIndent = leadingWhitespace(templateLine)
++  if (templateIndent.length === 0) return line
++  if (leadingWhitespace(line).length > 0) return line
++  return `${templateIndent}${line}`
++}
++
++function stripInsertAnchorEcho(anchorLine: string, newLines: string[]): string[] {
++  if (newLines.length <= 1) return newLines
++  if (equalsIgnoringWhitespace(newLines[0], anchorLine)) {
++    return newLines.slice(1)
++  }
++  return newLines
+ }
+ 
+-export function applySetLine(lines: string[], anchor: string, newText: string): string[] {
++function stripRangeBoundaryEcho(
++  lines: string[],
++  startLine: number,
++  endLine: number,
++  newLines: string[]
++): string[] {
++  const replacedCount = endLine - startLine + 1
++  if (newLines.length <= 1 || newLines.length <= replacedCount) {
++    return newLines
++  }
++
++  let out = newLines
++  const beforeIdx = startLine - 2
++  if (beforeIdx >= 0 && equalsIgnoringWhitespace(out[0], lines[beforeIdx])) {
++    out = out.slice(1)
++  }
++
++  const afterIdx = endLine
++  if (afterIdx < lines.length && out.length > 0 && equalsIgnoringWhitespace(out[out.length - 1], lines[afterIdx])) {
++    out = out.slice(0, -1)
++  }
++
++  return out
++}
++
++function toNewLines(input: string | string[]): string[] {
++  if (Array.isArray(input)) {
++    return stripLinePrefixes(input)
++  }
++  return stripLinePrefixes(input.split("\n"))
++}
++
++export function applySetLine(lines: string[], anchor: string, newText: string | string[]): string[] {
+   validateLineRef(lines, anchor)
+   const { line } = parseLineRef(anchor)
+   const result = [...lines]
+-  result[line - 1] = unescapeNewlines(newText)
++  const replacement = toNewLines(newText).map((entry, idx) => {
++    if (idx !== 0) return entry
++    return restoreLeadingIndent(lines[line - 1], entry)
++  })
++  result.splice(line - 1, 1, ...replacement)
+   return result
+ }
+ 
+@@ -17,7 +108,7 @@ export function applyReplaceLines(
+   lines: string[],
+   startAnchor: string,
+   endAnchor: string,
+-  newText: string
++  newText: string | string[]
+ ): string[] {
+   validateLineRef(lines, startAnchor)
+   validateLineRef(lines, endAnchor)
+@@ -32,25 +123,31 @@ export function applyReplaceLines(
+   }
+ 
+   const result = [...lines]
+-  const newLines = unescapeNewlines(newText).split("\n")
++  const stripped = stripRangeBoundaryEcho(lines, startLine, endLine, toNewLines(newText))
++  const newLines = stripped.map((entry, idx) => {
++    const oldLine = lines[startLine - 1 + idx]
++    if (!oldLine) return entry
++    return restoreLeadingIndent(oldLine, entry)
++  })
+   result.splice(startLine - 1, endLine - startLine + 1, ...newLines)
+   return result
+ }
+ 
+-export function applyInsertAfter(lines: string[], anchor: string, text: string): string[] {
++export function applyInsertAfter(lines: string[], anchor: string, text: string | string[]): string[] {
+   validateLineRef(lines, anchor)
+   const { line } = parseLineRef(anchor)
+   const result = [...lines]
+-  const newLines = unescapeNewlines(text).split("\n")
++  const newLines = stripInsertAnchorEcho(lines[line - 1], toNewLines(text))
+   result.splice(line, 0, ...newLines)
+   return result
+ }
+ 
+-export function applyReplace(content: string, oldText: string, newText: string): string {
++export function applyReplace(content: string, oldText: string, newText: string | string[]): string {
+   if (!content.includes(oldText)) {
+     throw new Error(`Text not found: "${oldText}"`)
+   }
+-  return content.replaceAll(oldText, unescapeNewlines(newText))
++  const replacement = Array.isArray(newText) ? newText.join("\n") : newText
++  return content.replaceAll(oldText, replacement)
+ }
+ 
+ function getEditLineNumber(edit: HashlineEdit): number {
+@@ -78,33 +175,34 @@ export function applyHashlineEdits(content: string, edits: HashlineEdit[]): stri
+   let result = content
+   let lines = result.split("\n")
+ 
++  const refs = sortedEdits.flatMap((edit) => {
++    switch (edit.type) {
++      case "set_line":
++        return [edit.line]
++      case "replace_lines":
++        return [edit.start_line, edit.end_line]
++      case "insert_after":
++        return [edit.line]
++      case "replace":
++        return []
++      default:
++        return []
++    }
++  })
++  validateLineRefs(lines, refs)
++
+   for (const edit of sortedEdits) {
+     switch (edit.type) {
+       case "set_line": {
+-        validateLineRef(lines, edit.line)
+-        const { line } = parseLineRef(edit.line)
+-        lines[line - 1] = unescapeNewlines(edit.text)
++        lines = applySetLine(lines, edit.line, edit.text)
+         break
+       }
+       case "replace_lines": {
+-        validateLineRef(lines, edit.start_line)
+-        validateLineRef(lines, edit.end_line)
+-        const { line: startLine } = parseLineRef(edit.start_line)
+-        const { line: endLine } = parseLineRef(edit.end_line)
+-        if (startLine > endLine) {
+-          throw new Error(
+-            `Invalid range: start line ${startLine} cannot be greater than end line ${endLine}`
+-          )
+-        }
+-        const newLines = unescapeNewlines(edit.text).split("\n")
+-        lines.splice(startLine - 1, endLine - startLine + 1, ...newLines)
++        lines = applyReplaceLines(lines, edit.start_line, edit.end_line, edit.text)
+         break
+       }
+       case "insert_after": {
+-        validateLineRef(lines, edit.line)
+-        const { line } = parseLineRef(edit.line)
+-        const newLines = unescapeNewlines(edit.text).split("\n")
+-        lines.splice(line, 0, ...newLines)
++        lines = applyInsertAfter(lines, edit.line, edit.text)
+         break
+       }
+       case "replace": {
+@@ -112,7 +210,8 @@ export function applyHashlineEdits(content: string, edits: HashlineEdit[]): stri
+         if (!result.includes(edit.old_text)) {
+           throw new Error(`Text not found: "${edit.old_text}"`)
+         }
+-        result = result.replaceAll(edit.old_text, unescapeNewlines(edit.new_text))
++        const replacement = Array.isArray(edit.new_text) ? edit.new_text.join("\n") : edit.new_text
++        result = result.replaceAll(edit.old_text, replacement)
+         lines = result.split("\n")
+         break
+       }
+diff --git a/src/tools/hashline-edit/tools.test.ts b/src/tools/hashline-edit/tools.test.ts
+index 44dfe409..37f9d2fd 100644
+--- a/src/tools/hashline-edit/tools.test.ts
++++ b/src/tools/hashline-edit/tools.test.ts
+@@ -1,18 +1,12 @@
+ import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test"
+ import type { ToolContext } from "@opencode-ai/plugin/tool"
+-import { consumeToolMetadata, clearPendingStore } from "../../features/tool-metadata-store"
+ import { createHashlineEditTool } from "./tools"
++import { computeLineHash } from "./hash-computation"
+ import * as fs from "node:fs"
+-import * as path from "node:path"
+ import * as os from "node:os"
+-import { computeLineHash } from "./hash-computation"
+-
+-type MetadataPayload = {
+-  title?: string
+-  metadata?: Record<string, unknown>
+-}
++import * as path from "node:path"
+ 
+-function createMockContext(overrides?: Partial<Pick<ToolContext, "metadata">>): ToolContext {
++function createMockContext(): ToolContext {
+   return {
+     sessionID: "test",
+     messageID: "test",
+@@ -20,17 +14,11 @@ function createMockContext(overrides?: Partial<Pick<ToolContext, "metadata">>):
+     directory: "/tmp",
+     worktree: "/tmp",
+     abort: new AbortController().signal,
+-    metadata: overrides?.metadata ?? mock(() => {}),
++    metadata: mock(() => {}),
+     ask: async () => {},
+   }
+ }
+ 
+-type ToolContextWithCallID = ToolContext & {
+-  callID?: string
+-  callId?: string
+-  call_id?: string
+-}
+-
+ describe("createHashlineEditTool", () => {
+   let tempDir: string
+   let tool: ReturnType<typeof createHashlineEditTool>
+@@ -42,373 +30,106 @@ describe("createHashlineEditTool", () => {
+ 
+   afterEach(() => {
+     fs.rmSync(tempDir, { recursive: true, force: true })
+-    clearPendingStore()
+   })
+ 
+-  describe("tool definition", () => {
+-    it("has correct description", () => {
+-      //#given tool is created
+-      //#when accessing tool properties
+-      //#then description explains LINE:HASH format
+-      expect(tool.description).toContain("LINE:HASH")
+-      expect(tool.description).toContain("set_line")
+-      expect(tool.description).toContain("replace_lines")
+-      expect(tool.description).toContain("insert_after")
+-      expect(tool.description).toContain("replace")
+-    })
+-
+-    it("has filePath parameter", () => {
+-      //#given tool is created
+-      //#when checking parameters
+-      //#then filePath exists
+-      expect(tool.args.filePath).toBeDefined()
+-    })
+-
+-    it("has edits parameter as array", () => {
+-      //#given tool is created
+-      //#when checking parameters
+-      //#then edits parameter exists as array
+-      expect(tool.args.edits).toBeDefined()
+-    })
++  it("applies set_line with LINE#ID anchor", async () => {
++    //#given
++    const filePath = path.join(tempDir, "test.txt")
++    fs.writeFileSync(filePath, "line1\nline2\nline3")
++    const hash = computeLineHash(2, "line2")
++
++    //#when
++    const result = await tool.execute(
++      {
++        filePath,
++        edits: [{ type: "set_line", line: `2#${hash}`, text: "modified line2" }],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(fs.readFileSync(filePath, "utf-8")).toBe("line1\nmodified line2\nline3")
++    expect(result).toContain("Successfully")
++    expect(result).toContain("Updated file (LINE#ID:content)")
++    expect(result).toMatch(/2#[ZPMQVRWSNKTXJBYH]{2}:modified line2/)
+   })
+ 
+-  describe("execute", () => {
+-    it("returns error when file does not exist", async () => {
+-      //#given non-existent file path
+-      const nonExistentPath = path.join(tempDir, "non-existent.txt")
+-
+-      //#when executing tool
+-      const result = await tool.execute(
+-        {
+-          filePath: nonExistentPath,
+-          edits: [{ type: "set_line", line: "1:00", text: "new content" }],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then error is returned
+-      expect(result).toContain("Error")
+-      expect(result).toContain("not found")
+-    })
+-
+-    it("applies set_line edit and returns diff", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2\nline3")
+-      const line2Hash = computeLineHash(2, "line2")
+-
+-      //#when executing set_line edit
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "set_line", line: `2:${line2Hash}`, text: "modified line2" }],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then file is modified and diff is returned
+-      const content = fs.readFileSync(filePath, "utf-8")
+-      expect(content).toBe("line1\nmodified line2\nline3")
+-      expect(result).toContain("modified line2")
+-    })
+-
+-    it("applies insert_after edit", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2")
+-      const line1Hash = computeLineHash(1, "line1")
+-
+-      //#when executing insert_after edit
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "insert_after", line: `1:${line1Hash}`, text: "inserted" }],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then line is inserted after specified line
+-      const content = fs.readFileSync(filePath, "utf-8")
+-      expect(content).toBe("line1\ninserted\nline2")
+-    })
+-
+-    it("applies replace_lines edit", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2\nline3\nline4")
+-      const line2Hash = computeLineHash(2, "line2")
+-      const line3Hash = computeLineHash(3, "line3")
+-
+-      //#when executing replace_lines edit
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [
+-            {
+-              type: "replace_lines",
+-              start_line: `2:${line2Hash}`,
+-              end_line: `3:${line3Hash}`,
+-              text: "replaced",
+-            },
+-          ],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then lines are replaced
+-      const content = fs.readFileSync(filePath, "utf-8")
+-      expect(content).toBe("line1\nreplaced\nline4")
+-    })
+-
+-    it("applies replace edit", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "hello world\nfoo bar")
+-
+-      //#when executing replace edit
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "replace", old_text: "world", new_text: "universe" }],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then text is replaced
+-      const content = fs.readFileSync(filePath, "utf-8")
+-      expect(content).toBe("hello universe\nfoo bar")
+-    })
+-
+-    it("applies multiple edits in bottom-up order", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2\nline3")
+-      const line1Hash = computeLineHash(1, "line1")
+-      const line3Hash = computeLineHash(3, "line3")
+-
+-      //#when executing multiple edits
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [
+-            { type: "set_line", line: `1:${line1Hash}`, text: "new1" },
+-            { type: "set_line", line: `3:${line3Hash}`, text: "new3" },
+-          ],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then both edits are applied
+-      const content = fs.readFileSync(filePath, "utf-8")
+-      expect(content).toBe("new1\nline2\nnew3")
+-    })
+-
+-    it("returns error on hash mismatch", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2")
+-
+-      //#when executing with wrong hash (valid format but wrong value)
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "set_line", line: "1:ff", text: "new" }],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then hash mismatch error is returned
+-      expect(result).toContain("Error")
+-      expect(result).toContain("hash")
+-    })
+-
+-    it("handles escaped newlines in text", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2")
+-      const line1Hash = computeLineHash(1, "line1")
+-
+-      //#when executing with escaped newline
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "set_line", line: `1:${line1Hash}`, text: "new\\nline" }],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then newline is unescaped
+-      const content = fs.readFileSync(filePath, "utf-8")
+-      expect(content).toBe("new\nline\nline2")
+-    })
+-
+-    it("returns success result with diff summary", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "old content")
+-      const line1Hash = computeLineHash(1, "old content")
+-
+-      //#when executing edit
+-      const result = await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "set_line", line: `1:${line1Hash}`, text: "new content" }],
+-        },
+-        createMockContext()
+-      )
+-
+-      //#then result contains success indicator and diff
+-      expect(result).toContain("Successfully")
+-      expect(result).toContain("old content")
+-      expect(result).toContain("new content")
+-      expect(result).toContain("Updated file (LINE:HASH|content)")
+-      expect(result).toMatch(/1:[a-f0-9]{2}\|new content/)
+-    })
++  it("applies replace_lines and insert_after", async () => {
++    //#given
++    const filePath = path.join(tempDir, "test.txt")
++    fs.writeFileSync(filePath, "line1\nline2\nline3\nline4")
++    const line2Hash = computeLineHash(2, "line2")
++    const line3Hash = computeLineHash(3, "line3")
++    const line4Hash = computeLineHash(4, "line4")
++
++    //#when
++    await tool.execute(
++      {
++        filePath,
++        edits: [
++          {
++            type: "replace_lines",
++            start_line: `2#${line2Hash}`,
++            end_line: `3#${line3Hash}`,
++            text: "replaced",
++          },
++          {
++            type: "insert_after",
++            line: `4#${line4Hash}`,
++            text: "inserted",
++          },
++        ],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(fs.readFileSync(filePath, "utf-8")).toBe("line1\nreplaced\nline4\ninserted")
+   })
+ 
+-  describe("context.metadata for TUI diff", () => {
+-    it("calls context.metadata with diff and filediff on successful edit", async () => {
+-      //#given file with content and mock context
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2\nline3")
+-      const line2Hash = computeLineHash(2, "line2")
+-      const metadataMock = mock((_: MetadataPayload) => {})
+-      const ctx = createMockContext({ metadata: metadataMock })
+-
+-      //#when executing a successful edit
+-      await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "set_line", line: `2:${line2Hash}`, text: "modified" }],
+-        },
+-        ctx
+-      )
+-
+-      //#then context.metadata is called with diff string and filediff object
+-      expect(metadataMock).toHaveBeenCalledTimes(1)
+-      const call = metadataMock.mock.calls[0]?.[0]
+-      expect(call).toBeDefined()
+-      if (!call || !call.metadata) {
+-        throw new Error("metadata payload missing")
+-      }
+-      expect(call.title).toBe(filePath)
+-      expect(call.metadata.filePath).toBe(filePath)
+-      expect(call.metadata.path).toBe(filePath)
+-      expect(call.metadata.file).toBe(filePath)
+-      expect(call.metadata.diff).toContain("---")
+-      expect(call.metadata.diff).toContain("+++")
+-      expect(call.metadata.diff).toContain("-line2")
+-      expect(call.metadata.diff).toContain("+modified")
+-      expect(call.metadata.filediff.file).toBe(filePath)
+-      expect(call.metadata.filediff.path).toBe(filePath)
+-      expect(call.metadata.filediff.filePath).toBe(filePath)
+-      expect(typeof call.metadata.filediff.before).toBe("string")
+-      expect(typeof call.metadata.filediff.after).toBe("string")
+-      expect(typeof call.metadata.filediff.additions).toBe("number")
+-      expect(typeof call.metadata.filediff.deletions).toBe("number")
+-    })
+-
+-    it("includes hashline content in filediff before/after", async () => {
+-      //#given file with known content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "hello\nworld")
+-      const line1Hash = computeLineHash(1, "hello")
+-      const metadataMock = mock((_: MetadataPayload) => {})
+-      const ctx = createMockContext({ metadata: metadataMock })
+-
+-      //#when executing edit
+-      await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "set_line", line: `1:${line1Hash}`, text: "hi" }],
+-        },
+-        ctx
+-      )
+-
+-      //#then filediff.before contains hashline format of original content
+-      const call = metadataMock.mock.calls[0]?.[0]
+-      expect(call).toBeDefined()
+-      if (!call || !call.metadata) {
+-        throw new Error("metadata payload missing")
+-      }
+-      expect(call.metadata.filediff.before).toContain("1:")
+-      expect(call.metadata.filediff.before).toContain("|hello")
+-      expect(call.metadata.filediff.after).toContain("1:")
+-      expect(call.metadata.filediff.after).toContain("|hi")
+-    })
+-
+-    it("reports correct additions and deletions count", async () => {
+-      //#given file with content
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "aaa\nbbb\nccc")
+-      const metadataMock = mock((_: MetadataPayload) => {})
+-      const ctx = createMockContext({ metadata: metadataMock })
+-
+-      //#when replacing text that changes one line
+-      await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "replace", old_text: "bbb", new_text: "xxx" }],
+-        },
+-        ctx
+-      )
+-
+-      //#then additions and deletions are both 1
+-      const call = metadataMock.mock.calls[0]?.[0]
+-      expect(call).toBeDefined()
+-      if (!call || !call.metadata) {
+-        throw new Error("metadata payload missing")
+-      }
+-      expect(call.metadata.filediff.additions).toBe(1)
+-      expect(call.metadata.filediff.deletions).toBe(1)
+-    })
+-
+-    it("does not call context.metadata on error", async () => {
+-      //#given non-existent file
+-      const nonExistentPath = path.join(tempDir, "nope.txt")
+-      const metadataMock = mock(() => {})
+-      const ctx = createMockContext({ metadata: metadataMock })
+-
+-      //#when executing tool on missing file
+-      await tool.execute(
+-        {
+-          filePath: nonExistentPath,
+-          edits: [{ type: "set_line", line: "1:00", text: "new" }],
+-        },
+-        ctx
+-      )
+-
+-      //#then context.metadata is never called
+-      expect(metadataMock).not.toHaveBeenCalled()
+-    })
+-
+-    it("stores metadata for tool.execute.after restoration when callID exists", async () => {
+-      //#given file and context with callID
+-      const filePath = path.join(tempDir, "test.txt")
+-      fs.writeFileSync(filePath, "line1\nline2")
+-      const line2Hash = computeLineHash(2, "line2")
+-
+-      const metadataMock = mock((_: MetadataPayload) => {})
+-      const ctx: ToolContextWithCallID = {
+-        ...createMockContext({ metadata: metadataMock }),
+-        callID: "call-edit-meta-1",
+-      }
+-
+-      //#when executing edit
+-      await tool.execute(
+-        {
+-          filePath,
+-          edits: [{ type: "set_line", line: `2:${line2Hash}`, text: "modified" }],
+-        },
+-        ctx,
+-      )
++  it("returns mismatch error on stale anchor", async () => {
++    //#given
++    const filePath = path.join(tempDir, "test.txt")
++    fs.writeFileSync(filePath, "line1\nline2")
++
++    //#when
++    const result = await tool.execute(
++      {
++        filePath,
++        edits: [{ type: "set_line", line: "1#ZZ", text: "new" }],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(result).toContain("Error")
++    expect(result).toContain("hash")
++  })
+ 
+-      //#then pending metadata store has restorable metadata
+-      const restored = consumeToolMetadata(ctx.sessionID, "call-edit-meta-1")
+-      expect(restored).toBeDefined()
+-      expect(restored?.title).toBe(filePath)
+-      expect(typeof restored?.metadata?.diff).toBe("string")
+-      expect(restored?.metadata?.filediff).toBeDefined()
+-    })
++  it("preserves literal backslash-n and supports string[] payload", async () => {
++    //#given
++    const filePath = path.join(tempDir, "test.txt")
++    fs.writeFileSync(filePath, "line1\nline2")
++    const line1Hash = computeLineHash(1, "line1")
++
++    //#when
++    await tool.execute(
++      {
++        filePath,
++        edits: [{ type: "set_line", line: `1#${line1Hash}`, text: "join(\\n)" }],
++      },
++      createMockContext(),
++    )
++
++    await tool.execute(
++      {
++        filePath,
++        edits: [{ type: "insert_after", line: `1#${computeLineHash(1, "join(\\n)")}`, text: ["a", "b"] }],
++      },
++      createMockContext(),
++    )
++
++    //#then
++    expect(fs.readFileSync(filePath, "utf-8")).toBe("join(\\n)\na\nb\nline2")
+   })
+ })
+diff --git a/src/tools/hashline-edit/tools.ts b/src/tools/hashline-edit/tools.ts
+index 61d8b916..e42254d5 100644
+--- a/src/tools/hashline-edit/tools.ts
++++ b/src/tools/hashline-edit/tools.ts
+@@ -37,12 +37,12 @@ function generateDiff(oldContent: string, newContent: string, filePath: string):
+     const hash = computeLineHash(lineNum, newLine)
+ 
+     if (i >= oldLines.length) {
+-      diff += `+ ${lineNum}:${hash}|${newLine}\n`
++      diff += `+ ${lineNum}#${hash}:${newLine}\n`
+     } else if (i >= newLines.length) {
+-      diff += `- ${lineNum}:  |${oldLine}\n`
++      diff += `- ${lineNum}#  :${oldLine}\n`
+     } else if (oldLine !== newLine) {
+-      diff += `- ${lineNum}:  |${oldLine}\n`
+-      diff += `+ ${lineNum}:${hash}|${newLine}\n`
++      diff += `- ${lineNum}#  :${oldLine}\n`
++      diff += `+ ${lineNum}#${hash}:${newLine}\n`
+     }
+   }
+ 
+@@ -51,41 +51,41 @@ function generateDiff(oldContent: string, newContent: string, filePath: string):
+ 
+ export function createHashlineEditTool(): ToolDefinition {
+   return tool({
+-    description: `Edit files using LINE:HASH format for precise, safe modifications.
++    description: `Edit files using LINE#ID format for precise, safe modifications.
+ 
+ WORKFLOW:
+-1. Read the file and copy exact LINE:HASH anchors.
++1. Read the file and copy exact LINE#ID anchors.
+ 2. Submit one edit call with all related operations for that file.
+ 3. If more edits are needed after success, use the latest anchors from read/edit output.
+-4. Use anchors as "LINE:HASH" only (never include trailing "|content").
++4. Use anchors as "LINE#ID" only (never include trailing ":content").
+ 
+ VALIDATION:
+ - Payload shape: { "filePath": string, "edits": [...] }
+ - Each edit must be one of: set_line, replace_lines, insert_after, replace
+-- text/new_text must contain plain replacement text only (no LINE:HASH prefixes, no diff + markers)
++- text/new_text must contain plain replacement text only (no LINE#ID prefixes, no diff + markers)
+ 
+-LINE:HASH FORMAT (CRITICAL - READ CAREFULLY):
+-Each line reference must be in "LINE:HASH" format where:
++LINE#ID FORMAT (CRITICAL - READ CAREFULLY):
++Each line reference must be in "LINE#ID" format where:
+ - LINE: 1-based line number
+-- HASH: First 2 characters of xxHash32 hash of line content (hex characters 0-9, a-f only)
+-- Example: "5:a3" means line 5 with hash "a3"
+-- WRONG: "2:co" (contains non-hex 'o') - will fail!
+-- CORRECT: "2:e8" (hex characters only)
++- ID: Two CID letters from the set ZPMQVRWSNKTXJBYH
++- Example: "5#VK" means line 5 with hash id "VK"
++- WRONG: "2#aa" (invalid characters) - will fail!
++- CORRECT: "2#VK"
+ 
+ GETTING HASHES:
+-Use the read tool - it returns lines in "LINE:HASH|content" format.
+-Successful edit output also includes updated file content in "LINE:HASH|content" format.
++Use the read tool - it returns lines in "LINE#ID:content" format.
++Successful edit output also includes updated file content in "LINE#ID:content" format.
+ 
+ FOUR OPERATION TYPES:
+ 
+ 1. set_line: Replace a single line
+-   { "type": "set_line", "line": "5:a3", "text": "const y = 2" }
++   { "type": "set_line", "line": "5#VK", "text": "const y = 2" }
+ 
+ 2. replace_lines: Replace a range of lines
+-   { "type": "replace_lines", "start_line": "5:a3", "end_line": "7:b2", "text": "new\\ncontent" }
++   { "type": "replace_lines", "start_line": "5#VK", "end_line": "7#NP", "text": ["new", "content"] }
+ 
+ 3. insert_after: Insert lines after a specific line
+-   { "type": "insert_after", "line": "5:a3", "text": "console.log('hi')" }
++   { "type": "insert_after", "line": "5#VK", "text": "console.log('hi')" }
+ 
+ 4. replace: Simple text replacement (no hash validation)
+    { "type": "replace", "old_text": "foo", "new_text": "bar" }
+@@ -101,8 +101,10 @@ SEQUENTIAL EDITS (ANTI-FLAKE):
+ BOTTOM-UP APPLICATION:
+ Edits are applied from bottom to top (highest line numbers first) to preserve line number references.
+ 
+-ESCAPING:
+-Use \\n in text to represent literal newlines.`,
++CONTENT FORMAT:
++- text/new_text can be a string (single line) or string[] (multi-line, preferred).
++- If you pass a multi-line string, it is split by real newline characters.
++- Literal "\\n" is preserved as text.`,
+     args: {
+       filePath: tool.schema.string().describe("Absolute path to the file to edit"),
+       edits: tool.schema
+@@ -110,24 +112,32 @@ Use \\n in text to represent literal newlines.`,
+           tool.schema.union([
+             tool.schema.object({
+               type: tool.schema.literal("set_line"),
+-              line: tool.schema.string().describe("Line reference in LINE:HASH format"),
+-              text: tool.schema.string().describe("New content for the line"),
++              line: tool.schema.string().describe("Line reference in LINE#ID format"),
++              text: tool.schema
++                .union([tool.schema.string(), tool.schema.array(tool.schema.string())])
++                .describe("New content for the line (string or string[] for multiline)"),
+             }),
+             tool.schema.object({
+               type: tool.schema.literal("replace_lines"),
+-              start_line: tool.schema.string().describe("Start line in LINE:HASH format"),
+-              end_line: tool.schema.string().describe("End line in LINE:HASH format"),
+-              text: tool.schema.string().describe("New content to replace the range"),
++              start_line: tool.schema.string().describe("Start line in LINE#ID format"),
++              end_line: tool.schema.string().describe("End line in LINE#ID format"),
++              text: tool.schema
++                .union([tool.schema.string(), tool.schema.array(tool.schema.string())])
++                .describe("New content to replace the range (string or string[] for multiline)"),
+             }),
+             tool.schema.object({
+               type: tool.schema.literal("insert_after"),
+-              line: tool.schema.string().describe("Line reference in LINE:HASH format"),
+-              text: tool.schema.string().describe("Content to insert after the line"),
++              line: tool.schema.string().describe("Line reference in LINE#ID format"),
++              text: tool.schema
++                .union([tool.schema.string(), tool.schema.array(tool.schema.string())])
++                .describe("Content to insert after the line (string or string[] for multiline)"),
+             }),
+             tool.schema.object({
+               type: tool.schema.literal("replace"),
+               old_text: tool.schema.string().describe("Text to find"),
+-              new_text: tool.schema.string().describe("Replacement text"),
++              new_text: tool.schema
++                .union([tool.schema.string(), tool.schema.array(tool.schema.string())])
++                .describe("Replacement text (string or string[] for multiline)"),
+             }),
+           ])
+         )
+@@ -154,7 +164,6 @@ Use \\n in text to represent literal newlines.`,
+         await Bun.write(filePath, newContent)
+ 
+         const diff = generateDiff(oldContent, newContent, filePath)
+-        const oldHashlined = toHashlineContent(oldContent)
+         const newHashlined = toHashlineContent(newContent)
+ 
+         const unifiedDiff = generateUnifiedDiff(oldContent, newContent, filePath)
+@@ -171,8 +180,8 @@ Use \\n in text to represent literal newlines.`,
+               file: filePath,
+               path: filePath,
+               filePath,
+-              before: oldHashlined,
+-              after: newHashlined,
++              before: oldContent,
++              after: newContent,
+               additions,
+               deletions,
+             },
+@@ -190,12 +199,12 @@ Use \\n in text to represent literal newlines.`,
+ 
+ ${diff}
+ 
+-Updated file (LINE:HASH|content):
++Updated file (LINE#ID:content):
+ ${newHashlined}`
+       } catch (error) {
+         const message = error instanceof Error ? error.message : String(error)
+-        if (message.includes("hash")) {
+-          return `Error: Hash mismatch - ${message}\nTip: reuse LINE:HASH entries from the latest read/edit output, or batch related edits in one call.`
++        if (message.toLowerCase().includes("hash")) {
++          return `Error: hash mismatch - ${message}\nTip: reuse LINE#ID entries from the latest read/edit output, or batch related edits in one call.`
+         }
+         return `Error: ${message}`
+       }
+diff --git a/src/tools/hashline-edit/validation.test.ts b/src/tools/hashline-edit/validation.test.ts
+index e824a4aa..8b6870f6 100644
+--- a/src/tools/hashline-edit/validation.test.ts
++++ b/src/tools/hashline-edit/validation.test.ts
+@@ -3,104 +3,52 @@ import { computeLineHash } from "./hash-computation"
+ import { parseLineRef, validateLineRef } from "./validation"
+ 
+ describe("parseLineRef", () => {
+-  it("parses valid line reference", () => {
++  it("parses valid LINE#ID reference", () => {
+     //#given
+-    const ref = "42:a3"
++    const ref = "42#VK"
+ 
+     //#when
+     const result = parseLineRef(ref)
+ 
+     //#then
+-    expect(result).toEqual({ line: 42, hash: "a3" })
++    expect(result).toEqual({ line: 42, hash: "VK" })
+   })
+ 
+-  it("parses line reference with different hash", () => {
++  it("throws on invalid format", () => {
+     //#given
+-    const ref = "1:ff"
++    const ref = "42:VK"
+ 
+-    //#when
+-    const result = parseLineRef(ref)
+-
+-    //#then
+-    expect(result).toEqual({ line: 1, hash: "ff" })
++    //#when / #then
++    expect(() => parseLineRef(ref)).toThrow("LINE#ID")
+   })
+ 
+-  it("throws on invalid format - no colon", () => {
++  it("accepts refs copied with markers and trailing content", () => {
+     //#given
+-    const ref = "42a3"
++    const ref = ">>> 42#VK:const value = 1"
+ 
+-    //#when & #then
+-    expect(() => parseLineRef(ref)).toThrow()
+-  })
+-
+-  it("throws on invalid format - non-numeric line", () => {
+-    //#given
+-    const ref = "abc:a3"
+-
+-    //#when & #then
+-    expect(() => parseLineRef(ref)).toThrow()
+-  })
+-
+-  it("throws on invalid format - invalid hash", () => {
+-    //#given
+-    const ref = "42:xyz"
+-
+-    //#when & #then
+-    expect(() => parseLineRef(ref)).toThrow()
+-  })
+-
+-  it("throws on empty string", () => {
+-    //#given
+-    const ref = ""
++    //#when
++    const result = parseLineRef(ref)
+ 
+-    //#when & #then
+-    expect(() => parseLineRef(ref)).toThrow()
++    //#then
++    expect(result).toEqual({ line: 42, hash: "VK" })
+   })
+ })
+ 
+ describe("validateLineRef", () => {
+-  it("validates matching hash", () => {
+-    //#given
+-    const lines = ["function hello() {", "  return 42", "}"]
+-    const ref = `1:${computeLineHash(1, lines[0])}`
+-
+-    //#when & #then
+-    expect(() => validateLineRef(lines, ref)).not.toThrow()
+-  })
+-
+-  it("throws on hash mismatch", () => {
+-    //#given
+-    const lines = ["function hello() {", "  return 42", "}"]
+-    const ref = "1:00" // Wrong hash
+-
+-    //#when & #then
+-    expect(() => validateLineRef(lines, ref)).toThrow()
+-  })
+-
+-  it("throws on line out of bounds", () => {
++  it("accepts matching reference", () => {
+     //#given
+     const lines = ["function hello() {", "  return 42", "}"]
+-    const ref = "99:a3"
+-
+-    //#when & #then
+-    expect(() => validateLineRef(lines, ref)).toThrow()
+-  })
+-
+-  it("throws on invalid line number", () => {
+-    //#given
+-    const lines = ["function hello() {"]
+-    const ref = "0:a3" // Line numbers start at 1
++    const hash = computeLineHash(1, lines[0])
+ 
+-    //#when & #then
+-    expect(() => validateLineRef(lines, ref)).toThrow()
++    //#when / #then
++    expect(() => validateLineRef(lines, `1#${hash}`)).not.toThrow()
+   })
+ 
+-  it("error message includes current hash", () => {
++  it("throws on mismatch and includes current hash", () => {
+     //#given
+     const lines = ["function hello() {"]
+-    const ref = "1:00"
+ 
+-    //#when & #then
+-    expect(() => validateLineRef(lines, ref)).toThrow(/current hash/)
++    //#when / #then
++    expect(() => validateLineRef(lines, "1#ZZ")).toThrow(/current hash/)
+   })
+ })
+diff --git a/src/tools/hashline-edit/validation.ts b/src/tools/hashline-edit/validation.ts
+index 178f35d8..feb9d3cc 100644
+--- a/src/tools/hashline-edit/validation.ts
++++ b/src/tools/hashline-edit/validation.ts
+@@ -1,15 +1,33 @@
+ import { computeLineHash } from "./hash-computation"
++import { HASHLINE_REF_PATTERN } from "./constants"
+ 
+ export interface LineRef {
+   line: number
+   hash: string
+ }
+ 
++const LINE_REF_EXTRACT_PATTERN = /([0-9]+#[ZPMQVRWSNKTXJBYH]{2})/
++
++function normalizeLineRef(ref: string): string {
++  const trimmed = ref.trim()
++  if (HASHLINE_REF_PATTERN.test(trimmed)) {
++    return trimmed
++  }
++
++  const extracted = trimmed.match(LINE_REF_EXTRACT_PATTERN)
++  if (extracted) {
++    return extracted[1]
++  }
++
++  return trimmed
++}
++
+ export function parseLineRef(ref: string): LineRef {
+-  const match = ref.match(/^(\d+):([0-9a-f]{2})$/)
++  const normalized = normalizeLineRef(ref)
++  const match = normalized.match(HASHLINE_REF_PATTERN)
+   if (!match) {
+     throw new Error(
+-      `Invalid line reference format: "${ref}". Expected format: "LINE:HASH" (e.g., "42:a3")`
++      `Invalid line reference format: "${ref}". Expected format: "LINE#ID" (e.g., "42#VK")`
+     )
+   }
+   return {
+@@ -37,3 +55,28 @@ export function validateLineRef(lines: string[], ref: string): void {
+     )
+   }
+ }
++
++export function validateLineRefs(lines: string[], refs: string[]): void {
++  const mismatches: string[] = []
++
++  for (const ref of refs) {
++    const { line, hash } = parseLineRef(ref)
++
++    if (line < 1 || line > lines.length) {
++      mismatches.push(`Line number ${line} out of bounds (file has ${lines.length} lines)`) 
++      continue
++    }
++
++    const content = lines[line - 1]
++    const currentHash = computeLineHash(line, content)
++    if (currentHash !== hash) {
++      mismatches.push(
++        `line ${line}: expected ${hash}, current ${currentHash} (${line}#${currentHash}) content: "${content}"`
++      )
++    }
++  }
++
++  if (mismatches.length > 0) {
++    throw new Error(`Hash mismatches:\n- ${mismatches.join("\n- ")}`)
++  }
++}
+-- 
+2.39.2
+

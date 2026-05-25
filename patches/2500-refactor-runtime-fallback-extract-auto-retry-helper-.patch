@@ -1,0 +1,243 @@
+From 5a406cab9ec11bfa50550a8d4012001d79c346e3 Mon Sep 17 00:00:00 2001
+From: Youngbin Kim <64558592+youngbinkim0@users.noreply.github.com>
+Date: Wed, 11 Feb 2026 17:14:18 -0500
+Subject: [PATCH 2500/5749] refactor(runtime-fallback): extract auto-retry
+ helper and fix provider constraint inconsistency
+
+- Extract duplicated auto-retry logic (~40 lines each) from session.error and
+  message.updated handlers into shared autoRetryWithFallback() helper
+- Fix userFallbackModels path in model-resolution-pipeline to respect
+  constraints.connectedProviders parameter instead of reading cache directly,
+  matching the behavior of categoryDefaultModel and fallbackChain paths
+---
+ src/hooks/runtime-fallback/index.ts     | 186 +++++++++---------------
+ src/shared/model-resolution-pipeline.ts |   2 +-
+ 2 files changed, 71 insertions(+), 117 deletions(-)
+
+diff --git a/src/hooks/runtime-fallback/index.ts b/src/hooks/runtime-fallback/index.ts
+index 3743bef7..202b917d 100644
+--- a/src/hooks/runtime-fallback/index.ts
++++ b/src/hooks/runtime-fallback/index.ts
+@@ -306,6 +306,74 @@ export function createRuntimeFallbackHook(
+     }
+   }
+ 
++  const autoRetryWithFallback = async (
++    sessionID: string,
++    newModel: string,
++    resolvedAgent: string | undefined,
++    source: string,
++  ): Promise<void> => {
++    if (sessionRetryInFlight.has(sessionID)) {
++      log(`[${HOOK_NAME}] Retry already in flight, skipping (${source})`, { sessionID })
++      return
++    }
++
++    const modelParts = newModel.split("/")
++    if (modelParts.length < 2) return
++
++    const fallbackModelObj = {
++      providerID: modelParts[0],
++      modelID: modelParts.slice(1).join("/"),
++    }
++
++    sessionRetryInFlight.add(sessionID)
++    try {
++      const messagesResp = await ctx.client.session.messages({
++        path: { id: sessionID },
++        query: { directory: ctx.directory },
++      })
++      const msgs = (messagesResp as {
++        data?: Array<{
++          info?: Record<string, unknown>
++          parts?: Array<{ type?: string; text?: string }>
++        }>
++      }).data
++      const lastUserMsg = msgs?.filter((m) => m.info?.role === "user").pop()
++      const lastUserPartsRaw =
++        lastUserMsg?.parts ??
++        (lastUserMsg?.info?.parts as Array<{ type?: string; text?: string }> | undefined)
++
++      if (lastUserPartsRaw && lastUserPartsRaw.length > 0) {
++        log(`[${HOOK_NAME}] Auto-retrying with fallback model (${source})`, {
++          sessionID,
++          model: newModel,
++        })
++
++        const retryParts = lastUserPartsRaw
++          .filter((p) => p.type === "text" && typeof p.text === "string" && p.text.length > 0)
++          .map((p) => ({ type: "text" as const, text: p.text! }))
++
++        if (retryParts.length > 0) {
++          const retryAgent = resolvedAgent ?? getSessionAgent(sessionID)
++          await ctx.client.session.promptAsync({
++            path: { id: sessionID },
++            body: {
++              ...(retryAgent ? { agent: retryAgent } : {}),
++              model: fallbackModelObj,
++              parts: retryParts,
++            },
++            query: { directory: ctx.directory },
++          })
++        }
++      } else {
++        log(`[${HOOK_NAME}] No user message found for auto-retry (${source})`, { sessionID })
++      }
++    } catch (retryError) {
++      log(`[${HOOK_NAME}] Auto-retry failed (${source})`, { sessionID, error: String(retryError) })
++    } finally {
++      sessionRetryInFlight.delete(sessionID)
++    }
++  }
++
+   const resolveAgentForSessionFromContext = async (
+     sessionID: string,
+     eventAgent?: string,
+@@ -443,65 +511,7 @@ export function createRuntimeFallbackHook(
+       }
+ 
+       if (result.success && result.newModel) {
+-        if (sessionRetryInFlight.has(sessionID)) {
+-          log(`[${HOOK_NAME}] Retry already in flight, skipping`, { sessionID })
+-        } else {
+-          const modelParts = result.newModel.split("/")
+-          if (modelParts.length >= 2) {
+-            const fallbackModelObj = {
+-              providerID: modelParts[0],
+-              modelID: modelParts.slice(1).join("/"),
+-            }
+-
+-            sessionRetryInFlight.add(sessionID)
+-            try {
+-              const messagesResp = await ctx.client.session.messages({
+-                path: { id: sessionID },
+-                query: { directory: ctx.directory },
+-              })
+-              const msgs = (messagesResp as {
+-                data?: Array<{
+-                  info?: Record<string, unknown>
+-                  parts?: Array<{ type?: string; text?: string }>
+-                }>
+-              }).data
+-              const lastUserMsg = msgs?.filter((m) => m.info?.role === "user").pop()
+-              const lastUserPartsRaw =
+-                lastUserMsg?.parts ??
+-                (lastUserMsg?.info?.parts as Array<{ type?: string; text?: string }> | undefined)
+-
+-              if (lastUserPartsRaw && lastUserPartsRaw.length > 0) {
+-                log(`[${HOOK_NAME}] Auto-retrying with fallback model`, {
+-                  sessionID,
+-                  model: result.newModel,
+-                })
+-
+-                const retryParts = lastUserPartsRaw
+-                  .filter((p) => p.type === "text" && typeof p.text === "string" && p.text.length > 0)
+-                  .map((p) => ({ type: "text" as const, text: p.text! }))
+-
+-                if (retryParts.length > 0) {
+-                  const retryAgent = resolvedAgent ?? getSessionAgent(sessionID)
+-                  await ctx.client.session.promptAsync({
+-                    path: { id: sessionID },
+-                    body: {
+-                      ...(retryAgent ? { agent: retryAgent } : {}),
+-                      model: fallbackModelObj,
+-                      parts: retryParts,
+-                    },
+-                    query: { directory: ctx.directory },
+-                  })
+-                }
+-              } else {
+-                log(`[${HOOK_NAME}] No user message found for auto-retry`, { sessionID })
+-              }
+-            } catch (retryError) {
+-              log(`[${HOOK_NAME}] Auto-retry failed`, { sessionID, error: String(retryError) })
+-            } finally {
+-              sessionRetryInFlight.delete(sessionID)
+-            }
+-          }
+-        }
++        await autoRetryWithFallback(sessionID, result.newModel, resolvedAgent, "session.error")
+       }
+ 
+       if (!result.success) {
+@@ -558,63 +568,7 @@ export function createRuntimeFallbackHook(
+         }
+ 
+         if (result.success && result.newModel) {
+-          if (sessionRetryInFlight.has(sessionID)) {
+-            log(`[${HOOK_NAME}] Retry already in flight, skipping (message.updated)`, { sessionID })
+-          } else {
+-            const modelParts = result.newModel.split("/")
+-            if (modelParts.length >= 2) {
+-              const fallbackModelObj = {
+-                providerID: modelParts[0],
+-                modelID: modelParts.slice(1).join("/"),
+-              }
+-
+-              sessionRetryInFlight.add(sessionID)
+-              try {
+-                const messagesResp = await ctx.client.session.messages({
+-                  path: { id: sessionID },
+-                  query: { directory: ctx.directory },
+-                })
+-              const msgs = (messagesResp as {
+-                data?: Array<{
+-                  info?: Record<string, unknown>
+-                  parts?: Array<{ type?: string; text?: string }>
+-                }>
+-              }).data
+-              const lastUserMsg = msgs?.filter((m) => m.info?.role === "user").pop()
+-              const lastUserPartsRaw =
+-                lastUserMsg?.parts ??
+-                (lastUserMsg?.info?.parts as Array<{ type?: string; text?: string }> | undefined)
+-
+-              if (lastUserPartsRaw && lastUserPartsRaw.length > 0) {
+-                log(`[${HOOK_NAME}] Auto-retrying with fallback model (message.updated)`, {
+-                  sessionID,
+-                  model: result.newModel,
+-                })
+-
+-                const retryParts = lastUserPartsRaw
+-                  .filter((p) => p.type === "text" && typeof p.text === "string" && p.text.length > 0)
+-                  .map((p) => ({ type: "text" as const, text: p.text! }))
+-
+-                  if (retryParts.length > 0) {
+-                    const retryAgent = resolvedAgent ?? getSessionAgent(sessionID)
+-                    await ctx.client.session.promptAsync({
+-                      path: { id: sessionID },
+-                      body: {
+-                        ...(retryAgent ? { agent: retryAgent } : {}),
+-                        model: fallbackModelObj,
+-                        parts: retryParts,
+-                      },
+-                      query: { directory: ctx.directory },
+-                    })
+-                  }
+-                }
+-              } catch (retryError) {
+-                log(`[${HOOK_NAME}] Auto-retry failed (message.updated)`, { sessionID, error: String(retryError) })
+-              } finally {
+-                sessionRetryInFlight.delete(sessionID)
+-              }
+-            }
+-          }
++          await autoRetryWithFallback(sessionID, result.newModel, resolvedAgent, "message.updated")
+         }
+       }
+       return
+diff --git a/src/shared/model-resolution-pipeline.ts b/src/shared/model-resolution-pipeline.ts
+index 12b337cf..ab99847e 100644
+--- a/src/shared/model-resolution-pipeline.ts
++++ b/src/shared/model-resolution-pipeline.ts
+@@ -102,7 +102,7 @@ export function resolveModelPipeline(
+   const userFallbackModels = intent?.userFallbackModels
+   if (userFallbackModels && userFallbackModels.length > 0) {
+     if (availableModels.size === 0) {
+-      const connectedProviders = readConnectedProvidersCache()
++      const connectedProviders = constraints.connectedProviders ?? connectedProvidersCache.readConnectedProvidersCache()
+       const connectedSet = connectedProviders ? new Set(connectedProviders) : null
+ 
+       if (connectedSet !== null) {
+-- 
+2.39.2
+

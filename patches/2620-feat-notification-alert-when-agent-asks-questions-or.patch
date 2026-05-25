@@ -1,0 +1,357 @@
+From 931c0cd1010559e953623e926b7284cf34fb2ae8 Mon Sep 17 00:00:00 2001
+From: acamq <179265037+acamq@users.noreply.github.com>
+Date: Sat, 21 Feb 2026 15:49:23 -0700
+Subject: [PATCH 2620/5749] feat(notification): alert when agent asks questions
+ or needs permission
+
+---
+ .../session-notification-input-needed.test.ts | 93 ++++++++++++++++++
+ src/hooks/session-notification.ts             | 96 +++++++++++++++++--
+ src/plugin/tool-execute-before.test.ts        | 54 +++++++++++
+ src/plugin/tool-execute-before.ts             | 19 ++++
+ 4 files changed, 254 insertions(+), 8 deletions(-)
+ create mode 100644 src/hooks/session-notification-input-needed.test.ts
+
+diff --git a/src/hooks/session-notification-input-needed.test.ts b/src/hooks/session-notification-input-needed.test.ts
+new file mode 100644
+index 00000000..9a3f3db4
+--- /dev/null
++++ b/src/hooks/session-notification-input-needed.test.ts
+@@ -0,0 +1,93 @@
++const { describe, expect, test, beforeEach, afterEach, spyOn } = require("bun:test")
++
++const { createSessionNotification } = require("./session-notification")
++const { setMainSession, subagentSessions, _resetForTesting } = require("../features/claude-code-session-state")
++const utils = require("./session-notification-utils")
++
++describe("session-notification input-needed events", () => {
++  let notificationCalls: string[]
++
++  function createMockPluginInput() {
++    return {
++      $: async (cmd: TemplateStringsArray | string, ...values: unknown[]) => {
++        const cmdStr = typeof cmd === "string"
++          ? cmd
++          : cmd.reduce((acc, part, i) => acc + part + (values[i] ?? ""), "")
++
++        if (cmdStr.includes("osascript") || cmdStr.includes("notify-send") || cmdStr.includes("powershell")) {
++          notificationCalls.push(cmdStr)
++        }
++
++        return { stdout: "", stderr: "", exitCode: 0 }
++      },
++      client: {
++        session: {
++          todo: async () => ({ data: [] }),
++        },
++      },
++      directory: "/tmp/test",
++    }
++  }
++
++  beforeEach(() => {
++    _resetForTesting()
++    notificationCalls = []
++
++    spyOn(utils, "getOsascriptPath").mockResolvedValue("/usr/bin/osascript")
++    spyOn(utils, "getNotifySendPath").mockResolvedValue("/usr/bin/notify-send")
++    spyOn(utils, "getPowershellPath").mockResolvedValue("powershell")
++    spyOn(utils, "startBackgroundCheck").mockImplementation(() => {})
++  })
++
++  afterEach(() => {
++    subagentSessions.clear()
++    _resetForTesting()
++  })
++
++  test("sends question notification when question tool asks for input", async () => {
++    const sessionID = "main-question"
++    setMainSession(sessionID)
++    const hook = createSessionNotification(createMockPluginInput())
++
++    await hook({
++      event: {
++        type: "tool.execute.before",
++        properties: {
++          sessionID,
++          tool: "question",
++          args: {
++            questions: [
++              {
++                question: "Which branch should we use?",
++                options: [{ label: "main" }, { label: "dev" }],
++              },
++            ],
++          },
++        },
++      },
++    })
++
++    expect(notificationCalls).toHaveLength(1)
++    expect(notificationCalls[0]).toContain("Agent is asking a question")
++  })
++
++  test("sends permission notification for permission events", async () => {
++    const sessionID = "main-permission"
++    setMainSession(sessionID)
++    const hook = createSessionNotification(createMockPluginInput())
++
++    await hook({
++      event: {
++        type: "permission.ask",
++        properties: {
++          sessionID,
++        },
++      },
++    })
++
++    expect(notificationCalls).toHaveLength(1)
++    expect(notificationCalls[0]).toContain("Agent needs permission to continue")
++  })
++})
++
++export {}
+diff --git a/src/hooks/session-notification.ts b/src/hooks/session-notification.ts
+index a6380c5a..48e0d288 100644
+--- a/src/hooks/session-notification.ts
++++ b/src/hooks/session-notification.ts
+@@ -15,6 +15,8 @@ import { createIdleNotificationScheduler } from "./session-notification-schedule
+ interface SessionNotificationConfig {
+   title?: string
+   message?: string
++  questionMessage?: string
++  permissionMessage?: string
+   playSound?: boolean
+   soundPath?: string
+   /** Delay in ms before sending notification to confirm session is still idle (default: 1500) */
+@@ -36,6 +38,8 @@ export function createSessionNotification(
+   const mergedConfig = {
+     title: "OpenCode",
+     message: "Agent is ready for input",
++    questionMessage: "Agent is asking a question",
++    permissionMessage: "Agent needs permission to continue",
+     playSound: false,
+     soundPath: defaultSoundPath,
+     idleConfirmationDelay: 1500,
+@@ -53,6 +57,56 @@ export function createSessionNotification(
+     playSound: playSessionNotificationSound,
+   })
+ 
++  const QUESTION_TOOLS = new Set(["question", "ask_user_question", "askuserquestion"])
++  const PERMISSION_EVENTS = new Set(["permission.ask", "permission.asked", "permission.updated", "permission.requested"])
++  const PERMISSION_HINT_PATTERN = /\b(permission|approve|approval|allow|deny|consent)\b/i
++
++  const getSessionID = (properties: Record<string, unknown> | undefined): string | undefined => {
++    const sessionID = properties?.sessionID
++    if (typeof sessionID === "string" && sessionID.length > 0) return sessionID
++
++    const sessionId = properties?.sessionId
++    if (typeof sessionId === "string" && sessionId.length > 0) return sessionId
++
++    const info = properties?.info as Record<string, unknown> | undefined
++    const infoSessionID = info?.sessionID
++    if (typeof infoSessionID === "string" && infoSessionID.length > 0) return infoSessionID
++
++    const infoSessionId = info?.sessionId
++    if (typeof infoSessionId === "string" && infoSessionId.length > 0) return infoSessionId
++
++    return undefined
++  }
++
++  const shouldNotifyForSession = (sessionID: string): boolean => {
++    if (subagentSessions.has(sessionID)) return false
++
++    const mainSessionID = getMainSessionID()
++    if (mainSessionID && sessionID !== mainSessionID) return false
++
++    return true
++  }
++
++  const getEventToolName = (properties: Record<string, unknown> | undefined): string | undefined => {
++    const tool = properties?.tool
++    if (typeof tool === "string" && tool.length > 0) return tool
++
++    const name = properties?.name
++    if (typeof name === "string" && name.length > 0) return name
++
++    return undefined
++  }
++
++  const getQuestionText = (properties: Record<string, unknown> | undefined): string => {
++    const args = properties?.args as Record<string, unknown> | undefined
++    const questions = args?.questions
++    if (!Array.isArray(questions) || questions.length === 0) return ""
++
++    const firstQuestion = questions[0] as Record<string, unknown> | undefined
++    const questionText = firstQuestion?.question
++    return typeof questionText === "string" ? questionText : ""
++  }
++
+   return async ({ event }: { event: { type: string; properties?: unknown } }) => {
+     if (currentPlatform === "unsupported") return
+ 
+@@ -68,14 +122,10 @@ export function createSessionNotification(
+     }
+ 
+     if (event.type === "session.idle") {
+-      const sessionID = props?.sessionID as string | undefined
++      const sessionID = getSessionID(props)
+       if (!sessionID) return
+ 
+-      if (subagentSessions.has(sessionID)) return
+-
+-      // Only trigger notifications for the main session (not subagent sessions)
+-      const mainSessionID = getMainSessionID()
+-      if (mainSessionID && sessionID !== mainSessionID) return
++      if (!shouldNotifyForSession(sessionID)) return
+ 
+       scheduler.scheduleIdleNotification(sessionID)
+       return
+@@ -83,17 +133,47 @@ export function createSessionNotification(
+ 
+     if (event.type === "message.updated") {
+       const info = props?.info as Record<string, unknown> | undefined
+-      const sessionID = info?.sessionID as string | undefined
++      const sessionID = getSessionID({ ...props, info })
+       if (sessionID) {
+         scheduler.markSessionActivity(sessionID)
+       }
+       return
+     }
+ 
++    if (PERMISSION_EVENTS.has(event.type)) {
++      const sessionID = getSessionID(props)
++      if (!sessionID) return
++      if (!shouldNotifyForSession(sessionID)) return
++
++      scheduler.markSessionActivity(sessionID)
++      await sendSessionNotification(ctx, currentPlatform, mergedConfig.title, mergedConfig.permissionMessage)
++      if (mergedConfig.playSound && mergedConfig.soundPath) {
++        await playSessionNotificationSound(ctx, currentPlatform, mergedConfig.soundPath)
++      }
++      return
++    }
++
+     if (event.type === "tool.execute.before" || event.type === "tool.execute.after") {
+-      const sessionID = props?.sessionID as string | undefined
++      const sessionID = getSessionID(props)
+       if (sessionID) {
+         scheduler.markSessionActivity(sessionID)
++
++        if (event.type === "tool.execute.before") {
++          const toolName = getEventToolName(props)?.toLowerCase()
++          if (toolName && QUESTION_TOOLS.has(toolName)) {
++            if (!shouldNotifyForSession(sessionID)) return
++
++            const questionText = getQuestionText(props)
++            const message = PERMISSION_HINT_PATTERN.test(questionText)
++              ? mergedConfig.permissionMessage
++              : mergedConfig.questionMessage
++
++            await sendSessionNotification(ctx, currentPlatform, mergedConfig.title, message)
++            if (mergedConfig.playSound && mergedConfig.soundPath) {
++              await playSessionNotificationSound(ctx, currentPlatform, mergedConfig.soundPath)
++            }
++          }
++        }
+       }
+       return
+     }
+diff --git a/src/plugin/tool-execute-before.test.ts b/src/plugin/tool-execute-before.test.ts
+index 95f28de1..b3cd3f7f 100644
+--- a/src/plugin/tool-execute-before.test.ts
++++ b/src/plugin/tool-execute-before.test.ts
+@@ -31,6 +31,60 @@ describe("createToolExecuteBeforeHandler", () => {
+     await expect(run).resolves.toBeUndefined()
+   })
+ 
++  test("triggers session notification hook for question tools", async () => {
++    let called = false
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++        },
++      },
++    }
++
++    const hooks = {
++      sessionNotification: async (input: { event: { type: string; properties?: Record<string, unknown> } }) => {
++        called = true
++        expect(input.event.type).toBe("tool.execute.before")
++        expect(input.event.properties?.sessionID).toBe("ses_q")
++        expect(input.event.properties?.tool).toBe("question")
++      },
++    }
++
++    const handler = createToolExecuteBeforeHandler({ ctx, hooks })
++    const input = { tool: "question", sessionID: "ses_q", callID: "call_q" }
++    const output = { args: { questions: [{ question: "Proceed?", options: [{ label: "Yes" }] }] } as Record<string, unknown> }
++
++    await handler(input, output)
++
++    expect(called).toBe(true)
++  })
++
++  test("does not trigger session notification hook for non-question tools", async () => {
++    let called = false
++    const ctx = {
++      client: {
++        session: {
++          messages: async () => ({ data: [] }),
++        },
++      },
++    }
++
++    const hooks = {
++      sessionNotification: async () => {
++        called = true
++      },
++    }
++
++    const handler = createToolExecuteBeforeHandler({ ctx, hooks })
++
++    await handler(
++      { tool: "bash", sessionID: "ses_b", callID: "call_b" },
++      { args: { command: "pwd" } as Record<string, unknown> },
++    )
++
++    expect(called).toBe(false)
++  })
++
+   describe("task tool subagent_type normalization", () => {
+     const emptyHooks = {}
+ 
+diff --git a/src/plugin/tool-execute-before.ts b/src/plugin/tool-execute-before.ts
+index 809b9a89..e2742baa 100644
+--- a/src/plugin/tool-execute-before.ts
++++ b/src/plugin/tool-execute-before.ts
+@@ -30,6 +30,25 @@ export function createToolExecuteBeforeHandler(args: {
+     await hooks.prometheusMdOnly?.["tool.execute.before"]?.(input, output)
+     await hooks.sisyphusJuniorNotepad?.["tool.execute.before"]?.(input, output)
+     await hooks.atlasHook?.["tool.execute.before"]?.(input, output)
++
++    const normalizedToolName = input.tool.toLowerCase()
++    if (
++      normalizedToolName === "question"
++      || normalizedToolName === "ask_user_question"
++      || normalizedToolName === "askuserquestion"
++    ) {
++      await hooks.sessionNotification?.({
++        event: {
++          type: "tool.execute.before",
++          properties: {
++            sessionID: input.sessionID,
++            tool: input.tool,
++            args: output.args,
++          },
++        },
++      })
++    }
++
+     if (input.tool === "task") {
+       const argsObject = output.args
+       const category = typeof argsObject.category === "string" ? argsObject.category : undefined
+-- 
+2.39.2
+

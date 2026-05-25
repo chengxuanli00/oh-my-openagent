@@ -1,0 +1,154 @@
+From 1ea0ee4319e3129183749fc7bdb96ec46fa35fbe Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 8 Apr 2026 20:10:25 +0900
+Subject: [PATCH 4107/5749] fix(preemptive-compaction): notify user on failure
+ and reduce timeout
+
+Reports from david_66 on Discord: sessions get perceived as 'stuck' when
+context usage crosses the 78% threshold. Investigation confirmed two
+issues in the preemptive compaction hook:
+
+1. PREEMPTIVE_COMPACTION_TIMEOUT_MS was 120s. While the summarize
+   request is in flight, tool.execute.after short-circuits via the
+   compactionInProgress guard. A hung summarize blocked the session
+   for two full minutes before giving up, which users reasonably
+   experience as a hang.
+
+2. On failure (timeout or exception) only a log line was emitted. The
+   user had no visibility into why their session was unresponsive or
+   why auto-compaction never ran, so a transient upstream error could
+   silently leave them well above the threshold with no signal.
+
+Fix:
+
+- Reduce timeout 120s -> 60s. Still gives the upstream a generous
+  window, but caps the worst-case perceived hang at one minute.
+- Show a warning toast via ctx.client.tui.showToast whenever the
+  catch block fires, including the underlying error string so users
+  can act (retry, manual /compact, or adjust provider).
+- Include providerID/modelID in the Compaction failed log entry so
+  wild failures are easier to correlate to a specific target model.
+
+Two existing failure-path assertions were updated to match the new
+log shape and a new test covers the toast notification contract.
+
+Discord report: https://discord.com/channels/1452487457085063218/1490536332961906829/1491345441399505037
+---
+ src/hooks/preemptive-compaction.test.ts | 49 +++++++++++++++++++++++++
+ src/hooks/preemptive-compaction.ts      | 22 ++++++++++-
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/src/hooks/preemptive-compaction.test.ts b/src/hooks/preemptive-compaction.test.ts
+index ef6e695b..09cbf83d 100644
+--- a/src/hooks/preemptive-compaction.test.ts
++++ b/src/hooks/preemptive-compaction.test.ts
+@@ -284,10 +284,57 @@ describe("preemptive-compaction", () => {
+     //#then
+     expect(logMock).toHaveBeenCalledWith("[preemptive-compaction] Compaction failed", {
+       sessionID,
++      providerID: "anthropic",
++      modelID: "claude-sonnet-4-6",
+       error: String(summarizeError),
+     })
+   })
+ 
++  // #given compaction fails
++  // #when tool.execute.after completes the catch block
++  // #then should show a warning toast explaining the failure to the user
++  it("should show a warning toast when preemptive compaction fails", async () => {
++    //#given
++    const hook = createPreemptiveCompactionHook(ctx as never, {} as never)
++    const sessionID = "ses_toast_on_failure"
++    const summarizeError = new Error("upstream rate limited")
++    ctx.client.session.summarize.mockRejectedValueOnce(summarizeError)
++
++    await hook.event({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            role: "assistant",
++            sessionID,
++            providerID: "anthropic",
++            modelID: "claude-sonnet-4-6",
++            finish: true,
++            tokens: {
++              input: 170000,
++              output: 0,
++              reasoning: 0,
++              cache: { read: 10000, write: 0 },
++            },
++          },
++        },
++      },
++    })
++
++    //#when
++    await hook["tool.execute.after"](
++      { tool: "bash", sessionID, callID: "call_toast" },
++      { title: "", output: "test", metadata: null },
++    )
++
++    //#then
++    expect(ctx.client.tui.showToast).toHaveBeenCalledTimes(1)
++    const toastCall = ctx.client.tui.showToast.mock.calls[0]?.[0]
++    expect(toastCall?.body?.title).toBe("Preemptive compaction failed")
++    expect(toastCall?.body?.variant).toBe("warning")
++    expect(String(toastCall?.body?.message)).toContain("upstream rate limited")
++  })
++
+   // #given compaction fails
+   // #when tool.execute.after is called again immediately
+   // #then should NOT retry due to cooldown
+@@ -475,6 +522,8 @@ describe("preemptive-compaction", () => {
+       expect(ctx.client.session.summarize).toHaveBeenCalledTimes(1)
+       expect(logMock).toHaveBeenCalledWith("[preemptive-compaction] Compaction failed", {
+         sessionID,
++        providerID: "anthropic",
++        modelID: "claude-sonnet-4-6",
+         error: expect.stringContaining("Compaction summarize timed out"),
+       })
+ 
+diff --git a/src/hooks/preemptive-compaction.ts b/src/hooks/preemptive-compaction.ts
+index ef58b1a9..ecab7067 100644
+--- a/src/hooks/preemptive-compaction.ts
++++ b/src/hooks/preemptive-compaction.ts
+@@ -8,7 +8,7 @@ import {
+ import { resolveCompactionModel } from "./shared/compaction-model-resolver"
+ import { createPostCompactionDegradationMonitor } from "./preemptive-compaction-degradation-monitor"
+ 
+-const PREEMPTIVE_COMPACTION_TIMEOUT_MS = 120_000
++const PREEMPTIVE_COMPACTION_TIMEOUT_MS = 60_000
+ const PREEMPTIVE_COMPACTION_THRESHOLD = 0.78
+ const PREEMPTIVE_COMPACTION_COOLDOWN_MS = 60_000
+ 
+@@ -134,7 +134,25 @@ export function createPreemptiveCompactionHook(
+ 
+       compactedSessions.add(sessionID)
+     } catch (error) {
+-      log("[preemptive-compaction] Compaction failed", { sessionID, error: String(error) })
++      log("[preemptive-compaction] Compaction failed", {
++        sessionID,
++        providerID: cached.providerID,
++        modelID: cached.modelID,
++        error: String(error),
++      })
++      ctx.client.tui.showToast({
++        body: {
++          title: "Preemptive compaction failed",
++          message: `Context window is above ${Math.round(PREEMPTIVE_COMPACTION_THRESHOLD * 100)}% and auto-compaction could not run. The session may grow large. Error: ${String(error)}`,
++          variant: "warning",
++          duration: 10000,
++        },
++      }).catch((toastError: unknown) => {
++        log("[preemptive-compaction] Failed to show toast", {
++          sessionID,
++          toastError: String(toastError),
++        })
++      })
+     } finally {
+       compactionInProgress.delete(sessionID)
+     }
+-- 
+2.39.2
+

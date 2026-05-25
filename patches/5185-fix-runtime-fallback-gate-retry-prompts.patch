@@ -1,0 +1,163 @@
+From 439e72839b3e6ac65ef49ead6bdf5aa83447eb3f Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 11:49:55 +0900
+Subject: [PATCH 5185/5749] fix(runtime-fallback): gate retry prompts
+
+---
+ src/hooks/runtime-fallback/auto-retry.ts | 36 +++++++++++---
+ src/hooks/runtime-fallback/index.test.ts | 62 ++++++++++++++++++++++++
+ 2 files changed, 91 insertions(+), 7 deletions(-)
+
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index cbb3be2b..7e8a7fd6 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -10,6 +10,10 @@ import { buildRetryModelPayload } from "./retry-model-payload"
+ import { getLastUserRetryParts } from "./last-user-retry-parts"
+ import { extractSessionMessages } from "./session-messages"
+ import { resolveRegisteredAgentName } from "../../features/claude-code-session-state"
++import {
++  promptAsyncAfterSessionIdle,
++  releasePromptAsyncReservation,
++} from "../shared/prompt-async-gate"
+ 
+ const SESSION_TTL_MS = 30 * 60 * 1000
+ 
+@@ -33,6 +37,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+   const abortSessionRequest = async (sessionID: string, source: string): Promise<void> => {
+     try {
+       await ctx.client.session.abort({ path: { id: sessionID } })
++      releasePromptAsyncReservation(sessionID, `runtime-fallback-abort:${source}`)
+       log(`[${HOOK_NAME}] Aborted in-flight session request (${source})`, { sessionID })
+     } catch (error) {
+       log(`[${HOOK_NAME}] Failed to abort in-flight session request (${source})`, {
+@@ -137,15 +142,32 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         sessionAwaitingFallbackResult.add(sessionID)
+         scheduleSessionFallbackTimeout(sessionID, retryAgent)
+ 
+-        await ctx.client.session.promptAsync({
+-          path: { id: sessionID },
+-          body: {
+-            ...(launchAgent ? { agent: launchAgent } : {}),
+-            ...retryModelPayload,
+-            parts: retryParts,
++        const promptResult = await promptAsyncAfterSessionIdle({
++          client: ctx.client,
++          sessionID,
++          source: `runtime-fallback:${source}`,
++          settleMs: 0,
++          postDispatchHoldMs: 0,
++          input: {
++            path: { id: sessionID },
++            body: {
++              ...(launchAgent ? { agent: launchAgent } : {}),
++              ...retryModelPayload,
++              parts: retryParts,
++            },
++            query: { directory: ctx.directory },
+           },
+-          query: { directory: ctx.directory },
+         })
++        if (promptResult.status === "failed") {
++          throw promptResult.error
++        }
++        if (promptResult.status !== "dispatched") {
++          log(`[${HOOK_NAME}] Auto-retry skipped by promptAsync gate (${source})`, {
++            sessionID,
++            status: promptResult.status,
++          })
++          return
++        }
+         retryDispatched = true
+       } else {
+         log(`[${HOOK_NAME}] No user message found for auto-retry (${source})`, { sessionID })
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index 29e8332e..b3ae368f 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -40,6 +40,7 @@ describe("runtime-fallback", () => {
+       messages?: (args: unknown) => Promise<unknown>
+       promptAsync?: (args: unknown) => Promise<unknown>
+       abort?: (args: unknown) => Promise<unknown>
++      status?: () => Promise<unknown>
+     }
+   }) {
+     return unsafeTestValue({
+@@ -57,6 +58,7 @@ describe("runtime-fallback", () => {
+           messages: overrides?.session?.messages ?? (async () => ({ data: [] })),
+           promptAsync: overrides?.session?.promptAsync ?? (async () => ({})),
+           abort: overrides?.session?.abort ?? (async () => ({})),
++          ...(overrides?.session?.status ? { status: overrides.session.status } : {}),
+         },
+       },
+       directory: "/test/dir",
+@@ -2471,6 +2473,66 @@ describe("runtime-fallback", () => {
+       expect(callBody?.agent).toBe("prometheus")
+       expect(callBody?.model).toEqual({ providerID: "github-copilot", modelID: "claude-opus-4.7" })
+     })
++
++    test("should not dispatch a second fallback prompt while the accepted retry session is still active", async () => {
++      const sessionID = "test-runtime-fallback-active-gate"
++      let sessionStatus = "idle"
++      const promptCalls: Array<Record<string, unknown>> = []
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [
++                {
++                  info: { role: "user" },
++                  parts: [{ type: "text", text: "retry this" }],
++                },
++              ],
++            }),
++            promptAsync: async (args: unknown) => {
++              promptCalls.push(args as Record<string, unknown>)
++              sessionStatus = "busy"
++              return {}
++            },
++            status: async () => ({ data: { [sessionID]: { type: sessionStatus } } }),
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: createMockPluginConfigWithCategoryFallback([
++            "github-copilot/claude-opus-4.7",
++            "openai/gpt-5.4",
++          ]),
++        },
++      )
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.created",
++          properties: { info: { id: sessionID, model: "anthropic/claude-opus-4-7" } },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID, error: { statusCode: 503, message: "Service unavailable" } },
++        },
++      })
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: {
++            sessionID,
++            model: "github-copilot/claude-opus-4.7",
++            error: { statusCode: 503, message: "Service unavailable" },
++          },
++        },
++      })
++
++      expect(promptCalls).toHaveLength(1)
++    })
+   })
+ 
+   describe("cooldown mechanism", () => {
+-- 
+2.39.2
+

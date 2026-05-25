@@ -1,0 +1,793 @@
+From b4e13883b1102eea2b2974bd0898ce0174757757 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 20:12:12 +0900
+Subject: [PATCH 3148/5749] fix(background-agent): fix 3 memory leaks in task
+ lifecycle management
+
+H3: cancelTask(skipNotification=true) now schedules task removal.
+Previously the early return path skipped cleanup, leaking task objects
+in this.tasks Map permanently. Extracted scheduleTaskRemoval() helper
+called from both skipNotification and normal paths.
+
+H2: Per-task completion cleanup timer decoupled from allComplete check.
+Previously cleanup timer only ran when ALL sibling tasks completed. Now
+each finished task gets its own removal timer regardless of siblings.
+
+H1+C2: TaskHistory.clearAll() added and wired into shutdown(). Added
+clearSession() calls on session error/deletion and prune cycles.
+taskHistory was the only data structure missed by shutdown().
+
+Tests: 10 pass (3 cancel + 3 completion + 4 history)
+---
+ .../cancel-task-cleanup.test.ts               | 192 ++++++++++++++
+ src/features/background-agent/manager.ts      |  80 ++++--
+ .../task-completion-cleanup.test.ts           | 245 ++++++++++++++++++
+ .../task-history-cleanup.test.ts              | 142 ++++++++++
+ src/features/background-agent/task-history.ts |   4 +
+ 5 files changed, 639 insertions(+), 24 deletions(-)
+ create mode 100644 src/features/background-agent/cancel-task-cleanup.test.ts
+ create mode 100644 src/features/background-agent/task-completion-cleanup.test.ts
+ create mode 100644 src/features/background-agent/task-history-cleanup.test.ts
+
+diff --git a/src/features/background-agent/cancel-task-cleanup.test.ts b/src/features/background-agent/cancel-task-cleanup.test.ts
+new file mode 100644
+index 00000000..e47e28ca
+--- /dev/null
++++ b/src/features/background-agent/cancel-task-cleanup.test.ts
+@@ -0,0 +1,192 @@
++import { tmpdir } from "node:os"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { afterEach, describe, expect, test } from "bun:test"
++import { ConcurrencyManager } from "./concurrency"
++import { BackgroundManager } from "./manager"
++import type { BackgroundTask, LaunchInput } from "./types"
++
++const managersToShutdown: BackgroundManager[] = []
++
++afterEach(() => {
++  while (managersToShutdown.length > 0) managersToShutdown.pop()?.shutdown()
++})
++
++function createBackgroundManager(config?: { defaultConcurrency?: number }): BackgroundManager {
++  const directory = tmpdir()
++  const client = { session: {} as PluginInput["client"]["session"] } as PluginInput["client"]
++
++  Reflect.set(client.session, "abort", async () => ({ data: true }))
++  Reflect.set(client.session, "create", async () => ({ data: { id: `session-${crypto.randomUUID().slice(0, 8)}` } }))
++  Reflect.set(client.session, "get", async () => ({ data: { directory } }))
++  Reflect.set(client.session, "messages", async () => ({ data: [] }))
++  Reflect.set(client.session, "prompt", async () => ({ data: { info: {}, parts: [] } }))
++  Reflect.set(client.session, "promptAsync", async () => ({ data: undefined }))
++
++  const manager = new BackgroundManager({
++    $: {} as PluginInput["$"],
++    client,
++    directory,
++    project: {} as PluginInput["project"],
++    serverUrl: new URL("http://localhost"),
++    worktree: directory,
++  }, config)
++  managersToShutdown.push(manager)
++  return manager
++}
++
++function createMockTask(overrides: Partial<BackgroundTask> & { id: string; parentSessionID: string }): BackgroundTask {
++  return {
++    id: overrides.id,
++    sessionID: overrides.sessionID,
++    parentSessionID: overrides.parentSessionID,
++    parentMessageID: overrides.parentMessageID ?? "parent-message-id",
++    description: overrides.description ?? "test task",
++    prompt: overrides.prompt ?? "test prompt",
++    agent: overrides.agent ?? "test-agent",
++    status: overrides.status ?? "running",
++    queuedAt: overrides.queuedAt,
++    startedAt: overrides.startedAt ?? new Date(),
++    completedAt: overrides.completedAt,
++    error: overrides.error,
++    model: overrides.model,
++    concurrencyKey: overrides.concurrencyKey,
++    concurrencyGroup: overrides.concurrencyGroup,
++    progress: overrides.progress,
++  }
++}
++
++function getTaskMap(manager: BackgroundManager): Map<string, BackgroundTask> { return Reflect.get(manager, "tasks") as Map<string, BackgroundTask> }
++
++function getPendingByParent(manager: BackgroundManager): Map<string, Set<string>> { return Reflect.get(manager, "pendingByParent") as Map<string, Set<string>> }
++
++function getQueuesByKey(manager: BackgroundManager): Map<string, Array<{ task: BackgroundTask; input: LaunchInput }>> { return Reflect.get(manager, "queuesByKey") as Map<string, Array<{ task: BackgroundTask; input: LaunchInput }>> }
++
++function getConcurrencyManager(manager: BackgroundManager): ConcurrencyManager { return Reflect.get(manager, "concurrencyManager") as ConcurrencyManager }
++
++function getCompletionTimers(manager: BackgroundManager): Map<string, ReturnType<typeof setTimeout>> { return Reflect.get(manager, "completionTimers") as Map<string, ReturnType<typeof setTimeout>> }
++
++async function processKeyForTest(manager: BackgroundManager, key: string): Promise<void> {
++  const processKey = Reflect.get(manager, "processKey") as (key: string) => Promise<void>
++  await processKey.call(manager, key)
++}
++
++function runScheduledCleanup(manager: BackgroundManager, taskId: string): void {
++  const timer = getCompletionTimers(manager).get(taskId)
++  if (!timer) {
++    throw new Error(`Expected cleanup timer for task ${taskId}`)
++  }
++
++  const onTimeout = Reflect.get(timer, "_onTimeout") as (() => void) | undefined
++  if (!onTimeout) {
++    throw new Error(`Expected cleanup callback for task ${taskId}`)
++  }
++
++  onTimeout()
++}
++
++describe("BackgroundManager.cancelTask cleanup", () => {
++  test("#given a running task in BackgroundManager #when cancelTask called with skipNotification=true #then task is eventually removed from this.tasks Map", async () => {
++    // given
++    const manager = createBackgroundManager()
++    const task = createMockTask({
++      id: "task-skip-notification-cleanup",
++      parentSessionID: "parent-session-skip-notification-cleanup",
++      sessionID: "session-skip-notification-cleanup",
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionID, new Set([task.id]))
++
++    // when
++    const cancelled = await manager.cancelTask(task.id, {
++      skipNotification: true,
++      source: "test",
++    })
++
++    // then
++    expect(cancelled).toBe(true)
++    runScheduledCleanup(manager, task.id)
++    expect(manager.getTask(task.id)).toBeUndefined()
++  })
++
++  test("#given a running task #when cancelTask called with skipNotification=false #then task is also eventually removed", async () => {
++    // given
++    const manager = createBackgroundManager()
++    const task = createMockTask({
++      id: "task-notify-cleanup",
++      parentSessionID: "parent-session-notify-cleanup",
++      sessionID: "session-notify-cleanup",
++    })
++
++    getTaskMap(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionID, new Set([task.id]))
++
++    // when
++    const cancelled = await manager.cancelTask(task.id, {
++      skipNotification: false,
++      source: "test",
++    })
++
++    // then
++    expect(cancelled).toBe(true)
++    runScheduledCleanup(manager, task.id)
++    expect(manager.getTask(task.id)).toBeUndefined()
++  })
++
++  test("#given a running task #when cancelTask called with skipNotification=true #then concurrency slot is freed and pending tasks can start", async () => {
++    // given
++    const manager = createBackgroundManager({ defaultConcurrency: 1 })
++    const concurrencyManager = getConcurrencyManager(manager)
++    const concurrencyKey = "test-provider/test-model"
++    await concurrencyManager.acquire(concurrencyKey)
++
++    const runningTask = createMockTask({
++      id: "task-running-before-cancel",
++      parentSessionID: "parent-session-concurrency-cleanup",
++      sessionID: "session-running-before-cancel",
++      concurrencyKey,
++    })
++    const pendingTask = createMockTask({
++      id: "task-pending-after-cancel",
++      parentSessionID: runningTask.parentSessionID,
++      status: "pending",
++      startedAt: undefined,
++      queuedAt: new Date(),
++      model: { providerID: "test-provider", modelID: "test-model" },
++    })
++    const queuedInput: LaunchInput = {
++      agent: pendingTask.agent,
++      description: pendingTask.description,
++      model: pendingTask.model,
++      parentMessageID: pendingTask.parentMessageID,
++      parentSessionID: pendingTask.parentSessionID,
++      prompt: pendingTask.prompt,
++    }
++
++    getTaskMap(manager).set(runningTask.id, runningTask)
++    getTaskMap(manager).set(pendingTask.id, pendingTask)
++    getPendingByParent(manager).set(runningTask.parentSessionID, new Set([runningTask.id, pendingTask.id]))
++    getQueuesByKey(manager).set(concurrencyKey, [{ input: queuedInput, task: pendingTask }])
++
++    Reflect.set(manager, "startTask", async ({ task }: { task: BackgroundTask; input: LaunchInput }) => {
++      task.status = "running"
++      task.startedAt = new Date()
++      task.sessionID = "session-started-after-cancel"
++      task.concurrencyKey = concurrencyKey
++      task.concurrencyGroup = concurrencyKey
++    })
++
++    // when
++    const cancelled = await manager.cancelTask(runningTask.id, {
++      abortSession: false,
++      skipNotification: true,
++      source: "test",
++    })
++    await processKeyForTest(manager, concurrencyKey)
++
++    // then
++    expect(cancelled).toBe(true)
++    expect(concurrencyManager.getCount(concurrencyKey)).toBe(1)
++    expect(manager.getTask(pendingTask.id)?.status).toBe("running")
++  })
++})
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 8d810fd5..0ecc68e3 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -906,6 +906,14 @@ export class BackgroundManager {
+         this.idleDeferralTimers.delete(task.id)
+       }
+ 
++      this.cleanupPendingByParent(task)
++      this.tasks.delete(task.id)
++      this.clearTaskHistoryWhenParentTasksGone(task.parentSessionID)
++      this.clearNotificationsForTask(task.id)
++      const toastManager = getTaskToastManager()
++      if (toastManager) {
++        toastManager.removeTask(task.id)
++      }
+       if (task.sessionID) {
+         SessionCategoryRegistry.remove(task.sessionID)
+       }
+@@ -932,7 +940,12 @@ export class BackgroundManager {
+ 
+       this.pendingNotifications.delete(sessionID)
+ 
+-      if (tasksToCancel.size === 0) return
++      if (tasksToCancel.size === 0) {
++        this.clearTaskHistoryWhenParentTasksGone(sessionID)
++        return
++      }
++
++      const parentSessionsToClear = new Set<string>()
+ 
+       const deletedSessionIDs = new Set<string>([sessionID])
+       for (const task of tasksToCancel.values()) {
+@@ -942,6 +955,8 @@ export class BackgroundManager {
+       }
+ 
+       for (const task of tasksToCancel.values()) {
++        parentSessionsToClear.add(task.parentSessionID)
++
+         if (task.status === "running" || task.status === "pending") {
+           void this.cancelTask(task.id, {
+             source: "session.deleted",
+@@ -959,6 +974,10 @@ export class BackgroundManager {
+         }
+       }
+ 
++      for (const parentSessionID of parentSessionsToClear) {
++        this.clearTaskHistoryWhenParentTasksGone(parentSessionID)
++      }
++
+       this.rootDescendantCounts.delete(sessionID)
+       SessionCategoryRegistry.remove(sessionID)
+     }
+@@ -1125,6 +1144,37 @@ export class BackgroundManager {
+     }
+   }
+ 
++  private clearTaskHistoryWhenParentTasksGone(parentSessionID: string | undefined): void {
++    if (!parentSessionID) return
++    if (this.getTasksByParentSession(parentSessionID).length > 0) return
++    this.taskHistory.clearSession(parentSessionID)
++  }
++
++  private scheduleTaskRemoval(taskId: string): void {
++    const existingTimer = this.completionTimers.get(taskId)
++    if (existingTimer) {
++      clearTimeout(existingTimer)
++      this.completionTimers.delete(taskId)
++    }
++
++    const timer = setTimeout(() => {
++      this.completionTimers.delete(taskId)
++      const task = this.tasks.get(taskId)
++      if (task) {
++        this.clearNotificationsForTask(taskId)
++        this.tasks.delete(taskId)
++        this.clearTaskHistoryWhenParentTasksGone(task.parentSessionID)
++        if (task.sessionID) {
++          subagentSessions.delete(task.sessionID)
++          SessionCategoryRegistry.remove(task.sessionID)
++        }
++        log("[background-agent] Removed completed task from memory:", taskId)
++      }
++    }, TASK_CLEANUP_DELAY_MS)
++
++    this.completionTimers.set(taskId, timer)
++  }
++
+   async cancelTask(
+     taskId: string,
+     options?: { source?: string; reason?: string; abortSession?: boolean; skipNotification?: boolean }
+@@ -1190,6 +1240,7 @@ export class BackgroundManager {
+     removeTaskToastTracking(task.id)
+ 
+     if (options?.skipNotification) {
++      this.scheduleTaskRemoval(task.id)
+       log(`[background-agent] Task cancelled via ${source} (notification skipped):`, task.id)
+       return true
+     }
+@@ -1480,29 +1531,8 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+         })
+       }
+ 
+-    if (allComplete) {
+-      for (const completedTask of completedTasks) {
+-        const taskId = completedTask.id
+-        const existingTimer = this.completionTimers.get(taskId)
+-        if (existingTimer) {
+-          clearTimeout(existingTimer)
+-          this.completionTimers.delete(taskId)
+-        }
+-        const timer = setTimeout(() => {
+-          this.completionTimers.delete(taskId)
+-          const taskToRemove = this.tasks.get(taskId)
+-          if (taskToRemove) {
+-            this.clearNotificationsForTask(taskId)
+-            if (taskToRemove.sessionID) {
+-              subagentSessions.delete(taskToRemove.sessionID)
+-              SessionCategoryRegistry.remove(taskToRemove.sessionID)
+-            }
+-            this.tasks.delete(taskId)
+-            log("[background-agent] Removed completed task from memory:", taskId)
+-          }
+-        }, TASK_CLEANUP_DELAY_MS)
+-        this.completionTimers.set(taskId, timer)
+-      }
++    if (task.status !== "running" && task.status !== "pending") {
++      this.scheduleTaskRemoval(task.id)
+     }
+   }
+ 
+@@ -1554,6 +1584,7 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+             }
+           }
+         }
++        this.cleanupPendingByParent(task)
+         this.markForNotification(task)
+         this.enqueueNotificationForParent(task.parentSessionID, () => this.notifyParentSession(task)).catch(err => {
+           log("[background-agent] Error in notifyParentSession for stale-pruned task:", { taskId: task.id, error: err })
+@@ -1708,6 +1739,7 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+     this.rootDescendantCounts.clear()
+     this.queuesByKey.clear()
+     this.processingKeys.clear()
++    this.taskHistory.clearAll()
+     this.unregisterProcessCleanup()
+     log("[background-agent] Shutdown complete")
+ 
+diff --git a/src/features/background-agent/task-completion-cleanup.test.ts b/src/features/background-agent/task-completion-cleanup.test.ts
+new file mode 100644
+index 00000000..77c42d6f
+--- /dev/null
++++ b/src/features/background-agent/task-completion-cleanup.test.ts
+@@ -0,0 +1,245 @@
++declare const require: (name: string) => any
++const { describe, test, expect, afterEach } = require("bun:test")
++import { tmpdir } from "node:os"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { TASK_CLEANUP_DELAY_MS } from "./constants"
++import { BackgroundManager } from "./manager"
++import type { BackgroundTask } from "./types"
++
++type PromptAsyncCall = {
++  path: { id: string }
++  body: {
++    noReply?: boolean
++    parts?: unknown[]
++  }
++}
++
++type FakeTimers = {
++  getDelay: (timer: ReturnType<typeof setTimeout>) => number | undefined
++  run: (timer: ReturnType<typeof setTimeout>) => void
++  restore: () => void
++}
++
++let managerUnderTest: BackgroundManager | undefined
++let fakeTimers: FakeTimers | undefined
++
++afterEach(() => {
++  managerUnderTest?.shutdown()
++  fakeTimers?.restore()
++  managerUnderTest = undefined
++  fakeTimers = undefined
++})
++
++function createTask(overrides: Partial<BackgroundTask> & { id: string; parentSessionID: string }): BackgroundTask {
++  const id = overrides.id
++  const parentSessionID = overrides.parentSessionID
++  const { id: _ignoredID, parentSessionID: _ignoredParentSessionID, ...rest } = overrides
++
++  return {
++    parentMessageID: overrides.parentMessageID ?? "parent-message-id",
++    description: overrides.description ?? overrides.id,
++    prompt: overrides.prompt ?? `Prompt for ${overrides.id}`,
++    agent: overrides.agent ?? "test-agent",
++    status: overrides.status ?? "running",
++    startedAt: overrides.startedAt ?? new Date("2026-03-11T00:00:00.000Z"),
++    ...rest,
++    id,
++    parentSessionID,
++  }
++}
++
++function createManager(enableParentSessionNotifications: boolean): {
++  manager: BackgroundManager
++  promptAsyncCalls: PromptAsyncCall[]
++} {
++  const promptAsyncCalls: PromptAsyncCall[] = []
++  const client = {
++    session: {
++      messages: async () => [],
++      prompt: async () => ({}),
++      promptAsync: async (call: PromptAsyncCall) => {
++        promptAsyncCalls.push(call)
++        return {}
++      },
++      abort: async () => ({}),
++    },
++  }
++  const placeholderClient = {} as PluginInput["client"]
++  const ctx: PluginInput = {
++    client: placeholderClient,
++    project: {} as PluginInput["project"],
++    directory: tmpdir(),
++    worktree: tmpdir(),
++    serverUrl: new URL("http://localhost"),
++    $: {} as PluginInput["$"],
++  }
++
++  const manager = new BackgroundManager(
++    ctx,
++    undefined,
++    { enableParentSessionNotifications }
++  )
++  Reflect.set(manager, "client", client)
++
++  return { manager, promptAsyncCalls }
++}
++
++function installFakeTimers(): FakeTimers {
++  const originalSetTimeout = globalThis.setTimeout
++  const originalClearTimeout = globalThis.clearTimeout
++  const callbacks = new Map<ReturnType<typeof setTimeout>, () => void>()
++  const delays = new Map<ReturnType<typeof setTimeout>, number>()
++
++  globalThis.setTimeout = ((handler: Parameters<typeof setTimeout>[0], delay?: number, ...args: unknown[]): ReturnType<typeof setTimeout> => {
++    if (typeof handler !== "function") {
++      throw new Error("Expected function timeout handler")
++    }
++
++    const timer = originalSetTimeout(() => {}, 60_000)
++    originalClearTimeout(timer)
++    const callback = handler as (...callbackArgs: Array<unknown>) => void
++    callbacks.set(timer, () => callback(...args))
++    delays.set(timer, delay ?? 0)
++    return timer
++  }) as typeof setTimeout
++
++  globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>): void => {
++    callbacks.delete(timer)
++    delays.delete(timer)
++  }) as typeof clearTimeout
++
++  return {
++    getDelay(timer) {
++      return delays.get(timer)
++    },
++    run(timer) {
++      const callback = callbacks.get(timer)
++      if (!callback) {
++        throw new Error(`Timer not found: ${String(timer)}`)
++      }
++
++      callbacks.delete(timer)
++      delays.delete(timer)
++      callback()
++    },
++    restore() {
++      globalThis.setTimeout = originalSetTimeout
++      globalThis.clearTimeout = originalClearTimeout
++    },
++  }
++}
++
++function getTasks(manager: BackgroundManager): Map<string, BackgroundTask> {
++  return Reflect.get(manager, "tasks") as Map<string, BackgroundTask>
++}
++
++function getPendingByParent(manager: BackgroundManager): Map<string, Set<string>> {
++  return Reflect.get(manager, "pendingByParent") as Map<string, Set<string>>
++}
++
++function getCompletionTimers(manager: BackgroundManager): Map<string, ReturnType<typeof setTimeout>> {
++  return Reflect.get(manager, "completionTimers") as Map<string, ReturnType<typeof setTimeout>>
++}
++
++async function notifyParentSessionForTest(manager: BackgroundManager, task: BackgroundTask): Promise<void> {
++  const notifyParentSession = Reflect.get(manager, "notifyParentSession") as (task: BackgroundTask) => Promise<void>
++  return notifyParentSession.call(manager, task)
++}
++
++function getRequiredTimer(manager: BackgroundManager, taskID: string): ReturnType<typeof setTimeout> {
++  const timer = getCompletionTimers(manager).get(taskID)
++  expect(timer).toBeDefined()
++  if (timer === undefined) {
++    throw new Error(`Missing completion timer for ${taskID}`)
++  }
++
++  return timer
++}
++
++describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
++  describe("#given 2 tasks for same parent and task A completed", () => {
++    test("#when task B is still running #then task A is cleaned up from this.tasks after delay even though task B is not done", async () => {
++      // given
++      const { manager } = createManager(false)
++      managerUnderTest = manager
++      fakeTimers = installFakeTimers()
++      const taskA = createTask({ id: "task-a", parentSessionID: "parent-1", description: "task A", status: "completed", completedAt: new Date("2026-03-11T00:01:00.000Z") })
++      const taskB = createTask({ id: "task-b", parentSessionID: "parent-1", description: "task B", status: "running" })
++      getTasks(manager).set(taskA.id, taskA)
++      getTasks(manager).set(taskB.id, taskB)
++      getPendingByParent(manager).set(taskA.parentSessionID, new Set([taskA.id, taskB.id]))
++
++      // when
++      await notifyParentSessionForTest(manager, taskA)
++      const taskATimer = getRequiredTimer(manager, taskA.id)
++      expect(fakeTimers.getDelay(taskATimer)).toBe(TASK_CLEANUP_DELAY_MS)
++      fakeTimers.run(taskATimer)
++
++      // then
++      expect(fakeTimers.getDelay(taskATimer)).toBeUndefined()
++      expect(getTasks(manager).has(taskA.id)).toBe(false)
++      expect(getTasks(manager).get(taskB.id)).toBe(taskB)
++    })
++  })
++
++  describe("#given 2 tasks for same parent and both completed", () => {
++    test("#when the second completion notification is sent #then ALL BACKGROUND TASKS COMPLETE notification still works correctly", async () => {
++      // given
++      const { manager, promptAsyncCalls } = createManager(true)
++      managerUnderTest = manager
++      fakeTimers = installFakeTimers()
++      const taskA = createTask({ id: "task-a", parentSessionID: "parent-1", description: "task A", status: "completed", completedAt: new Date("2026-03-11T00:01:00.000Z") })
++      const taskB = createTask({ id: "task-b", parentSessionID: "parent-1", description: "task B", status: "running" })
++      getTasks(manager).set(taskA.id, taskA)
++      getTasks(manager).set(taskB.id, taskB)
++      getPendingByParent(manager).set(taskA.parentSessionID, new Set([taskA.id, taskB.id]))
++
++      await notifyParentSessionForTest(manager, taskA)
++      taskB.status = "completed"
++      taskB.completedAt = new Date("2026-03-11T00:02:00.000Z")
++
++      // when
++      await notifyParentSessionForTest(manager, taskB)
++
++      // then
++      expect(promptAsyncCalls).toHaveLength(2)
++      expect(getCompletionTimers(manager).size).toBe(2)
++      const allCompleteCall = promptAsyncCalls[1]
++      expect(allCompleteCall).toBeDefined()
++      if (!allCompleteCall) {
++        throw new Error("Missing all-complete notification call")
++      }
++
++      expect(allCompleteCall.body.noReply).toBe(false)
++      const allCompletePayload = JSON.stringify(allCompleteCall.body.parts)
++      expect(allCompletePayload).toContain("ALL BACKGROUND TASKS COMPLETE")
++      expect(allCompletePayload).toContain(taskA.id)
++      expect(allCompletePayload).toContain(taskB.id)
++      expect(allCompletePayload).toContain(taskA.description)
++      expect(allCompletePayload).toContain(taskB.description)
++    })
++  })
++
++  describe("#given a completed task with cleanup timer scheduled", () => {
++    test("#when cleanup timer fires #then task is deleted from this.tasks Map", async () => {
++      // given
++      const { manager } = createManager(false)
++      managerUnderTest = manager
++      fakeTimers = installFakeTimers()
++      const task = createTask({ id: "task-a", parentSessionID: "parent-1", description: "task A", status: "completed", completedAt: new Date("2026-03-11T00:01:00.000Z") })
++      getTasks(manager).set(task.id, task)
++      getPendingByParent(manager).set(task.parentSessionID, new Set([task.id]))
++
++      await notifyParentSessionForTest(manager, task)
++      const cleanupTimer = getRequiredTimer(manager, task.id)
++
++      // when
++      expect(fakeTimers.getDelay(cleanupTimer)).toBe(TASK_CLEANUP_DELAY_MS)
++      fakeTimers.run(cleanupTimer)
++
++      // then
++      expect(getCompletionTimers(manager).has(task.id)).toBe(false)
++      expect(getTasks(manager).has(task.id)).toBe(false)
++    })
++  })
++})
+diff --git a/src/features/background-agent/task-history-cleanup.test.ts b/src/features/background-agent/task-history-cleanup.test.ts
+new file mode 100644
+index 00000000..1b585488
+--- /dev/null
++++ b/src/features/background-agent/task-history-cleanup.test.ts
+@@ -0,0 +1,142 @@
++import { afterEach, describe, expect, test } from "bun:test"
++import { tmpdir } from "node:os"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { BackgroundManager } from "./manager"
++import { TaskHistory } from "./task-history"
++import type { BackgroundTask } from "./types"
++
++let managerUnderTest: BackgroundManager | undefined
++
++afterEach(() => {
++  managerUnderTest?.shutdown()
++  managerUnderTest = undefined
++})
++
++function createManager(): BackgroundManager {
++  const client = {
++    session: {
++      abort: async () => ({}),
++    },
++  }
++
++  const placeholderClient = {} as PluginInput["client"]
++  const ctx: PluginInput = {
++    client: placeholderClient,
++    project: {} as PluginInput["project"],
++    directory: tmpdir(),
++    worktree: tmpdir(),
++    serverUrl: new URL("http://localhost"),
++    $: {} as PluginInput["$"],
++  }
++
++  const manager = new BackgroundManager(ctx)
++  Reflect.set(manager, "client", client)
++
++  return manager
++}
++
++function createTask(overrides: Partial<BackgroundTask> & { id: string; parentSessionID: string }): BackgroundTask {
++  const { id, parentSessionID, ...rest } = overrides
++
++  return {
++    ...rest,
++    id,
++    parentSessionID,
++    parentMessageID: rest.parentMessageID ?? "parent-message-id",
++    description: rest.description ?? id,
++    prompt: rest.prompt ?? `Prompt for ${id}`,
++    agent: rest.agent ?? "test-agent",
++    status: rest.status ?? "running",
++    startedAt: rest.startedAt ?? new Date("2026-03-11T00:00:00.000Z"),
++  }
++}
++
++function getTaskMap(manager: BackgroundManager): Map<string, BackgroundTask> {
++  return Reflect.get(manager, "tasks") as Map<string, BackgroundTask>
++}
++
++function pruneStaleTasksAndNotificationsForTest(manager: BackgroundManager): void {
++  const pruneStaleTasksAndNotifications = Reflect.get(manager, "pruneStaleTasksAndNotifications") as () => void
++  pruneStaleTasksAndNotifications.call(manager)
++}
++
++describe("task history cleanup", () => {
++  test("#given TaskHistory with entries for multiple parents #when clearSession called for one parent #then only that parent's entries are removed, others remain", () => {
++    // given
++    const history = new TaskHistory()
++    history.record("parent-1", { id: "task-1", agent: "explore", description: "task 1", status: "pending" })
++    history.record("parent-2", { id: "task-2", agent: "oracle", description: "task 2", status: "running" })
++
++    // when
++    history.clearSession("parent-1")
++
++    // then
++    expect(history.getByParentSession("parent-1")).toHaveLength(0)
++    expect(history.getByParentSession("parent-2")).toHaveLength(1)
++  })
++
++  test("#given TaskHistory with entries for multiple parents #when clearAll called #then all entries are removed", () => {
++    // given
++    const history = new TaskHistory()
++    history.record("parent-1", { id: "task-1", agent: "explore", description: "task 1", status: "pending" })
++    history.record("parent-2", { id: "task-2", agent: "oracle", description: "task 2", status: "running" })
++
++    // when
++    history.clearAll()
++
++    // then
++    expect(history.getByParentSession("parent-1")).toHaveLength(0)
++    expect(history.getByParentSession("parent-2")).toHaveLength(0)
++  })
++
++  test("#given BackgroundManager with taskHistory entries #when shutdown() called #then taskHistory is cleared via clearAll()", () => {
++    // given
++    const manager = createManager()
++    managerUnderTest = manager
++    manager.taskHistory.record("parent-1", { id: "task-1", agent: "explore", description: "task 1", status: "pending" })
++
++    let clearAllCalls = 0
++    const originalClearAll = manager.taskHistory.clearAll.bind(manager.taskHistory)
++    manager.taskHistory.clearAll = (): void => {
++      clearAllCalls += 1
++      originalClearAll()
++    }
++
++    // when
++    manager.shutdown()
++
++    // then
++    expect(clearAllCalls).toBe(1)
++    expect(manager.taskHistory.getByParentSession("parent-1")).toHaveLength(0)
++
++    managerUnderTest = undefined
++  })
++
++  test("#given BackgroundManager with stale tasks for one parent #when pruneStaleTasksAndNotifications() runs #then only that parent's history is removed", () => {
++    // given
++    const manager = createManager()
++    managerUnderTest = manager
++    const staleTask = createTask({
++      id: "task-stale",
++      parentSessionID: "parent-1",
++      startedAt: new Date(Date.now() - 31 * 60 * 1000),
++    })
++    const liveTask = createTask({
++      id: "task-live",
++      parentSessionID: "parent-2",
++      startedAt: new Date(),
++    })
++
++    getTaskMap(manager).set(staleTask.id, staleTask)
++    getTaskMap(manager).set(liveTask.id, liveTask)
++    manager.taskHistory.record("parent-1", { id: staleTask.id, agent: staleTask.agent, description: staleTask.description, status: staleTask.status })
++    manager.taskHistory.record("parent-2", { id: liveTask.id, agent: liveTask.agent, description: liveTask.description, status: liveTask.status })
++
++    // when
++    pruneStaleTasksAndNotificationsForTest(manager)
++
++    // then
++    expect(manager.taskHistory.getByParentSession("parent-1")).toHaveLength(0)
++    expect(manager.taskHistory.getByParentSession("parent-2")).toHaveLength(1)
++  })
++})
+diff --git a/src/features/background-agent/task-history.ts b/src/features/background-agent/task-history.ts
+index e737a052..14d1cdeb 100644
+--- a/src/features/background-agent/task-history.ts
++++ b/src/features/background-agent/task-history.ts
+@@ -54,6 +54,10 @@ export class TaskHistory {
+     this.entries.delete(parentSessionID)
+   }
+ 
++  clearAll(): void {
++    this.entries.clear()
++  }
++
+   formatForCompaction(parentSessionID: string): string | null {
+     const list = this.getByParentSession(parentSessionID)
+     if (list.length === 0) return null
+-- 
+2.39.2
+

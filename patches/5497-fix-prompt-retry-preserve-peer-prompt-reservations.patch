@@ -1,0 +1,143 @@
+From dfc2e8e4ae0017b57ac08582572121ee8d6bdcd9 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 19 May 2026 12:00:01 +0900
+Subject: [PATCH 5497/5749] fix(prompt-retry): preserve peer prompt
+ reservations
+
+---
+ src/features/background-agent/spawner.ts  |  3 --
+ src/shared/model-suggestion-retry.test.ts | 44 ++++++++++++++++++++++-
+ src/shared/model-suggestion-retry.ts      |  8 +++--
+ 3 files changed, 49 insertions(+), 6 deletions(-)
+
+diff --git a/src/features/background-agent/spawner.ts b/src/features/background-agent/spawner.ts
+index cb2961ae..026905c5 100644
+--- a/src/features/background-agent/spawner.ts
++++ b/src/features/background-agent/spawner.ts
+@@ -1,6 +1,5 @@
+ import { createInternalAgentTextPart, getAgentToolRestrictions, log, promptWithRetryInDirectory } from "../../shared"
+ import { stripAgentListSortPrefix } from "../../shared/agent-display-names"
+-import { releasePromptAsyncReservation } from "../../shared/prompt-async-gate"
+ import { applySessionPromptParams } from "../../shared/session-prompt-params-helpers"
+ import { setSessionTools } from "../../shared/session-tools-store"
+ import { isInsideTmux } from "../../shared/tmux"
+@@ -192,7 +191,6 @@ export async function startTask(
+         taskId: task.id,
+       })
+       try {
+-        releasePromptAsyncReservation(sessionID, "model-suggestion-retry")
+         const fallbackBody = buildFallbackBody(promptBody, FALLBACK_AGENT, {
+           includeTeamToolDenylist: input.teamRunId === undefined,
+         })
+@@ -336,7 +334,6 @@ export async function resumeTask(
+         taskId: task.id,
+       })
+       try {
+-        releasePromptAsyncReservation(sessionID, "model-suggestion-retry")
+         const fallbackBody = buildFallbackBody(resumeBody, FALLBACK_AGENT, {
+           includeTeamToolDenylist: task.teamRunId === undefined,
+         })
+diff --git a/src/shared/model-suggestion-retry.test.ts b/src/shared/model-suggestion-retry.test.ts
+index 019f87e8..caf7258f 100644
+--- a/src/shared/model-suggestion-retry.test.ts
++++ b/src/shared/model-suggestion-retry.test.ts
+@@ -1,4 +1,5 @@
+-import { describe, it, expect, mock } from "bun:test"
++import { afterEach, describe, it, expect, mock } from "bun:test"
++import { dispatchInternalPrompt, releaseAllPromptAsyncReservationsForTesting } from "./prompt-async-gate"
+ import { parseModelSuggestion, promptWithModelSuggestionRetry, promptSyncWithModelSuggestionRetry } from "./model-suggestion-retry"
+ import { unsafeTestValue } from "../../test-support/unsafe-test-value"
+ 
+@@ -212,6 +213,11 @@ describe("parseModelSuggestion", () => {
+ })
+ 
+ describe("promptWithModelSuggestionRetry", () => {
++  afterEach(() => {
++    // then
++    releaseAllPromptAsyncReservationsForTesting()
++  })
++
+   it("should succeed on first try without retry", async () => {
+     // given a client where promptAsync succeeds
+     const promptMock = mock(() => Promise.resolve())
+@@ -291,6 +297,42 @@ describe("promptWithModelSuggestionRetry", () => {
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
++  it("#given same-source retry observes a peer reservation #when it rejects #then the peer hold remains reserved", async () => {
++    // given
++    const promptMock = mock(async () => undefined)
++    const client = {
++      session: {
++        promptAsync: promptMock,
++      },
++    }
++    const args = {
++      path: { id: "session-peer-reservation" },
++      body: {
++        parts: [{ type: "text", text: "hello" }],
++        model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
++      },
++    }
++
++    // when
++    await promptWithModelSuggestionRetry(unsafeTestValue(client), args)
++    await expect(
++      promptWithModelSuggestionRetry(unsafeTestValue(client), args)
++    ).rejects.toThrow("promptAsync skipped by gate: reserved")
++    const third = await dispatchInternalPrompt({
++      mode: "async",
++      client,
++      sessionID: "session-peer-reservation",
++      input: args,
++      source: "test:third",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(third).toEqual({ status: "reserved", reservedBy: "model-suggestion-retry" })
++    expect(promptMock).toHaveBeenCalledTimes(1)
++  })
++
+   it("should throw error from promptAsync directly on model-not-found error", async () => {
+     // given a client that fails with model-not-found error
+     const promptMock = mock().mockRejectedValueOnce({
+diff --git a/src/shared/model-suggestion-retry.ts b/src/shared/model-suggestion-retry.ts
+index 3f0dff3b..1f21828d 100644
+--- a/src/shared/model-suggestion-retry.ts
++++ b/src/shared/model-suggestion-retry.ts
+@@ -8,6 +8,7 @@ import {
+ import {
+   dispatchInternalPrompt,
+   releasePromptAsyncReservation,
++  type InternalPromptDispatchResult,
+ } from "./prompt-async-gate"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+@@ -97,9 +98,10 @@ export async function promptWithModelSuggestionRetry(
+ ): Promise<void> {
+   const timeoutMs = options.timeoutMs ?? PROMPT_TIMEOUT_MS
+   const timeoutContext = createPromptTimeoutContext(args, timeoutMs)
++  let promptResult: InternalPromptDispatchResult | undefined
+ 
+   try {
+-    const promptResult = await dispatchInternalPrompt({
++    promptResult = await dispatchInternalPrompt({
+       mode: "async",
+       client,
+       sessionID: args.path.id,
+@@ -123,7 +125,9 @@ export async function promptWithModelSuggestionRetry(
+     if (timeoutContext.wasTimedOut()) {
+       throw new Error(`promptAsync timed out after ${timeoutMs}ms`)
+     }
+-    releasePromptAsyncReservation(args.path.id, "model-suggestion-retry")
++    if (promptResult?.status === "failed") {
++      releasePromptAsyncReservation(args.path.id, "model-suggestion-retry")
++    }
+     throw error
+   } finally {
+     timeoutContext.cleanup()
+-- 
+2.39.2
+

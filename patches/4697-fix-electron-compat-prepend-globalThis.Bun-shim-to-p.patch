@@ -1,0 +1,245 @@
+From f178ea3207629a15cc457f2addb936b377355f3c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 5 May 2026 22:17:06 +0900
+Subject: [PATCH 4697/5749] fix(electron-compat): prepend globalThis.Bun shim
+ to prevent Electron/Node crash
+
+On Node/Electron, globalThis.Bun is undefined. The Bun bundler emits top-level
+  var { spawn } = globalThis.Bun;
+destructures from its internal modules, causing 'Cannot destructure property
+of undefined' before any plugin hook is reached (25 occurrences in dist/index.js).
+
+Fix:
+- Add src/electron-compat.ts: a side-effect module that populates globalThis.Bun
+  with node:child_process-backed spawn/spawnSync shims when Bun is unavailable
+- Add script/prepend-electron-shim.ts: post-build script that prepends the shim
+  code to dist/index.js, guaranteeing it runs BEFORE the top-level destructures
+  (Bun bundler does not preserve import side-effect evaluation order reliably)
+- Update build script to run prepend-shim after bundling
+- Add src/electron-compat.test.ts verifying shim position in dist
+
+The shim only activates when globalThis.Bun is absent (real Bun runtime is
+unaffected). Spawn-dependent features degrade gracefully at call time.
+
+Fixes #3797 (follow-up to #3795/#3796)
+---
+ package.json                    |  3 +-
+ script/prepend-electron-shim.ts | 65 +++++++++++++++++++++++++++++
+ src/electron-compat.test.ts     | 27 ++++++++++++
+ src/electron-compat.ts          | 74 +++++++++++++++++++++++++++++++++
+ src/index.ts                    |  1 +
+ 5 files changed, 169 insertions(+), 1 deletion(-)
+ create mode 100644 script/prepend-electron-shim.ts
+ create mode 100644 src/electron-compat.test.ts
+ create mode 100644 src/electron-compat.ts
+
+diff --git a/package.json b/package.json
+index ffd57237..c72accc3 100644
+--- a/package.json
++++ b/package.json
+@@ -22,7 +22,8 @@
+     "./schema.json": "./dist/oh-my-opencode.schema.json"
+   },
+   "scripts": {
+-    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @ast-grep/napi --external zod && tsc --emitDeclarationOnly && bun build src/cli/index.ts --outdir dist/cli --target bun --format esm --external @ast-grep/napi && bun run build:schema",
++    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @ast-grep/napi --external zod && bun run build:prepend-shim && tsc --emitDeclarationOnly && bun build src/cli/index.ts --outdir dist/cli --target bun --format esm --external @ast-grep/napi && bun run build:schema",
++    "build:prepend-shim": "bun run script/prepend-electron-shim.ts",
+     "build:all": "bun run build && bun run build:binaries",
+     "build:binaries": "bun run script/build-binaries.ts",
+     "build:schema": "bun run script/build-schema.ts",
+diff --git a/script/prepend-electron-shim.ts b/script/prepend-electron-shim.ts
+new file mode 100644
+index 00000000..8b4f5f58
+--- /dev/null
++++ b/script/prepend-electron-shim.ts
+@@ -0,0 +1,65 @@
++#!/usr/bin/env bun
++/**
++ * Prepend the Electron/Node compat shim to dist/index.js.
++ *
++ * When bundled with --target bun, Bun inlines top-level
++ *   var { spawn } = globalThis.Bun;
++ * statements from its own internal modules. These crash on Node/Electron
++ * because globalThis.Bun is undefined there.
++ *
++ * Since Bun's bundler does not guarantee that a side-effect import at the
++ * top of src/index.ts will appear before all other module top-level code,
++ * we post-process the bundle and manually prepend the shim.
++ */
++
++import { readFileSync, writeFileSync } from "node:fs"
++import { join } from "node:path"
++
++const DIST_PATH = join(import.meta.dir, "..", "dist", "index.js")
++
++const SHIM = `// [omo] Electron/Node compat shim — prepended by script/prepend-electron-shim.ts
++// Populates globalThis.Bun before any top-level destructure fires.
++if (!globalThis.Bun) {
++  const _cp = await import("node:child_process");
++  const _Readable = (await import("node:stream")).Readable;
++  function _mkproc(p) {
++    let c = null;
++    const exited = new Promise(r => {
++      p.on("exit", code => { c = code ?? 1; r(c); });
++      p.on("error", () => { if (c === null) { c = 1; r(1); } });
++    });
++    return { get exitCode() { return c; }, exited,
++      stdout: p.stdout ? _Readable.toWeb(p.stdout) : undefined,
++      stderr: p.stderr ? _Readable.toWeb(p.stderr) : undefined,
++      stdin: p.stdin, kill(s) { try { p.kill(s); } catch {} }, pid: p.pid };
++  }
++  function _spawn(cmdOrOpts, opts) {
++    const isObj = !Array.isArray(cmdOrOpts);
++    const cmd = isObj ? cmdOrOpts.cmd : cmdOrOpts;
++    const o = isObj ? cmdOrOpts : (opts || {});
++    const [bin, ...args] = cmd;
++    return _mkproc(_cp.spawn(bin, args, { cwd: o.cwd, env: o.env,
++      stdio: [o.stdin||"pipe", o.stdout||"pipe", o.stderr||"pipe"] }));
++  }
++  function _spawnSync(cmdOrOpts) {
++    const isObj = !Array.isArray(cmdOrOpts);
++    const cmd = isObj ? cmdOrOpts.cmd : cmdOrOpts;
++    const o = isObj ? cmdOrOpts : {};
++    const [bin, ...args] = cmd;
++    const r = _cp.spawnSync(bin, args, { cwd: o.cwd, env: o.env, stdio: ["pipe","pipe","pipe"] });
++    return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
++  }
++  globalThis.Bun = { spawn: _spawn, spawnSync: _spawnSync, env: process.env, version: "0.0.0-node-shim" };
++}
++`
++
++const original = readFileSync(DIST_PATH, "utf-8")
++
++// Avoid double-prepend
++if (original.includes("[omo] Electron/Node compat shim")) {
++  console.log("Shim already present in dist/index.js, skipping.")
++  process.exit(0)
++}
++
++writeFileSync(DIST_PATH, SHIM + original, "utf-8")
++console.log(`✓ Prepended Electron/Node compat shim to dist/index.js`)
+diff --git a/src/electron-compat.test.ts b/src/electron-compat.test.ts
+new file mode 100644
+index 00000000..7da00cbc
+--- /dev/null
++++ b/src/electron-compat.test.ts
+@@ -0,0 +1,27 @@
++import { describe, test, expect } from "bun:test"
++
++describe("electron-compat shim", () => {
++  test("#given shim module #when inspected #then it exports no values (side-effect only)", async () => {
++    // The shim is a side-effect module — no named exports
++    const mod = await import("./electron-compat")
++    expect(Object.keys(mod)).toHaveLength(0)
++  })
++
++  test("#given Bun runtime #when shim is loaded #then globalThis.Bun remains the real Bun", () => {
++    // In Bun (our test environment), globalThis.Bun is already defined.
++    // The shim must not overwrite it.
++    expect(globalThis.Bun).toBeDefined()
++    // Real Bun version looks like "1.x.x", not our shim string
++    expect(globalThis.Bun.version).not.toBe("0.0.0-node-shim")
++  })
++
++  test("#given dist/index.js #when inspected #then compat shim appears before first globalThis.Bun destructure", async () => {
++    // This test guards that build/prepend-electron-shim ran.
++    // If the shim is missing, the plugin crashes on Electron at line 2876.
++    const dist = await Bun.file("dist/index.js").text()
++    const shimPos = dist.indexOf("[omo] Electron/Node compat shim")
++    const firstDestructure = dist.indexOf("} = globalThis.Bun;")
++    expect(shimPos).toBeGreaterThanOrEqual(0) // shim present
++    expect(shimPos).toBeLessThan(firstDestructure) // shim before destructures
++  })
++})
+diff --git a/src/electron-compat.ts b/src/electron-compat.ts
+new file mode 100644
+index 00000000..b60ab0be
+--- /dev/null
++++ b/src/electron-compat.ts
+@@ -0,0 +1,74 @@
++/**
++ * Electron/Node runtime compatibility shim.
++ *
++ * OpenCode Desktop runs the plugin in an Electron renderer/main process
++ * whose ESM loader is Node — not Bun. When bundled with `--target bun`,
++ * every chunk that calls `Bun.spawn` / `Bun.spawnSync` emits a top-level
++ * `var { spawn } = globalThis.Bun` destructure. On Node/Electron,
++ * `globalThis.Bun` is `undefined`, so module evaluation crashes before any
++ * plugin hook is ever reached.
++ *
++ * We patch globalThis.Bun at module-evaluation time so the destructures
++ * resolve to real functions backed by node:child_process.
++ */
++
++// eslint-disable-next-line @typescript-eslint/no-require-imports
++const _cp = require("node:child_process") as typeof import("node:child_process")
++// eslint-disable-next-line @typescript-eslint/no-require-imports
++const _stream = require("node:stream") as typeof import("node:stream")
++
++// eslint-disable-next-line @typescript-eslint/no-explicit-any
++type AnyRecord = Record<string, any>
++
++function _makeProc(proc: ReturnType<typeof _cp.spawn>) {
++  let _exitCode: number | null = null
++  const exited = new Promise<number>((resolve) => {
++    proc.on("exit", (code) => { _exitCode = code ?? 1; resolve(_exitCode) })
++    proc.on("error", () => { if (_exitCode === null) { _exitCode = 1; resolve(1) } })
++  })
++  return {
++    get exitCode() { return _exitCode },
++    exited,
++    stdout: proc.stdout ? (_stream.Readable.toWeb(proc.stdout) as ReadableStream<Uint8Array>) : undefined,
++    stderr: proc.stderr ? (_stream.Readable.toWeb(proc.stderr) as ReadableStream<Uint8Array>) : undefined,
++    stdin: proc.stdin,
++    kill(sig?: NodeJS.Signals) { try { proc.kill(sig) } catch {} },
++    pid: proc.pid,
++  }
++}
++
++function _spawnShim(cmdOrOpts: string[] | AnyRecord, optsArg?: AnyRecord) {
++  const isObj = !Array.isArray(cmdOrOpts)
++  const cmd: string[] = isObj ? (cmdOrOpts as AnyRecord)["cmd"] as string[] : (cmdOrOpts as string[])
++  const o: AnyRecord = isObj ? (cmdOrOpts as AnyRecord) : (optsArg ?? {})
++  const [bin, ...args] = cmd
++  const proc = _cp.spawn(bin, args, {
++    cwd: o["cwd"] as string | undefined,
++    env: o["env"] as NodeJS.ProcessEnv | undefined,
++    stdio: [(o["stdin"] ?? "pipe") as "pipe", (o["stdout"] ?? "pipe") as "pipe", (o["stderr"] ?? "pipe") as "pipe"],
++  })
++  return _makeProc(proc)
++}
++
++function _spawnSyncShim(cmdOrOpts: string[] | AnyRecord) {
++  const isObj = !Array.isArray(cmdOrOpts)
++  const cmd: string[] = isObj ? (cmdOrOpts as AnyRecord)["cmd"] as string[] : (cmdOrOpts as string[])
++  const o: AnyRecord = isObj ? (cmdOrOpts as AnyRecord) : {}
++  const [bin, ...args] = cmd
++  const r = _cp.spawnSync(bin, args, {
++    cwd: o["cwd"] as string | undefined,
++    env: o["env"] as NodeJS.ProcessEnv | undefined,
++    stdio: ["pipe", "pipe", "pipe"],
++  })
++  return { exitCode: r.status ?? 1, stdout: r.stdout, stderr: r.stderr }
++}
++
++if (!globalThis.Bun) {
++  // @ts-expect-error – intentional globalThis shim for Electron/Node compat
++  globalThis.Bun = {
++    spawn: _spawnShim as unknown as typeof globalThis.Bun.spawn,
++    spawnSync: _spawnSyncShim as unknown as typeof globalThis.Bun.spawnSync,
++    env: process.env,
++    version: "0.0.0-node-shim",
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index a5f549d3..6ac93ece 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,3 +1,4 @@
++import "./electron-compat"
+ import { initConfigContext } from "./cli/config-manager/config-context"
+ import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin"
+ 
+-- 
+2.39.2
+

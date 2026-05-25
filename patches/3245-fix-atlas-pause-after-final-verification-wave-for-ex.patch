@@ -1,0 +1,640 @@
+From 04b0c6f33c47005ac3678a8626441746d1dada21 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 13 Mar 2026 12:43:33 +0900
+Subject: [PATCH 3245/5749] fix(atlas): pause after final verification wave for
+ explicit user approval
+
+---
+ src/hooks/atlas/atlas-hook.ts                 |   2 +-
+ src/hooks/atlas/event-handler.ts              |   4 +
+ .../atlas/final-wave-approval-gate.test.ts    | 224 ++++++++++++++++++
+ src/hooks/atlas/final-wave-approval-gate.ts   |  47 ++++
+ src/hooks/atlas/idle-event.ts                 |  60 +----
+ .../atlas/resolve-active-boulder-session.ts   |  53 +++++
+ src/hooks/atlas/tool-execute-after.ts         |  46 +++-
+ src/hooks/atlas/types.ts                      |   1 +
+ src/hooks/atlas/verification-reminders.ts     |  39 +++
+ 9 files changed, 416 insertions(+), 60 deletions(-)
+ create mode 100644 src/hooks/atlas/final-wave-approval-gate.test.ts
+ create mode 100644 src/hooks/atlas/final-wave-approval-gate.ts
+ create mode 100644 src/hooks/atlas/resolve-active-boulder-session.ts
+
+diff --git a/src/hooks/atlas/atlas-hook.ts b/src/hooks/atlas/atlas-hook.ts
+index 97d0842d..855cdacb 100644
+--- a/src/hooks/atlas/atlas-hook.ts
++++ b/src/hooks/atlas/atlas-hook.ts
+@@ -21,6 +21,6 @@ export function createAtlasHook(ctx: PluginInput, options?: AtlasHookOptions) {
+   return {
+     handler: createAtlasEventHandler({ ctx, options, sessions, getState }),
+     "tool.execute.before": createToolExecuteBeforeHandler({ ctx, pendingFilePaths }),
+-    "tool.execute.after": createToolExecuteAfterHandler({ ctx, pendingFilePaths, autoCommit }),
++    "tool.execute.after": createToolExecuteAfterHandler({ ctx, pendingFilePaths, autoCommit, getState }),
+   }
+ }
+diff --git a/src/hooks/atlas/event-handler.ts b/src/hooks/atlas/event-handler.ts
+index e6084c59..95cdbe53 100644
+--- a/src/hooks/atlas/event-handler.ts
++++ b/src/hooks/atlas/event-handler.ts
+@@ -38,11 +38,15 @@ export function createAtlasEventHandler(input: {
+     if (event.type === "message.updated") {
+       const info = props?.info as Record<string, unknown> | undefined
+       const sessionID = info?.sessionID as string | undefined
++      const role = info?.role as string | undefined
+       if (!sessionID) return
+ 
+       const state = sessions.get(sessionID)
+       if (state) {
+         state.lastEventWasAbortError = false
++        if (role === "user") {
++          state.waitingForFinalWaveApproval = false
++        }
+       }
+       return
+     }
+diff --git a/src/hooks/atlas/final-wave-approval-gate.test.ts b/src/hooks/atlas/final-wave-approval-gate.test.ts
+new file mode 100644
+index 00000000..5812c4ba
+--- /dev/null
++++ b/src/hooks/atlas/final-wave-approval-gate.test.ts
+@@ -0,0 +1,224 @@
++import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
++import { randomUUID } from "node:crypto"
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { createOpencodeClient } from "@opencode-ai/sdk"
++import type { AssistantMessage, Session } from "@opencode-ai/sdk"
++import type { BoulderState } from "../../features/boulder-state"
++import { clearBoulderState, writeBoulderState } from "../../features/boulder-state"
++
++const TEST_STORAGE_ROOT = join(tmpdir(), `atlas-final-wave-storage-${randomUUID()}`)
++const TEST_MESSAGE_STORAGE = join(TEST_STORAGE_ROOT, "message")
++const TEST_PART_STORAGE = join(TEST_STORAGE_ROOT, "part")
++
++mock.module("../../features/hook-message-injector/constants", () => ({
++  OPENCODE_STORAGE: TEST_STORAGE_ROOT,
++  MESSAGE_STORAGE: TEST_MESSAGE_STORAGE,
++  PART_STORAGE: TEST_PART_STORAGE,
++}))
++
++mock.module("../../shared/opencode-message-dir", () => ({
++  getMessageDir: (sessionID: string) => {
++    const directoryPath = join(TEST_MESSAGE_STORAGE, sessionID)
++    return existsSync(directoryPath) ? directoryPath : null
++  },
++}))
++
++mock.module("../../shared/opencode-storage-detection", () => ({
++  isSqliteBackend: () => false,
++}))
++
++const { createAtlasHook } = await import("./index")
++const { MESSAGE_STORAGE } = await import("../../features/hook-message-injector")
++
++type AtlasHookContext = Parameters<typeof createAtlasHook>[0]
++type PromptMock = ReturnType<typeof mock>
++
++describe("Atlas final verification approval gate", () => {
++  let testDirectory = ""
++
++  function createMockPluginInput(): AtlasHookContext & { _promptMock: PromptMock } {
++    const client = createOpencodeClient({ baseUrl: "http://localhost" })
++    const promptMock = mock((input: unknown) => input)
++
++    Reflect.set(client.session, "prompt", async (input: unknown) => {
++      promptMock(input)
++      return {
++        data: { info: {} as AssistantMessage, parts: [] },
++        request: new Request("http://localhost/session/prompt"),
++        response: new Response(),
++      }
++    })
++
++    Reflect.set(client.session, "promptAsync", async (input: unknown) => {
++      promptMock(input)
++      return {
++        data: undefined,
++        request: new Request("http://localhost/session/prompt_async"),
++        response: new Response(),
++      }
++    })
++
++    Reflect.set(client.session, "get", async () => {
++      return {
++        data: { parentID: "main-session-123" } as Session,
++        request: new Request("http://localhost/session/main-session-123"),
++        response: new Response(),
++      }
++    })
++
++    return {
++      directory: testDirectory,
++      project: {} as AtlasHookContext["project"],
++      worktree: testDirectory,
++      serverUrl: new URL("http://localhost"),
++      $: {} as AtlasHookContext["$"],
++      client,
++      _promptMock: promptMock,
++    }
++  }
++
++  function setupMessageStorage(sessionID: string): void {
++    const messageDirectory = join(MESSAGE_STORAGE, sessionID)
++    if (!existsSync(messageDirectory)) {
++      mkdirSync(messageDirectory, { recursive: true })
++    }
++
++    writeFileSync(
++      join(messageDirectory, "msg_test001.json"),
++      JSON.stringify({
++        agent: "atlas",
++        model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
++      }),
++    )
++  }
++
++  function cleanupMessageStorage(sessionID: string): void {
++    const messageDirectory = join(MESSAGE_STORAGE, sessionID)
++    if (existsSync(messageDirectory)) {
++      rmSync(messageDirectory, { recursive: true, force: true })
++    }
++  }
++
++  beforeEach(() => {
++    testDirectory = join(tmpdir(), `atlas-final-wave-test-${randomUUID()}`)
++    mkdirSync(join(testDirectory, ".sisyphus"), { recursive: true })
++    clearBoulderState(testDirectory)
++  })
++
++  afterEach(() => {
++    clearBoulderState(testDirectory)
++    if (existsSync(testDirectory)) {
++      rmSync(testDirectory, { recursive: true, force: true })
++    }
++  })
++
++  test("waits for explicit user approval after the last final-wave approval arrives", async () => {
++    // given
++    const sessionID = "atlas-final-wave-session"
++    setupMessageStorage(sessionID)
++
++    const planPath = join(testDirectory, "final-wave-plan.md")
++    writeFileSync(
++      planPath,
++      `# Plan
++
++## TODOs
++- [x] 1. Ship the implementation
++
++## Final Verification Wave (MANDATORY - after ALL implementation tasks)
++- [x] F1. **Plan Compliance Audit** - \`oracle\`
++- [x] F2. **Code Quality Review** - \`unspecified-high\`
++- [x] F3. **Real Manual QA** - \`unspecified-high\`
++- [ ] F4. **Scope Fidelity Check** - \`deep\`
++`,
++    )
++
++    const state: BoulderState = {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [sessionID],
++      plan_name: "final-wave-plan",
++      agent: "atlas",
++    }
++    writeBoulderState(testDirectory, state)
++
++    const mockInput = createMockPluginInput()
++    const hook = createAtlasHook(mockInput)
++    const toolOutput = {
++      title: "Sisyphus Task",
++      output: `Tasks [4/4 compliant] | Contamination [CLEAN] | Unaccounted [CLEAN] | VERDICT: APPROVE
++
++<task_metadata>
++session_id: ses_final_wave_review
++</task_metadata>`,
++      metadata: {},
++    }
++
++    // when
++    await hook["tool.execute.after"]({ tool: "task", sessionID }, toolOutput)
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID } } })
++
++    // then
++    expect(toolOutput.output).toContain("FINAL WAVE APPROVAL GATE")
++    expect(toolOutput.output).toContain("explicit user approval")
++    expect(toolOutput.output).not.toContain("STEP 8: PROCEED TO NEXT TASK")
++    expect(mockInput._promptMock).not.toHaveBeenCalled()
++
++    cleanupMessageStorage(sessionID)
++  })
++
++  test("keeps normal auto-continue instructions for non-final tasks", async () => {
++    // given
++    const sessionID = "atlas-non-final-session"
++    setupMessageStorage(sessionID)
++
++    const planPath = join(testDirectory, "implementation-plan.md")
++    writeFileSync(
++      planPath,
++      `# Plan
++
++## TODOs
++- [x] 1. Setup
++- [ ] 2. Implement feature
++
++## Final Verification Wave (MANDATORY - after ALL implementation tasks)
++- [ ] F1. **Plan Compliance Audit** - \`oracle\`
++- [ ] F2. **Code Quality Review** - \`unspecified-high\`
++- [ ] F3. **Real Manual QA** - \`unspecified-high\`
++- [ ] F4. **Scope Fidelity Check** - \`deep\`
++`,
++    )
++
++    const state: BoulderState = {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [sessionID],
++      plan_name: "implementation-plan",
++      agent: "atlas",
++    }
++    writeBoulderState(testDirectory, state)
++
++    const hook = createAtlasHook(createMockPluginInput())
++    const toolOutput = {
++      title: "Sisyphus Task",
++      output: `Implementation finished successfully
++
++<task_metadata>
++session_id: ses_feature_task
++</task_metadata>`,
++      metadata: {},
++    }
++
++    // when
++    await hook["tool.execute.after"]({ tool: "task", sessionID }, toolOutput)
++
++    // then
++    expect(toolOutput.output).toContain("COMPLETION GATE")
++    expect(toolOutput.output).toContain("STEP 8: PROCEED TO NEXT TASK")
++    expect(toolOutput.output).not.toContain("FINAL WAVE APPROVAL GATE")
++
++    cleanupMessageStorage(sessionID)
++  })
++})
+diff --git a/src/hooks/atlas/final-wave-approval-gate.ts b/src/hooks/atlas/final-wave-approval-gate.ts
+new file mode 100644
+index 00000000..9928bbe1
+--- /dev/null
++++ b/src/hooks/atlas/final-wave-approval-gate.ts
+@@ -0,0 +1,47 @@
++import { existsSync, readFileSync } from "node:fs"
++
++const APPROVE_VERDICT_PATTERN = /\bVERDICT:\s*APPROVE\b/i
++const FINAL_VERIFICATION_HEADING_PATTERN = /^##\s+Final Verification Wave\b/i
++const UNCHECKED_TASK_PATTERN = /^\s*[-*]\s*\[\s*\]\s*(.+)$/
++const FINAL_WAVE_TASK_PATTERN = /^F\d+\./i
++
++export function shouldPauseForFinalWaveApproval(input: {
++  planPath: string
++  taskOutput: string
++}): boolean {
++  if (!APPROVE_VERDICT_PATTERN.test(input.taskOutput)) {
++    return false
++  }
++
++  if (!existsSync(input.planPath)) {
++    return false
++  }
++
++  try {
++    const content = readFileSync(input.planPath, "utf-8")
++    const lines = content.split(/\r?\n/)
++    let inFinalVerificationWave = false
++    let uncheckedTaskCount = 0
++    let uncheckedFinalWaveTaskCount = 0
++
++    for (const line of lines) {
++      if (/^##\s+/.test(line)) {
++        inFinalVerificationWave = FINAL_VERIFICATION_HEADING_PATTERN.test(line)
++      }
++
++      const uncheckedTaskMatch = line.match(UNCHECKED_TASK_PATTERN)
++      if (!uncheckedTaskMatch) {
++        continue
++      }
++
++      uncheckedTaskCount += 1
++      if (inFinalVerificationWave && FINAL_WAVE_TASK_PATTERN.test(uncheckedTaskMatch[1].trim())) {
++        uncheckedFinalWaveTaskCount += 1
++      }
++    }
++
++    return uncheckedTaskCount === 1 && uncheckedFinalWaveTaskCount === 1
++  } catch {
++    return false
++  }
++}
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 77b153da..1f5cfeb2 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -1,11 +1,9 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+-import { appendSessionId, getPlanProgress, readBoulderState } from "../../features/boulder-state"
+-import type { BoulderState, PlanProgress } from "../../features/boulder-state"
+-import { subagentSessions } from "../../features/claude-code-session-state"
++import { getPlanProgress, readBoulderState } from "../../features/boulder-state"
+ import { log } from "../../shared/logger"
+-import { isSessionInBoulderLineage } from "./boulder-session-lineage"
+ import { injectBoulderContinuation } from "./boulder-continuation-injector"
+ import { HOOK_NAME } from "./hook-name"
++import { resolveActiveBoulderSession } from "./resolve-active-boulder-session"
+ import type { AtlasHookOptions, SessionState } from "./types"
+ 
+ const CONTINUATION_COOLDOWN_MS = 5000
+@@ -19,54 +17,6 @@ function hasRunningBackgroundTasks(sessionID: string, options?: AtlasHookOptions
+     : false
+ }
+ 
+-async function resolveActiveBoulderSession(input: {
+-  client: PluginInput["client"]
+-  directory: string
+-  sessionID: string
+-}): Promise<{
+-  boulderState: BoulderState
+-  progress: PlanProgress
+-  appendedSession: boolean
+-} | null> {
+-  const boulderState = readBoulderState(input.directory)
+-  if (!boulderState) {
+-    return null
+-  }
+-
+-  const progress = getPlanProgress(boulderState.active_plan)
+-  if (progress.isComplete) {
+-    return { boulderState, progress, appendedSession: false }
+-  }
+-
+-  if (boulderState.session_ids.includes(input.sessionID)) {
+-    return { boulderState, progress, appendedSession: false }
+-  }
+-
+-  if (!subagentSessions.has(input.sessionID)) {
+-    return null
+-  }
+-
+-  const belongsToActiveBoulder = await isSessionInBoulderLineage({
+-    client: input.client,
+-    sessionID: input.sessionID,
+-    boulderSessionIDs: boulderState.session_ids,
+-  })
+-  if (!belongsToActiveBoulder) {
+-    return null
+-  }
+-
+-  const updatedBoulderState = appendSessionId(input.directory, input.sessionID)
+-  if (!updatedBoulderState?.session_ids.includes(input.sessionID)) {
+-    return null
+-  }
+-
+-  return {
+-    boulderState: updatedBoulderState,
+-    progress,
+-    appendedSession: true,
+-  }
+-}
+-
+ async function injectContinuation(input: {
+   ctx: PluginInput
+   sessionID: string
+@@ -113,6 +63,7 @@ function scheduleRetry(input: {
+     sessionState.pendingRetryTimer = undefined
+ 
+     if (sessionState.promptFailureCount >= 2) return
++    if (sessionState.waitingForFinalWaveApproval) return
+ 
+     const currentBoulder = readBoulderState(ctx.directory)
+     if (!currentBoulder) return
+@@ -173,6 +124,11 @@ export async function handleAtlasSessionIdle(input: {
+   const sessionState = getState(sessionID)
+   const now = Date.now()
+ 
++  if (sessionState.waitingForFinalWaveApproval) {
++    log(`[${HOOK_NAME}] Skipped: waiting for explicit final-wave approval`, { sessionID })
++    return
++  }
++
+   if (sessionState.lastEventWasAbortError) {
+     sessionState.lastEventWasAbortError = false
+     log(`[${HOOK_NAME}] Skipped: abort error immediately before idle`, { sessionID })
+diff --git a/src/hooks/atlas/resolve-active-boulder-session.ts b/src/hooks/atlas/resolve-active-boulder-session.ts
+new file mode 100644
+index 00000000..81e28ef6
+--- /dev/null
++++ b/src/hooks/atlas/resolve-active-boulder-session.ts
+@@ -0,0 +1,53 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { appendSessionId, getPlanProgress, readBoulderState } from "../../features/boulder-state"
++import type { BoulderState, PlanProgress } from "../../features/boulder-state"
++import { subagentSessions } from "../../features/claude-code-session-state"
++import { isSessionInBoulderLineage } from "./boulder-session-lineage"
++
++export async function resolveActiveBoulderSession(input: {
++  client: PluginInput["client"]
++  directory: string
++  sessionID: string
++}): Promise<{
++  boulderState: BoulderState
++  progress: PlanProgress
++  appendedSession: boolean
++} | null> {
++  const boulderState = readBoulderState(input.directory)
++  if (!boulderState) {
++    return null
++  }
++
++  const progress = getPlanProgress(boulderState.active_plan)
++  if (progress.isComplete) {
++    return { boulderState, progress, appendedSession: false }
++  }
++
++  if (boulderState.session_ids.includes(input.sessionID)) {
++    return { boulderState, progress, appendedSession: false }
++  }
++
++  if (!subagentSessions.has(input.sessionID)) {
++    return null
++  }
++
++  const belongsToActiveBoulder = await isSessionInBoulderLineage({
++    client: input.client,
++    sessionID: input.sessionID,
++    boulderSessionIDs: boulderState.session_ids,
++  })
++  if (!belongsToActiveBoulder) {
++    return null
++  }
++
++  const updatedBoulderState = appendSessionId(input.directory, input.sessionID)
++  if (!updatedBoulderState?.session_ids.includes(input.sessionID)) {
++    return null
++  }
++
++  return {
++    boulderState: updatedBoulderState,
++    progress,
++    appendedSession: true,
++  }
++}
+diff --git a/src/hooks/atlas/tool-execute-after.ts b/src/hooks/atlas/tool-execute-after.ts
+index fd8c1824..9c4e82ea 100644
+--- a/src/hooks/atlas/tool-execute-after.ts
++++ b/src/hooks/atlas/tool-execute-after.ts
+@@ -3,20 +3,28 @@ import { appendSessionId, getPlanProgress, readBoulderState } from "../../featur
+ import { log } from "../../shared/logger"
+ import { isCallerOrchestrator } from "../../shared/session-utils"
+ import { collectGitDiffStats, formatFileChanges } from "../../shared/git-worktree"
++import { shouldPauseForFinalWaveApproval } from "./final-wave-approval-gate"
+ import { HOOK_NAME } from "./hook-name"
+ import { DIRECT_WORK_REMINDER } from "./system-reminder-templates"
+ import { isSisyphusPath } from "./sisyphus-path"
+ import { extractSessionIdFromOutput } from "./subagent-session-id"
+-import { buildCompletionGate, buildOrchestratorReminder, buildStandaloneVerificationReminder } from "./verification-reminders"
++import {
++  buildCompletionGate,
++  buildFinalWaveApprovalReminder,
++  buildOrchestratorReminder,
++  buildStandaloneVerificationReminder,
++} from "./verification-reminders"
+ import { isWriteOrEditToolName } from "./write-edit-tool-policy"
++import type { SessionState } from "./types"
+ import type { ToolExecuteAfterInput, ToolExecuteAfterOutput } from "./types"
+ 
+ export function createToolExecuteAfterHandler(input: {
+   ctx: PluginInput
+   pendingFilePaths: Map<string, string>
+   autoCommit: boolean
+-  }): (toolInput: ToolExecuteAfterInput, toolOutput: ToolExecuteAfterOutput) => Promise<void> {
+-  const { ctx, pendingFilePaths, autoCommit } = input
++  getState: (sessionID: string) => SessionState
++}): (toolInput: ToolExecuteAfterInput, toolOutput: ToolExecuteAfterOutput) => Promise<void> {
++  const { ctx, pendingFilePaths, autoCommit, getState } = input
+   return async (toolInput, toolOutput): Promise<void> => {
+     // Guard against undefined output (e.g., from /review command - see issue #1035)
+     if (!toolOutput) {
+@@ -75,10 +83,31 @@ export function createToolExecuteAfterHandler(input: {
+ 
+         // Preserve original subagent response - critical for debugging failed tasks
+         const originalResponse = toolOutput.output
++        const shouldPauseForApproval = shouldPauseForFinalWaveApproval({
++          planPath: boulderState.active_plan,
++          taskOutput: originalResponse,
++        })
++
++        if (toolInput.sessionID) {
++          const sessionState = getState(toolInput.sessionID)
++          sessionState.waitingForFinalWaveApproval = shouldPauseForApproval
++
++          if (shouldPauseForApproval && sessionState.pendingRetryTimer) {
++            clearTimeout(sessionState.pendingRetryTimer)
++            sessionState.pendingRetryTimer = undefined
++          }
++        }
++
++        const leadReminder = shouldPauseForApproval
++          ? buildFinalWaveApprovalReminder(boulderState.plan_name, progress, subagentSessionId)
++          : buildCompletionGate(boulderState.plan_name, subagentSessionId)
++        const followupReminder = shouldPauseForApproval
++          ? null
++          : buildOrchestratorReminder(boulderState.plan_name, progress, subagentSessionId, autoCommit, false)
+ 
+         toolOutput.output = `
+ <system-reminder>
+-${buildCompletionGate(boulderState.plan_name, subagentSessionId)}
++${leadReminder}
+ </system-reminder>
+ 
+ ## SUBAGENT WORK COMPLETED
+@@ -91,13 +120,16 @@ ${fileChanges}
+ 
+ ${originalResponse}
+ 
+-<system-reminder>
+-${buildOrchestratorReminder(boulderState.plan_name, progress, subagentSessionId, autoCommit, false)}
+-</system-reminder>`
++${
++  followupReminder === null
++    ? ""
++    : `<system-reminder>\n${followupReminder}\n</system-reminder>`
++}`
+         log(`[${HOOK_NAME}] Output transformed for orchestrator mode (boulder)`, {
+           plan: boulderState.plan_name,
+           progress: `${progress.completed}/${progress.total}`,
+           fileCount: gitStats.length,
++          waitingForFinalWaveApproval: shouldPauseForApproval,
+         })
+       } else {
+         toolOutput.output += `\n<system-reminder>\n${buildStandaloneVerificationReminder(subagentSessionId)}\n</system-reminder>`
+diff --git a/src/hooks/atlas/types.ts b/src/hooks/atlas/types.ts
+index 54e45051..bbc83a14 100644
+--- a/src/hooks/atlas/types.ts
++++ b/src/hooks/atlas/types.ts
+@@ -31,4 +31,5 @@ export interface SessionState {
+   promptFailureCount: number
+   lastFailureAt?: number
+   pendingRetryTimer?: ReturnType<typeof setTimeout>
++  waitingForFinalWaveApproval?: boolean
+ }
+diff --git a/src/hooks/atlas/verification-reminders.ts b/src/hooks/atlas/verification-reminders.ts
+index 019e5e86..33d7a47f 100644
+--- a/src/hooks/atlas/verification-reminders.ts
++++ b/src/hooks/atlas/verification-reminders.ts
+@@ -108,6 +108,45 @@ ${commitStep}
+ **${remaining} tasks remain. Keep bouldering.**`
+ }
+ 
++export function buildFinalWaveApprovalReminder(
++  planName: string,
++  progress: { total: number; completed: number },
++  sessionId: string
++): string {
++  const remaining = progress.total - progress.completed
++
++  return `
++---
++
++**BOULDER STATE:** Plan: \
++\`${planName}\` | ${progress.completed}/${progress.total} done | ${remaining} remaining
++
++---
++
++${buildVerificationReminder(sessionId)}
++
++**FINAL WAVE APPROVAL GATE**
++
++The last Final Verification Wave result just passed.
++This is the ONLY point where approval-style user interaction is required.
++
++1. Read \
++\`.sisyphus/plans/${planName}.md\` again and confirm the remaining unchecked item is the last final-wave task.
++2. Consolidate the F1-F4 verdicts into a short summary for the user.
++3. Tell the user all final reviewers approved.
++4. Ask for explicit user approval before editing the last final-wave checkbox or marking the plan complete.
++5. Wait for the user's explicit approval. Do NOT auto-continue. Do NOT call \
++\`task()\` again unless the user rejects and requests fixes.
++
++If the user rejects or requests changes:
++- delegate the required fix
++- re-run the affected final-wave reviewer
++- present the updated results again
++- wait again for explicit user approval
++
++**DO NOT mark the final-wave checkbox complete until the user explicitly says okay.**`
++}
++
+ export function buildStandaloneVerificationReminder(sessionId: string): string {
+   return `
+ ---
+-- 
+2.39.2
+

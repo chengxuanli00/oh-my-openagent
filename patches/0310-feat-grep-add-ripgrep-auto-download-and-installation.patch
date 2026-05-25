@@ -1,0 +1,307 @@
+From d3e317663edbe818c01a77f8484e164a02e24cb4 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 14 Dec 2025 10:52:18 +0900
+Subject: [PATCH 0310/5749] feat(grep): add ripgrep auto-download and
+ installation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Port ripgrep auto-installation feature from original OpenCode (sst/opencode).
+When ripgrep is not available, automatically downloads and installs it from
+GitHub releases.
+
+Features:
+- Platform detection (darwin/linux/win32, arm64/x64)
+- Archive extraction (tar.gz/zip)
+- Caches binary in ~/.cache/oh-my-opencode/bin/
+- New resolveGrepCliWithAutoInstall() async function
+- Falls back to grep if auto-install fails
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/tools/grep/constants.ts  |  38 ++++++--
+ src/tools/grep/downloader.ts | 168 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 199 insertions(+), 7 deletions(-)
+ create mode 100644 src/tools/grep/downloader.ts
+
+diff --git a/src/tools/grep/constants.ts b/src/tools/grep/constants.ts
+index bcc1f0b0..b87fa804 100644
+--- a/src/tools/grep/constants.ts
++++ b/src/tools/grep/constants.ts
+@@ -1,6 +1,7 @@
+ import { existsSync } from "node:fs"
+ import { join, dirname } from "node:path"
+ import { spawnSync } from "node:child_process"
++import { getInstalledRipgrepPath, downloadAndInstallRipgrep } from "./downloader"
+ 
+ export type GrepBackend = "rg" | "grep"
+ 
+@@ -10,6 +11,7 @@ interface ResolvedCli {
+ }
+ 
+ let cachedCli: ResolvedCli | null = null
++let autoInstallAttempted = false
+ 
+ function findExecutable(name: string): string | null {
+   const isWindows = process.platform === "win32"
+@@ -21,20 +23,18 @@ function findExecutable(name: string): string | null {
+       return result.stdout.trim().split("\n")[0]
+     }
+   } catch {
+-    // ignore
++    // Command execution failed
+   }
+   return null
+ }
+ 
+ function getOpenCodeBundledRg(): string | null {
+-  // OpenCode binary directory (where opencode executable lives)
+   const execPath = process.execPath
+   const execDir = dirname(execPath)
+ 
+   const isWindows = process.platform === "win32"
+   const rgName = isWindows ? "rg.exe" : "rg"
+ 
+-  // Check common bundled locations
+   const candidates = [
+     join(execDir, rgName),
+     join(execDir, "bin", rgName),
+@@ -54,32 +54,56 @@ function getOpenCodeBundledRg(): string | null {
+ export function resolveGrepCli(): ResolvedCli {
+   if (cachedCli) return cachedCli
+ 
+-  // Priority 1: OpenCode bundled rg
+   const bundledRg = getOpenCodeBundledRg()
+   if (bundledRg) {
+     cachedCli = { path: bundledRg, backend: "rg" }
+     return cachedCli
+   }
+ 
+-  // Priority 2: System rg
+   const systemRg = findExecutable("rg")
+   if (systemRg) {
+     cachedCli = { path: systemRg, backend: "rg" }
+     return cachedCli
+   }
+ 
+-  // Priority 3: grep (fallback)
++  const installedRg = getInstalledRipgrepPath()
++  if (installedRg) {
++    cachedCli = { path: installedRg, backend: "rg" }
++    return cachedCli
++  }
++
+   const grep = findExecutable("grep")
+   if (grep) {
+     cachedCli = { path: grep, backend: "grep" }
+     return cachedCli
+   }
+ 
+-  // Last resort: assume rg is in PATH
+   cachedCli = { path: "rg", backend: "rg" }
+   return cachedCli
+ }
+ 
++export async function resolveGrepCliWithAutoInstall(): Promise<ResolvedCli> {
++  const current = resolveGrepCli()
++
++  if (current.backend === "rg") {
++    return current
++  }
++
++  if (autoInstallAttempted) {
++    return current
++  }
++
++  autoInstallAttempted = true
++
++  try {
++    const rgPath = await downloadAndInstallRipgrep()
++    cachedCli = { path: rgPath, backend: "rg" }
++    return cachedCli
++  } catch {
++    return current
++  }
++}
++
+ export const DEFAULT_MAX_DEPTH = 20
+ export const DEFAULT_MAX_FILESIZE = "10M"
+ export const DEFAULT_MAX_COUNT = 500
+diff --git a/src/tools/grep/downloader.ts b/src/tools/grep/downloader.ts
+new file mode 100644
+index 00000000..8c703ad8
+--- /dev/null
++++ b/src/tools/grep/downloader.ts
+@@ -0,0 +1,168 @@
++import { existsSync, mkdirSync, chmodSync, unlinkSync } from "node:fs"
++import { join } from "node:path"
++import { spawn } from "bun"
++
++const RG_VERSION = "14.1.1"
++
++const PLATFORM_CONFIG: Record<string, { platform: string; extension: "tar.gz" | "zip" } | undefined> = {
++  "arm64-darwin": { platform: "aarch64-apple-darwin", extension: "tar.gz" },
++  "arm64-linux": { platform: "aarch64-unknown-linux-gnu", extension: "tar.gz" },
++  "x64-darwin": { platform: "x86_64-apple-darwin", extension: "tar.gz" },
++  "x64-linux": { platform: "x86_64-unknown-linux-musl", extension: "tar.gz" },
++  "x64-win32": { platform: "x86_64-pc-windows-msvc", extension: "zip" },
++}
++
++function getPlatformKey(): string {
++  return `${process.arch}-${process.platform}`
++}
++
++function getInstallDir(): string {
++  const homeDir = process.env.HOME || process.env.USERPROFILE || "."
++  return join(homeDir, ".cache", "oh-my-opencode", "bin")
++}
++
++function getRgPath(): string {
++  const isWindows = process.platform === "win32"
++  return join(getInstallDir(), isWindows ? "rg.exe" : "rg")
++}
++
++async function downloadFile(url: string, destPath: string): Promise<void> {
++  const response = await fetch(url)
++  if (!response.ok) {
++    throw new Error(`Failed to download: ${response.status} ${response.statusText}`)
++  }
++
++  const buffer = await response.arrayBuffer()
++  await Bun.write(destPath, buffer)
++}
++
++async function extractTarGz(archivePath: string, destDir: string): Promise<void> {
++  const platformKey = getPlatformKey()
++
++  const args = ["tar", "-xzf", archivePath, "--strip-components=1"]
++
++  if (platformKey.endsWith("-darwin")) {
++    args.push("--include=*/rg")
++  } else if (platformKey.endsWith("-linux")) {
++    args.push("--wildcards", "*/rg")
++  }
++
++  const proc = spawn(args, {
++    cwd: destDir,
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++
++  const exitCode = await proc.exited
++  if (exitCode !== 0) {
++    const stderr = await new Response(proc.stderr).text()
++    throw new Error(`Failed to extract tar.gz: ${stderr}`)
++  }
++}
++
++async function extractZipWindows(archivePath: string, destDir: string): Promise<void> {
++  const proc = spawn(
++    ["powershell", "-Command", `Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force`],
++    { stdout: "pipe", stderr: "pipe" }
++  )
++  const exitCode = await proc.exited
++  if (exitCode !== 0) {
++    throw new Error("Failed to extract zip with PowerShell")
++  }
++
++  const { globSync } = await import("glob")
++  const rgFiles = globSync("**/rg.exe", { cwd: destDir })
++  if (rgFiles.length > 0) {
++    const srcPath = join(destDir, rgFiles[0])
++    const destPath = join(destDir, "rg.exe")
++    if (srcPath !== destPath) {
++      const { renameSync } = await import("node:fs")
++      renameSync(srcPath, destPath)
++    }
++  }
++}
++
++async function extractZipUnix(archivePath: string, destDir: string): Promise<void> {
++  const proc = spawn(["unzip", "-o", archivePath, "-d", destDir], {
++    stdout: "pipe",
++    stderr: "pipe",
++  })
++  const exitCode = await proc.exited
++  if (exitCode !== 0) {
++    throw new Error("Failed to extract zip")
++  }
++
++  const { globSync } = await import("glob")
++  const rgFiles = globSync("**/rg", { cwd: destDir })
++  if (rgFiles.length > 0) {
++    const srcPath = join(destDir, rgFiles[0])
++    const destPath = join(destDir, "rg")
++    if (srcPath !== destPath) {
++      const { renameSync } = await import("node:fs")
++      renameSync(srcPath, destPath)
++    }
++  }
++}
++
++async function extractZip(archivePath: string, destDir: string): Promise<void> {
++  if (process.platform === "win32") {
++    await extractZipWindows(archivePath, destDir)
++  } else {
++    await extractZipUnix(archivePath, destDir)
++  }
++}
++
++export async function downloadAndInstallRipgrep(): Promise<string> {
++  const platformKey = getPlatformKey()
++  const config = PLATFORM_CONFIG[platformKey]
++
++  if (!config) {
++    throw new Error(`Unsupported platform: ${platformKey}`)
++  }
++
++  const installDir = getInstallDir()
++  const rgPath = getRgPath()
++
++  if (existsSync(rgPath)) {
++    return rgPath
++  }
++
++  mkdirSync(installDir, { recursive: true })
++
++  const filename = `ripgrep-${RG_VERSION}-${config.platform}.${config.extension}`
++  const url = `https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${filename}`
++  const archivePath = join(installDir, filename)
++
++  try {
++    await downloadFile(url, archivePath)
++
++    if (config.extension === "tar.gz") {
++      await extractTarGz(archivePath, installDir)
++    } else {
++      await extractZip(archivePath, installDir)
++    }
++
++    if (process.platform !== "win32") {
++      chmodSync(rgPath, 0o755)
++    }
++
++    if (!existsSync(rgPath)) {
++      throw new Error("ripgrep binary not found after extraction")
++    }
++
++    return rgPath
++  } finally {
++    if (existsSync(archivePath)) {
++      try {
++        unlinkSync(archivePath)
++      } catch {
++        // Cleanup failures are non-critical
++      }
++    }
++  }
++}
++
++export function getInstalledRipgrepPath(): string | null {
++  const rgPath = getRgPath()
++  return existsSync(rgPath) ? rgPath : null
++}
+-- 
+2.39.2
+

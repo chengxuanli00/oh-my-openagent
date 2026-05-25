@@ -1,0 +1,239 @@
+From d21ed3f7657d1260a0e81a0282cb19b05bd4ff08 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 11 Apr 2026 23:10:58 +0900
+Subject: [PATCH 4243/5749] fix(doctor): add timeouts to subprocess spawns to
+ prevent exit code 137
+
+Doctor checks spawned subprocesses (gh, opencode, sg) without timeouts,
+causing the process to hang indefinitely if any binary was stuck.
+The OS would then SIGKILL the process (exit code 137).
+
+- Add spawnWithTimeout utility with 10s per-spawn timeout and proper
+  cleanup (timer cleared on success, proc.exited awaited after kill)
+- Capture both stdout and stderr to preserve gh auth status behavior
+- Add 30s overall doctor command timeout with JSON-mode support
+- Distinguish timeout errors from other failures in runner
+- Update all doctor check subprocess calls to use timeouts
+---
+ src/cli/doctor/checks/tools-gh.ts         |  2 +-
+ src/cli/doctor/runner.ts                  | 45 ++++++++++++++++++-----
+ src/cli/doctor/spawn-with-timeout.test.ts | 17 +++++++++
+ src/cli/doctor/spawn-with-timeout.ts      | 21 ++++++++---
+ src/shared/posthog.ts                     | 13 +++++++
+ 5 files changed, 82 insertions(+), 16 deletions(-)
+
+diff --git a/src/cli/doctor/checks/tools-gh.ts b/src/cli/doctor/checks/tools-gh.ts
+index 3abdf064..71a539d1 100644
+--- a/src/cli/doctor/checks/tools-gh.ts
++++ b/src/cli/doctor/checks/tools-gh.ts
+@@ -47,7 +47,7 @@ async function getGhAuthStatus(): Promise<{
+       return { authenticated: false, username: null, scopes: [], error: "gh auth status timed out" }
+     }
+ 
+-    const output = result.stdout
++    const output = result.stderr || result.stdout
+     if (result.exitCode === 0) {
+       const usernameMatch = output.match(/Logged in to github\.com account (\S+)/)
+       const scopesMatch = output.match(/Token scopes?:\s*(.+)/i)
+diff --git a/src/cli/doctor/runner.ts b/src/cli/doctor/runner.ts
+index d636e910..1ac25fdc 100644
+--- a/src/cli/doctor/runner.ts
++++ b/src/cli/doctor/runner.ts
+@@ -5,6 +5,13 @@ import { formatDoctorOutput, formatJsonOutput } from "./formatter"
+ 
+ const DOCTOR_TIMEOUT_MS = 30_000
+ 
++class DoctorTimeoutError extends Error {
++  constructor() {
++    super("Doctor timed out")
++    this.name = "DoctorTimeoutError"
++  }
++}
++
+ export async function runCheck(check: CheckDefinition): Promise<CheckResult> {
+   const start = performance.now()
+   try {
+@@ -37,6 +44,25 @@ export function determineExitCode(results: CheckResult[]): number {
+   return results.some((r) => r.status === "fail") ? EXIT_CODES.FAILURE : EXIT_CODES.SUCCESS
+ }
+ 
++function buildTimeoutResult(start: number, options: DoctorOptions): DoctorResult {
++  const timeoutResult: DoctorResult = {
++    results: [{ name: "Timeout", status: "fail", message: "Doctor timed out after 30s", issues: [{ title: "Doctor timeout", description: "Checks did not complete within 30s. A subprocess may be hanging.", severity: "error" }] }],
++    systemInfo: { opencodeVersion: null, opencodePath: null, pluginVersion: null, loadedVersion: null, bunVersion: null, configPath: null, configValid: false, isLocalDev: false },
++    tools: { lspServers: [], astGrepCli: false, astGrepNapi: false, commentChecker: false, ghCli: { installed: false, authenticated: false, username: null }, mcpBuiltin: [], mcpUser: [] },
++    summary: { total: 1, passed: 0, failed: 1, warnings: 0, skipped: 0, duration: Math.round(performance.now() - start) },
++    exitCode: EXIT_CODES.FAILURE,
++  }
++
++  if (options.json) {
++    console.log(formatJsonOutput(timeoutResult))
++  } else {
++    console.error("\nDoctor timed out after 30s. A subprocess may be hanging.")
++    console.error("Try running with --verbose to identify the stuck check.\n")
++  }
++
++  return timeoutResult
++}
++
+ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
+   const start = performance.now()
+ 
+@@ -48,8 +74,9 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
+     gatherToolsSummary(),
+   ])
+ 
++  let timer: ReturnType<typeof setTimeout> | undefined
+   const timeoutPromise = new Promise<never>((_, reject) => {
+-    setTimeout(() => reject(new Error("Doctor timed out")), DOCTOR_TIMEOUT_MS)
++    timer = setTimeout(() => reject(new DoctorTimeoutError()), DOCTOR_TIMEOUT_MS)
+   })
+ 
+   let results: CheckResult[]
+@@ -58,18 +85,16 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorResult> {
+ 
+   try {
+     ;[results, systemInfo, tools] = await Promise.race([checksPromise, timeoutPromise])
+-  } catch {
+-    console.error("\nDoctor timed out after 30s. A subprocess may be hanging.")
+-    console.error("Try running with --verbose to identify the stuck check.\n")
+-    return {
+-      results: [],
+-      systemInfo: { opencodeVersion: null, opencodePath: null, pluginVersion: null, loadedVersion: null, bunVersion: null, configPath: null, configValid: false, isLocalDev: false },
+-      tools: { lspServers: [], astGrepCli: false, astGrepNapi: false, commentChecker: false, ghCli: { installed: false, authenticated: false, username: null }, mcpBuiltin: [], mcpUser: [] },
+-      summary: { total: 0, passed: 0, failed: 0, warnings: 0, skipped: 0, duration: Math.round(performance.now() - start) },
+-      exitCode: EXIT_CODES.FAILURE,
++  } catch (error) {
++    clearTimeout(timer)
++    if (error instanceof DoctorTimeoutError) {
++      return buildTimeoutResult(start, options)
+     }
++    throw error
+   }
+ 
++  clearTimeout(timer)
++
+   const duration = performance.now() - start
+   const summary = calculateSummary(results, duration)
+   const exitCode = determineExitCode(results)
+diff --git a/src/cli/doctor/spawn-with-timeout.test.ts b/src/cli/doctor/spawn-with-timeout.test.ts
+index 5e28249e..099b4240 100644
+--- a/src/cli/doctor/spawn-with-timeout.test.ts
++++ b/src/cli/doctor/spawn-with-timeout.test.ts
+@@ -11,6 +11,21 @@ describe("spawnWithTimeout", () => {
+       expect(result.timedOut).toBe(false)
+       expect(result.exitCode).toBe(0)
+       expect(result.stdout.trim()).toBe("hello")
++      expect(result.stderr).toBe("")
++    })
++  })
++
++  describe("#given a command that writes to stderr", () => {
++    it("captures stderr output", async () => {
++      // when
++      const result = await spawnWithTimeout(
++        ["bash", "-c", "echo err >&2"],
++        { stdout: "pipe", stderr: "pipe" }
++      )
++
++      // then
++      expect(result.timedOut).toBe(false)
++      expect(result.stderr.trim()).toBe("err")
+     })
+   })
+ 
+@@ -37,6 +52,7 @@ describe("spawnWithTimeout", () => {
+       // then
+       expect(result.timedOut).toBe(true)
+       expect(result.stdout).toBe("")
++      expect(result.stderr).toBe("")
+     })
+   })
+ 
+@@ -51,6 +67,7 @@ describe("spawnWithTimeout", () => {
+ 
+       // then
+       expect(result.timedOut).toBe(false)
++      expect(result.exitCode).toBe(1)
+     })
+   })
+ })
+diff --git a/src/cli/doctor/spawn-with-timeout.ts b/src/cli/doctor/spawn-with-timeout.ts
+index 70a10e4b..9f6d52f0 100644
+--- a/src/cli/doctor/spawn-with-timeout.ts
++++ b/src/cli/doctor/spawn-with-timeout.ts
+@@ -3,20 +3,28 @@ import { spawnWithWindowsHide } from "../../shared/spawn-with-windows-hide"
+ 
+ const DEFAULT_SPAWN_TIMEOUT_MS = 10_000
+ 
++export interface SpawnWithTimeoutResult {
++  stdout: string
++  stderr: string
++  exitCode: number
++  timedOut: boolean
++}
++
+ export async function spawnWithTimeout(
+   command: string[],
+   options: SpawnOptions,
+   timeoutMs: number = DEFAULT_SPAWN_TIMEOUT_MS
+-): Promise<{ stdout: string; exitCode: number; timedOut: boolean }> {
++): Promise<SpawnWithTimeoutResult> {
+   let proc: ReturnType<typeof spawnWithWindowsHide>
+   try {
+     proc = spawnWithWindowsHide(command, options)
+   } catch {
+-    return { stdout: "", exitCode: 1, timedOut: false }
++    return { stdout: "", stderr: "", exitCode: 1, timedOut: false }
+   }
+ 
++  let timer: ReturnType<typeof setTimeout> | undefined
+   const timeoutPromise = new Promise<"timeout">((resolve) => {
+-    setTimeout(() => resolve("timeout"), timeoutMs)
++    timer = setTimeout(() => resolve("timeout"), timeoutMs)
+   })
+ 
+   const processPromise = (async (): Promise<"done"> => {
+@@ -28,9 +36,12 @@ export async function spawnWithTimeout(
+ 
+   if (race === "timeout") {
+     proc.kill("SIGTERM")
+-    return { stdout: "", exitCode: 1, timedOut: true }
++    await proc.exited.catch(() => {})
++    return { stdout: "", stderr: "", exitCode: 1, timedOut: true }
+   }
+ 
++  clearTimeout(timer)
+   const stdout = proc.stdout ? await new Response(proc.stdout).text() : ""
+-  return { stdout, exitCode: proc.exitCode ?? 1, timedOut: false }
++  const stderr = proc.stderr ? await new Response(proc.stderr).text() : ""
++  return { stdout, stderr, exitCode: proc.exitCode ?? 1, timedOut: false }
+ }
+diff --git a/src/shared/posthog.ts b/src/shared/posthog.ts
+index 6fd721e7..22981d8c 100644
+--- a/src/shared/posthog.ts
++++ b/src/shared/posthog.ts
+@@ -62,7 +62,20 @@ function getSharedProperties(source: PostHogSource): NonNullable<PostHogCaptureE
+     plugin_name: PLUGIN_NAME,
+     package_version: packageJson.version,
+     runtime: "bun",
++    runtime_version: process.versions.bun ?? process.version,
+     source,
++    $os: os.platform(),
++    $os_version: os.release(),
++    os_arch: os.arch(),
++    os_type: os.type(),
++    cpu_count: os.cpus().length,
++    cpu_model: os.cpus()[0]?.model,
++    total_memory_gb: Math.round(os.totalmem() / 1024 / 1024 / 1024),
++    locale: Intl.DateTimeFormat().resolvedOptions().locale,
++    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
++    shell: process.env.SHELL,
++    ci: Boolean(process.env.CI),
++    terminal: process.env.TERM_PROGRAM,
+   }
+ }
+ 
+-- 
+2.39.2
+

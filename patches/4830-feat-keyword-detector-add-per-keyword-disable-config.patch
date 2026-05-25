@@ -1,0 +1,503 @@
+From 91c0d75588715496fd882c5840fece46f69ca5d2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 28 Apr 2026 14:20:35 +0900
+Subject: [PATCH 4830/5749] feat(keyword-detector): add per-keyword disable
+ config
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds keyword_detector.disabled_keywords config so users can opt out of
+specific keyword detectors individually without disabling the entire
+keyword-detector hook. Allowed values: 'ultrawork', 'search', 'analyze',
+'team'. Default empty/missing -> all four detectors active (no behavior
+change for existing configs).
+
+Motivation: an audit revealed search and analyze patterns trigger on
+~30-60% of normal conversational user messages (e.g. 'how to', 'why is',
+'show me', '왜', '어떻게'). The disable list is the immediate kill switch
+while the patterns themselves are tightened in a separate PR.
+
+Schema follows the existing per-feature config block convention shared
+by team_mode, ralph_loop, runtime_fallback, and comment_checker. The
+KeywordType enum (z.enum) lives next to the config schema and is
+re-imported by the detector to keep the union type in lockstep with the
+schema.
+
+Threading:
+  pluginConfig.keyword_detector
+    -> create-transform-hooks.ts (factory wiring)
+    -> createKeywordDetectorHook(config)
+    -> detectKeywordsWithType(text, agent, model, disabledKeywords)
+    -> Set-based filter at the source-of-truth detector
+
+Adds 8 regression tests covering per-keyword disable, multi-keyword
+disable, partial disable (one keyword off, another still firing),
+ultrawork toast suppression, undefined config, and empty array.
+---
+ src/config/index.ts                        |   2 +
+ src/config/schema.ts                       |   1 +
+ src/config/schema/keyword-detector.ts      |  10 +
+ src/config/schema/oh-my-opencode-config.ts |   3 +
+ src/hooks/keyword-detector/AGENTS.md       |  15 +-
+ src/hooks/keyword-detector/detector.ts     |  32 +--
+ src/hooks/keyword-detector/hook.ts         |   7 +-
+ src/hooks/keyword-detector/index.test.ts   | 234 +++++++++++++++++++++
+ src/plugin/hooks/create-transform-hooks.ts |   8 +-
+ 9 files changed, 296 insertions(+), 16 deletions(-)
+ create mode 100644 src/config/schema/keyword-detector.ts
+
+diff --git a/src/config/index.ts b/src/config/index.ts
+index 122dc1aa..c1572d5e 100644
+--- a/src/config/index.ts
++++ b/src/config/index.ts
+@@ -22,4 +22,6 @@ export type {
+   ModelCapabilitiesConfig,
+   FallbackModels,
+   TeamModeConfig,
++  KeywordDetectorConfig,
++  KeywordType,
+ } from "./schema"
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index f0394d6d..86ad7eca 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -13,6 +13,7 @@ export * from "./schema/fallback-models"
+ export * from "./schema/git-env-prefix"
+ export * from "./schema/git-master"
+ export * from "./schema/hooks"
++export * from "./schema/keyword-detector"
+ export * from "./schema/model-capabilities"
+ export * from "./schema/notification"
+ export * from "./schema/oh-my-opencode-config"
+diff --git a/src/config/schema/keyword-detector.ts b/src/config/schema/keyword-detector.ts
+new file mode 100644
+index 00000000..f47bc54d
+--- /dev/null
++++ b/src/config/schema/keyword-detector.ts
+@@ -0,0 +1,10 @@
++import { z } from "zod"
++
++export const KeywordTypeSchema = z.enum(["ultrawork", "search", "analyze", "team"])
++export type KeywordType = z.infer<typeof KeywordTypeSchema>
++
++export const KeywordDetectorConfigSchema = z.object({
++  disabled_keywords: z.array(KeywordTypeSchema).optional(),
++})
++
++export type KeywordDetectorConfig = z.infer<typeof KeywordDetectorConfigSchema>
+diff --git a/src/config/schema/oh-my-opencode-config.ts b/src/config/schema/oh-my-opencode-config.ts
+index 67cace71..df703251 100644
+--- a/src/config/schema/oh-my-opencode-config.ts
++++ b/src/config/schema/oh-my-opencode-config.ts
+@@ -12,6 +12,7 @@ import { CommentCheckerConfigSchema } from "./comment-checker"
+ import { BuiltinCommandNameSchema } from "./commands"
+ import { ExperimentalConfigSchema } from "./experimental"
+ import { GitMasterConfigSchema } from "./git-master"
++import { KeywordDetectorConfigSchema } from "./keyword-detector"
+ import { NotificationConfigSchema } from "./notification"
+ import { OpenClawConfigSchema } from "./openclaw"
+ import { ModelCapabilitiesConfigSchema } from "./model-capabilities"
+@@ -65,6 +66,8 @@ export const OhMyOpenCodeConfigSchema = z.object({
+   model_capabilities: ModelCapabilitiesConfigSchema.optional(),
+   openclaw: OpenClawConfigSchema.optional(),
+   team_mode: TeamModeConfigSchema.optional(),
++  /** Per-keyword disable list for the keyword-detector transform hook. Allowed values: "ultrawork", "search", "analyze", "team". */
++  keyword_detector: KeywordDetectorConfigSchema.optional(),
+   babysitting: BabysittingConfigSchema.optional(),
+   git_master: GitMasterConfigSchema.default({
+     commit_footer: true,
+diff --git a/src/hooks/keyword-detector/AGENTS.md b/src/hooks/keyword-detector/AGENTS.md
+index dc99464b..6b007f18 100644
+--- a/src/hooks/keyword-detector/AGENTS.md
++++ b/src/hooks/keyword-detector/AGENTS.md
+@@ -47,11 +47,24 @@ chat.message (user input)
+   → extractPromptText(parts)
+   → isSystemDirective? → skip
+   → removeSystemReminders(text)  # strip <SYSTEM_REMINDER> blocks
+-  → detectKeywordsWithType(cleanText, agentName, modelID)
++  → detectKeywordsWithType(cleanText, agentName, modelID, disabledKeywords)
+   → isPlannerAgent(agentName)? → filter out ultrawork
+   → for each detected keyword: inject mode message into output
+ ```
+ 
++## CONFIG
++
++```jsonc
++{
++  "keyword_detector": {
++    // Skip injection for any keyword in this list. Allowed: "ultrawork", "search", "analyze", "team".
++    "disabled_keywords": ["search", "analyze"]
++  }
++}
++```
++
++Default: empty/missing → all four detectors active. Schema lives at [src/config/schema/keyword-detector.ts](../../config/schema/keyword-detector.ts).
++
+ ## GUARDS
+ 
+ - **System directive skip**: Messages tagged as system directives are not scanned (prevents infinite loops)
+diff --git a/src/hooks/keyword-detector/detector.ts b/src/hooks/keyword-detector/detector.ts
+index c149ea63..85f2740e 100644
+--- a/src/hooks/keyword-detector/detector.ts
++++ b/src/hooks/keyword-detector/detector.ts
+@@ -1,3 +1,4 @@
++import type { KeywordType } from "../../config/schema/keyword-detector"
+ import {
+   KEYWORD_DETECTORS,
+   CODE_BLOCK_PATTERN,
+@@ -5,7 +6,7 @@ import {
+ } from "./constants"
+ 
+ export interface DetectedKeyword {
+-  type: "ultrawork" | "search" | "analyze" | "team"
++  type: KeywordType
+   message: string
+ }
+ 
+@@ -13,9 +14,6 @@ export function removeCodeBlocks(text: string): string {
+   return text.replace(CODE_BLOCK_PATTERN, "").replace(INLINE_CODE_PATTERN, "")
+ }
+ 
+-/**
+- * Resolves message to string, handling both static strings and dynamic functions.
+- */
+ function resolveMessage(
+   message: string | ((agentName?: string, modelID?: string) => string),
+   agentName?: string,
+@@ -24,22 +22,32 @@ function resolveMessage(
+   return typeof message === "function" ? message(agentName, modelID) : message
+ }
+ 
+-export function detectKeywords(text: string, agentName?: string, modelID?: string): string[] {
+-  const textWithoutCode = removeCodeBlocks(text)
+-  return KEYWORD_DETECTORS.filter(({ pattern }) =>
+-    pattern.test(textWithoutCode)
+-  ).map(({ message }) => resolveMessage(message, agentName, modelID))
++export function detectKeywords(
++  text: string,
++  agentName?: string,
++  modelID?: string,
++  disabledKeywords?: ReadonlyArray<KeywordType>,
++): string[] {
++  return detectKeywordsWithType(text, agentName, modelID, disabledKeywords).map(
++    ({ message }) => message,
++  )
+ }
+ 
+-export function detectKeywordsWithType(text: string, agentName?: string, modelID?: string): DetectedKeyword[] {
++export function detectKeywordsWithType(
++  text: string,
++  agentName?: string,
++  modelID?: string,
++  disabledKeywords?: ReadonlyArray<KeywordType>,
++): DetectedKeyword[] {
+   const textWithoutCode = removeCodeBlocks(text)
+-  const types: Array<DetectedKeyword["type"]> = ["ultrawork", "search", "analyze", "team"]
++  const types: Array<KeywordType> = ["ultrawork", "search", "analyze", "team"]
++  const disabled = new Set<KeywordType>(disabledKeywords ?? [])
+   return KEYWORD_DETECTORS.map(({ pattern, message }, index) => ({
+     matches: pattern.test(textWithoutCode),
+     type: types[index],
+     message: resolveMessage(message, agentName, modelID),
+   }))
+-    .filter((result) => result.matches)
++    .filter((result) => result.matches && !disabled.has(result.type))
+     .map(({ type, message }) => ({ type, message }))
+ }
+ 
+diff --git a/src/hooks/keyword-detector/hook.ts b/src/hooks/keyword-detector/hook.ts
+index b5931f97..6ebd974f 100644
+--- a/src/hooks/keyword-detector/hook.ts
++++ b/src/hooks/keyword-detector/hook.ts
+@@ -1,4 +1,5 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
++import type { KeywordDetectorConfig } from "../../config/schema/keyword-detector"
+ import { detectKeywordsWithType, extractPromptText } from "./detector"
+ import { isPlannerAgent, isNonOmoAgent } from "./constants"
+ import { log } from "../../shared"
+@@ -17,8 +18,10 @@ import type { RalphLoopHook } from "../ralph-loop"
+ export function createKeywordDetectorHook(
+   ctx: PluginInput,
+   _collector?: ContextCollector,
+-  _ralphLoop?: Pick<RalphLoopHook, "startLoop">
++  _ralphLoop?: Pick<RalphLoopHook, "startLoop">,
++  config?: KeywordDetectorConfig,
+ ) {
++  const disabledKeywords = config?.disabled_keywords
+   function getRuntimeVariant(input: { variant?: string }, message: Record<string, unknown>): string | undefined {
+     if (typeof message["variant"] === "string") {
+       return message["variant"]
+@@ -59,7 +62,7 @@ export function createKeywordDetectorHook(
+       // Remove system-reminder content to prevent automated system messages from triggering mode keywords
+       const cleanText = removeSystemReminders(promptText)
+       const modelID = input.model?.modelID
+-      let detectedKeywords = detectKeywordsWithType(cleanText, currentAgent, modelID)
++      let detectedKeywords = detectKeywordsWithType(cleanText, currentAgent, modelID, disabledKeywords)
+ 
+       if (isPlannerAgent(currentAgent)) {
+         const preFilterCount = detectedKeywords.length
+diff --git a/src/hooks/keyword-detector/index.test.ts b/src/hooks/keyword-detector/index.test.ts
+index 4fe241bd..5d566b67 100644
+--- a/src/hooks/keyword-detector/index.test.ts
++++ b/src/hooks/keyword-detector/index.test.ts
+@@ -1041,3 +1041,237 @@ describe("keyword-detector team mode", () => {
+     expect(textPart!.text).not.toContain("[team-mode]")
+   })
+ })
++
++describe("keyword-detector disabled_keywords config", () => {
++  let logCalls: Array<{ msg: string; data?: unknown }>
++  let logSpy: ReturnType<typeof spyOn>
++  let getMainSessionSpy: ReturnType<typeof spyOn>
++
++  beforeEach(() => {
++    _resetForTesting()
++    logCalls = []
++    logSpy = spyOn(sharedModule, "log").mockImplementation((msg: string, data?: unknown) => {
++      logCalls.push({ msg, data })
++    })
++  })
++
++  afterEach(() => {
++    logSpy?.mockRestore()
++    getMainSessionSpy?.mockRestore()
++    _resetForTesting()
++  })
++
++  function createMockPluginInput(options: { toastCalls?: string[] } = {}) {
++    const toastCalls = options.toastCalls ?? []
++    return {
++      client: {
++        tui: {
++          showToast: async (opts: { body: { title: string } }) => {
++            toastCalls.push(opts.body.title)
++          },
++        },
++      },
++    } as unknown as PluginInput
++  }
++
++  test("should NOT inject search-mode when disabled_keywords includes 'search'", async () => {
++    // given - keyword detector with search disabled
++    const sessionID = "search-disabled-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput(),
++      undefined,
++      undefined,
++      { disabled_keywords: ["search"] },
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "search for the bug in the code" }],
++    }
++
++    // when - search keyword would normally trigger
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - search-mode injection should be skipped
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).toBe("search for the bug in the code")
++    expect(textPart!.text).not.toContain("[search-mode]")
++  })
++
++  test("should NOT inject analyze-mode when disabled_keywords includes 'analyze'", async () => {
++    // given - keyword detector with analyze disabled
++    const sessionID = "analyze-disabled-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput(),
++      undefined,
++      undefined,
++      { disabled_keywords: ["analyze"] },
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "how to do this" }],
++    }
++
++    // when - analyze keyword would normally trigger
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - analyze-mode injection should be skipped
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).toBe("how to do this")
++    expect(textPart!.text).not.toContain("[analyze-mode]")
++  })
++
++  test("should NOT inject team-mode when disabled_keywords includes 'team'", async () => {
++    // given - keyword detector with team disabled
++    const sessionID = "team-disabled-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput(),
++      undefined,
++      undefined,
++      { disabled_keywords: ["team"] },
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "let's use team mode for this" }],
++    }
++
++    // when - team keyword would normally trigger
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - team-mode injection should be skipped
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).toBe("let's use team mode for this")
++    expect(textPart!.text).not.toContain("[team-mode]")
++  })
++
++  test("should NOT inject ultrawork message AND not show toast when disabled_keywords includes 'ultrawork'", async () => {
++    // given - keyword detector with ultrawork disabled
++    const sessionID = "ultrawork-disabled-session"
++    const toastCalls: string[] = []
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput({ toastCalls }),
++      undefined,
++      undefined,
++      { disabled_keywords: ["ultrawork"] },
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "ultrawork do this task" }],
++    }
++
++    // when - ultrawork keyword would normally trigger toast + injection
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - neither toast nor injection should occur
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).toBe("ultrawork do this task")
++    expect(textPart!.text).not.toContain("YOU MUST LEVERAGE ALL AVAILABLE AGENTS")
++    expect(toastCalls).not.toContain("Ultrawork Mode Activated")
++  })
++
++  test("should disable multiple keywords simultaneously when listed together", async () => {
++    // given - keyword detector with both search and analyze disabled
++    const sessionID = "multi-disabled-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput(),
++      undefined,
++      undefined,
++      { disabled_keywords: ["search", "analyze"] },
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "search and analyze the codebase" }],
++    }
++
++    // when - both search and analyze would normally fire
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - neither mode should inject
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).toBe("search and analyze the codebase")
++    expect(textPart!.text).not.toContain("[search-mode]")
++    expect(textPart!.text).not.toContain("[analyze-mode]")
++  })
++
++  test("should let other keywords through when only one is disabled", async () => {
++    // given - keyword detector with only search disabled, but message contains both search and analyze triggers
++    const sessionID = "partial-disabled-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput(),
++      undefined,
++      undefined,
++      { disabled_keywords: ["search"] },
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "search and analyze the codebase" }],
++    }
++
++    // when - both keywords match but only search is disabled
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - analyze should still inject, search should be skipped
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).not.toContain("[search-mode]")
++    expect(textPart!.text).toContain("[analyze-mode]")
++    expect(textPart!.text).toContain("search and analyze the codebase")
++  })
++
++  test("should behave normally (all keywords enabled) when config is undefined", async () => {
++    // given - keyword detector with no config (regression test for backward compat)
++    const sessionID = "no-config-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput(),
++      undefined,
++      undefined,
++      undefined,
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "search for the answer" }],
++    }
++
++    // when - search keyword fires with no config
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - search-mode should inject as usual
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).toContain("[search-mode]")
++  })
++
++  test("should behave normally when disabled_keywords is an empty array", async () => {
++    // given - keyword detector with empty disable list
++    const sessionID = "empty-disabled-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(
++      createMockPluginInput(),
++      undefined,
++      undefined,
++      { disabled_keywords: [] },
++    )
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "investigate this issue" }],
++    }
++
++    // when - analyze keyword fires with empty disable list
++    await hook["chat.message"]({ sessionID }, output)
++
++    // then - analyze-mode should still inject
++    const textPart = output.parts.find(p => p.type === "text")
++    expect(textPart).toBeDefined()
++    expect(textPart!.text).toContain("[analyze-mode]")
++  })
++})
+diff --git a/src/plugin/hooks/create-transform-hooks.ts b/src/plugin/hooks/create-transform-hooks.ts
+index 966600f2..387ae8eb 100644
+--- a/src/plugin/hooks/create-transform-hooks.ts
++++ b/src/plugin/hooks/create-transform-hooks.ts
+@@ -55,7 +55,13 @@ export function createTransformHooks(args: {
+   const keywordDetector = isHookEnabled("keyword-detector")
+     ? safeCreateHook(
+         "keyword-detector",
+-        () => createKeywordDetectorHook(ctx, contextCollector, ralphLoop ?? undefined),
++        () =>
++          createKeywordDetectorHook(
++            ctx,
++            contextCollector,
++            ralphLoop ?? undefined,
++            pluginConfig.keyword_detector,
++          ),
+         { enabled: safeHookEnabled },
+       )
+     : null
+-- 
+2.39.2
+

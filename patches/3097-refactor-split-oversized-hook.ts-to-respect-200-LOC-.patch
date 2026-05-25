@@ -1,0 +1,446 @@
+From 0e093afb57933ef5ba44aa25a3ef783a2ef41aa7 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 20:16:08 +0900
+Subject: [PATCH 3097/5749] refactor: split oversized hook.ts to respect 200
+ LOC limit
+
+- Extract types to types.ts
+- Extract constants to constants.ts
+- Extract session ID helpers to session-id.ts
+- Extract recovery logic to recovery.ts
+
+hook.ts reduced from 331 to 164 LOC
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../compaction-context-injector/constants.ts  |   5 +
+ src/hooks/compaction-context-injector/hook.ts | 181 +-----------------
+ .../compaction-context-injector/recovery.ts   | 143 ++++++++++++++
+ .../compaction-context-injector/session-id.ts |   8 +
+ .../compaction-context-injector/types.ts      |  25 +++
+ 5 files changed, 188 insertions(+), 174 deletions(-)
+ create mode 100644 src/hooks/compaction-context-injector/constants.ts
+ create mode 100644 src/hooks/compaction-context-injector/recovery.ts
+ create mode 100644 src/hooks/compaction-context-injector/session-id.ts
+ create mode 100644 src/hooks/compaction-context-injector/types.ts
+
+diff --git a/src/hooks/compaction-context-injector/constants.ts b/src/hooks/compaction-context-injector/constants.ts
+new file mode 100644
+index 00000000..b57c2451
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/constants.ts
+@@ -0,0 +1,5 @@
++export const HOOK_NAME = "compaction-context-injector"
++export const AGENT_RECOVERY_PROMPT = "[restore checkpointed session agent configuration after compaction]"
++export const NO_TEXT_TAIL_THRESHOLD = 5
++export const RECOVERY_COOLDOWN_MS = 60_000
++export const RECENT_COMPACTION_WINDOW_MS = 10 * 60 * 1000
+diff --git a/src/hooks/compaction-context-injector/hook.ts b/src/hooks/compaction-context-injector/hook.ts
+index 81857e12..462dc18a 100644
+--- a/src/hooks/compaction-context-injector/hook.ts
++++ b/src/hooks/compaction-context-injector/hook.ts
+@@ -1,70 +1,15 @@
+ import type { BackgroundManager } from "../../features/background-agent"
+-import { updateSessionAgent } from "../../features/claude-code-session-state"
+ import {
+   clearCompactionAgentConfigCheckpoint,
+-  getCompactionAgentConfigCheckpoint,
+   setCompactionAgentConfigCheckpoint,
+ } from "../../shared/compaction-agent-config-checkpoint"
+-import { createInternalAgentTextPart } from "../../shared/internal-initiator-marker"
+ import { log } from "../../shared/logger"
+-import { setSessionModel } from "../../shared/session-model-state"
+-import { setSessionTools } from "../../shared/session-tools-store"
+ import { COMPACTION_CONTEXT_PROMPT } from "./compaction-context-prompt"
+-import {
+-  createExpectedRecoveryPromptConfig,
+-  isPromptConfigRecovered,
+-} from "./recovery-prompt-config"
+-import {
+-  resolveLatestSessionPromptConfig,
+-  resolveSessionPromptConfig,
+-} from "./session-prompt-config-resolver"
+-import {
+-  finalizeTrackedAssistantMessage,
+-  shouldTreatAssistantPartAsOutput,
+-  trackAssistantOutput,
+-  type TailMonitorState,
+-} from "./tail-monitor"
+-
+-const HOOK_NAME = "compaction-context-injector"
+-const AGENT_RECOVERY_PROMPT = "[restore checkpointed session agent configuration after compaction]"
+-const NO_TEXT_TAIL_THRESHOLD = 5
+-const RECOVERY_COOLDOWN_MS = 60_000
+-const RECENT_COMPACTION_WINDOW_MS = 10 * 60 * 1000
+-
+-type CompactionContextClient = {
+-  client: {
+-    session: {
+-      messages: (input: { path: { id: string } }) => Promise<unknown>
+-      promptAsync: (input: {
+-        path: { id: string }
+-        body: {
+-          noReply?: boolean
+-          agent?: string
+-          model?: { providerID: string; modelID: string }
+-          tools?: Record<string, boolean>
+-          parts: Array<{ type: "text"; text: string }>
+-        }
+-        query?: { directory: string }
+-      }) => Promise<unknown>
+-    }
+-  }
+-  directory: string
+-}
+-
+-export interface CompactionContextInjector {
+-  capture: (sessionID: string) => Promise<void>
+-  inject: (sessionID?: string) => string
+-  event: (input: { event: { type: string; properties?: unknown } }) => Promise<void>
+-}
+-
+-function isCompactionAgent(agent: string | undefined): boolean {
+-  return agent?.trim().toLowerCase() === "compaction"
+-}
+-
+-function resolveSessionID(props?: Record<string, unknown>): string | undefined {
+-  return (props?.sessionID ??
+-    (props?.info as { id?: string } | undefined)?.id) as string | undefined
+-}
++import { resolveSessionPromptConfig } from "./session-prompt-config-resolver"
++import { finalizeTrackedAssistantMessage, shouldTreatAssistantPartAsOutput, trackAssistantOutput, type TailMonitorState } from "./tail-monitor"
++import { resolveSessionID } from "./session-id"
++import type { CompactionContextClient, CompactionContextInjector } from "./types"
++import { createRecoveryLogic } from "./recovery"
+ 
+ export function createCompactionContextInjector(options?: {
+   ctx?: CompactionContextClient
+@@ -88,119 +33,7 @@ export function createCompactionContextInjector(options?: {
+     return created
+   }
+ 
+-  const recoverCheckpointedAgentConfig = async (
+-    sessionID: string,
+-    reason: "session.compacted" | "no-text-tail",
+-  ): Promise<boolean> => {
+-    if (!ctx) {
+-      return false
+-    }
+-
+-    const checkpoint = getCompactionAgentConfigCheckpoint(sessionID)
+-    if (!checkpoint?.agent) {
+-      return false
+-    }
+-    const checkpointWithAgent = {
+-      ...checkpoint,
+-      agent: checkpoint.agent,
+-    }
+-
+-    const tailState = getTailState(sessionID)
+-    const now = Date.now()
+-    if (tailState.lastRecoveryAt && now - tailState.lastRecoveryAt < RECOVERY_COOLDOWN_MS) {
+-      return false
+-    }
+-
+-    const currentPromptConfig = await resolveSessionPromptConfig(ctx, sessionID)
+-    const expectedPromptConfig = createExpectedRecoveryPromptConfig(
+-      checkpointWithAgent,
+-      currentPromptConfig,
+-    )
+-    const model = expectedPromptConfig.model
+-    const tools = expectedPromptConfig.tools
+-
+-    if (reason === "session.compacted") {
+-      const latestPromptConfig = await resolveLatestSessionPromptConfig(ctx, sessionID)
+-      if (isPromptConfigRecovered(latestPromptConfig, expectedPromptConfig)) {
+-        return false
+-      }
+-    }
+-
+-    try {
+-      await ctx.client.session.promptAsync({
+-        path: { id: sessionID },
+-        body: {
+-          noReply: true,
+-          agent: expectedPromptConfig.agent,
+-          ...(model ? { model } : {}),
+-          ...(tools ? { tools } : {}),
+-          parts: [createInternalAgentTextPart(AGENT_RECOVERY_PROMPT)],
+-        },
+-        query: { directory: ctx.directory },
+-      })
+-
+-      const recoveredPromptConfig = await resolveLatestSessionPromptConfig(ctx, sessionID)
+-      if (!isPromptConfigRecovered(recoveredPromptConfig, expectedPromptConfig)) {
+-        log(`[${HOOK_NAME}] Re-injected agent config but recovery is still incomplete`, {
+-          sessionID,
+-          reason,
+-          agent: expectedPromptConfig.agent,
+-          model,
+-          hasTools: !!tools,
+-          recoveredPromptConfig,
+-        })
+-        return false
+-      }
+-
+-      updateSessionAgent(sessionID, expectedPromptConfig.agent)
+-      if (model) {
+-        setSessionModel(sessionID, model)
+-      }
+-      if (tools) {
+-        setSessionTools(sessionID, tools)
+-      }
+-
+-      tailState.lastRecoveryAt = now
+-      tailState.consecutiveNoTextMessages = 0
+-
+-      log(`[${HOOK_NAME}] Re-injected checkpointed agent config`, {
+-        sessionID,
+-        reason,
+-        agent: expectedPromptConfig.agent,
+-        model,
+-      })
+-
+-      return true
+-    } catch (error) {
+-      log(`[${HOOK_NAME}] Failed to re-inject checkpointed agent config`, {
+-        sessionID,
+-        reason,
+-        error: String(error),
+-      })
+-      return false
+-    }
+-  }
+-
+-  const maybeWarnAboutNoTextTail = async (sessionID: string): Promise<void> => {
+-    const tailState = getTailState(sessionID)
+-    if (tailState.consecutiveNoTextMessages < NO_TEXT_TAIL_THRESHOLD) {
+-      return
+-    }
+-
+-    const recentlyCompacted =
+-      tailState.lastCompactedAt !== undefined &&
+-      Date.now() - tailState.lastCompactedAt < RECENT_COMPACTION_WINDOW_MS
+-
+-    log(`[${HOOK_NAME}] Detected consecutive assistant messages with no text`, {
+-      sessionID,
+-      consecutiveNoTextMessages: tailState.consecutiveNoTextMessages,
+-      recentlyCompacted,
+-    })
+-
+-    if (recentlyCompacted) {
+-      await recoverCheckpointedAgentConfig(sessionID, "no-text-tail")
+-    }
+-  }
++  const { recoverCheckpointedAgentConfig, maybeWarnAboutNoTextTail } = createRecoveryLogic(ctx, getTailState)
+ 
+   const capture = async (sessionID: string): Promise<void> => {
+     if (!ctx || !sessionID) {
+@@ -213,7 +46,7 @@ export function createCompactionContextInjector(options?: {
+     }
+ 
+     setCompactionAgentConfigCheckpoint(sessionID, promptConfig)
+-    log(`[${HOOK_NAME}] Captured agent checkpoint before compaction`, {
++    log(`[compaction-context-injector] Captured agent checkpoint before compaction`, {
+       sessionID,
+       agent: promptConfig.agent,
+       model: promptConfig.model,
+diff --git a/src/hooks/compaction-context-injector/recovery.ts b/src/hooks/compaction-context-injector/recovery.ts
+new file mode 100644
+index 00000000..9542d6e1
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/recovery.ts
+@@ -0,0 +1,143 @@
++import { updateSessionAgent } from "../../features/claude-code-session-state"
++import {
++  getCompactionAgentConfigCheckpoint,
++} from "../../shared/compaction-agent-config-checkpoint"
++import { createInternalAgentTextPart } from "../../shared/internal-initiator-marker"
++import { log } from "../../shared/logger"
++import { setSessionModel } from "../../shared/session-model-state"
++import { setSessionTools } from "../../shared/session-tools-store"
++import {
++  createExpectedRecoveryPromptConfig,
++  isPromptConfigRecovered,
++} from "./recovery-prompt-config"
++import {
++  resolveLatestSessionPromptConfig,
++  resolveSessionPromptConfig,
++} from "./session-prompt-config-resolver"
++import { AGENT_RECOVERY_PROMPT, NO_TEXT_TAIL_THRESHOLD, RECOVERY_COOLDOWN_MS, RECENT_COMPACTION_WINDOW_MS } from "./constants"
++import type { CompactionContextClient } from "./types"
++import type { TailMonitorState } from "./tail-monitor"
++
++export function createRecoveryLogic(
++  ctx: CompactionContextClient | undefined,
++  getTailState: (sessionID: string) => TailMonitorState,
++) {
++  const recoverCheckpointedAgentConfig = async (
++    sessionID: string,
++    reason: "session.compacted" | "no-text-tail",
++  ): Promise<boolean> => {
++    if (!ctx) {
++      return false
++    }
++
++    const checkpoint = getCompactionAgentConfigCheckpoint(sessionID)
++    if (!checkpoint?.agent) {
++      return false
++    }
++    const checkpointWithAgent = {
++      ...checkpoint,
++      agent: checkpoint.agent,
++    }
++
++    const tailState = getTailState(sessionID)
++    const now = Date.now()
++    if (tailState.lastRecoveryAt && now - tailState.lastRecoveryAt < RECOVERY_COOLDOWN_MS) {
++      return false
++    }
++
++    const currentPromptConfig = await resolveSessionPromptConfig(ctx, sessionID)
++    const expectedPromptConfig = createExpectedRecoveryPromptConfig(
++      checkpointWithAgent,
++      currentPromptConfig,
++    )
++    const model = expectedPromptConfig.model
++    const tools = expectedPromptConfig.tools
++
++    if (reason === "session.compacted") {
++      const latestPromptConfig = await resolveLatestSessionPromptConfig(ctx, sessionID)
++      if (isPromptConfigRecovered(latestPromptConfig, expectedPromptConfig)) {
++        return false
++      }
++    }
++
++    try {
++      await ctx.client.session.promptAsync({
++        path: { id: sessionID },
++        body: {
++          noReply: true,
++          agent: expectedPromptConfig.agent,
++          ...(model ? { model } : {}),
++          ...(tools ? { tools } : {}),
++          parts: [createInternalAgentTextPart(AGENT_RECOVERY_PROMPT)],
++        },
++        query: { directory: ctx.directory },
++      })
++
++      const recoveredPromptConfig = await resolveLatestSessionPromptConfig(ctx, sessionID)
++      if (!isPromptConfigRecovered(recoveredPromptConfig, expectedPromptConfig)) {
++        log(`[compaction-context-injector] Re-injected agent config but recovery is still incomplete`, {
++          sessionID,
++          reason,
++          agent: expectedPromptConfig.agent,
++          model,
++          hasTools: !!tools,
++          recoveredPromptConfig,
++        })
++        return false
++      }
++
++      updateSessionAgent(sessionID, expectedPromptConfig.agent)
++      if (model) {
++        setSessionModel(sessionID, model)
++      }
++      if (tools) {
++        setSessionTools(sessionID, tools)
++      }
++
++      tailState.lastRecoveryAt = now
++      tailState.consecutiveNoTextMessages = 0
++
++      log(`[compaction-context-injector] Re-injected checkpointed agent config`, {
++        sessionID,
++        reason,
++        agent: expectedPromptConfig.agent,
++        model,
++      })
++
++      return true
++    } catch (error) {
++      log(`[compaction-context-injector] Failed to re-inject checkpointed agent config`, {
++        sessionID,
++        reason,
++        error: String(error),
++      })
++      return false
++    }
++  }
++
++  const maybeWarnAboutNoTextTail = async (sessionID: string): Promise<void> => {
++    const tailState = getTailState(sessionID)
++    if (tailState.consecutiveNoTextMessages < NO_TEXT_TAIL_THRESHOLD) {
++      return
++    }
++
++    const recentlyCompacted =
++      tailState.lastCompactedAt !== undefined &&
++      Date.now() - tailState.lastCompactedAt < RECENT_COMPACTION_WINDOW_MS
++
++    log(`[compaction-context-injector] Detected consecutive assistant messages with no text`, {
++      sessionID,
++      consecutiveNoTextMessages: tailState.consecutiveNoTextMessages,
++      recentlyCompacted,
++    })
++
++    if (recentlyCompacted) {
++      await recoverCheckpointedAgentConfig(sessionID, "no-text-tail")
++    }
++  }
++
++  return {
++    recoverCheckpointedAgentConfig,
++    maybeWarnAboutNoTextTail,
++  }
++}
+diff --git a/src/hooks/compaction-context-injector/session-id.ts b/src/hooks/compaction-context-injector/session-id.ts
+new file mode 100644
+index 00000000..29de9c5c
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/session-id.ts
+@@ -0,0 +1,8 @@
++export function isCompactionAgent(agent: string | undefined): boolean {
++  return agent?.trim().toLowerCase() === "compaction"
++}
++
++export function resolveSessionID(props?: Record<string, unknown>): string | undefined {
++  return (props?.sessionID ??
++    (props?.info as { id?: string } | undefined)?.id) as string | undefined
++}
+diff --git a/src/hooks/compaction-context-injector/types.ts b/src/hooks/compaction-context-injector/types.ts
+new file mode 100644
+index 00000000..b97c2e6f
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/types.ts
+@@ -0,0 +1,25 @@
++export interface CompactionContextInjector {
++  capture: (sessionID: string) => Promise<void>
++  inject: (sessionID?: string) => string
++  event: (input: { event: { type: string; properties?: unknown } }) => Promise<void>
++}
++
++export type CompactionContextClient = {
++  client: {
++    session: {
++      messages: (input: { path: { id: string } }) => Promise<unknown>
++      promptAsync: (input: {
++        path: { id: string }
++        body: {
++          noReply?: boolean
++          agent?: string
++          model?: { providerID: string; modelID: string }
++          tools?: Record<string, boolean>
++          parts: Array<{ type: "text"; text: string }>
++        }
++        query?: { directory: string }
++      }) => Promise<unknown>
++    }
++  }
++  directory: string
++}
+-- 
+2.39.2
+

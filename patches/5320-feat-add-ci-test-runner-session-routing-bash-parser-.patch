@@ -1,0 +1,568 @@
+From 4f9813848a5eb4998f8acbbadaf275208241980b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 16 May 2026 23:51:43 +0900
+Subject: [PATCH 5320/5749] feat: add ci test runner, session routing, bash
+ parser, and test fixtures
+
+- script/run-ci-tests.ts: CI test sharding and isolation logic
+- script/run-ci-tests.test.ts: tests for CI test target selection
+- src/features/background-agent/session-route.ts: session prompt routing for background agents
+- src/hooks/interactive-bash-session/parser.ts: interactive bash output parser
+- src/hooks/ralph-loop/completion-promise-detector-test-input.ts: test fixture for completion promise detection
+---
+ script/run-ci-tests.test.ts                   |  45 ++++
+ script/run-ci-tests.ts                        | 253 ++++++++++++++++++
+ .../background-agent/session-route.ts         |  72 +++++
+ src/hooks/interactive-bash-session/parser.ts  | 118 ++++++++
+ .../completion-promise-detector-test-input.ts |  23 ++
+ 5 files changed, 511 insertions(+)
+ create mode 100644 script/run-ci-tests.test.ts
+ create mode 100644 script/run-ci-tests.ts
+ create mode 100644 src/features/background-agent/session-route.ts
+ create mode 100644 src/hooks/interactive-bash-session/parser.ts
+ create mode 100644 src/hooks/ralph-loop/completion-promise-detector-test-input.ts
+
+diff --git a/script/run-ci-tests.test.ts b/script/run-ci-tests.test.ts
+new file mode 100644
+index 00000000..f43098b4
+--- /dev/null
++++ b/script/run-ci-tests.test.ts
+@@ -0,0 +1,45 @@
++import { describe, expect, test } from "bun:test"
++import { selectCiTestTargets } from "./run-ci-tests"
++
++describe("plain test script policy", () => {
++  test("#given mock.module tests in the suite #then bun run test remains the package test script", async () => {
++    //#given
++    const packageJson = await Bun.file("package.json").json()
++
++    //#then
++    expect(packageJson.scripts.test).toBe("bun test")
++  })
++
++  test("#given isolated test shards #when selecting targets #then shards are deterministic and complete", () => {
++    // given
++    const ciTestPlan = {
++      isolatedModuleMockFiles: [],
++      isolatedTestTargets: ["a.test.ts", "b.test.ts", "c.test.ts", "d.test.ts", "e.test.ts"],
++      sharedTestFiles: ["shared.test.ts"],
++    }
++
++    // when
++    const shardOne = selectCiTestTargets(ciTestPlan, { phase: "isolated", shardCount: 2, shardIndex: 0 })
++    const shardTwo = selectCiTestTargets(ciTestPlan, { phase: "isolated", shardCount: 2, shardIndex: 1 })
++
++    // then
++    expect(shardOne).toEqual({ isolatedTestTargets: ["a.test.ts", "c.test.ts", "e.test.ts"], sharedTestFiles: [] })
++    expect(shardTwo).toEqual({ isolatedTestTargets: ["b.test.ts", "d.test.ts"], sharedTestFiles: [] })
++    expect([...shardOne.isolatedTestTargets, ...shardTwo.isolatedTestTargets].sort()).toEqual(ciTestPlan.isolatedTestTargets)
++  })
++
++  test("#given shared phase #when selecting targets #then only shared tests run", () => {
++    // given
++    const ciTestPlan = {
++      isolatedModuleMockFiles: [],
++      isolatedTestTargets: ["isolated.test.ts"],
++      sharedTestFiles: ["shared.test.ts"],
++    }
++
++    // when
++    const selectedTargets = selectCiTestTargets(ciTestPlan, { phase: "shared", shardCount: 1, shardIndex: 0 })
++
++    // then
++    expect(selectedTargets).toEqual({ isolatedTestTargets: [], sharedTestFiles: ["shared.test.ts"] })
++  })
++})
+diff --git a/script/run-ci-tests.ts b/script/run-ci-tests.ts
+new file mode 100644
+index 00000000..1c77bc62
+--- /dev/null
++++ b/script/run-ci-tests.ts
+@@ -0,0 +1,253 @@
++/// <reference types="bun-types" />
++
++type CiTestPlan = {
++  isolatedTestTargets: string[]
++  isolatedModuleMockFiles: string[]
++  sharedTestFiles: string[]
++}
++
++type CiTestPhase = "all" | "isolated" | "shared"
++
++type CiTestRunOptions = {
++  phase: CiTestPhase
++  shardCount: number
++  shardIndex: number
++}
++
++type CiTestTargetSelection = {
++  isolatedTestTargets: string[]
++  sharedTestFiles: string[]
++}
++
++const TEST_ROOTS = ["bin", "script", "src"] as const
++const MODULE_MOCK_PATTERN = "mock.module("
++const ALWAYS_ISOLATED_TEST_FILES = [
++  "src/features/team-mode/team-mailbox/ack.test.ts",
++  "src/features/team-mode/team-mailbox/send.test.ts",
++  "src/features/team-mode/team-runtime/shutdown.test.ts",
++  "src/features/team-mode/team-runtime/status.test.ts",
++  "src/features/team-mode/team-state-store/resume.test.ts",
++  "src/features/team-mode/team-state-store/store.test.ts",
++  "src/features/boulder-state/storage.test.ts",
++  "src/hooks/anthropic-context-window-limit-recovery/aggressive-truncation-strategy.test.ts",
++  "src/hooks/session-notification-input-needed.test.ts",
++  "src/hooks/session-notification-sender.test.ts",
++  "src/hooks/session-notification.test.ts",
++  "src/openclaw/__tests__/reply-listener-discord.test.ts",
++  "src/tools/background-task/create-background-output.blocking.test.ts",
++  "src/tools/background-task/tools.test.ts",
++  "src/tools/interactive-bash/tmux-path-resolver.test.ts",
++  "src/tools/task/task-list.test.ts",
++] as const
++
++async function collectTestFiles(rootDirectory: string): Promise<string[]> {
++  const testFiles: string[] = []
++
++  for (const testRoot of TEST_ROOTS) {
++    const glob = new Bun.Glob("**/*.test.ts")
++
++    for await (const testFile of glob.scan({ cwd: `${rootDirectory}/${testRoot}` })) {
++      testFiles.push(`${testRoot}/${testFile}`)
++    }
++  }
++
++  return testFiles.sort((left, right) => left.localeCompare(right))
++}
++
++async function usesModuleMock(rootDirectory: string, testFile: string): Promise<boolean> {
++  const testContents = await Bun.file(`${rootDirectory}/${testFile}`).text()
++  return testContents.includes(MODULE_MOCK_PATTERN)
++}
++
++function toIsolatedTarget(testFile: string): string {
++  return testFile
++}
++
++function isCoveredByTarget(testFile: string, isolatedTarget: string): boolean {
++  return testFile === isolatedTarget || testFile.startsWith(`${isolatedTarget}/`)
++}
++
++function collapseNestedTargets(isolatedTargets: string[]): string[] {
++  return isolatedTargets.filter((isolatedTarget) => {
++    return !isolatedTargets.some((otherTarget) => {
++      return otherTarget !== isolatedTarget && isolatedTarget.startsWith(`${otherTarget}/`)
++    })
++  })
++}
++
++function readFlagValue(args: string[], flagName: string): string | null {
++  const prefix = `${flagName}=`
++  const flag = args.find((arg) => arg.startsWith(prefix))
++
++  return flag?.slice(prefix.length) ?? null
++}
++
++function parsePhase(rawPhase: string | null): CiTestPhase {
++  if (rawPhase === null) {
++    return "all"
++  }
++
++  if (rawPhase === "all" || rawPhase === "isolated" || rawPhase === "shared") {
++    return rawPhase
++  }
++
++  throw new Error(`Invalid --phase value: ${rawPhase}. Expected all, isolated, or shared.`)
++}
++
++function parsePositiveIntegerFlag(args: string[], flagName: string, defaultValue: number): number {
++  const rawValue = readFlagValue(args, flagName)
++  if (rawValue === null) {
++    return defaultValue
++  }
++
++  const parsedValue = Number(rawValue)
++  if (!Number.isInteger(parsedValue) || parsedValue < 1) {
++    throw new Error(`Invalid ${flagName} value: ${rawValue}. Expected a positive integer.`)
++  }
++
++  return parsedValue
++}
++
++function parseNonNegativeIntegerFlag(args: string[], flagName: string, defaultValue: number): number {
++  const rawValue = readFlagValue(args, flagName)
++  if (rawValue === null) {
++    return defaultValue
++  }
++
++  const parsedValue = Number(rawValue)
++  if (!Number.isInteger(parsedValue) || parsedValue < 0) {
++    throw new Error(`Invalid ${flagName} value: ${rawValue}. Expected a non-negative integer.`)
++  }
++
++  return parsedValue
++}
++
++function parseCiTestRunOptions(args: string[]): CiTestRunOptions {
++  const phase = parsePhase(readFlagValue(args, "--phase"))
++  const shardCount = parsePositiveIntegerFlag(args, "--shard-count", 1)
++  const shardIndex = parseNonNegativeIntegerFlag(args, "--shard-index", 0)
++
++  if (shardIndex >= shardCount) {
++    throw new Error(`Invalid --shard-index value: ${shardIndex}. Expected a value less than --shard-count ${shardCount}.`)
++  }
++
++  if (shardCount > 1 && phase !== "isolated") {
++    throw new Error("Test sharding is only supported with --phase=isolated.")
++  }
++
++  return { phase, shardCount, shardIndex }
++}
++
++function selectShard(testTargets: string[], shardCount: number, shardIndex: number): string[] {
++  if (shardCount === 1) {
++    return testTargets
++  }
++
++  return testTargets.filter((_, index) => index % shardCount === shardIndex)
++}
++
++export function selectCiTestTargets(ciTestPlan: CiTestPlan, options: CiTestRunOptions): CiTestTargetSelection {
++  const isolatedTestTargets = options.phase === "shared"
++    ? []
++    : selectShard(ciTestPlan.isolatedTestTargets, options.shardCount, options.shardIndex)
++  const sharedTestFiles = options.phase === "isolated" ? [] : ciTestPlan.sharedTestFiles
++
++  return { isolatedTestTargets, sharedTestFiles }
++}
++
++export async function createCiTestPlan(rootDirectory: string = process.cwd()): Promise<CiTestPlan> {
++  const allTestFiles = await collectTestFiles(rootDirectory)
++  const isolatedModuleMockFiles: string[] = []
++
++  for (const testFile of allTestFiles) {
++    if (await usesModuleMock(rootDirectory, testFile)) {
++      isolatedModuleMockFiles.push(testFile)
++    }
++  }
++
++  const isolatedTestFiles = Array.from(
++    new Set([...isolatedModuleMockFiles, ...ALWAYS_ISOLATED_TEST_FILES.filter((testFile) => allTestFiles.includes(testFile))]),
++  )
++  const isolatedTestTargets = collapseNestedTargets(
++    isolatedTestFiles.map((testFile) => toIsolatedTarget(testFile)).sort((left, right) =>
++      left.localeCompare(right),
++    ),
++  )
++  const sharedTestFiles = allTestFiles.filter((testFile) => {
++    return !isolatedTestTargets.some((isolatedTarget) => isCoveredByTarget(testFile, isolatedTarget))
++  })
++
++  return {
++    isolatedTestTargets,
++    isolatedModuleMockFiles,
++    sharedTestFiles,
++  }
++}
++
++async function runBunTest(testFiles: string[], label: string): Promise<void> {
++  if (testFiles.length === 0) {
++    return
++  }
++
++  console.log(`::group::${label}`)
++
++  const args = testFiles.map((testFile) => {
++    if (testFile.includes("/") && !testFile.endsWith(".test.ts")) {
++      return [testFile, "!_auc-*/**/*.test.ts"]
++    }
++
++    return testFile
++  }).flat()
++
++  const command = ["bun", "test", ...args]
++  const spawnedProcess = Bun.spawn(command, {
++    cwd: process.cwd(),
++    stdin: "inherit",
++    stdout: "inherit",
++    stderr: "inherit",
++  })
++  const exitCode = await spawnedProcess.exited
++  console.log("::endgroup::")
++
++  if (exitCode !== 0) {
++    throw new Error(`Command failed: ${command.join(" ")}`)
++  }
++}
++
++async function main(): Promise<void> {
++  const options = parseCiTestRunOptions(process.argv.slice(2))
++  const ciTestPlan = await createCiTestPlan()
++  const selectedTargets = selectCiTestTargets(ciTestPlan, options)
++
++  console.log(
++    `Detected ${ciTestPlan.isolatedModuleMockFiles.length} mock.module() test files, ${ciTestPlan.isolatedTestTargets.length} isolated targets, and ${ciTestPlan.sharedTestFiles.length} shared test files.`,
++  )
++
++  if (options.phase === "isolated" && options.shardCount > 1) {
++    console.log(
++      `Running isolated test shard ${options.shardIndex + 1}/${options.shardCount} with ${selectedTargets.isolatedTestTargets.length} targets.`,
++    )
++  }
++
++  for (const isolatedTestTarget of selectedTargets.isolatedTestTargets) {
++    await runBunTest([isolatedTestTarget], `Isolated ${isolatedTestTarget}`)
++  }
++
++  await runBunTest(selectedTargets.sharedTestFiles, "Shared Bun test suite")
++}
++
++export const moduleMockPattern = MODULE_MOCK_PATTERN
++export const testRoots = TEST_ROOTS
++
++if (process.argv.includes("--print-plan")) {
++  const ciTestPlan = await createCiTestPlan()
++  console.log(JSON.stringify(ciTestPlan, null, 2))
++} else if (import.meta.main) {
++  try {
++    await main()
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error)
++    console.error(message)
++    process.exit(1)
++  }
++}
+diff --git a/src/features/background-agent/session-route.ts b/src/features/background-agent/session-route.ts
+new file mode 100644
+index 00000000..0bd7759b
+--- /dev/null
++++ b/src/features/background-agent/session-route.ts
+@@ -0,0 +1,72 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++
++import { promptWithModelSuggestionRetry } from "../../shared"
++import { promptAsyncAfterSessionIdle } from "../../shared/prompt-async-gate"
++
++type OpencodeClient = PluginInput["client"]
++
++type PromptAsyncArgs = Parameters<OpencodeClient["session"]["promptAsync"]>[0]
++type PromptRetryClient = Parameters<typeof promptWithModelSuggestionRetry>[0]
++type PromptRetryArgs = Parameters<typeof promptWithModelSuggestionRetry>[1]
++type SessionMessagesArgs = Parameters<OpencodeClient["session"]["messages"]>[0]
++
++export function routeSessionPrompt(args: PromptAsyncArgs, directory: string): PromptAsyncArgs {
++  return {
++    ...args,
++    query: { directory },
++  }
++}
++
++function routePromptRetry(args: PromptRetryArgs, directory: string): PromptRetryArgs {
++  return {
++    ...args,
++    query: { directory },
++  }
++}
++
++export function promptAsyncInDirectory(
++  client: OpencodeClient,
++  args: PromptAsyncArgs,
++  directory: string,
++): Promise<unknown> {
++  const routedArgs = routeSessionPrompt(args, directory)
++  const sessionID = routedArgs.path?.id
++  if (!sessionID) {
++    return Promise.reject(new Error("session id is required for routed promptAsync"))
++  }
++
++  return promptAsyncAfterSessionIdle({
++    client,
++    sessionID,
++    input: routedArgs,
++    source: "background-agent-session-route",
++    settleMs: 0,
++  }).then((result) => {
++    if (result.status === "failed") {
++      throw result.error
++    }
++    if (result.status !== "dispatched") {
++      throw new Error(`promptAsync skipped by gate: ${result.status}`)
++    }
++    return result.response
++  })
++}
++
++export function promptWithRetryInDirectory(
++  client: PromptRetryClient,
++  args: PromptRetryArgs,
++  directory: string,
++): Promise<void> {
++  return promptWithModelSuggestionRetry(client, routePromptRetry(args, directory))
++}
++
++export function messagesInDirectory(
++  client: OpencodeClient,
++  args: SessionMessagesArgs,
++  directory: string,
++): Promise<unknown> {
++  return client.session.messages({
++    ...args,
++    query: { directory },
++  })
++}
+diff --git a/src/hooks/interactive-bash-session/parser.ts b/src/hooks/interactive-bash-session/parser.ts
+new file mode 100644
+index 00000000..0002d931
+--- /dev/null
++++ b/src/hooks/interactive-bash-session/parser.ts
+@@ -0,0 +1,118 @@
++/**
++ * Quote-aware command tokenizer with escape handling
++ * Handles single/double quotes and backslash escapes
++ */
++export function tokenizeCommand(cmd: string): string[] {
++  const tokens: string[] = []
++  let current = ""
++  let inQuote = false
++  let quoteChar = ""
++  let escaped = false
++
++  for (let i = 0; i < cmd.length; i++) {
++    const char = cmd[i]
++
++    if (escaped) {
++      current += char
++      escaped = false
++      continue
++    }
++
++    if (char === "\\") {
++      escaped = true
++      continue
++    }
++
++    if ((char === "'" || char === '"') && !inQuote) {
++      inQuote = true
++      quoteChar = char
++    } else if (char === quoteChar && inQuote) {
++      inQuote = false
++      quoteChar = ""
++    } else if (char === " " && !inQuote) {
++      if (current) {
++        tokens.push(current)
++        current = ""
++      }
++    } else {
++      current += char
++    }
++  }
++
++  if (current) tokens.push(current)
++  return tokens
++}
++
++/**
++ * Normalize session name by stripping :window and .pane suffixes
++ * e.g., "omo-x:1" -> "omo-x", "omo-x:1.2" -> "omo-x"
++ */
++export function normalizeSessionName(name: string): string {
++  return name.split(":")[0].split(".")[0]
++}
++
++export function findFlagValue(tokens: string[], flag: string): string | null {
++  for (let i = 0; i < tokens.length - 1; i++) {
++    if (tokens[i] === flag) return tokens[i + 1]
++  }
++  return null
++}
++
++/**
++ * Extract session name from tokens, considering the subCommand
++ * For new-session: prioritize -s over -t
++ * For other commands: use -t
++ */
++export function extractSessionNameFromTokens(tokens: string[], subCommand: string): string | null {
++  if (subCommand === "new-session") {
++    const sFlag = findFlagValue(tokens, "-s")
++    if (sFlag) return normalizeSessionName(sFlag)
++    const tFlag = findFlagValue(tokens, "-t")
++    if (tFlag) return normalizeSessionName(tFlag)
++  } else {
++    const tFlag = findFlagValue(tokens, "-t")
++    if (tFlag) return normalizeSessionName(tFlag)
++  }
++  return null
++}
++
++/**
++ * Find the tmux subcommand from tokens, skipping global options.
++ * tmux allows global options before the subcommand:
++ * e.g., `tmux -L socket-name new-session -s omo-x`
++ * Global options with args: -L, -S, -f, -c, -T
++ * Standalone flags: -C, -v, -V, etc.
++ * Special: -- (end of options marker)
++ */
++export function findSubcommand(tokens: string[]): string {
++  // Options that require an argument: -L, -S, -f, -c, -T
++  const globalOptionsWithArgs = new Set(["-L", "-S", "-f", "-c", "-T"])
++
++  let i = 0
++  while (i < tokens.length) {
++    const token = tokens[i]
++
++    // Handle end of options marker
++    if (token === "--") {
++      // Next token is the subcommand
++      return tokens[i + 1] ?? ""
++    }
++
++    if (globalOptionsWithArgs.has(token)) {
++      // Skip the option and its argument
++      i += 2
++      continue
++    }
++
++    if (token.startsWith("-")) {
++      // Skip standalone flags like -C, -v, -V
++      i++
++      continue
++    }
++
++    // Found the subcommand
++    return token
++  }
++
++  return ""
++}
+diff --git a/src/hooks/ralph-loop/completion-promise-detector-test-input.ts b/src/hooks/ralph-loop/completion-promise-detector-test-input.ts
+new file mode 100644
+index 00000000..4a1e6c25
+--- /dev/null
++++ b/src/hooks/ralph-loop/completion-promise-detector-test-input.ts
+@@ -0,0 +1,23 @@
++/// <reference types="bun-types" />
++import type { PluginInput } from "@opencode-ai/plugin"
++
++export type SessionMessage = {
++	info?: { role?: string }
++	parts?: Array<{ type: string; text?: string }>
++}
++
++export function createPluginInput(messages: SessionMessage[]): PluginInput {
++	const pluginInput = {
++		client: { session: {} } as PluginInput["client"],
++		project: {} as PluginInput["project"],
++		directory: "/tmp",
++		worktree: "/tmp",
++		serverUrl: new URL("http://localhost"),
++		$: {} as PluginInput["$"],
++	} as PluginInput
++
++	pluginInput.client.session.messages =
++		(async () => ({ data: messages })) as unknown as PluginInput["client"]["session"]["messages"]
++
++	return pluginInput
++}
+-- 
+2.39.2
+

@@ -1,0 +1,381 @@
+From c9f762f980838a77d93f9dc776302382c9aaf89d Mon Sep 17 00:00:00 2001
+From: justsisyphus <sisyphus-dev-ai@users.noreply.github.com>
+Date: Fri, 16 Jan 2026 02:33:44 +0900
+Subject: [PATCH 1112/5749] fix(hooks): use API instead of filesystem to
+ resolve model info for session.prompt
+
+Previously, continuation hooks (todo-continuation, boulder-continuation, ralph-loop)
+and background tasks resolved model info from filesystem cache, which could be stale
+or missing. This caused session.prompt to fallback to default model (Sonnet) instead
+of using the originally configured model (e.g., Opus).
+
+Now all session.prompt calls first try API (session.messages) to get current model
+info, with filesystem as fallback if API fails.
+
+Affected files:
+- todo-continuation-enforcer.ts
+- sisyphus-orchestrator/index.ts
+- ralph-loop/index.ts
+- background-agent/manager.ts
+- sisyphus-task/tools.ts
+- hook-message-injector/index.ts (export ToolPermission type)
+---
+ src/features/background-agent/manager.ts    | 34 ++++++---
+ src/features/hook-message-injector/index.ts |  2 +-
+ src/hooks/ralph-loop/index.ts               | 30 ++++++--
+ src/hooks/sisyphus-orchestrator/index.ts    | 25 ++++--
+ src/hooks/todo-continuation-enforcer.ts     | 84 ++++++++++++++-------
+ src/tools/sisyphus-task/tools.ts            | 30 ++++++--
+ 6 files changed, 150 insertions(+), 55 deletions(-)
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 5860258f..2abc4cac 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -675,21 +675,33 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+ </system-reminder>`
+     }
+ 
+-    // Dynamically lookup the parent session's current message context
+-    // This ensures we use the CURRENT model/agent, not the stale one from task creation time
+-    const messageDir = getMessageDir(task.parentSessionID)
+-    const currentMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
++    let agent: string | undefined = task.parentAgent
++    let model: { providerID: string; modelID: string } | undefined
+ 
+-    const agent = currentMessage?.agent ?? task.parentAgent
+-    const model = currentMessage?.model?.providerID && currentMessage?.model?.modelID
+-      ? { providerID: currentMessage.model.providerID, modelID: currentMessage.model.modelID }
+-      : undefined
++    try {
++      const messagesResp = await this.client.session.messages({ path: { id: task.parentSessionID } })
++      const messages = (messagesResp.data ?? []) as Array<{
++        info?: { agent?: string; model?: { providerID: string; modelID: string } }
++      }>
++      for (let i = messages.length - 1; i >= 0; i--) {
++        const info = messages[i].info
++        if (info?.agent || info?.model) {
++          agent = info.agent ?? task.parentAgent
++          model = info.model
++          break
++        }
++      }
++    } catch {
++      const messageDir = getMessageDir(task.parentSessionID)
++      const currentMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
++      agent = currentMessage?.agent ?? task.parentAgent
++      model = currentMessage?.model?.providerID && currentMessage?.model?.modelID
++        ? { providerID: currentMessage.model.providerID, modelID: currentMessage.model.modelID }
++        : undefined
++    }
+ 
+     log("[background-agent] notifyParentSession context:", {
+       taskId: task.id,
+-      messageDir: !!messageDir,
+-      currentAgent: currentMessage?.agent,
+-      currentModel: currentMessage?.model,
+       resolvedAgent: agent,
+       resolvedModel: model,
+     })
+diff --git a/src/features/hook-message-injector/index.ts b/src/features/hook-message-injector/index.ts
+index fcb0624d..9a46758f 100644
+--- a/src/features/hook-message-injector/index.ts
++++ b/src/features/hook-message-injector/index.ts
+@@ -1,4 +1,4 @@
+ export { injectHookMessage, findNearestMessageWithFields, findFirstMessageWithAgent } from "./injector"
+ export type { StoredMessage } from "./injector"
+-export type { MessageMeta, OriginalMessageContext, TextPart } from "./types"
++export type { MessageMeta, OriginalMessageContext, TextPart, ToolPermission } from "./types"
+ export { MESSAGE_STORAGE } from "./constants"
+diff --git a/src/hooks/ralph-loop/index.ts b/src/hooks/ralph-loop/index.ts
+index 6fcc31c9..aef0cb3d 100644
+--- a/src/hooks/ralph-loop/index.ts
++++ b/src/hooks/ralph-loop/index.ts
+@@ -315,12 +315,30 @@ export function createRalphLoopHook(
+         .catch(() => {})
+ 
+       try {
+-        const messageDir = getMessageDir(sessionID)
+-        const currentMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
+-        const agent = currentMessage?.agent
+-        const model = currentMessage?.model?.providerID && currentMessage?.model?.modelID
+-          ? { providerID: currentMessage.model.providerID, modelID: currentMessage.model.modelID }
+-          : undefined
++        let agent: string | undefined
++        let model: { providerID: string; modelID: string } | undefined
++
++        try {
++          const messagesResp = await ctx.client.session.messages({ path: { id: sessionID } })
++          const messages = (messagesResp.data ?? []) as Array<{
++            info?: { agent?: string; model?: { providerID: string; modelID: string } }
++          }>
++          for (let i = messages.length - 1; i >= 0; i--) {
++            const info = messages[i].info
++            if (info?.agent || info?.model) {
++              agent = info.agent
++              model = info.model
++              break
++            }
++          }
++        } catch {
++          const messageDir = getMessageDir(sessionID)
++          const currentMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
++          agent = currentMessage?.agent
++          model = currentMessage?.model?.providerID && currentMessage?.model?.modelID
++            ? { providerID: currentMessage.model.providerID, modelID: currentMessage.model.modelID }
++            : undefined
++        }
+ 
+         await ctx.client.session.prompt({
+           path: { id: sessionID },
+diff --git a/src/hooks/sisyphus-orchestrator/index.ts b/src/hooks/sisyphus-orchestrator/index.ts
+index e79bf271..b032cfe8 100644
+--- a/src/hooks/sisyphus-orchestrator/index.ts
++++ b/src/hooks/sisyphus-orchestrator/index.ts
+@@ -436,11 +436,26 @@ export function createSisyphusOrchestratorHook(
+     try {
+       log(`[${HOOK_NAME}] Injecting boulder continuation`, { sessionID, planName, remaining })
+ 
+-      const messageDir = getMessageDir(sessionID)
+-      const currentMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
+-      const model = currentMessage?.model?.providerID && currentMessage?.model?.modelID
+-        ? { providerID: currentMessage.model.providerID, modelID: currentMessage.model.modelID }
+-        : undefined
++      let model: { providerID: string; modelID: string } | undefined
++      try {
++        const messagesResp = await ctx.client.session.messages({ path: { id: sessionID } })
++        const messages = (messagesResp.data ?? []) as Array<{
++          info?: { model?: { providerID: string; modelID: string } }
++        }>
++        for (let i = messages.length - 1; i >= 0; i--) {
++          const msgModel = messages[i].info?.model
++          if (msgModel?.providerID && msgModel?.modelID) {
++            model = { providerID: msgModel.providerID, modelID: msgModel.modelID }
++            break
++          }
++        }
++      } catch {
++        const messageDir = getMessageDir(sessionID)
++        const currentMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
++        model = currentMessage?.model?.providerID && currentMessage?.model?.modelID
++          ? { providerID: currentMessage.model.providerID, modelID: currentMessage.model.modelID }
++          : undefined
++      }
+ 
+       await ctx.client.session.prompt({
+         path: { id: sessionID },
+diff --git a/src/hooks/todo-continuation-enforcer.ts b/src/hooks/todo-continuation-enforcer.ts
+index 0c4966ea..e88103a0 100644
+--- a/src/hooks/todo-continuation-enforcer.ts
++++ b/src/hooks/todo-continuation-enforcer.ts
+@@ -6,6 +6,7 @@ import { getMainSessionID, subagentSessions } from "../features/claude-code-sess
+ import {
+     findNearestMessageWithFields,
+     MESSAGE_STORAGE,
++    type ToolPermission,
+ } from "../features/hook-message-injector"
+ import { log } from "../shared/logger"
+ 
+@@ -151,7 +152,18 @@ export function createTodoContinuationEnforcer(
+     }).catch(() => {})
+   }
+ 
+-  async function injectContinuation(sessionID: string, incompleteCount: number, total: number): Promise<void> {
++  interface ResolvedMessageInfo {
++    agent?: string
++    model?: { providerID: string; modelID: string }
++    tools?: Record<string, ToolPermission>
++  }
++
++  async function injectContinuation(
++    sessionID: string,
++    incompleteCount: number,
++    total: number,
++    resolvedInfo?: ResolvedMessageInfo
++  ): Promise<void> {
+     const state = sessions.get(sessionID)
+ 
+     if (state?.isRecovering) {
+@@ -159,8 +171,6 @@ export function createTodoContinuationEnforcer(
+       return
+     }
+ 
+-
+-
+     const hasRunningBgTasks = backgroundManager
+       ? backgroundManager.getTasksByParentSession(sessionID).some(t => t.status === "running")
+       : false
+@@ -185,38 +195,44 @@ export function createTodoContinuationEnforcer(
+       return
+     }
+ 
+-    const messageDir = getMessageDir(sessionID)
+-    const prevMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
++    let agentName = resolvedInfo?.agent
++    let model = resolvedInfo?.model
++    let tools = resolvedInfo?.tools
++
++    if (!agentName || !model) {
++      const messageDir = getMessageDir(sessionID)
++      const prevMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
++      agentName = agentName ?? prevMessage?.agent
++      model = model ?? (prevMessage?.model?.providerID && prevMessage?.model?.modelID
++        ? { providerID: prevMessage.model.providerID, modelID: prevMessage.model.modelID }
++        : undefined)
++      tools = tools ?? prevMessage?.tools
++    }
+ 
+-    const agentName = prevMessage?.agent
+     if (agentName && skipAgents.includes(agentName)) {
+       log(`[${HOOK_NAME}] Skipped: agent in skipAgents list`, { sessionID, agent: agentName })
+       return
+     }
+ 
+-    const editPermission = prevMessage?.tools?.edit
+-    const writePermission = prevMessage?.tools?.write
+-    const hasWritePermission = !prevMessage?.tools ||
++    const editPermission = tools?.edit
++    const writePermission = tools?.write
++    const hasWritePermission = !tools ||
+       ((editPermission !== false && editPermission !== "deny") &&
+        (writePermission !== false && writePermission !== "deny"))
+     if (!hasWritePermission) {
+-      log(`[${HOOK_NAME}] Skipped: agent lacks write permission`, { sessionID, agent: prevMessage?.agent })
++      log(`[${HOOK_NAME}] Skipped: agent lacks write permission`, { sessionID, agent: agentName })
+       return
+     }
+ 
+     const prompt = `${CONTINUATION_PROMPT}\n\n[Status: ${todos.length - freshIncompleteCount}/${todos.length} completed, ${freshIncompleteCount} remaining]`
+ 
+-    const model = prevMessage?.model?.providerID && prevMessage?.model?.modelID
+-      ? { providerID: prevMessage.model.providerID, modelID: prevMessage.model.modelID }
+-      : undefined
+-
+     try {
+-      log(`[${HOOK_NAME}] Injecting continuation`, { sessionID, agent: prevMessage?.agent, model, incompleteCount: freshIncompleteCount })
++      log(`[${HOOK_NAME}] Injecting continuation`, { sessionID, agent: agentName, model, incompleteCount: freshIncompleteCount })
+ 
+       await ctx.client.session.prompt({
+         path: { id: sessionID },
+         body: {
+-          agent: prevMessage?.agent,
++          agent: agentName,
+           ...(model !== undefined ? { model } : {}),
+           parts: [{ type: "text", text: prompt }],
+         },
+@@ -229,7 +245,12 @@ export function createTodoContinuationEnforcer(
+     }
+   }
+ 
+-  function startCountdown(sessionID: string, incompleteCount: number, total: number): void {
++  function startCountdown(
++    sessionID: string,
++    incompleteCount: number,
++    total: number,
++    resolvedInfo?: ResolvedMessageInfo
++  ): void {
+     const state = getState(sessionID)
+     cancelCountdown(sessionID)
+ 
+@@ -246,7 +267,7 @@ export function createTodoContinuationEnforcer(
+ 
+     state.countdownTimer = setTimeout(() => {
+       cancelCountdown(sessionID)
+-      injectContinuation(sessionID, incompleteCount, total)
++      injectContinuation(sessionID, incompleteCount, total, resolvedInfo)
+     }, COUNTDOWN_SECONDS * 1000)
+ 
+     log(`[${HOOK_NAME}] Countdown started`, { sessionID, seconds: COUNTDOWN_SECONDS, incompleteCount })
+@@ -350,15 +371,26 @@ export function createTodoContinuationEnforcer(
+         return
+       }
+ 
+-      let agentName: string | undefined
++      let resolvedInfo: ResolvedMessageInfo | undefined
+       try {
+         const messagesResp = await ctx.client.session.messages({
+           path: { id: sessionID },
+         })
+-        const messages = (messagesResp.data ?? []) as Array<{ info?: { agent?: string } }>
++        const messages = (messagesResp.data ?? []) as Array<{
++          info?: {
++            agent?: string
++            model?: { providerID: string; modelID: string }
++            tools?: Record<string, ToolPermission>
++          }
++        }>
+         for (let i = messages.length - 1; i >= 0; i--) {
+-          if (messages[i].info?.agent) {
+-            agentName = messages[i].info?.agent
++          const info = messages[i].info
++          if (info?.agent || info?.model) {
++            resolvedInfo = {
++              agent: info.agent,
++              model: info.model,
++              tools: info.tools,
++            }
+             break
+           }
+         }
+@@ -366,13 +398,13 @@ export function createTodoContinuationEnforcer(
+         log(`[${HOOK_NAME}] Failed to fetch messages for agent check`, { sessionID, error: String(err) })
+       }
+ 
+-      log(`[${HOOK_NAME}] Agent check`, { sessionID, agentName, skipAgents })
+-      if (agentName && skipAgents.includes(agentName)) {
+-        log(`[${HOOK_NAME}] Skipped: agent in skipAgents list`, { sessionID, agent: agentName })
++      log(`[${HOOK_NAME}] Agent check`, { sessionID, agentName: resolvedInfo?.agent, skipAgents })
++      if (resolvedInfo?.agent && skipAgents.includes(resolvedInfo.agent)) {
++        log(`[${HOOK_NAME}] Skipped: agent in skipAgents list`, { sessionID, agent: resolvedInfo.agent })
+         return
+       }
+ 
+-      startCountdown(sessionID, incompleteCount, todos.length)
++      startCountdown(sessionID, incompleteCount, todos.length, resolvedInfo)
+       return
+     }
+ 
+diff --git a/src/tools/sisyphus-task/tools.ts b/src/tools/sisyphus-task/tools.ts
+index b499dd89..e6ee744f 100644
+--- a/src/tools/sisyphus-task/tools.ts
++++ b/src/tools/sisyphus-task/tools.ts
+@@ -279,12 +279,30 @@ Use \`background_output\` with task_id="${task.id}" to check progress.`
+         })
+ 
+         try {
+-          const resumeMessageDir = getMessageDir(args.resume)
+-          const resumeMessage = resumeMessageDir ? findNearestMessageWithFields(resumeMessageDir) : null
+-          const resumeAgent = resumeMessage?.agent
+-          const resumeModel = resumeMessage?.model?.providerID && resumeMessage?.model?.modelID
+-            ? { providerID: resumeMessage.model.providerID, modelID: resumeMessage.model.modelID }
+-            : undefined
++          let resumeAgent: string | undefined
++          let resumeModel: { providerID: string; modelID: string } | undefined
++
++          try {
++            const messagesResp = await client.session.messages({ path: { id: args.resume } })
++            const messages = (messagesResp.data ?? []) as Array<{
++              info?: { agent?: string; model?: { providerID: string; modelID: string } }
++            }>
++            for (let i = messages.length - 1; i >= 0; i--) {
++              const info = messages[i].info
++              if (info?.agent || info?.model) {
++                resumeAgent = info.agent
++                resumeModel = info.model
++                break
++              }
++            }
++          } catch {
++            const resumeMessageDir = getMessageDir(args.resume)
++            const resumeMessage = resumeMessageDir ? findNearestMessageWithFields(resumeMessageDir) : null
++            resumeAgent = resumeMessage?.agent
++            resumeModel = resumeMessage?.model?.providerID && resumeMessage?.model?.modelID
++              ? { providerID: resumeMessage.model.providerID, modelID: resumeMessage.model.modelID }
++              : undefined
++          }
+ 
+           await client.session.prompt({
+             path: { id: args.resume },
+-- 
+2.39.2
+

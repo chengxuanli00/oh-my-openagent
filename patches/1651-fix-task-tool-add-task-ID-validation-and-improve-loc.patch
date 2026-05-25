@@ -1,0 +1,493 @@
+From 134dc7687e14cd2975888783224d3adecb37711d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 1 Feb 2026 23:48:48 +0900
+Subject: [PATCH 1651/5749] fix(task-tool): add task ID validation and improve
+ lock acquisition safety
+
+- Add task ID pattern validation (T-[A-Za-z0-9-]+) to prevent path traversal
+- Refactor lock mechanism to use UUID-based IDs for reliable ownership tracking
+- Implement atomic lock creation with stale lock detection and cleanup
+- Add lock acquisition checks in create/update/delete handlers
+- Expand task-reminder hook to track split tool names and clean up on session deletion
+- Add comprehensive test coverage for validation and lock handling
+---
+ assets/oh-my-opencode.schema.json     | 32 ++-----------
+ src/config/schema.ts                  |  2 +-
+ src/features/claude-tasks/AGENTS.md   |  6 +--
+ src/features/claude-tasks/storage.ts  | 66 +++++++++++++++++++-------
+ src/hooks/task-reminder/index.test.ts | 25 ++++++++++
+ src/hooks/task-reminder/index.ts      | 18 ++++++-
+ src/plugin-config.ts                  |  7 ++-
+ src/tools/task/task.test.ts           | 67 +++++++++++++++++++++++++++
+ src/tools/task/task.ts                | 37 +++++++++++++--
+ 9 files changed, 206 insertions(+), 54 deletions(-)
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index f0d4d3c8..658e1778 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -8,6 +8,9 @@
+     "$schema": {
+       "type": "string"
+     },
++    "new_task_system_enabled": {
++      "type": "boolean"
++    },
+     "disabled_mcps": {
+       "type": "array",
+       "items": {
+@@ -83,7 +86,8 @@
+           "start-work",
+           "atlas",
+           "unstable-agent-babysitter",
+-          "stop-continuation-guard"
++          "stop-continuation-guard",
++          "tasks-todowrite-disabler"
+         ]
+       }
+     },
+@@ -3005,10 +3009,6 @@
+         "tasks": {
+           "type": "object",
+           "properties": {
+-            "enabled": {
+-              "default": false,
+-              "type": "boolean"
+-            },
+             "storage_path": {
+               "default": ".sisyphus/tasks",
+               "type": "string"
+@@ -3018,28 +3018,6 @@
+               "type": "boolean"
+             }
+           }
+-        },
+-        "swarm": {
+-          "type": "object",
+-          "properties": {
+-            "enabled": {
+-              "default": false,
+-              "type": "boolean"
+-            },
+-            "storage_path": {
+-              "default": ".sisyphus/teams",
+-              "type": "string"
+-            },
+-            "ui_mode": {
+-              "default": "toast",
+-              "type": "string",
+-              "enum": [
+-                "toast",
+-                "tmux",
+-                "both"
+-              ]
+-            }
+-          }
+         }
+       }
+     }
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index 7c84588f..293435ad 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -365,7 +365,7 @@ export const SisyphusConfigSchema = z.object({
+ export const OhMyOpenCodeConfigSchema = z.object({
+   $schema: z.string().optional(),
+   /** Enable new task system (default: false) */
+-  new_task_system_enabled: z.boolean().default(false),
++  new_task_system_enabled: z.boolean().optional(),
+   disabled_mcps: z.array(AnyMcpNameSchema).optional(),
+   disabled_agents: z.array(BuiltinAgentNameSchema).optional(),
+   disabled_skills: z.array(BuiltinSkillNameSchema).optional(),
+diff --git a/src/features/claude-tasks/AGENTS.md b/src/features/claude-tasks/AGENTS.md
+index abf36429..ce5ae4a2 100644
+--- a/src/features/claude-tasks/AGENTS.md
++++ b/src/features/claude-tasks/AGENTS.md
+@@ -40,9 +40,9 @@ interface Task {
+ 
+ ## STORAGE UTILITIES
+ 
+-### getTaskDir(teamName, config)
++### getTaskDir(config)
+ 
+-Returns: `.sisyphus/tasks/{teamName}` (or custom path from config)
++Returns: `.sisyphus/tasks` (or custom path from config)
+ 
+ ### readJsonSafe(filePath, schema)
+ 
+@@ -80,7 +80,7 @@ Returns: `.sisyphus/tasks/{teamName}` (or custom path from config)
+ ```typescript
+ import { TaskSchema, getTaskDir, readJsonSafe, writeJsonAtomic, acquireLock } from "./features/claude-tasks"
+ 
+-const taskDir = getTaskDir("my-team", config)
++const taskDir = getTaskDir(config)
+ const lock = acquireLock(taskDir)
+ 
+ try {
+diff --git a/src/features/claude-tasks/storage.ts b/src/features/claude-tasks/storage.ts
+index a8e1cbab..e889c1df 100644
+--- a/src/features/claude-tasks/storage.ts
++++ b/src/features/claude-tasks/storage.ts
+@@ -73,37 +73,69 @@ export function listTaskFiles(config: Partial<OhMyOpenCodeConfig> = {}): string[
+ 
+ export function acquireLock(dirPath: string): { acquired: boolean; release: () => void } {
+   const lockPath = join(dirPath, ".lock")
+-  const now = Date.now()
++  const lockId = randomUUID()
+ 
+-  if (existsSync(lockPath)) {
++  const createLock = (timestamp: number) => {
++    writeFileSync(lockPath, JSON.stringify({ id: lockId, timestamp }), {
++      encoding: "utf-8",
++      flag: "wx",
++    })
++  }
++
++  const isStale = () => {
+     try {
+       const lockContent = readFileSync(lockPath, "utf-8")
+       const lockData = JSON.parse(lockContent)
+-      const lockAge = now - lockData.timestamp
+-
+-      if (lockAge <= STALE_LOCK_THRESHOLD_MS) {
+-        return {
+-          acquired: false,
+-          release: () => {
+-            // No-op release for failed acquisition
+-          },
+-        }
+-      }
++      const lockAge = Date.now() - lockData.timestamp
++      return lockAge > STALE_LOCK_THRESHOLD_MS
+     } catch {
+-      // If lock file is corrupted, treat as stale and override
++      return true
++    }
++  }
++
++  const tryAcquire = () => {
++    const now = Date.now()
++    try {
++      createLock(now)
++      return true
++    } catch (error) {
++      if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
++        return false
++      }
++      throw error
+     }
+   }
+ 
+   ensureDir(dirPath)
+-  writeFileSync(lockPath, JSON.stringify({ timestamp: now }), "utf-8")
++
++  let acquired = tryAcquire()
++  if (!acquired && isStale()) {
++    try {
++      unlinkSync(lockPath)
++    } catch {
++      // Ignore cleanup errors
++    }
++    acquired = tryAcquire()
++  }
++
++  if (!acquired) {
++    return {
++      acquired: false,
++      release: () => {
++        // No-op release for failed acquisition
++      },
++    }
++  }
+ 
+   return {
+     acquired: true,
+     release: () => {
+       try {
+-        if (existsSync(lockPath)) {
+-          unlinkSync(lockPath)
+-        }
++        if (!existsSync(lockPath)) return
++        const lockContent = readFileSync(lockPath, "utf-8")
++        const lockData = JSON.parse(lockContent)
++        if (lockData.id !== lockId) return
++        unlinkSync(lockPath)
+       } catch {
+         // Ignore cleanup errors
+       }
+diff --git a/src/hooks/task-reminder/index.test.ts b/src/hooks/task-reminder/index.test.ts
+index aab0f8ee..db43ac58 100644
+--- a/src/hooks/task-reminder/index.test.ts
++++ b/src/hooks/task-reminder/index.test.ts
+@@ -122,4 +122,29 @@ describe("TaskReminderHook", () => {
+     expect(output1.output).toContain("task tools haven't been used")
+     expect(output2.output).not.toContain("task tools haven't been used")
+   })
++
++  test("cleans up counters on session.deleted", async () => {
++    //#given
++    const sessionID = "test-session"
++    const output = { output: "Result" }
++
++    //#when
++    for (let i = 0; i < 10; i++) {
++      await hook["tool.execute.after"]?.(
++        { tool: "bash", sessionID, callID: `call-${i}` },
++        output
++      )
++    }
++    await hook.event?.({ event: { type: "session.deleted", properties: { info: { id: sessionID } } } })
++    const outputAfterDelete = { output: "Result" }
++    for (let i = 0; i < 9; i++) {
++      await hook["tool.execute.after"]?.(
++        { tool: "bash", sessionID, callID: `call-after-${i}` },
++        outputAfterDelete
++      )
++    }
++
++    //#then
++    expect(outputAfterDelete.output).not.toContain("task tools haven't been used")
++  })
+ })
+diff --git a/src/hooks/task-reminder/index.ts b/src/hooks/task-reminder/index.ts
+index 05b421a0..4e795018 100644
+--- a/src/hooks/task-reminder/index.ts
++++ b/src/hooks/task-reminder/index.ts
+@@ -1,10 +1,17 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ 
+-const TASK_TOOLS = new Set(["task"])
++const TASK_TOOLS = new Set([
++  "task",
++  "task_create",
++  "task_list",
++  "task_get",
++  "task_update",
++  "task_delete",
++])
+ const TURN_THRESHOLD = 10
+ const REMINDER_MESSAGE = `
+ 
+-The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status (set to in_progress when starting, completed when done).`
++The task tools haven't been used recently. If you're tracking work, use task with action=create/update (or task_create/task_update) to record progress.`
+ 
+ interface ToolExecuteInput {
+   tool: string
+@@ -41,5 +48,12 @@ export function createTaskReminderHook(_ctx: PluginInput) {
+ 
+   return {
+     "tool.execute.after": toolExecuteAfter,
++    event: async ({ event }: { event: { type: string; properties?: unknown } }) => {
++      if (event.type !== "session.deleted") return
++      const props = event.properties as { info?: { id?: string } } | undefined
++      const sessionId = props?.info?.id
++      if (!sessionId) return
++      sessionCounters.delete(sessionId)
++    },
+   }
+ }
+diff --git a/src/plugin-config.ts b/src/plugin-config.ts
+index 7a6bd1b3..3f560839 100644
+--- a/src/plugin-config.ts
++++ b/src/plugin-config.ts
+@@ -113,7 +113,7 @@ export function loadPluginConfig(
+ 
+   // Load user config first (base)
+   let config: OhMyOpenCodeConfig =
+-    loadConfigFromPath(userConfigPath, ctx) ?? { new_task_system_enabled: false };
++    loadConfigFromPath(userConfigPath, ctx) ?? {};
+ 
+   // Override with project config
+   const projectConfig = loadConfigFromPath(projectConfigPath, ctx);
+@@ -121,6 +121,11 @@ export function loadPluginConfig(
+     config = mergeConfigs(config, projectConfig);
+   }
+ 
++  config = {
++    ...config,
++    new_task_system_enabled: config.new_task_system_enabled ?? false,
++  };
++
+   log("Final merged config", {
+     agents: config.agents,
+     disabled_agents: config.disabled_agents,
+diff --git a/src/tools/task/task.test.ts b/src/tools/task/task.test.ts
+index 1d157055..7bd9809c 100644
+--- a/src/tools/task/task.test.ts
++++ b/src/tools/task/task.test.ts
+@@ -351,6 +351,22 @@ describe("task_tool", () => {
+       expect(result.task).toBeNull()
+     })
+ 
++    test("rejects invalid task id", async () => {
++      //#given
++      const args = {
++        action: "get" as const,
++        id: "../package",
++      }
++
++      //#when
++      const resultStr = await taskTool.execute(args, TEST_CONTEXT)
++      const result = JSON.parse(resultStr)
++
++      //#then
++      expect(result).toHaveProperty("error")
++      expect(result.error).toBe("invalid_task_id")
++    })
++
+     test("returns result as JSON string with task property", async () => {
+       //#given
+       const testId = await createTestTask("Test task")
+@@ -480,6 +496,41 @@ describe("task_tool", () => {
+       expect(result.error).toBe("task_not_found")
+     })
+ 
++    test("rejects invalid task id", async () => {
++      //#given
++      const args = {
++        action: "update" as const,
++        id: "../package",
++        title: "New title",
++      }
++
++      //#when
++      const resultStr = await taskTool.execute(args, TEST_CONTEXT)
++      const result = JSON.parse(resultStr)
++
++      //#then
++      expect(result).toHaveProperty("error")
++      expect(result.error).toBe("invalid_task_id")
++    })
++
++    test("returns lock unavailable when lock is held", async () => {
++      //#given
++      writeFileSync(join(TEST_DIR, ".lock"), JSON.stringify({ id: "test", timestamp: Date.now() }))
++      const args = {
++        action: "update" as const,
++        id: "T-nonexistent",
++        title: "New title",
++      }
++
++      //#when
++      const resultStr = await taskTool.execute(args, TEST_CONTEXT)
++      const result = JSON.parse(resultStr)
++
++      //#then
++      expect(result).toHaveProperty("error")
++      expect(result.error).toBe("task_lock_unavailable")
++    })
++
+     test("returns result as JSON string with task property", async () => {
+       //#given
+       const testId = await createTestTask("Test task")
+@@ -574,6 +625,22 @@ describe("task_tool", () => {
+       expect(result.error).toBe("task_not_found")
+     })
+ 
++    test("rejects invalid task id", async () => {
++      //#given
++      const args = {
++        action: "delete" as const,
++        id: "../package",
++      }
++
++      //#when
++      const resultStr = await taskTool.execute(args, TEST_CONTEXT)
++      const result = JSON.parse(resultStr)
++
++      //#then
++      expect(result).toHaveProperty("error")
++      expect(result.error).toBe("invalid_task_id")
++    })
++
+     test("returns result as JSON string", async () => {
+       //#given
+       const testId = await createTestTask("Test task")
+diff --git a/src/tools/task/task.ts b/src/tools/task/task.ts
+index 5e2d7534..25432fd7 100644
+--- a/src/tools/task/task.ts
++++ b/src/tools/task/task.ts
+@@ -27,6 +27,13 @@ import {
+   listTaskFiles,
+ } from "../../features/claude-tasks/storage"
+ 
++const TASK_ID_PATTERN = /^T-[A-Za-z0-9-]+$/
++
++function parseTaskId(id: string): string | null {
++  if (!TASK_ID_PATTERN.test(id)) return null
++  return id
++}
++
+ export function createTask(config: Partial<OhMyOpenCodeConfig>): ToolDefinition {
+   return tool({
+     description: `Unified task management tool with create, list, get, update, delete actions.
+@@ -88,6 +95,10 @@ async function handleCreate(
+   const taskDir = getTaskDir(config)
+   const lock = acquireLock(taskDir)
+ 
++  if (!lock.acquired) {
++    return JSON.stringify({ error: "task_lock_unavailable" })
++  }
++
+   try {
+     const taskId = generateTaskId()
+     const task: TaskObject = {
+@@ -176,8 +187,12 @@ async function handleGet(
+   config: Partial<OhMyOpenCodeConfig>
+ ): Promise<string> {
+   const validatedArgs = TaskGetInputSchema.parse(args)
++  const taskId = parseTaskId(validatedArgs.id)
++  if (!taskId) {
++    return JSON.stringify({ error: "invalid_task_id" })
++  }
+   const taskDir = getTaskDir(config)
+-  const taskPath = join(taskDir, `${validatedArgs.id}.json`)
++  const taskPath = join(taskDir, `${taskId}.json`)
+ 
+   const task = readJsonSafe(taskPath, TaskObjectSchema)
+ 
+@@ -189,11 +204,19 @@ async function handleUpdate(
+   config: Partial<OhMyOpenCodeConfig>
+ ): Promise<string> {
+   const validatedArgs = TaskUpdateInputSchema.parse(args)
++  const taskId = parseTaskId(validatedArgs.id)
++  if (!taskId) {
++    return JSON.stringify({ error: "invalid_task_id" })
++  }
+   const taskDir = getTaskDir(config)
+   const lock = acquireLock(taskDir)
+ 
++  if (!lock.acquired) {
++    return JSON.stringify({ error: "task_lock_unavailable" })
++  }
++
+   try {
+-    const taskPath = join(taskDir, `${validatedArgs.id}.json`)
++    const taskPath = join(taskDir, `${taskId}.json`)
+     const task = readJsonSafe(taskPath, TaskObjectSchema)
+ 
+     if (!task) {
+@@ -234,11 +257,19 @@ async function handleDelete(
+   config: Partial<OhMyOpenCodeConfig>
+ ): Promise<string> {
+   const validatedArgs = TaskDeleteInputSchema.parse(args)
++  const taskId = parseTaskId(validatedArgs.id)
++  if (!taskId) {
++    return JSON.stringify({ error: "invalid_task_id" })
++  }
+   const taskDir = getTaskDir(config)
+   const lock = acquireLock(taskDir)
+ 
++  if (!lock.acquired) {
++    return JSON.stringify({ error: "task_lock_unavailable" })
++  }
++
+   try {
+-    const taskPath = join(taskDir, `${validatedArgs.id}.json`)
++    const taskPath = join(taskDir, `${taskId}.json`)
+ 
+     if (!existsSync(taskPath)) {
+       return JSON.stringify({ error: "task_not_found" })
+-- 
+2.39.2
+

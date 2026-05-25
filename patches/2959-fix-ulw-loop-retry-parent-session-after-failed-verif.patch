@@ -1,0 +1,406 @@
+From 8ec2c44615b94354223ef65818f75f105af22cec Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 7 Mar 2026 04:54:37 +0900
+Subject: [PATCH 2959/5749] fix(ulw-loop): retry parent session after failed
+ verification
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../ralph-loop/continuation-prompt-builder.ts |  26 ++++
+ src/hooks/ralph-loop/loop-state-controller.ts |  23 ++++
+ .../ralph-loop/ralph-loop-event-handler.ts    |  34 ++++-
+ .../ralph-loop/ulw-loop-verification.test.ts  | 122 ++++++++++++++++++
+ .../verification-failure-handler.ts           |  99 ++++++++++++++
+ 5 files changed, 300 insertions(+), 4 deletions(-)
+ create mode 100644 src/hooks/ralph-loop/verification-failure-handler.ts
+
+diff --git a/src/hooks/ralph-loop/continuation-prompt-builder.ts b/src/hooks/ralph-loop/continuation-prompt-builder.ts
+index ede8561f..8d807fe3 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-builder.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-builder.ts
+@@ -31,6 +31,20 @@ REQUIRED NOW:
+ Original task:
+ {{PROMPT}}`
+ 
++const ULTRAWORK_VERIFICATION_FAILED_PROMPT = `${SYSTEM_DIRECTIVE_PREFIX} - ULTRAWORK LOOP VERIFICATION FAILED {{ITERATION}}/{{MAX}}]
++
++Oracle did not emit <promise>VERIFIED</promise>. Verification failed.
++
++REQUIRED NOW:
++- Verification failed. Fix the task until Oracle's review is satisfied
++- Oracle does not lie. Treat the verification result as ground truth
++- Do not claim completion early or argue with the failed verification
++- After fixing the remaining issues, request Oracle review again using task(subagent_type="oracle", load_skills=[], run_in_background=false, ...)
++- Only when the work is ready for review again, output: <promise>{{PROMISE}}</promise>
++
++Original task:
++{{PROMPT}}`
++
+ export function buildContinuationPrompt(state: RalphLoopState): string {
+ 	const template = state.verification_pending
+ 		? ULTRAWORK_VERIFICATION_PROMPT
+@@ -46,3 +60,15 @@ export function buildContinuationPrompt(state: RalphLoopState): string {
+ 
+ 	return state.ultrawork ? `ultrawork ${continuationPrompt}` : continuationPrompt
+ }
++
++export function buildVerificationFailurePrompt(state: RalphLoopState): string {
++	const continuationPrompt = ULTRAWORK_VERIFICATION_FAILED_PROMPT.replace(
++		"{{ITERATION}}",
++		String(state.iteration),
++	)
++		.replace("{{MAX}}", getMaxIterationsLabel(state))
++		.replace("{{PROMISE}}", state.completion_promise)
++		.replace("{{PROMPT}}", state.prompt)
++
++	return state.ultrawork ? `ultrawork ${continuationPrompt}` : continuationPrompt
++}
+diff --git a/src/hooks/ralph-loop/loop-state-controller.ts b/src/hooks/ralph-loop/loop-state-controller.ts
+index e1836aee..49be08da 100644
+--- a/src/hooks/ralph-loop/loop-state-controller.ts
++++ b/src/hooks/ralph-loop/loop-state-controller.ts
+@@ -150,5 +150,28 @@ export function createLoopStateController(options: {
+ 
+ 			return state
+ 		},
++
++		restartAfterFailedVerification(sessionID: string, messageCountAtStart?: number): RalphLoopState | null {
++			const state = readState(directory, stateDir)
++			if (!state || state.session_id !== sessionID || !state.ultrawork || !state.verification_pending) {
++				return null
++			}
++
++			state.iteration += 1
++			state.started_at = new Date().toISOString()
++			state.completion_promise = state.initial_completion_promise ?? DEFAULT_COMPLETION_PROMISE
++			state.verification_pending = undefined
++			state.verification_attempt_id = undefined
++			state.verification_session_id = undefined
++			if (typeof messageCountAtStart === "number") {
++				state.message_count_at_start = messageCountAtStart
++			}
++
++			if (!writeState(directory, state, stateDir)) {
++				return null
++			}
++
++			return state
++		},
+ 	}
+ }
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index 6861d051..bd41ce5b 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -9,6 +9,7 @@ import {
+ } from "./completion-promise-detector"
+ import { continueIteration } from "./iteration-continuation"
+ import { handleDeletedLoopSession, handleErroredLoopSession } from "./session-event-handler"
++import { handleFailedVerification } from "./verification-failure-handler"
+ 
+ type SessionRecovery = {
+ 	isRecovering: (sessionID: string) => boolean
+@@ -22,6 +23,7 @@ type LoopStateController = {
+ 	setSessionID: (sessionID: string) => RalphLoopState | null
+ 	markVerificationPending: (sessionID: string) => RalphLoopState | null
+ 	setVerificationSessionID: (sessionID: string, verificationSessionID: string) => RalphLoopState | null
++	restartAfterFailedVerification: (sessionID: string, messageCountAtStart?: number) => RalphLoopState | null
+ }
+ type RalphLoopEventHandlerOptions = { directory: string; apiTimeoutMs: number; getTranscriptPath: (sessionID: string) => string | undefined; checkSessionExists?: RalphLoopOptions["checkSessionExists"]; sessionRecovery: SessionRecovery; loopState: LoopStateController }
+ 
+@@ -57,7 +59,13 @@ export function createRalphLoopEventHandler(
+ 					return
+ 				}
+ 
+-				if (state.session_id && state.session_id !== sessionID) {
++				const verificationSessionID = state.verification_pending
++					? state.verification_session_id
++					: undefined
++				const matchesParentSession = state.session_id === undefined || state.session_id === sessionID
++				const matchesVerificationSession = verificationSessionID === sessionID
++
++				if (!matchesParentSession && !matchesVerificationSession && state.session_id) {
+ 					if (options.checkSessionExists) {
+ 						try {
+ 							const exists = await options.checkSessionExists(state.session_id)
+@@ -79,9 +87,6 @@ export function createRalphLoopEventHandler(
+ 					return
+ 				}
+ 
+-				const verificationSessionID = state.verification_pending
+-					? state.verification_session_id
+-					: undefined
+ 				const completionSessionID = verificationSessionID ?? (state.verification_pending ? undefined : sessionID)
+ 				const transcriptPath = completionSessionID ? options.getTranscriptPath(completionSessionID) : undefined
+ 				const completionViaTranscript = completionSessionID
+@@ -130,6 +135,27 @@ export function createRalphLoopEventHandler(
+ 					return
+ 				}
+ 
++				if (state.verification_pending) {
++					if (verificationSessionID && matchesVerificationSession) {
++						const restarted = await handleFailedVerification(ctx, {
++							state,
++							loopState: options.loopState,
++							directory: options.directory,
++							apiTimeoutMs: options.apiTimeoutMs,
++						})
++						if (restarted) {
++							return
++						}
++					}
++
++					log(`[${HOOK_NAME}] Waiting for oracle verification`, {
++						sessionID,
++						verificationSessionID,
++						iteration: state.iteration,
++					})
++					return
++				}
++
+ 				if (
+ 					typeof state.max_iterations === "number"
+ 					&& state.iteration >= state.max_iterations
+diff --git a/src/hooks/ralph-loop/ulw-loop-verification.test.ts b/src/hooks/ralph-loop/ulw-loop-verification.test.ts
+index 4506bee0..2018964b 100644
+--- a/src/hooks/ralph-loop/ulw-loop-verification.test.ts
++++ b/src/hooks/ralph-loop/ulw-loop-verification.test.ts
+@@ -103,6 +103,128 @@ describe("ulw-loop verification", () => {
+ 		expect(toastCalls.some((toast) => toast.title === "ULTRAWORK LOOP COMPLETE!")).toBe(true)
+ 	})
+ 
++	test("#given ulw loop is awaiting verification #when oracle session idles with VERIFIED #then loop completes without parent idle", async () => {
++		const hook = createRalphLoopHook(createMockPluginInput(), {
++			getTranscriptPath: (sessionID) => sessionID === "ses-oracle" ? oracleTranscriptPath : parentTranscriptPath,
++		})
++		hook.startLoop("session-123", "Build API", { ultrawork: true })
++		writeFileSync(
++			parentTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "done <promise>DONE</promise>" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++		writeState(testDir, {
++			...hook.getState()!,
++			verification_session_id: "ses-oracle",
++		})
++		writeFileSync(
++			oracleTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: `verified <promise>${ULTRAWORK_VERIFICATION_PROMISE}</promise>` } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "ses-oracle" } } })
++
++		expect(hook.getState()).toBeNull()
++		expect(toastCalls.some((toast) => toast.title === "ULTRAWORK LOOP COMPLETE!")).toBe(true)
++	})
++
++	test("#given ulw loop is awaiting verification without oracle session #when idle fires again #then loop waits instead of continuing", async () => {
++		const hook = createRalphLoopHook(createMockPluginInput(), {
++			getTranscriptPath: (sessionID) => sessionID === "ses-oracle" ? oracleTranscriptPath : parentTranscriptPath,
++		})
++		hook.startLoop("session-123", "Build API", { ultrawork: true })
++		writeFileSync(
++			parentTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "done <promise>DONE</promise>" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++		const stateAfterDone = hook.getState()
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++
++		expect(hook.getState()?.iteration).toBe(stateAfterDone?.iteration)
++		expect(promptCalls).toHaveLength(1)
++		expect(hook.getState()?.verification_pending).toBe(true)
++	})
++
++	test("#given ulw loop is awaiting oracle verification #when oracle has not verified yet #then loop waits instead of continuing", async () => {
++		const hook = createRalphLoopHook(createMockPluginInput(), {
++			getTranscriptPath: (sessionID) => sessionID === "ses-oracle" ? oracleTranscriptPath : parentTranscriptPath,
++		})
++		hook.startLoop("session-123", "Build API", { ultrawork: true })
++		writeFileSync(
++			parentTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "done <promise>DONE</promise>" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++		writeState(testDir, {
++			...hook.getState()!,
++			verification_session_id: "ses-oracle",
++		})
++		writeFileSync(
++			oracleTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "still checking" } })}\n`,
++		)
++		const stateBeforeWait = hook.getState()
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++
++		expect(hook.getState()?.iteration).toBe(stateBeforeWait?.iteration)
++		expect(promptCalls).toHaveLength(1)
++		expect(hook.getState()?.verification_session_id).toBe("ses-oracle")
++	})
++
++	test("#given oracle verification fails #when oracle session idles #then main session receives retry instructions", async () => {
++		const sessionMessages: Record<string, unknown[]> = {
++			"session-123": [{}, {}, {}],
++		}
++		const hook = createRalphLoopHook({
++			...createMockPluginInput(),
++			client: {
++				...createMockPluginInput().client,
++				session: {
++					...createMockPluginInput().client.session,
++					messages: async (opts: { path: { id: string } }) => ({
++						data: sessionMessages[opts.path.id] ?? [],
++					}),
++				},
++			},
++		} as Parameters<typeof createRalphLoopHook>[0], {
++			getTranscriptPath: (sessionID) => sessionID === "ses-oracle" ? oracleTranscriptPath : parentTranscriptPath,
++		})
++		hook.startLoop("session-123", "Build API", { ultrawork: true })
++		writeFileSync(
++			parentTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "done <promise>DONE</promise>" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "session-123" } } })
++		writeState(testDir, {
++			...hook.getState()!,
++			verification_session_id: "ses-oracle",
++		})
++		writeFileSync(
++			oracleTranscriptPath,
++			`${JSON.stringify({ type: "tool_result", timestamp: new Date().toISOString(), tool_output: { output: "verification failed: missing tests" } })}\n`,
++		)
++
++		await hook.event({ event: { type: "session.idle", properties: { sessionID: "ses-oracle" } } })
++
++		expect(hook.getState()?.iteration).toBe(2)
++		expect(hook.getState()?.completion_promise).toBe("DONE")
++		expect(hook.getState()?.verification_pending).toBeUndefined()
++		expect(hook.getState()?.verification_session_id).toBeUndefined()
++		expect(hook.getState()?.message_count_at_start).toBe(3)
++		expect(promptCalls).toHaveLength(2)
++		expect(promptCalls[1]?.sessionID).toBe("session-123")
++		expect(promptCalls[1]?.text).toContain("Verification failed")
++		expect(promptCalls[1]?.text).toContain("Oracle does not lie")
++		expect(promptCalls[1]?.text).toContain('task(subagent_type="oracle"')
++	})
++
+ 	test("#given ulw loop without max iterations #when it continues #then it stays unbounded", async () => {
+ 		const hook = createRalphLoopHook(createMockPluginInput(), {
+ 			getTranscriptPath: (sessionID) => sessionID === "ses-oracle" ? oracleTranscriptPath : parentTranscriptPath,
+diff --git a/src/hooks/ralph-loop/verification-failure-handler.ts b/src/hooks/ralph-loop/verification-failure-handler.ts
+new file mode 100644
+index 00000000..5acd9084
+--- /dev/null
++++ b/src/hooks/ralph-loop/verification-failure-handler.ts
+@@ -0,0 +1,99 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared/logger"
++import { buildVerificationFailurePrompt } from "./continuation-prompt-builder"
++import { HOOK_NAME } from "./constants"
++import { injectContinuationPrompt } from "./continuation-prompt-injector"
++import type { RalphLoopState } from "./types"
++
++type LoopStateController = {
++	restartAfterFailedVerification: (
++		sessionID: string,
++		messageCountAtStart?: number,
++	) => RalphLoopState | null
++}
++
++function getMessageCountFromResponse(messagesResponse: unknown): number {
++	if (Array.isArray(messagesResponse)) {
++		return messagesResponse.length
++	}
++
++	if (
++		typeof messagesResponse === "object"
++		&& messagesResponse !== null
++		&& "data" in messagesResponse
++	) {
++		const data = (messagesResponse as { data?: unknown }).data
++		return Array.isArray(data) ? data.length : 0
++	}
++
++	return 0
++}
++
++async function getSessionMessageCount(
++	ctx: PluginInput,
++	sessionID: string,
++	directory: string,
++): Promise<number> {
++	const messagesResponse = await ctx.client.session.messages({
++		path: { id: sessionID },
++		query: { directory },
++	})
++
++	return getMessageCountFromResponse(messagesResponse)
++}
++
++export async function handleFailedVerification(
++	ctx: PluginInput,
++	input: {
++		state: RalphLoopState
++		directory: string
++		apiTimeoutMs: number
++		loopState: LoopStateController
++	},
++): Promise<boolean> {
++	const { state, directory, apiTimeoutMs, loopState } = input
++	const parentSessionID = state.session_id
++	if (!parentSessionID) {
++		return false
++	}
++
++	let messageCountAtStart: number
++	try {
++		messageCountAtStart = await getSessionMessageCount(ctx, parentSessionID, directory)
++	} catch (error) {
++		log(`[${HOOK_NAME}] Failed to read parent session before verification retry`, {
++			parentSessionID,
++			error: String(error),
++		})
++		return false
++	}
++
++	const resumedState = loopState.restartAfterFailedVerification(
++		parentSessionID,
++		messageCountAtStart,
++	)
++	if (!resumedState) {
++		log(`[${HOOK_NAME}] Failed to restart loop after verification failure`, {
++			parentSessionID,
++		})
++		return false
++	}
++
++	await injectContinuationPrompt(ctx, {
++		sessionID: parentSessionID,
++		prompt: buildVerificationFailurePrompt(resumedState),
++		directory,
++		apiTimeoutMs,
++	})
++
++	await ctx.client.tui?.showToast?.({
++		body: {
++			title: "ULTRAWORK LOOP",
++			message: "Oracle verification failed. Continuing ULTRAWORK loop.",
++			variant: "warning",
++			duration: 5000,
++		},
++	}).catch(() => {})
++
++	return true
++}
+-- 
+2.39.2
+

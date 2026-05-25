@@ -1,0 +1,142 @@
+From 8e9dea949ba1af53e1520b7017dcf2c3ec71bd94 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 18:43:53 +0900
+Subject: [PATCH 5211/5749] fix(session-recovery): persist dedupe across stale
+ repeated session.error
+
+processingErrors was emptied in a finally block, so a second
+session.error fired for the same assistant message id after the
+first recovery resolved would re-run abort, history fetch, the
+recovery toast, and any auto-resume promptAsync (resumeSession),
+producing duplicate internal prompt injections during stale event
+re-emission or polling-driven retries.
+
+Drop the in-flight delete and keep the dedupe permanent for the
+plugin lifetime. A genuinely new failure starts a new assistant
+message with a different id, so this never blocks future legitimate
+errors. Same-id duplicates collapse into a single recovery attempt.
+
+Add hook.test.ts asserting that two sequential handleSessionRecovery
+calls for the same recoverable info trigger session.abort, the
+recovery toast, and any internal promptAsync at most once.
+---
+ src/hooks/session-recovery/hook.test.ts | 86 +++++++++++++++++++++++++
+ src/hooks/session-recovery/hook.ts      |  9 ++-
+ 2 files changed, 93 insertions(+), 2 deletions(-)
+ create mode 100644 src/hooks/session-recovery/hook.test.ts
+
+diff --git a/src/hooks/session-recovery/hook.test.ts b/src/hooks/session-recovery/hook.test.ts
+new file mode 100644
+index 00000000..72056bcc
+--- /dev/null
++++ b/src/hooks/session-recovery/hook.test.ts
+@@ -0,0 +1,86 @@
++import { describe, expect, test } from "bun:test"
++import { createSessionRecoveryHook } from "./hook"
++
++type RecoverableInfo = Parameters<ReturnType<typeof createSessionRecoveryHook>["handleSessionRecovery"]>[0]
++
++function createPrefillErrorInfo(): RecoverableInfo {
++  return {
++    id: "msg_failed_prefill",
++    role: "assistant",
++    sessionID: "ses_recovery_dedupe",
++    error: { message: "This model does not support assistant message prefill." },
++  }
++}
++
++function createCountingCtx() {
++  const counts = { abort: 0, messages: 0, promptAsync: 0, toast: 0 }
++  const info = createPrefillErrorInfo()
++  const ctx = {
++    client: {
++      session: {
++        abort: async () => {
++          counts.abort++
++          return {}
++        },
++        messages: async () => {
++          counts.messages++
++          return {
++            data: [
++              {
++                info: {
++                  id: info.id,
++                  role: "assistant",
++                  error: info.error,
++                },
++              },
++            ],
++          }
++        },
++        promptAsync: async () => {
++          counts.promptAsync++
++          return {}
++        },
++      },
++      tui: {
++        showToast: async () => {
++          counts.toast++
++          return {}
++        },
++      },
++    },
++    directory: "/tmp/session-recovery-dedupe-test",
++  }
++  return { ctx, counts, info }
++}
++
++describe("session-recovery hook persistent dedupe", () => {
++  test("#given the same recoverable session.error fires twice for the same assistant message id #when handleSessionRecovery is called twice in sequence #then recovery side effects run only once", async () => {
++    // given
++    const { ctx, counts, info } = createCountingCtx()
++    const hook = createSessionRecoveryHook(ctx as never)
++
++    // when
++    await hook.handleSessionRecovery(info)
++    await hook.handleSessionRecovery(info)
++
++    // then
++    expect(counts.abort).toBe(1)
++    expect(counts.toast).toBe(1)
++    expect(counts.promptAsync).toBe(0)
++  })
++
++  test("#given a recovered assistant message id is later reused by a stale duplicate session.error #when handleSessionRecovery is called for that stale duplicate #then recovery is suppressed", async () => {
++    // given
++    const { ctx, counts, info } = createCountingCtx()
++    const hook = createSessionRecoveryHook(ctx as never)
++
++    // when
++    await hook.handleSessionRecovery(info)
++    await Promise.resolve()
++    const result = await hook.handleSessionRecovery(info)
++
++    // then
++    expect(result).toBe(false)
++    expect(counts.abort).toBe(1)
++  })
++})
+diff --git a/src/hooks/session-recovery/hook.ts b/src/hooks/session-recovery/hook.ts
+index aac3abc8..d3951b60 100644
+--- a/src/hooks/session-recovery/hook.ts
++++ b/src/hooks/session-recovery/hook.ts
+@@ -151,8 +151,13 @@ export function createSessionRecoveryHook(ctx: PluginInput, options?: SessionRec
+       log("[session-recovery] Recovery failed:", err)
+       return false
+     } finally {
+-      processingErrors.delete(assistantMsgID)
+-
++      // Keep assistantMsgID in processingErrors permanently so that a
++      // stale duplicate session.error for the SAME assistant message
++      // does not retrigger recovery (and a second resumeSession
++      // promptAsync injection) after the first attempt resolves.
++      // Successful recovery starts a new assistant message on the next
++      // turn with a different id, so this dedupe never blocks future
++      // legitimate errors.
+       if (sessionID && onRecoveryCompleteCallback) {
+         onRecoveryCompleteCallback(sessionID)
+       }
+-- 
+2.39.2
+

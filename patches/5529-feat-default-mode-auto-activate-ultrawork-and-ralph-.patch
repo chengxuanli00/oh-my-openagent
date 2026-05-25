@@ -1,0 +1,255 @@
+From e5463e2db7f22e9e22565e057a0c8ffb2c359aa4 Mon Sep 17 00:00:00 2001
+From: herjarsa <204746071+herjarsa@users.noreply.github.com>
+Date: Tue, 19 May 2026 15:35:21 +0200
+Subject: [PATCH 5529/5749] feat(default-mode): auto-activate ultrawork and
+ ralph loop without commands
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add new `default_mode` config section with two boolean fields:
+- `ultrawork`: Auto-inject ultrawork mode prompt on main session start
+  without requiring the "ultrawork"/"ulw" keyword. Wired through the
+  keyword-detector hook — injects once per session, respects existing
+  guards (non-OMO agents, planner agents, subagent sessions).
+- `ralph_loop`: Auto-start ralph loop on first main session message
+  without requiring /ralph-loop or /ulw-loop commands. When ultrawork
+  is also enabled, the loop starts in ultrawork mode.
+
+Usage:
+  ```jsonc
+  {
+    "default_mode": {
+      "ultrawork": true,    // Always get ultrawork prompt on start
+      "ralph_loop": true    // Auto-start ralph loop
+    }
+  }
+  ```
+
+Files: 7 modified/added, ~65 LOC added.
+---
+ src/config/index.ts                        |  1 +
+ src/config/schema.ts                       |  1 +
+ src/config/schema/default-mode.ts          | 18 ++++++++
+ src/config/schema/oh-my-opencode-config.ts |  3 ++
+ src/hooks/keyword-detector/hook.ts         | 48 ++++++++++++++++++----
+ src/plugin/chat-message.ts                 | 19 +++++++++
+ src/plugin/hooks/create-transform-hooks.ts |  1 +
+ 7 files changed, 83 insertions(+), 8 deletions(-)
+ create mode 100644 src/config/schema/default-mode.ts
+
+diff --git a/src/config/index.ts b/src/config/index.ts
+index c1572d5e..cfdc11db 100644
+--- a/src/config/index.ts
++++ b/src/config/index.ts
+@@ -13,6 +13,7 @@ export type {
+   SisyphusAgentConfig,
+   ExperimentalConfig,
+   DynamicContextPruningConfig,
++  DefaultModeConfig,
+   RalphLoopConfig,
+   TmuxConfig,
+   TmuxLayout,
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index 86ad7eca..4c5473c9 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -7,6 +7,7 @@ export * from "./schema/categories"
+ export * from "./schema/claude-code"
+ export * from "./schema/comment-checker"
+ export * from "./schema/commands"
++export * from "./schema/default-mode"
+ export * from "./schema/dynamic-context-pruning"
+ export * from "./schema/experimental"
+ export * from "./schema/fallback-models"
+diff --git a/src/config/schema/default-mode.ts b/src/config/schema/default-mode.ts
+new file mode 100644
+index 00000000..4c96b819
+--- /dev/null
++++ b/src/config/schema/default-mode.ts
+@@ -0,0 +1,18 @@
++import { z } from "zod"
++
++export const DefaultModeConfigSchema = z.object({
++  /**
++   * Automatically inject ultrawork mode prompt on main session start
++   * without requiring "ultrawork"/"ulw" keyword in the message.
++   * The ultrawork mode system prompt is injected once per session.
++   */
++  ultrawork: z.boolean().default(false),
++  /**
++   * Automatically start ralph loop on main session start
++   * without requiring /ralph-loop or /ulw-loop commands.
++   * When ultrawork is also enabled, the loop starts in ultrawork mode.
++   */
++  ralph_loop: z.boolean().default(false),
++})
++
++export type DefaultModeConfig = z.infer<typeof DefaultModeConfigSchema>
+diff --git a/src/config/schema/oh-my-opencode-config.ts b/src/config/schema/oh-my-opencode-config.ts
+index 197948bc..3ae85430 100644
+--- a/src/config/schema/oh-my-opencode-config.ts
++++ b/src/config/schema/oh-my-opencode-config.ts
+@@ -10,6 +10,7 @@ import { CategoriesConfigSchema } from "./categories"
+ import { ClaudeCodeConfigSchema } from "./claude-code"
+ import { CommentCheckerConfigSchema } from "./comment-checker"
+ import { BuiltinCommandNameSchema } from "./commands"
++import { DefaultModeConfigSchema } from "./default-mode"
+ import { ExperimentalConfigSchema } from "./experimental"
+ import { GitMasterConfigSchema } from "./git-master"
+ import { KeywordDetectorConfigSchema } from "./keyword-detector"
+@@ -81,6 +82,8 @@ export const OhMyOpenCodeConfigSchema = z.object({
+   tmux: TmuxConfigSchema.optional(),
+   sisyphus: SisyphusConfigSchema.optional(),
+   start_work: StartWorkConfigSchema.optional(),
++  /** Default mode auto-activation settings (ultrawork, ralph loop) */
++  default_mode: DefaultModeConfigSchema.optional(),
+   /** Migration history to prevent re-applying migrations (e.g., model version upgrades) */
+   _migrations: z.array(z.string()).optional(),
+ })
+diff --git a/src/hooks/keyword-detector/hook.ts b/src/hooks/keyword-detector/hook.ts
+index 83494c4f..1376ded9 100644
+--- a/src/hooks/keyword-detector/hook.ts
++++ b/src/hooks/keyword-detector/hook.ts
+@@ -1,4 +1,5 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
++import type { DefaultModeConfig } from "../../config/schema/default-mode"
+ import type { KeywordDetectorConfig } from "../../config/schema/keyword-detector"
+ import {
+   getMainSessionID,
+@@ -16,10 +17,12 @@ import {
+   removeSystemReminders,
+ } from "../../shared/system-directive"
+ import type { RalphLoopHook } from "../ralph-loop"
+-import { isNonOmoAgent, isPlannerAgent } from "./constants"
++import { getUltraworkMessage, isNonOmoAgent, isPlannerAgent } from "./constants"
+ import type { DetectedKeyword } from "./detector"
+ import { detectKeywordsWithType, extractPromptText, looksLikeSlashCommand } from "./detector"
+ 
++const defaultModeUltraworkInjectedSessions = new Set<string>()
++
+ function suppressComboStandalones(detected: DetectedKeyword[]): DetectedKeyword[] {
+   const hasCombo = detected.some((k) => k.type === "hyperplan-ultrawork")
+   if (!hasCombo) return detected
+@@ -31,6 +34,7 @@ export function createKeywordDetectorHook(
+   _collector?: ContextCollector,
+   _ralphLoop?: Pick<RalphLoopHook, "startLoop">,
+   config?: KeywordDetectorConfig,
++  defaultMode?: DefaultModeConfig,
+ ) {
+   const disabledKeywords = config?.disabled_keywords
+   function getRuntimeVariant(input: { variant?: string }, message: Record<string, unknown>): string | undefined {
+@@ -74,13 +78,11 @@ export function createKeywordDetectorHook(
+ 
+       const currentAgent = getSessionAgent(input.sessionID) ?? input.agent
+ 
+-      // Skip all keyword injection for non-OMO agents (e.g., OpenCode-Builder, Plan)
+       if (isNonOmoAgent(currentAgent)) {
+         log(`[keyword-detector] Skipping keyword injection for non-OMO agent`, { sessionID: input.sessionID, agent: currentAgent })
+         return
+       }
+ 
+-      // Remove system-reminder content to prevent automated system messages from triggering mode keywords
+       const cleanText = removeSystemReminders(promptText)
+       const modelID = input.model?.modelID
+       let detectedKeywords = detectKeywordsWithType(cleanText, currentAgent, modelID, disabledKeywords)
+@@ -96,19 +98,49 @@ export function createKeywordDetectorHook(
+         }
+       }
+ 
+-      if (detectedKeywords.length === 0) {
+-        return
+-      }
+-
+       const isBackgroundTaskSession = subagentSessions.has(input.sessionID)
+       if (isBackgroundTaskSession) {
+-        log(`[keyword-detector] Skipping keyword injection for background task session`, { sessionID: input.sessionID })
++        if (detectedKeywords.length > 0) {
++          log(`[keyword-detector] Skipping keyword injection for background task session`, { sessionID: input.sessionID })
++        }
+         return
+       }
+ 
+       const mainSessionID = getMainSessionID()
+       const isNonMainSession = mainSessionID && input.sessionID !== mainSessionID
+ 
++      if (detectedKeywords.length === 0) {
++        if (defaultMode?.ultrawork && !isNonMainSession && !defaultModeUltraworkInjectedSessions.has(input.sessionID)) {
++          defaultModeUltraworkInjectedSessions.add(input.sessionID)
++
++          const ultraworkMessage = getUltraworkMessage(currentAgent, modelID)
++          const textPartIndex = output.parts.findIndex(isRealUserTextPart)
++          if (textPartIndex >= 0) {
++            const originalText = output.parts[textPartIndex].text ?? ""
++            output.parts[textPartIndex].text = `${ultraworkMessage}\n\n---\n\n${originalText}`
++          }
++
++          log(`[keyword-detector] Default ultrawork mode auto-activated`, { sessionID: input.sessionID })
++
++          ctx.client.tui
++            .showToast({
++              body: {
++                title: "Ultrawork Mode Activated",
++                message: "Default ultrawork mode enabled. All agents at your disposal.",
++                variant: "success" as const,
++                duration: 3000,
++              },
++            })
++            .catch((err) =>
++              log(`[keyword-detector] Failed to show toast`, {
++                error: err,
++                sessionID: input.sessionID,
++              })
++            )
++        }
++        return
++      }
++
+       if (isNonMainSession) {
+         detectedKeywords = detectedKeywords.filter(
+           (k) => k.type === "ultrawork" || k.type === "hyperplan-ultrawork"
+diff --git a/src/plugin/chat-message.ts b/src/plugin/chat-message.ts
+index ca8577d8..b32c8656 100644
+--- a/src/plugin/chat-message.ts
++++ b/src/plugin/chat-message.ts
+@@ -304,6 +304,25 @@ export function createChatMessageHandler(args: {
+       } else if (isCancelRalphTemplate || rawLoopCommand?.command === "cancel-ralph") {
+         hooks.ralphLoop.cancelLoop(input.sessionID)
+       }
++
++      if (
++        !isRalphLoopTemplate
++        && !isUlwLoopTemplate
++        && !isCancelRalphTemplate
++        && !rawLoopCommand
++        && isFirstMessage
++        && pluginConfig.default_mode?.ralph_loop
++      ) {
++        const loopPrompt = promptText
++        const ultrawork = pluginConfig.default_mode?.ultrawork ?? false
++        hooks.ralphLoop.startLoop(input.sessionID, loopPrompt, {
++          ultrawork,
++        })
++        log("[chat-message] Default ralph loop auto-started", {
++          sessionID: input.sessionID,
++          ultrawork,
++        })
++      }
+     }
+ 
+     await applyUltraworkModelOverrideOnMessage(
+diff --git a/src/plugin/hooks/create-transform-hooks.ts b/src/plugin/hooks/create-transform-hooks.ts
+index 36fb4c4d..fe71aefd 100644
+--- a/src/plugin/hooks/create-transform-hooks.ts
++++ b/src/plugin/hooks/create-transform-hooks.ts
+@@ -61,6 +61,7 @@ export function createTransformHooks(args: {
+             contextCollector,
+             ralphLoop ?? undefined,
+             pluginConfig.keyword_detector,
++            pluginConfig.default_mode,
+           ),
+         { enabled: safeHookEnabled },
+       )
+-- 
+2.39.2
+

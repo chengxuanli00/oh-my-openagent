@@ -1,0 +1,303 @@
+From b03e463bde97c128a83c55252685866ee9a045f0 Mon Sep 17 00:00:00 2001
+From: Nguyen Khac Trung Kien <55886589+KNN-07@users.noreply.github.com>
+Date: Sat, 31 Jan 2026 14:01:19 +0700
+Subject: [PATCH 1601/5749] fix: prevent zombie processes with proper process
+ lifecycle management (#1306)
+
+* fix: prevent zombie processes with proper process lifecycle management
+
+- Await proc.exited for fire-and-forget spawns in tmux-utils.ts
+- Remove competing process.exit() calls from LSP client and skill-mcp-manager
+  signal handlers to let background-agent manager coordinate final exit
+- Await process exit after kill() in interactive-bash timeout handler
+- Await process exit after kill() in LSP client stop() method
+
+These changes ensure spawned processes are properly reaped and prevent
+orphan/zombie processes when running with tmux integration.
+
+* fix: address Copilot review comments on process cleanup
+
+- LSP cleanup: use async/sync split with Promise.allSettled for proper subprocess cleanup
+- LSP stop(): make idempotent by nulling proc before await to prevent race conditions
+- Interactive-bash timeout: use .then()/.catch() pattern instead of async callback to avoid unhandled rejections
+- Skill-mcp-manager: use void+catch pattern for fire-and-forget signal handlers
+
+* fix: address remaining Copilot review comments
+
+- interactive-bash: reject timeout immediately, fire-and-forget zombie cleanup
+- skill-mcp-manager: update comments to accurately describe signal handling strategy
+
+* fix: address additional Copilot review comments
+
+- LSP stop(): add 5s timeout to prevent indefinite hang on stuck processes
+- tmux-utils: log warnings when pane title setting fails (both spawn/replace)
+- BackgroundManager: delay process.exit() to next tick via setImmediate to allow other signal handlers to complete cleanup
+
+* fix: address code review findings
+
+- Increase exit delay from setImmediate to 100ms setTimeout to allow async cleanup
+- Use asyncCleanup for SIGBREAK on Windows for consistency with SIGINT/SIGTERM
+- Add try/catch around stderr read in spawnTmuxPane for consistency with replaceTmuxPane
+
+* fix: address latest Copilot review comments
+
+- LSP stop(): properly clear timeout when proc.exited wins the race
+- BackgroundManager: use process.exitCode before delayed exit for cleaner shutdown
+- spawnTmuxPane: remove redundant log import, reuse existing one
+
+* fix: address latest Copilot review comments
+
+- LSP stop(): escalate to SIGKILL on timeout, add logging
+- tmux spawnTmuxPane/replaceTmuxPane: drain stderr immediately to avoid backpressure
+
+* fix: address latest Copilot review comments
+
+- Add .catch() to asyncCleanup() signal handlers to prevent unhandled rejections
+- Await proc.exited after SIGKILL with 1s timeout to confirm termination
+
+* fix: increase exit delay to 6s to accommodate LSP cleanup
+
+LSP cleanup can take up to 5s (timeout) + 1s (SIGKILL wait), so the exit
+delay must be at least 6s to ensure child processes are properly reaped.
+---
+ src/features/background-agent/manager.ts  |  5 +-
+ src/features/skill-mcp-manager/manager.ts | 22 +++-----
+ src/shared/tmux/tmux-utils.ts             | 31 ++++++++--
+ src/tools/interactive-bash/tools.ts       | 15 ++++-
+ src/tools/lsp/client.ts                   | 69 +++++++++++++++++------
+ 5 files changed, 102 insertions(+), 40 deletions(-)
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 21e18c9a..a9c6b701 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -1396,7 +1396,10 @@ function registerProcessSignal(
+   const listener = () => {
+     handler()
+     if (exitAfter) {
+-      process.exit(0)
++      // Set exitCode and schedule exit after delay to allow other handlers to complete async cleanup
++      // Use 6s delay to accommodate LSP cleanup (5s timeout + 1s SIGKILL wait)
++      process.exitCode = 0
++      setTimeout(() => process.exit(), 6000)
+     }
+   }
+   process.on(signal, listener)
+diff --git a/src/features/skill-mcp-manager/manager.ts b/src/features/skill-mcp-manager/manager.ts
+index 0b43ca0c..4173f1d7 100644
+--- a/src/features/skill-mcp-manager/manager.ts
++++ b/src/features/skill-mcp-manager/manager.ts
+@@ -114,23 +114,15 @@ export class SkillMcpManager {
+       this.pendingConnections.clear()
+     }
+ 
+-    // Note: 'exit' event is synchronous-only in Node.js, so we use 'beforeExit' for async cleanup
+-    // However, 'beforeExit' is not emitted on explicit process.exit() calls
+-    // Signal handlers are made async to properly await cleanup
++    // Note: Node's 'exit' event is synchronous-only, so we rely on signal handlers for async cleanup.
++    // Signal handlers invoke the async cleanup function and ignore errors so they don't block or throw.
++    // Don't call process.exit() here - let the background-agent manager handle the final process exit.
++    // Use void + catch to trigger async cleanup without awaiting it in the signal handler.
+ 
+-    process.on("SIGINT", async () => {
+-      await cleanup()
+-      process.exit(0)
+-    })
+-    process.on("SIGTERM", async () => {
+-      await cleanup()
+-      process.exit(0)
+-    })
++    process.on("SIGINT", () => void cleanup().catch(() => {}))
++    process.on("SIGTERM", () => void cleanup().catch(() => {}))
+     if (process.platform === "win32") {
+-      process.on("SIGBREAK", async () => {
+-        await cleanup()
+-        process.exit(0)
+-      })
++      process.on("SIGBREAK", () => void cleanup().catch(() => {}))
+     }
+   }
+ 
+diff --git a/src/shared/tmux/tmux-utils.ts b/src/shared/tmux/tmux-utils.ts
+index 540bcff2..c5e7d4a5 100644
+--- a/src/shared/tmux/tmux-utils.ts
++++ b/src/shared/tmux/tmux-utils.ts
+@@ -139,10 +139,22 @@ export async function spawnTmuxPane(
+   }
+ 
+   const title = `omo-subagent-${description.slice(0, 20)}`
+-  spawn([tmux, "select-pane", "-t", paneId, "-T", title], {
++  const titleProc = spawn([tmux, "select-pane", "-t", paneId, "-T", title], {
+     stdout: "ignore",
+-    stderr: "ignore",
++    stderr: "pipe",
+   })
++  // Drain stderr immediately to avoid backpressure
++  const stderrPromise = new Response(titleProc.stderr).text().catch(() => "")
++  const titleExitCode = await titleProc.exited
++  if (titleExitCode !== 0) {
++    const titleStderr = await stderrPromise
++    log("[spawnTmuxPane] WARNING: failed to set pane title", {
++      paneId,
++      title,
++      exitCode: titleExitCode,
++      stderr: titleStderr.trim(),
++    })
++  }
+ 
+   return { success: true, paneId }
+ }
+@@ -217,10 +229,21 @@ export async function replaceTmuxPane(
+   }
+ 
+   const title = `omo-subagent-${description.slice(0, 20)}`
+-  spawn([tmux, "select-pane", "-t", paneId, "-T", title], {
++  const titleProc = spawn([tmux, "select-pane", "-t", paneId, "-T", title], {
+     stdout: "ignore",
+-    stderr: "ignore",
++    stderr: "pipe",
+   })
++  // Drain stderr immediately to avoid backpressure
++  const stderrPromise = new Response(titleProc.stderr).text().catch(() => "")
++  const titleExitCode = await titleProc.exited
++  if (titleExitCode !== 0) {
++    const titleStderr = await stderrPromise
++    log("[replaceTmuxPane] WARNING: failed to set pane title", {
++      paneId,
++      exitCode: titleExitCode,
++      stderr: titleStderr.trim(),
++    })
++  }
+ 
+   log("[replaceTmuxPane] SUCCESS", { paneId, sessionId })
+   return { success: true, paneId }
+diff --git a/src/tools/interactive-bash/tools.ts b/src/tools/interactive-bash/tools.ts
+index 5a1e2d53..bca941b9 100644
+--- a/src/tools/interactive-bash/tools.ts
++++ b/src/tools/interactive-bash/tools.ts
+@@ -96,10 +96,19 @@ The Bash tool can execute these commands directly. Do NOT retry with interactive
+ 
+       const timeoutPromise = new Promise<never>((_, reject) => {
+         const id = setTimeout(() => {
+-          proc.kill()
+-          reject(new Error(`Timeout after ${DEFAULT_TIMEOUT_MS}ms`))
++          const timeoutError = new Error(`Timeout after ${DEFAULT_TIMEOUT_MS}ms`)
++          try {
++            proc.kill()
++            // Fire-and-forget: wait for process exit in background to avoid zombies
++            void proc.exited.catch(() => {})
++          } catch {
++            // Ignore kill errors; we'll still reject with timeoutError below
++          }
++          reject(timeoutError)
+         }, DEFAULT_TIMEOUT_MS)
+-        proc.exited.then(() => clearTimeout(id))
++        proc.exited
++          .then(() => clearTimeout(id))
++          .catch(() => clearTimeout(id))
+       })
+ 
+       // Read stdout and stderr in parallel to avoid race conditions
+diff --git a/src/tools/lsp/client.ts b/src/tools/lsp/client.ts
+index b4802033..eda481aa 100644
+--- a/src/tools/lsp/client.ts
++++ b/src/tools/lsp/client.ts
+@@ -33,10 +33,12 @@ class LSPServerManager {
+   }
+ 
+   private registerProcessCleanup(): void {
+-    const cleanup = () => {
++    // Synchronous cleanup for 'exit' event (cannot await)
++    const syncCleanup = () => {
+       for (const [, managed] of this.clients) {
+         try {
+-          managed.client.stop()
++          // Fire-and-forget during sync exit - process is terminating
++          void managed.client.stop().catch(() => {})
+         } catch {}
+       }
+       this.clients.clear()
+@@ -46,23 +48,30 @@ class LSPServerManager {
+       }
+     }
+ 
+-    process.on("exit", cleanup)
++    // Async cleanup for signal handlers - properly await all stops
++    const asyncCleanup = async () => {
++      const stopPromises: Promise<void>[] = []
++      for (const [, managed] of this.clients) {
++        stopPromises.push(managed.client.stop().catch(() => {}))
++      }
++      await Promise.allSettled(stopPromises)
++      this.clients.clear()
++      if (this.cleanupInterval) {
++        clearInterval(this.cleanupInterval)
++        this.cleanupInterval = null
++      }
++    }
+ 
+-    process.on("SIGINT", () => {
+-      cleanup()
+-      process.exit(0)
+-    })
++    process.on("exit", syncCleanup)
+ 
+-    process.on("SIGTERM", () => {
+-      cleanup()
+-      process.exit(0)
+-    })
++    // Don't call process.exit() here - let other handlers complete their cleanup first
++    // The background-agent manager handles the final exit call
++    // Use async handlers to properly await LSP subprocess cleanup
++    process.on("SIGINT", () => void asyncCleanup().catch(() => {}))
++    process.on("SIGTERM", () => void asyncCleanup().catch(() => {}))
+ 
+     if (process.platform === "win32") {
+-      process.on("SIGBREAK", () => {
+-        cleanup()
+-        process.exit(0)
+-      })
++      process.on("SIGBREAK", () => void asyncCleanup().catch(() => {}))
+     }
+   }
+ 
+@@ -532,8 +541,34 @@ export class LSPClient {
+       this.connection.dispose()
+       this.connection = null
+     }
+-    this.proc?.kill()
+-    this.proc = null
++    const proc = this.proc
++    if (proc) {
++      this.proc = null
++      let exitedBeforeTimeout = false
++      try {
++        proc.kill()
++        // Wait for exit with timeout to prevent indefinite hang
++        let timeoutId: ReturnType<typeof setTimeout> | undefined
++        const timeoutPromise = new Promise<void>((resolve) => {
++          timeoutId = setTimeout(resolve, 5000)
++        })
++        await Promise.race([
++          proc.exited.then(() => { exitedBeforeTimeout = true }).finally(() => timeoutId && clearTimeout(timeoutId)),
++          timeoutPromise,
++        ])
++        if (!exitedBeforeTimeout) {
++          log("[LSPClient] Process did not exit within timeout, escalating to SIGKILL")
++          try {
++            proc.kill("SIGKILL")
++            // Wait briefly for SIGKILL to take effect
++            await Promise.race([
++              proc.exited,
++              new Promise<void>((resolve) => setTimeout(resolve, 1000)),
++            ])
++          } catch {}
++        }
++      } catch {}
++    }
+     this.processExited = true
+     this.diagnosticsStore.clear()
+   }
+-- 
+2.39.2
+

@@ -1,0 +1,421 @@
+From d22867db2727e6611fd89add041d577acabdd818 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 21:59:59 +0900
+Subject: [PATCH 3122/5749] fix(todo-continuation): improve stagnation
+ detection accuracy
+
+---
+ .../session-state.regression.test.ts          | 105 ++++++++++++++++++
+ .../session-state.ts                          | 103 +++++++++++++----
+ .../stagnation-detection.test.ts              |  46 ++++++++
+ .../stagnation-detection.ts                   |   3 +
+ 4 files changed, 237 insertions(+), 20 deletions(-)
+ create mode 100644 src/hooks/todo-continuation-enforcer/session-state.regression.test.ts
+ create mode 100644 src/hooks/todo-continuation-enforcer/stagnation-detection.test.ts
+
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.regression.test.ts b/src/hooks/todo-continuation-enforcer/session-state.regression.test.ts
+new file mode 100644
+index 00000000..08cd5fb9
+--- /dev/null
++++ b/src/hooks/todo-continuation-enforcer/session-state.regression.test.ts
+@@ -0,0 +1,105 @@
++/// <reference path="../../../bun-test.d.ts" />
++
++import { afterEach, beforeEach, describe, expect, it as test } from "bun:test"
++
++import { MAX_STAGNATION_COUNT } from "./constants"
++import { createSessionStateStore, type SessionStateStore } from "./session-state"
++
++describe("createSessionStateStore regressions", () => {
++  let sessionStateStore: SessionStateStore
++
++  beforeEach(() => {
++    sessionStateStore = createSessionStateStore()
++  })
++
++  afterEach(() => {
++    sessionStateStore.shutdown()
++  })
++
++  describe("#given external activity happens after a successful continuation", () => {
++    describe("#when todos stay unchanged", () => {
++      test("#then it treats the activity as progress instead of stagnation", () => {
++        const sessionID = "ses-activity-progress"
++        const todos = [
++          { id: "1", content: "Task 1", status: "pending", priority: "high" },
++          { id: "2", content: "Task 2", status: "pending", priority: "medium" },
++        ]
++        const state = sessionStateStore.getState(sessionID)
++
++        sessionStateStore.trackContinuationProgress(sessionID, 2, todos)
++        state.awaitingPostInjectionProgressCheck = true
++
++        const trackedState = sessionStateStore.getExistingState(sessionID)
++        if (!trackedState) {
++          throw new Error("Expected tracked session state")
++        }
++
++        trackedState.abortDetectedAt = undefined
++        const progressUpdate = sessionStateStore.trackContinuationProgress(sessionID, 2, todos)
++
++        expect(progressUpdate.hasProgressed).toBe(true)
++        expect(progressUpdate.progressSource).toBe("activity")
++        expect(progressUpdate.stagnationCount).toBe(0)
++      })
++    })
++  })
++
++  describe("#given todos only change order between idle checks", () => {
++    describe("#when the same todos are compared again", () => {
++      test("#then it keeps the snapshot stable and counts stagnation", () => {
++        const sessionID = "ses-stable-snapshot"
++        const firstTodos = [
++          { id: "2", content: "Task 2", status: "pending", priority: "medium" },
++          { id: "1", content: "Task 1", status: "pending", priority: "high" },
++        ]
++        const reorderedTodos = [
++          { id: "1", content: "Task 1", status: "pending", priority: "high" },
++          { id: "2", content: "Task 2", status: "pending", priority: "medium" },
++        ]
++        const state = sessionStateStore.getState(sessionID)
++
++        sessionStateStore.trackContinuationProgress(sessionID, 2, firstTodos)
++        state.awaitingPostInjectionProgressCheck = true
++
++        const progressUpdate = sessionStateStore.trackContinuationProgress(sessionID, 2, reorderedTodos)
++
++        expect(progressUpdate.hasProgressed).toBe(false)
++        expect(progressUpdate.progressSource).toBe("none")
++        expect(progressUpdate.stagnationCount).toBe(1)
++      })
++    })
++  })
++
++  describe("#given stagnation already halted a session", () => {
++    describe("#when new activity appears before the next idle check", () => {
++      test("#then it resets the stop condition on the next progress check", () => {
++        const sessionID = "ses-stagnation-recovery"
++        const todos = [
++          { id: "1", content: "Task 1", status: "pending", priority: "high" },
++          { id: "2", content: "Task 2", status: "pending", priority: "medium" },
++        ]
++        const state = sessionStateStore.getState(sessionID)
++
++        sessionStateStore.trackContinuationProgress(sessionID, 2, todos)
++
++        for (let index = 0; index < MAX_STAGNATION_COUNT; index++) {
++          state.awaitingPostInjectionProgressCheck = true
++          sessionStateStore.trackContinuationProgress(sessionID, 2, todos)
++        }
++
++        const trackedState = sessionStateStore.getExistingState(sessionID)
++        if (!trackedState) {
++          throw new Error("Expected tracked session state")
++        }
++
++        trackedState.abortDetectedAt = undefined
++        const progressUpdate = sessionStateStore.trackContinuationProgress(sessionID, 2, todos)
++
++        expect(progressUpdate.previousStagnationCount).toBe(MAX_STAGNATION_COUNT)
++        expect(progressUpdate.hasProgressed).toBe(true)
++        expect(progressUpdate.progressSource).toBe("activity")
++        expect(progressUpdate.stagnationCount).toBe(0)
++      })
++    })
++  })
++})
+diff --git a/src/hooks/todo-continuation-enforcer/session-state.ts b/src/hooks/todo-continuation-enforcer/session-state.ts
+index 6c116562..810fdcfb 100644
+--- a/src/hooks/todo-continuation-enforcer/session-state.ts
++++ b/src/hooks/todo-continuation-enforcer/session-state.ts
+@@ -1,5 +1,11 @@
+ import type { SessionState, Todo } from "./types"
+ 
++type TimerHandle = number | { unref?: () => void }
++
++declare function setInterval(callback: () => void, delay?: number): TimerHandle
++declare function clearInterval(timeout: TimerHandle): void
++declare function clearTimeout(timeout: TimerHandle): void
++
+ // TTL for idle session state entries (10 minutes)
+ const SESSION_STATE_TTL_MS = 10 * 60 * 1000
+ // Prune interval (every 2 minutes)
+@@ -9,13 +15,17 @@ interface TrackedSessionState {
+   state: SessionState
+   lastAccessedAt: number
+   lastCompletedCount?: number
+-  lastTodoStatusSignature?: string
++  lastTodoSnapshot?: string
++  activitySignalCount: number
++  lastObservedActivitySignalCount?: number
+ }
+ 
+ export interface ContinuationProgressUpdate {
+   previousIncompleteCount?: number
++  previousStagnationCount: number
+   stagnationCount: number
+   hasProgressed: boolean
++  progressSource: "none" | "todo" | "activity"
+ }
+ 
+ export interface SessionStateStore {
+@@ -29,18 +39,37 @@ export interface SessionStateStore {
+   shutdown: () => void
+ }
+ 
+-function getTodoStatusSignature(todos: Todo[]): string {
+-  return todos
+-    .map((todo) => `${todo.id ?? `${todo.content}:${todo.priority}`}:${todo.status}`)
+-    .sort()
+-    .join("|")
++function getTodoSnapshot(todos: Todo[]): string {
++  const normalizedTodos = todos
++    .map((todo) => ({
++      id: todo.id ?? null,
++      content: todo.content,
++      priority: todo.priority,
++      status: todo.status,
++    }))
++    .sort((left, right) => {
++      const leftKey = left.id ?? `${left.content}:${left.priority}:${left.status}`
++      const rightKey = right.id ?? `${right.content}:${right.priority}:${right.status}`
++      if (leftKey !== rightKey) {
++        return leftKey.localeCompare(rightKey)
++      }
++      if (left.content !== right.content) {
++        return left.content.localeCompare(right.content)
++      }
++      if (left.priority !== right.priority) {
++        return left.priority.localeCompare(right.priority)
++      }
++      return left.status.localeCompare(right.status)
++    })
++
++  return JSON.stringify(normalizedTodos)
+ }
+ 
+ export function createSessionStateStore(): SessionStateStore {
+   const sessions = new Map<string, TrackedSessionState>()
+ 
+   // Periodic pruning of stale session states to prevent unbounded Map growth
+-  let pruneInterval: ReturnType<typeof setInterval> | undefined
++  let pruneInterval: TimerHandle | undefined
+   pruneInterval = setInterval(() => {
+     const now = Date.now()
+     for (const [sessionID, tracked] of sessions.entries()) {
+@@ -51,7 +80,7 @@ export function createSessionStateStore(): SessionStateStore {
+     }
+   }, SESSION_STATE_PRUNE_INTERVAL_MS)
+   // Allow process to exit naturally even if interval is running
+-  if (typeof pruneInterval === "object" && "unref" in pruneInterval) {
++  if (typeof pruneInterval === "object" && typeof pruneInterval.unref === "function") {
+     pruneInterval.unref()
+   }
+ 
+@@ -62,14 +91,24 @@ export function createSessionStateStore(): SessionStateStore {
+       return existing
+     }
+ 
+-    const state: SessionState = {
++    const rawState: SessionState = {
+       stagnationCount: 0,
+       consecutiveFailures: 0,
+     }
+     const trackedSession: TrackedSessionState = {
+-      state,
++      state: rawState,
+       lastAccessedAt: Date.now(),
++      activitySignalCount: 0,
+     }
++    trackedSession.state = new Proxy(rawState, {
++      set(target, property, value, receiver) {
++        if (property === "abortDetectedAt" && value === undefined) {
++          trackedSession.activitySignalCount += 1
++        }
++
++        return Reflect.set(target, property, value, receiver)
++      },
++    })
+     sessions.set(sessionID, trackedSession)
+     return trackedSession
+   }
+@@ -95,50 +134,68 @@ export function createSessionStateStore(): SessionStateStore {
+     const trackedSession = getTrackedSession(sessionID)
+     const state = trackedSession.state
+     const previousIncompleteCount = state.lastIncompleteCount
++    const previousStagnationCount = state.stagnationCount
+     const currentCompletedCount = todos?.filter((todo) => todo.status === "completed").length
+-    const currentTodoStatusSignature = todos ? getTodoStatusSignature(todos) : undefined
++    const currentTodoSnapshot = todos ? getTodoSnapshot(todos) : undefined
++    const currentActivitySignalCount = trackedSession.activitySignalCount
+     const hasCompletedMoreTodos =
+       currentCompletedCount !== undefined
+       && trackedSession.lastCompletedCount !== undefined
+       && currentCompletedCount > trackedSession.lastCompletedCount
+-    const hasTodoStatusChanged =
+-      currentTodoStatusSignature !== undefined
+-      && trackedSession.lastTodoStatusSignature !== undefined
+-      && currentTodoStatusSignature !== trackedSession.lastTodoStatusSignature
++    const hasTodoSnapshotChanged =
++      currentTodoSnapshot !== undefined
++      && trackedSession.lastTodoSnapshot !== undefined
++      && currentTodoSnapshot !== trackedSession.lastTodoSnapshot
++    const hasObservedExternalActivity =
++      trackedSession.lastObservedActivitySignalCount !== undefined
++      && currentActivitySignalCount > trackedSession.lastObservedActivitySignalCount
+     const hadSuccessfulInjectionAwaitingProgressCheck = state.awaitingPostInjectionProgressCheck === true
+ 
+     state.lastIncompleteCount = incompleteCount
+     if (currentCompletedCount !== undefined) {
+       trackedSession.lastCompletedCount = currentCompletedCount
+     }
+-    if (currentTodoStatusSignature !== undefined) {
+-      trackedSession.lastTodoStatusSignature = currentTodoStatusSignature
++    if (currentTodoSnapshot !== undefined) {
++      trackedSession.lastTodoSnapshot = currentTodoSnapshot
+     }
++    trackedSession.lastObservedActivitySignalCount = currentActivitySignalCount
+ 
+     if (previousIncompleteCount === undefined) {
+       state.stagnationCount = 0
+       return {
+         previousIncompleteCount,
++        previousStagnationCount,
+         stagnationCount: state.stagnationCount,
+         hasProgressed: false,
++        progressSource: "none",
+       }
+     }
+ 
+-    if (incompleteCount < previousIncompleteCount || hasCompletedMoreTodos || hasTodoStatusChanged) {
++    const progressSource = incompleteCount < previousIncompleteCount || hasCompletedMoreTodos || hasTodoSnapshotChanged
++      ? "todo"
++      : hasObservedExternalActivity
++        ? "activity"
++        : "none"
++
++    if (progressSource !== "none") {
+       state.stagnationCount = 0
+       state.awaitingPostInjectionProgressCheck = false
+       return {
+         previousIncompleteCount,
++        previousStagnationCount,
+         stagnationCount: state.stagnationCount,
+         hasProgressed: true,
++        progressSource,
+       }
+     }
+ 
+     if (!hadSuccessfulInjectionAwaitingProgressCheck) {
+       return {
+         previousIncompleteCount,
++        previousStagnationCount,
+         stagnationCount: state.stagnationCount,
+         hasProgressed: false,
++        progressSource: "none",
+       }
+     }
+ 
+@@ -146,8 +203,10 @@ export function createSessionStateStore(): SessionStateStore {
+     state.stagnationCount += 1
+     return {
+       previousIncompleteCount,
++      previousStagnationCount,
+       stagnationCount: state.stagnationCount,
+       hasProgressed: false,
++      progressSource: "none",
+     }
+   }
+ 
+@@ -163,7 +222,9 @@ export function createSessionStateStore(): SessionStateStore {
+     state.stagnationCount = 0
+     state.awaitingPostInjectionProgressCheck = false
+     trackedSession.lastCompletedCount = undefined
+-    trackedSession.lastTodoStatusSignature = undefined
++    trackedSession.lastTodoSnapshot = undefined
++    trackedSession.activitySignalCount = 0
++    trackedSession.lastObservedActivitySignalCount = undefined
+   }
+ 
+   function cancelCountdown(sessionID: string): void {
+@@ -197,7 +258,9 @@ export function createSessionStateStore(): SessionStateStore {
+   }
+ 
+   function shutdown(): void {
+-    clearInterval(pruneInterval)
++    if (pruneInterval !== undefined) {
++      clearInterval(pruneInterval)
++    }
+     cancelAllCountdowns()
+     sessions.clear()
+   }
+diff --git a/src/hooks/todo-continuation-enforcer/stagnation-detection.test.ts b/src/hooks/todo-continuation-enforcer/stagnation-detection.test.ts
+new file mode 100644
+index 00000000..f309f44f
+--- /dev/null
++++ b/src/hooks/todo-continuation-enforcer/stagnation-detection.test.ts
+@@ -0,0 +1,46 @@
++/// <reference path="../../../bun-test.d.ts" />
++
++import { describe, expect, it as test } from "bun:test"
++
++import { MAX_STAGNATION_COUNT } from "./constants"
++import { shouldStopForStagnation } from "./stagnation-detection"
++
++describe("shouldStopForStagnation", () => {
++  describe("#given stagnation reaches the configured limit", () => {
++    describe("#when no progress is detected", () => {
++      test("#then it stops continuation", () => {
++        const shouldStop = shouldStopForStagnation({
++          sessionID: "ses-stagnated",
++          incompleteCount: 2,
++          progressUpdate: {
++            previousIncompleteCount: 2,
++            previousStagnationCount: MAX_STAGNATION_COUNT - 1,
++            stagnationCount: MAX_STAGNATION_COUNT,
++            hasProgressed: false,
++            progressSource: "none",
++          },
++        })
++
++        expect(shouldStop).toBe(true)
++      })
++    })
++
++    describe("#when activity progress is detected after the halt", () => {
++      test("#then it clears the stop condition", () => {
++        const shouldStop = shouldStopForStagnation({
++          sessionID: "ses-recovered",
++          incompleteCount: 2,
++          progressUpdate: {
++            previousIncompleteCount: 2,
++            previousStagnationCount: MAX_STAGNATION_COUNT,
++            stagnationCount: 0,
++            hasProgressed: true,
++            progressSource: "activity",
++          },
++        })
++
++        expect(shouldStop).toBe(false)
++      })
++    })
++  })
++})
+diff --git a/src/hooks/todo-continuation-enforcer/stagnation-detection.ts b/src/hooks/todo-continuation-enforcer/stagnation-detection.ts
+index ff35a357..98ae9d4c 100644
+--- a/src/hooks/todo-continuation-enforcer/stagnation-detection.ts
++++ b/src/hooks/todo-continuation-enforcer/stagnation-detection.ts
+@@ -14,7 +14,10 @@ export function shouldStopForStagnation(args: {
+     log(`[${HOOK_NAME}] Progress detected: reset stagnation count`, {
+       sessionID,
+       previousIncompleteCount: progressUpdate.previousIncompleteCount,
++      previousStagnationCount: progressUpdate.previousStagnationCount,
+       incompleteCount,
++      progressSource: progressUpdate.progressSource,
++      recoveredFromStagnationStop: progressUpdate.previousStagnationCount >= MAX_STAGNATION_COUNT,
+     })
+   }
+ 
+-- 
+2.39.2
+

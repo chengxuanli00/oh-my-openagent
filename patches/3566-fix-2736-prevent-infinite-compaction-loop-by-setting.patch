@@ -1,0 +1,178 @@
+From 041770ff42f9f5000c26922955e1bcfd48907a09 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 27 Mar 2026 14:25:38 +0900
+Subject: [PATCH 3566/5749] fix(#2736): prevent infinite compaction loop by
+ setting cooldown before try
+
+lastCompactionTime was only set on successful compaction. When compaction
+failed (rate limit, timeout, etc.), no cooldown was recorded, causing
+immediate retries in an infinite loop.
+
+Fix: set lastCompactionTime before the try block so both success and
+failure respect the cooldown window.
+
+- test: add failed-compaction cooldown enforcement test
+- test: fix timeout retry test to advance past cooldown
+---
+ src/hooks/preemptive-compaction.test.ts | 113 ++++++++++++++++++++++--
+ src/hooks/preemptive-compaction.ts      |   2 +-
+ 2 files changed, 107 insertions(+), 8 deletions(-)
+
+diff --git a/src/hooks/preemptive-compaction.test.ts b/src/hooks/preemptive-compaction.test.ts
+index 54025242..e045de72 100644
+--- a/src/hooks/preemptive-compaction.test.ts
++++ b/src/hooks/preemptive-compaction.test.ts
+@@ -284,6 +284,74 @@ describe("preemptive-compaction", () => {
+     })
+   })
+ 
++  // #given compaction fails
++  // #when tool.execute.after is called again immediately
++  // #then should NOT retry due to cooldown
++  it("should enforce cooldown even after failed compaction to prevent rapid retry loops", async () => {
++    //#given
++    const hook = createPreemptiveCompactionHook(ctx as never, {} as never)
++    const sessionID = "ses_fail_cooldown"
++    ctx.client.session.summarize.mockRejectedValueOnce(new Error("rate limited"))
++
++    await hook.event({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            role: "assistant",
++            sessionID,
++            providerID: "anthropic",
++            modelID: "claude-sonnet-4-6",
++            finish: true,
++            tokens: {
++              input: 170000,
++              output: 0,
++              reasoning: 0,
++              cache: { read: 10000, write: 0 },
++            },
++          },
++        },
++      },
++    })
++
++    await hook["tool.execute.after"](
++      { tool: "bash", sessionID, callID: "call_fail" },
++      { title: "", output: "test", metadata: null }
++    )
++
++    expect(ctx.client.session.summarize).toHaveBeenCalledTimes(1)
++
++    //#when - message.updated clears compactedSessions, but cooldown should still block
++    await hook.event({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            role: "assistant",
++            sessionID,
++            providerID: "anthropic",
++            modelID: "claude-sonnet-4-6",
++            finish: true,
++            tokens: {
++              input: 170000,
++              output: 0,
++              reasoning: 0,
++              cache: { read: 10000, write: 0 },
++            },
++          },
++        },
++      },
++    })
++
++    await hook["tool.execute.after"](
++      { tool: "bash", sessionID, callID: "call_fail_2" },
++      { title: "", output: "test", metadata: null }
++    )
++
++    //#then - should NOT have retried
++    expect(ctx.client.session.summarize).toHaveBeenCalledTimes(1)
++  })
++
+   it("should use 1M limit when model cache flag is enabled", async () => {
+     //#given
+     const hook = createPreemptiveCompactionHook(ctx as never, {}, {
+@@ -399,17 +467,48 @@ describe("preemptive-compaction", () => {
+         { title: "", output: "test", metadata: null },
+       )
+ 
+-      await hook["tool.execute.after"](
+-        { tool: "bash", sessionID, callID: "call_timeout_2" },
+-        { title: "", output: "test", metadata: null },
+-      )
+-
+-      //#then
+-      expect(ctx.client.session.summarize).toHaveBeenCalledTimes(2)
++      //#then - first call timed out
++      expect(ctx.client.session.summarize).toHaveBeenCalledTimes(1)
+       expect(logMock).toHaveBeenCalledWith("[preemptive-compaction] Compaction failed", {
+         sessionID,
+         error: expect.stringContaining("Compaction summarize timed out"),
+       })
++
++      //#when - advance past cooldown, clear compactedSessions via message.updated, then retry
++      const originalNow = Date.now
++      Date.now = () => originalNow() + 61_000
++      try {
++        await hook.event({
++          event: {
++            type: "message.updated",
++            properties: {
++              info: {
++                role: "assistant",
++                sessionID,
++                providerID: "anthropic",
++                modelID: "claude-sonnet-4-6",
++                finish: true,
++                tokens: {
++                  input: 170000,
++                  output: 0,
++                  reasoning: 0,
++                  cache: { read: 10000, write: 0 },
++                },
++              },
++            },
++          },
++        })
++
++        await hook["tool.execute.after"](
++          { tool: "bash", sessionID, callID: "call_timeout_2" },
++          { title: "", output: "test", metadata: null },
++        )
++
++        //#then - should have retried after cooldown
++        expect(ctx.client.session.summarize).toHaveBeenCalledTimes(2)
++      } finally {
++        Date.now = originalNow
++      }
+     } finally {
+       restoreTimeouts()
+     }
+diff --git a/src/hooks/preemptive-compaction.ts b/src/hooks/preemptive-compaction.ts
+index d11c1a7e..ef58b1a9 100644
+--- a/src/hooks/preemptive-compaction.ts
++++ b/src/hooks/preemptive-compaction.ts
+@@ -112,6 +112,7 @@ export function createPreemptiveCompactionHook(
+     if (usageRatio < PREEMPTIVE_COMPACTION_THRESHOLD || !cached.modelID) return
+ 
+     compactionInProgress.add(sessionID)
++    lastCompactionTime.set(sessionID, Date.now())
+ 
+     try {
+       const { providerID: targetProviderID, modelID: targetModelID } = resolveCompactionModel(
+@@ -132,7 +133,6 @@ export function createPreemptiveCompactionHook(
+       )
+ 
+       compactedSessions.add(sessionID)
+-      lastCompactionTime.set(sessionID, Date.now())
+     } catch (error) {
+       log("[preemptive-compaction] Compaction failed", { sessionID, error: String(error) })
+     } finally {
+-- 
+2.39.2
+

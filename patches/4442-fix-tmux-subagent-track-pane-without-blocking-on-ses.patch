@@ -1,0 +1,179 @@
+From c9c1c58c2cb96cf85ec86f4bf1b5af7dd8e2c7e7 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 18 Apr 2026 17:22:01 +0900
+Subject: [PATCH 4442/5749] fix(tmux-subagent): track pane without blocking on
+ session readiness
+
+waitForSessionReady polled session.status for up to 10s before the pane was registered, but session.status only becomes visible after promptAsync starts. Blocking pane tracking on that signal caused the attach client to see an empty session and render a blank TUI.
+
+Track the pane immediately after spawn, and run the readiness probe in the background purely for observability.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/features/tmux-subagent/manager.test.ts | 21 +++++++++++
+ src/features/tmux-subagent/manager.ts      | 44 +++++++++-------------
+ 2 files changed, 38 insertions(+), 27 deletions(-)
+
+diff --git a/src/features/tmux-subagent/manager.test.ts b/src/features/tmux-subagent/manager.test.ts
+index 8c47097f..c8cf2c1d 100644
+--- a/src/features/tmux-subagent/manager.test.ts
++++ b/src/features/tmux-subagent/manager.test.ts
+@@ -1056,6 +1056,27 @@ describe('TmuxSessionManager', () => {
+         logSpy.mockRestore()
+       })
+     })
++
++    test('#given session.status never reports session ready #when onSessionCreated runs #then pane is tracked immediately without blocking', async () => {
++      // given
++      mockIsInsideTmux.mockReturnValue(true)
++      mockQueryWindowState.mockImplementation(async () => createWindowState())
++
++      const { TmuxSessionManager } = await import('./manager')
++      const ctx = createMockContext({ sessionStatusResult: { data: {} } })
++      const config = createTmuxConfig({ enabled: true })
++      const manager = new TmuxSessionManager(ctx, config, mockTmuxDeps)
++      const event = createSessionCreatedEvent('ses_fast_track', 'ses_parent', 'Fast Track')
++
++      // when
++      const start = Date.now()
++      await manager.onSessionCreated(event)
++      const elapsed = Date.now() - start
++
++      // then
++      expect(elapsed < 500).toBe(true)
++      expect(getTrackedSessions(manager).has('ses_fast_track')).toBe(true)
++    })
+   })
+ 
+   describe('onSessionDeleted', () => {
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index a31f668b..e379bce9 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -511,7 +511,6 @@ export class TmuxSessionManager {
+     if (deferred.retryIsolatedContainer) {
+       const isolatedPaneId = await this.spawnInIsolatedContainer(sessionId, deferred.title)
+       if (isolatedPaneId) {
+-        const sessionReady = await this.waitForSessionReady(sessionId)
+         this.sessions.set(
+           sessionId,
+           createTrackedSession({
+@@ -525,8 +524,8 @@ export class TmuxSessionManager {
+         log("[tmux-session-manager] deferred session attached in isolated window", {
+           sessionId,
+           paneId: isolatedPaneId,
+-          sessionReady,
+         })
++        this.logSessionReadinessInBackground(sessionId)
+         return
+       }
+     }
+@@ -585,14 +584,6 @@ export class TmuxSessionManager {
+       return
+     }
+ 
+-    const sessionReady = await this.waitForSessionReady(sessionId)
+-    if (!sessionReady) {
+-      log("[tmux-session-manager] deferred session not ready after timeout", {
+-        sessionId,
+-        paneId: result.spawnedPaneId,
+-      })
+-    }
+-
+     this.sessions.set(
+       sessionId,
+       createTrackedSession({
+@@ -606,18 +597,27 @@ export class TmuxSessionManager {
+     log("[tmux-session-manager] deferred session attached", {
+       sessionId,
+       paneId: result.spawnedPaneId,
+-      sessionReady,
++    })
++    this.logSessionReadinessInBackground(sessionId)
++  }
++
++  private logSessionReadinessInBackground(sessionId: string): void {
++    void this.waitForSessionReady(sessionId).catch((error) => {
++      log("[tmux-session-manager] background readiness probe failed", {
++        sessionId,
++        error: String(error),
++      })
+     })
+   }
+ 
+   private async waitForSessionReady(sessionId: string): Promise<boolean> {
+     const startTime = Date.now()
+-    
++
+     while (Date.now() - startTime < SESSION_READY_TIMEOUT_MS) {
+       try {
+         const statusResult = await this.client.session.status({ path: undefined })
+         const allStatuses = normalizeSDKResponse(statusResult, {} as Record<string, { type: string }>)
+-        
++
+         if (allStatuses[sessionId]) {
+           log("[tmux-session-manager] session ready", {
+             sessionId,
+@@ -629,10 +629,10 @@ export class TmuxSessionManager {
+       } catch (err) {
+         log("[tmux-session-manager] session status check error", { error: String(err) })
+       }
+-      
++
+       await new Promise((resolve) => setTimeout(resolve, SESSION_READY_POLL_INTERVAL_MS))
+     }
+-    
++
+     log("[tmux-session-manager] session ready timeout", {
+       sessionId,
+       timeoutMs: SESSION_READY_TIMEOUT_MS,
+@@ -682,7 +682,6 @@ export class TmuxSessionManager {
+       try {
+         const isolatedPaneId = await this.spawnInIsolatedContainer(sessionId, title)
+         if (isolatedPaneId) {
+-          const sessionReady = await this.waitForSessionReady(sessionId)
+           this.sessions.set(
+             sessionId,
+             createTrackedSession({ sessionId, paneId: isolatedPaneId, description: title }),
+@@ -691,8 +690,8 @@ export class TmuxSessionManager {
+           log("[tmux-session-manager] first subagent spawned in isolated window", {
+             sessionId,
+             paneId: isolatedPaneId,
+-            sessionReady,
+           })
++          this.logSessionReadinessInBackground(sessionId)
+           return
+         }
+ 
+@@ -773,15 +772,6 @@ export class TmuxSessionManager {
+         }
+ 
+         if (result.success && result.spawnedPaneId) {
+-          const sessionReady = await this.waitForSessionReady(sessionId)
+-
+-          if (!sessionReady) {
+-            log("[tmux-session-manager] session not ready after timeout, tracking anyway", {
+-              sessionId,
+-              paneId: result.spawnedPaneId,
+-            })
+-          }
+-
+           this.sessions.set(
+             sessionId,
+             createTrackedSession({
+@@ -793,9 +783,9 @@ export class TmuxSessionManager {
+           log("[tmux-session-manager] pane spawned and tracked", {
+             sessionId,
+             paneId: result.spawnedPaneId,
+-            sessionReady,
+           })
+           this.pollingManager.startPolling()
++          this.logSessionReadinessInBackground(sessionId)
+         } else {
+           log("[tmux-session-manager] spawn failed", {
+             success: result.success,
+-- 
+2.39.2
+

@@ -1,0 +1,248 @@
+From d3318617d09586ae65d8defc39bfa791e70f7c83 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 17 May 2026 00:30:50 +0900
+Subject: [PATCH 5327/5749] fix(background-agent): clean child session-agent
+ state on pre-start abort and normalize stored agent
+
+Two adjacent gaps cubic flagged on the previous diff:
+
+1. spawner.startTask stored input.agent (potentially prefixed with sort
+   marker and ZWSP) in setSessionAgent, but the prompt body used the
+   stripped/normalized form. The session-agent registry therefore did
+   not match what promptAsync actually dispatched. Capture the
+   normalized agent once at the top of startTask and use it for
+   setSessionAgent plus the launch log lines.
+2. manager.startTask wrote setSessionAgent(sessionID, input.agent)
+   before the cancelled and stale-attempt cleanup branches, but those
+   branches only cleared subagentSessions and the delegated bootstrap.
+   The session->agent mapping survived as orphan state after an aborted
+   launch. Call clearSessionAgent inside both early-return paths so
+   nothing remains tied to a session we just aborted.
+
+Adds focused tests for both: spawner persistence parity with promptAsync
+and manager cancellation cleanup leaving getSessionAgent undefined.
+---
+ src/features/background-agent/manager.test.ts | 61 +++++++++++++++++++
+ src/features/background-agent/manager.ts      |  4 +-
+ src/features/background-agent/spawner.test.ts | 61 +++++++++++++++++++
+ src/features/background-agent/spawner.ts      |  8 +--
+ 4 files changed, 129 insertions(+), 5 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 123f6e23..edb79de5 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -7391,6 +7391,67 @@ describe("BackgroundManager attempt lifecycle bindings", () => {
+     manager.shutdown()
+   })
+ 
++  test("startTask clears child session agent state when task is cancelled before launch binding", async () => {
++    //#given
++    resetClaudeCodeSessionState()
++    const sessionID = "session-cancelled-prelaunch"
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: "/test/dir" } }),
++        create: async () => ({ data: { id: sessionID } }),
++        promptAsync: async () => ({}),
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ pluginContext: createPluginInput(client) })
++    const task: BackgroundTask = {
++      id: "task-cancel-prelaunch",
++      status: "pending",
++      queuedAt: new Date(),
++      description: "cancel before bind",
++      prompt: "continue",
++      agent: "sisyphus-junior",
++      parentSessionId: "parent-session",
++      parentMessageId: "parent-message",
++      model: { providerID: "anthropic", modelID: "claude-haiku-4.5" },
++      attempts: [
++        {
++          attemptId: "attempt-1",
++          attemptNumber: 1,
++          providerId: "anthropic",
++          modelId: "claude-haiku-4.5",
++          status: "pending",
++        },
++      ],
++      currentAttemptID: "attempt-1",
++      attemptCount: 1,
++    }
++    const input: import("./types").LaunchInput = {
++      description: task.description,
++      prompt: task.prompt,
++      agent: task.agent,
++      parentSessionId: task.parentSessionId,
++      parentMessageId: task.parentMessageId,
++      model: task.model,
++      onSessionCreated: async () => {
++        // simulate parent flipping task to cancelled between create and bind
++        task.status = "cancelled"
++        const internal = cast<{ tasks: Map<string, BackgroundTask> }>(manager)
++        internal.tasks.set(task.id, task)
++      },
++    }
++
++    //#when
++    await (cast<{
++      startTask: (item: { task: BackgroundTask; input: import("./types").LaunchInput; attemptID: string }) => Promise<void>
++    }>(manager)).startTask({ task, input, attemptID: "attempt-1" })
++
++    //#then
++    expect(getSessionAgent(sessionID)).toBeUndefined()
++
++    manager.shutdown()
++  })
++
+   test("historical attempt session IDs resolve to the task while stale session.error events leave the current attempt unchanged", async () => {
+     //#given
+     const manager = createBackgroundManager()
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 354db77b..a93a7f6b 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -28,7 +28,7 @@ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+ import { applySessionPromptParams } from "../../shared/session-prompt-params-helpers"
+ import { setSessionTools } from "../../shared/session-tools-store"
+ import { isInsideTmux } from "../../shared/tmux"
+-import { setSessionAgent, subagentSessions, updateSessionAgent } from "../claude-code-session-state"
++import { clearSessionAgent, setSessionAgent, subagentSessions, updateSessionAgent } from "../claude-code-session-state"
+ import { MESSAGE_STORAGE } from "../hook-message-injector"
+ import { getTaskToastManager } from "../task-toast-manager"
+ import { abortWithTimeout } from "./abort-with-timeout"
+@@ -762,6 +762,7 @@ export class BackgroundManager {
+ 
+     if (this.tasks.get(task.id)?.status === "cancelled") {
+       clearDelegatedChildSessionBootstrap(sessionID)
++      clearSessionAgent(sessionID)
+       await this.abortSessionWithLogging(sessionID, "cancelled during launch setup")
+       subagentSessions.delete(sessionID)
+       if (task.rootSessionId) {
+@@ -774,6 +775,7 @@ export class BackgroundManager {
+     const boundAttempt = bindAttemptSession(task, attemptID, sessionID, input.model)
+     if (!boundAttempt) {
+       clearDelegatedChildSessionBootstrap(sessionID)
++      clearSessionAgent(sessionID)
+       await this.abortSessionWithLogging(sessionID, "stale attempt binding cleanup")
+       subagentSessions.delete(sessionID)
+       if (task.rootSessionId) {
+diff --git a/src/features/background-agent/spawner.test.ts b/src/features/background-agent/spawner.test.ts
+index c1a31e01..558cbefb 100644
+--- a/src/features/background-agent/spawner.test.ts
++++ b/src/features/background-agent/spawner.test.ts
+@@ -694,6 +694,67 @@ describe("background-agent spawner fallback model promotion", () => {
+     expect(promptCalls).toHaveLength(1)
+     expect(promptCalls[0]?.body?.agent).toBe("Hephaestus - Deep Agent")
+   })
++
++  test("persists the same normalized agent used by promptAsync into session-agent state (GH-3259 follow-up)", async () => {
++    //#given - ZWSP+sort-prefix wrapped agent name
++    const promptCalls: Array<{ body?: { agent?: string } }> = []
++    const sessionID = "ses_child_normalized"
++    const wrappedAgent = "\u200B\u200B5|Hephaestus - Deep Agent"
++
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: "/parent/dir" } }),
++        create: async () => ({ data: { id: sessionID } }),
++        promptAsync: async (args?: { body?: { agent?: string } }) => {
++          promptCalls.push(args ?? {})
++          return {}
++        },
++      },
++    }
++
++    const { _resetForTesting: resetState, getSessionAgent } = await import("../claude-code-session-state")
++    resetState()
++
++    const task = createTask({
++      description: "Normalized agent storage",
++      prompt: "Do work",
++      agent: wrappedAgent,
++      parentSessionId: "ses_parent",
++      parentMessageId: "msg_parent",
++    })
++
++    const item = {
++      task,
++      input: {
++        description: task.description,
++        prompt: task.prompt,
++        agent: task.agent,
++        parentSessionId: task.parentSessionId,
++        parentMessageId: task.parentMessageId,
++        parentModel: task.parentModel,
++        parentAgent: task.parentAgent,
++        model: task.model,
++      },
++    }
++
++    const ctx = {
++      client,
++      directory: "/fallback",
++      concurrencyManager: { release: () => {} },
++      tmuxEnabled: false,
++      onTaskError: () => {},
++    }
++
++    //#when
++    await startTask(item as never, ctx as never)
++    await new Promise((resolve) => setTimeout(resolve, 0))
++
++    //#then
++    expect(promptCalls).toHaveLength(1)
++    const dispatchedAgent = promptCalls[0]?.body?.agent
++    expect(dispatchedAgent).toBe("Hephaestus - Deep Agent")
++    expect(getSessionAgent(sessionID)).toBe(dispatchedAgent)
++  })
+ })
+ 
+ describe("background-agent spawner tmux callback ordering", () => {
+diff --git a/src/features/background-agent/spawner.ts b/src/features/background-agent/spawner.ts
+index b61fe5e0..cb2961ae 100644
+--- a/src/features/background-agent/spawner.ts
++++ b/src/features/background-agent/spawner.ts
+@@ -123,9 +123,10 @@ export async function startTask(
+   }
+ 
+   const sessionID = createResult.data.id
++  const normalizedAgent = stripAgentListSortPrefix(input.agent)
+   await input.onSessionCreated?.(sessionID)
+   subagentSessions.add(sessionID)
+-  setSessionAgent(sessionID, input.agent)
++  setSessionAgent(sessionID, normalizedAgent)
+ 
+   task.status = "running"
+   task.startedAt = new Date()
+@@ -137,7 +138,7 @@ export async function startTask(
+   task.concurrencyKey = concurrencyKey
+   task.concurrencyGroup = concurrencyKey
+ 
+-  log("[background-agent] Launching task:", { taskId: task.id, sessionID, agent: input.agent })
++  log("[background-agent] Launching task:", { taskId: task.id, sessionID, agent: normalizedAgent })
+ 
+   const toastManager = getTaskToastManager()
+   if (toastManager) {
+@@ -146,7 +147,7 @@ export async function startTask(
+ 
+   log("[background-agent] Calling prompt (fire-and-forget) for launch with:", {
+     sessionID,
+-    agent: input.agent,
++    agent: normalizedAgent,
+     model: input.model,
+     hasSkillContent: !!input.skillContent,
+     promptLength: input.prompt.length,
+@@ -159,7 +160,6 @@ export async function startTask(
+       }
+     : undefined
+   const launchVariant = input.model?.variant
+-  const normalizedAgent = stripAgentListSortPrefix(input.agent)
+ 
+   applySessionPromptParams(sessionID, input.model)
+ 
+-- 
+2.39.2
+

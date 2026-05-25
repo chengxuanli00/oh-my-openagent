@@ -1,0 +1,195 @@
+From 612b9c163d2e049855229b5b6eb3f09ebfde0455 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 14 Mar 2026 13:48:59 +0900
+Subject: [PATCH 3286/5749] fix(config): clear stale context limit cache on
+ provider updates
+
+Rebuilding provider model limits prevents removed entries from leaking into later compaction decisions after config changes.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ ...ive-compaction.context-limit-cache.test.ts | 94 +++++++++++++++++++
+ .../provider-config-handler.test.ts           | 40 ++++++++
+ .../provider-config-handler.ts                |  5 +-
+ 3 files changed, 138 insertions(+), 1 deletion(-)
+ create mode 100644 src/hooks/preemptive-compaction.context-limit-cache.test.ts
+
+diff --git a/src/hooks/preemptive-compaction.context-limit-cache.test.ts b/src/hooks/preemptive-compaction.context-limit-cache.test.ts
+new file mode 100644
+index 00000000..7b533b62
+--- /dev/null
++++ b/src/hooks/preemptive-compaction.context-limit-cache.test.ts
+@@ -0,0 +1,94 @@
++import { describe, expect, it, mock } from "bun:test"
++
++import { applyProviderConfig } from "../plugin-handlers/provider-config-handler"
++import { createModelCacheState } from "../plugin-state"
++
++const logMock = mock(() => {})
++
++mock.module("../shared/logger", () => ({
++  log: logMock,
++}))
++
++const { createPreemptiveCompactionHook } = await import("./preemptive-compaction")
++
++function createMockCtx() {
++  return {
++    client: {
++      session: {
++        messages: mock(() => Promise.resolve({ data: [] })),
++        summarize: mock(() => Promise.resolve({})),
++      },
++      tui: {
++        showToast: mock(() => Promise.resolve()),
++      },
++    },
++    directory: "/tmp/test",
++  }
++}
++
++describe("preemptive-compaction context-limit cache invalidation", () => {
++  it("skips compaction after provider config removes a cached model limit", async () => {
++    // given
++    const ctx = createMockCtx()
++    const modelCacheState = createModelCacheState()
++    const sessionID = "ses_removed_limit"
++
++    applyProviderConfig({
++      config: {
++        provider: {
++          opencode: {
++            models: {
++              "kimi-k2.5-free": {
++                limit: { context: 200000 },
++              },
++            },
++          },
++        },
++      },
++      modelCacheState,
++    })
++
++    const hook = createPreemptiveCompactionHook(ctx as never, {} as never, modelCacheState)
++
++    await hook.event({
++      event: {
++        type: "message.updated",
++        properties: {
++          info: {
++            role: "assistant",
++            sessionID,
++            providerID: "opencode",
++            modelID: "kimi-k2.5-free",
++            finish: true,
++            tokens: {
++              input: 170000,
++              output: 0,
++              reasoning: 0,
++              cache: { read: 0, write: 0 },
++            },
++          },
++        },
++      },
++    })
++
++    applyProviderConfig({
++      config: {
++        provider: {
++          opencode: {
++            models: {},
++          },
++        },
++      },
++      modelCacheState,
++    })
++
++    // when
++    await hook["tool.execute.after"](
++      { tool: "bash", sessionID, callID: "call_1" },
++      { title: "", output: "test", metadata: null },
++    )
++
++    // then
++    expect(ctx.client.session.summarize).not.toHaveBeenCalled()
++  })
++})
+diff --git a/src/plugin-handlers/provider-config-handler.test.ts b/src/plugin-handlers/provider-config-handler.test.ts
+index 421dd5d0..890715e7 100644
+--- a/src/plugin-handlers/provider-config-handler.test.ts
++++ b/src/plugin-handlers/provider-config-handler.test.ts
+@@ -6,6 +6,46 @@ import { createModelCacheState } from "../plugin-state"
+ import { clearVisionCapableModelsCache, readVisionCapableModelsCache } from "../shared/vision-capable-models-cache"
+ 
+ describe("applyProviderConfig", () => {
++  test("clears stale model context limits when provider config changes", () => {
++    // given
++    const modelCacheState = createModelCacheState()
++    applyProviderConfig({
++      config: {
++        provider: {
++          opencode: {
++            models: {
++              "kimi-k2.5-free": {
++                limit: { context: 262144 },
++              },
++            },
++          },
++        },
++      },
++      modelCacheState,
++    })
++
++    // when
++    applyProviderConfig({
++      config: {
++        provider: {
++          google: {
++            models: {
++              "gemini-2.5-pro": {
++                limit: { context: 1048576 },
++              },
++            },
++          },
++        },
++      },
++      modelCacheState,
++    })
++
++    // then
++    expect(Array.from(modelCacheState.modelContextLimitsCache.entries())).toEqual([
++      ["google/gemini-2.5-pro", 1048576],
++    ])
++  })
++
+   test("caches vision-capable models from modalities and capabilities", () => {
+     // given
+     const modelCacheState = createModelCacheState()
+diff --git a/src/plugin-handlers/provider-config-handler.ts b/src/plugin-handlers/provider-config-handler.ts
+index cc01508b..5bc2e995 100644
+--- a/src/plugin-handlers/provider-config-handler.ts
++++ b/src/plugin-handlers/provider-config-handler.ts
+@@ -33,6 +33,9 @@ export function applyProviderConfig(params: {
+   const providers = params.config.provider as
+     | Record<string, ProviderConfig>
+     | undefined;
++  const modelContextLimitsCache = params.modelCacheState.modelContextLimitsCache;
++
++  modelContextLimitsCache.clear()
+ 
+   const anthropicBeta = providers?.anthropic?.options?.headers?.["anthropic-beta"];
+   params.modelCacheState.anthropicContext1MEnabled =
+@@ -61,7 +64,7 @@ export function applyProviderConfig(params: {
+       const contextLimit = modelConfig?.limit?.context;
+       if (!contextLimit) continue;
+ 
+-      params.modelCacheState.modelContextLimitsCache.set(
++      modelContextLimitsCache.set(
+         `${providerID}/${modelID}`,
+         contextLimit,
+       );
+-- 
+2.39.2
+

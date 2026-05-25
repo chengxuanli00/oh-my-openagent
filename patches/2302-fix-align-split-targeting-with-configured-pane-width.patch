@@ -1,0 +1,202 @@
+From da3f24b8b146095ed98e20b775f5b6bcd3728f5e Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 17 Feb 2026 03:40:37 +0900
+Subject: [PATCH 2302/5749] fix: align split targeting with configured pane
+ width
+
+Use the configured agent pane width consistently in split target selection and avoid close+spawn churn by replacing the oldest pane when eviction is required.
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../tmux-subagent/decision-engine.test.ts     | 30 ++++++++++++++++---
+ .../tmux-subagent/pane-split-availability.ts  | 16 ++++++++--
+ .../tmux-subagent/spawn-action-decider.ts     | 15 ++++------
+ .../tmux-subagent/spawn-target-finder.ts      | 17 +++++++----
+ 4 files changed, 55 insertions(+), 23 deletions(-)
+
+diff --git a/src/features/tmux-subagent/decision-engine.test.ts b/src/features/tmux-subagent/decision-engine.test.ts
+index c0fa2ccc..9573b69d 100644
+--- a/src/features/tmux-subagent/decision-engine.test.ts
++++ b/src/features/tmux-subagent/decision-engine.test.ts
+@@ -228,7 +228,7 @@ describe("decideSpawnActions", () => {
+       expect(result.actions[0].type).toBe("spawn")
+     })
+ 
+-    it("closes oldest pane when existing panes are too small to split", () => {
++    it("replaces oldest pane when existing panes are too small to split", () => {
+       // given - existing pane is below minimum splittable size
+       const state = createWindowState(220, 30, [
+         { paneId: "%1", width: 50, height: 15, left: 110, top: 0 },
+@@ -242,9 +242,8 @@ describe("decideSpawnActions", () => {
+ 
+       // then
+       expect(result.canSpawn).toBe(true)
+-      expect(result.actions.length).toBe(2)
+-      expect(result.actions[0].type).toBe("close")
+-      expect(result.actions[1].type).toBe("spawn")
++      expect(result.actions.length).toBe(1)
++      expect(result.actions[0].type).toBe("replace")
+     })
+ 
+     it("can spawn when existing pane is large enough to split", () => {
+@@ -394,4 +393,27 @@ describe("decideSpawnActions with custom agentPaneWidth", () => {
+     expect(defaultResult.canSpawn).toBe(false)
+     expect(customResult.canSpawn).toBe(true)
+   })
++
++  it("#given custom agentPaneWidth and splittable existing pane #when deciding spawn #then uses spawn without eviction", () => {
++    //#given
++    const customConfig: CapacityConfig = { mainPaneMinWidth: 120, agentPaneWidth: 40 }
++    const state = createWindowState(220, 44, [
++      { paneId: "%1", width: 90, height: 30, left: 110, top: 0 },
++    ])
++    const mappings: SessionMapping[] = [
++      { sessionId: "old-ses", paneId: "%1", createdAt: new Date("2024-01-01") },
++    ]
++
++    //#when
++    const result = decideSpawnActions(state, "ses1", "test", customConfig, mappings)
++
++    //#then
++    expect(result.canSpawn).toBe(true)
++    expect(result.actions.length).toBe(1)
++    expect(result.actions[0].type).toBe("spawn")
++    if (result.actions[0].type === "spawn") {
++      expect(result.actions[0].targetPaneId).toBe("%1")
++      expect(result.actions[0].splitDirection).toBe("-h")
++    }
++  })
+ })
+diff --git a/src/features/tmux-subagent/pane-split-availability.ts b/src/features/tmux-subagent/pane-split-availability.ts
+index ac279492..68d437e4 100644
+--- a/src/features/tmux-subagent/pane-split-availability.ts
++++ b/src/features/tmux-subagent/pane-split-availability.ts
+@@ -57,11 +57,21 @@ export function canSplitPane(
+ }
+ 
+ export function canSplitPaneAnyDirection(pane: TmuxPaneInfo): boolean {
+-	return pane.width >= MIN_SPLIT_WIDTH || pane.height >= MIN_SPLIT_HEIGHT
++	return canSplitPaneAnyDirectionWithMinWidth(pane, MIN_PANE_WIDTH)
+ }
+ 
+-export function getBestSplitDirection(pane: TmuxPaneInfo): SplitDirection | null {
+-	const canH = pane.width >= MIN_SPLIT_WIDTH
++export function canSplitPaneAnyDirectionWithMinWidth(
++	pane: TmuxPaneInfo,
++	minPaneWidth: number = MIN_PANE_WIDTH,
++): boolean {
++	return pane.width >= minSplitWidthFor(minPaneWidth) || pane.height >= MIN_SPLIT_HEIGHT
++}
++
++export function getBestSplitDirection(
++	pane: TmuxPaneInfo,
++	minPaneWidth: number = MIN_PANE_WIDTH,
++): SplitDirection | null {
++	const canH = pane.width >= minSplitWidthFor(minPaneWidth)
+ 	const canV = pane.height >= MIN_SPLIT_HEIGHT
+ 
+ 	if (!canH && !canV) return null
+diff --git a/src/features/tmux-subagent/spawn-action-decider.ts b/src/features/tmux-subagent/spawn-action-decider.ts
+index 9a2f71ff..7dec369f 100644
+--- a/src/features/tmux-subagent/spawn-action-decider.ts
++++ b/src/features/tmux-subagent/spawn-action-decider.ts
+@@ -62,7 +62,7 @@ export function decideSpawnActions(
+ 	}
+ 
+ 	if (isSplittableAtCount(agentAreaWidth, currentCount, minPaneWidth)) {
+-		const spawnTarget = findSpawnTarget(state)
++		const spawnTarget = findSpawnTarget(state, minPaneWidth)
+ 		if (spawnTarget) {
+ 			return {
+ 				canSpawn: true,
+@@ -85,19 +85,14 @@ export function decideSpawnActions(
+ 			canSpawn: true,
+ 			actions: [
+ 				{
+-					type: "close",
++					type: "replace",
+ 					paneId: oldestPane.paneId,
+-					sessionId: oldestMapping?.sessionId || "",
+-				},
+-				{
+-					type: "spawn",
+-					sessionId,
++					oldSessionId: oldestMapping?.sessionId || "",
++					newSessionId: sessionId,
+ 					description,
+-					targetPaneId: state.mainPane.paneId,
+-					splitDirection: "-h",
+ 				},
+ 			],
+-			reason: "closed 1 pane to make room for split",
++			reason: "replaced oldest pane to avoid split churn",
+ 		}
+ 	}
+ 
+diff --git a/src/features/tmux-subagent/spawn-target-finder.ts b/src/features/tmux-subagent/spawn-target-finder.ts
+index 592f4c2f..61f69e4e 100644
+--- a/src/features/tmux-subagent/spawn-target-finder.ts
++++ b/src/features/tmux-subagent/spawn-target-finder.ts
+@@ -2,6 +2,7 @@ import type { SplitDirection, TmuxPaneInfo, WindowState } from "./types"
+ import { MAIN_PANE_RATIO } from "./tmux-grid-constants"
+ import { computeGridPlan, mapPaneToSlot } from "./grid-planning"
+ import { canSplitPane, getBestSplitDirection } from "./pane-split-availability"
++import { MIN_PANE_WIDTH } from "./types"
+ 
+ export interface SpawnTarget {
+ 	targetPaneId: string
+@@ -37,6 +38,7 @@ function findFirstEmptySlot(
+ 
+ function findSplittableTarget(
+ 	state: WindowState,
++	minPaneWidth: number,
+ 	_preferredDirection?: SplitDirection,
+ ): SpawnTarget | null {
+ 	if (!state.mainPane) return null
+@@ -44,7 +46,7 @@ function findSplittableTarget(
+ 
+ 	if (existingCount === 0) {
+ 		const virtualMainPane: TmuxPaneInfo = { ...state.mainPane, width: state.windowWidth }
+-		if (canSplitPane(virtualMainPane, "-h")) {
++		if (canSplitPane(virtualMainPane, "-h", minPaneWidth)) {
+ 			return { targetPaneId: state.mainPane.paneId, splitDirection: "-h" }
+ 		}
+ 		return null
+@@ -56,17 +58,17 @@ function findSplittableTarget(
+ 	const targetSlot = findFirstEmptySlot(occupancy, plan)
+ 
+ 	const leftPane = occupancy.get(`${targetSlot.row}:${targetSlot.col - 1}`)
+-	if (leftPane && canSplitPane(leftPane, "-h")) {
++	if (leftPane && canSplitPane(leftPane, "-h", minPaneWidth)) {
+ 		return { targetPaneId: leftPane.paneId, splitDirection: "-h" }
+ 	}
+ 
+ 	const abovePane = occupancy.get(`${targetSlot.row - 1}:${targetSlot.col}`)
+-	if (abovePane && canSplitPane(abovePane, "-v")) {
++	if (abovePane && canSplitPane(abovePane, "-v", minPaneWidth)) {
+ 		return { targetPaneId: abovePane.paneId, splitDirection: "-v" }
+ 	}
+ 
+ 	const splittablePanes = state.agentPanes
+-		.map((pane) => ({ pane, direction: getBestSplitDirection(pane) }))
++		.map((pane) => ({ pane, direction: getBestSplitDirection(pane, minPaneWidth) }))
+ 		.filter(
+ 			(item): item is { pane: TmuxPaneInfo; direction: SplitDirection } =>
+ 				item.direction !== null,
+@@ -81,6 +83,9 @@ function findSplittableTarget(
+ 	return null
+ }
+ 
+-export function findSpawnTarget(state: WindowState): SpawnTarget | null {
+-	return findSplittableTarget(state)
++export function findSpawnTarget(
++	state: WindowState,
++	minPaneWidth: number = MIN_PANE_WIDTH,
++): SpawnTarget | null {
++	return findSplittableTarget(state, minPaneWidth)
+ }
+-- 
+2.39.2
+

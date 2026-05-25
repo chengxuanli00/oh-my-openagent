@@ -1,0 +1,144 @@
+From 2b8ae214b649ae27ca3313765ac6e037f9a0487e Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 14 Mar 2026 13:42:24 +0900
+Subject: [PATCH 3276/5749] fix(auto-slash-command): expire duplicate
+ suppression after 30s
+
+Allow legitimate repeated slash commands in long sessions by replacing session-lifetime dedup with a short-lived TTL cache.
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../auto-slash-command-leak.test.ts           | 58 +++++++++++++++----
+ .../processed-command-store.ts                | 26 +++++++--
+ 2 files changed, 67 insertions(+), 17 deletions(-)
+
+diff --git a/src/hooks/auto-slash-command/auto-slash-command-leak.test.ts b/src/hooks/auto-slash-command/auto-slash-command-leak.test.ts
+index 0dc5f41a..be35be92 100644
+--- a/src/hooks/auto-slash-command/auto-slash-command-leak.test.ts
++++ b/src/hooks/auto-slash-command/auto-slash-command-leak.test.ts
+@@ -58,19 +58,55 @@ describe("createAutoSlashCommandHook leak prevention", () => {
+   })
+ 
+   describe("#given hook with sessionProcessedCommandExecutions", () => {
+-    describe("#when same command executed twice for same session", () => {
++    describe("#when same command executed twice within TTL for same session", () => {
+       it("#then second execution is deduplicated", async () => {
+-        const hook = createAutoSlashCommandHook()
+-        const input = createCommandInput("session-dedup", "leak-test-command")
+-        const firstOutput = createCommandOutput("first")
+-        const secondOutput = createCommandOutput("second")
+-
+-        await hook["command.execute.before"](input, firstOutput)
+-        await hook["command.execute.before"](input, secondOutput)
++        //#given
++        const nowSpy = spyOn(Date, "now")
++        try {
++          const hook = createAutoSlashCommandHook()
++          const input = createCommandInput("session-dedup", "leak-test-command")
++          const firstOutput = createCommandOutput("first")
++          const secondOutput = createCommandOutput("second")
++
++          //#when
++          nowSpy.mockReturnValue(0)
++          await hook["command.execute.before"](input, firstOutput)
++          nowSpy.mockReturnValue(29_999)
++          await hook["command.execute.before"](input, secondOutput)
++
++          //#then
++          expect(executeSlashCommandMock).toHaveBeenCalledTimes(1)
++          expect(firstOutput.parts[0].text).toContain(AUTO_SLASH_COMMAND_TAG_OPEN)
++          expect(secondOutput.parts[0].text).toBe("second")
++        } finally {
++          nowSpy.mockRestore()
++        }
++      })
++    })
+ 
+-        expect(executeSlashCommandMock).toHaveBeenCalledTimes(1)
+-        expect(firstOutput.parts[0].text).toContain(AUTO_SLASH_COMMAND_TAG_OPEN)
+-        expect(secondOutput.parts[0].text).toBe("second")
++    describe("#when same command is repeated after TTL expires", () => {
++      it("#then command executes again", async () => {
++        //#given
++        const nowSpy = spyOn(Date, "now")
++        try {
++          const hook = createAutoSlashCommandHook()
++          const input = createCommandInput("session-dedup", "leak-test-command")
++          const firstOutput = createCommandOutput("first")
++          const secondOutput = createCommandOutput("second")
++
++          //#when
++          nowSpy.mockReturnValue(0)
++          await hook["command.execute.before"](input, firstOutput)
++          nowSpy.mockReturnValue(30_001)
++          await hook["command.execute.before"](input, secondOutput)
++
++          //#then
++          expect(executeSlashCommandMock).toHaveBeenCalledTimes(2)
++          expect(firstOutput.parts[0].text).toContain(AUTO_SLASH_COMMAND_TAG_OPEN)
++          expect(secondOutput.parts[0].text).toContain(AUTO_SLASH_COMMAND_TAG_OPEN)
++        } finally {
++          nowSpy.mockRestore()
++        }
+       })
+     })
+   })
+diff --git a/src/hooks/auto-slash-command/processed-command-store.ts b/src/hooks/auto-slash-command/processed-command-store.ts
+index cbd41b16..11ed3c86 100644
+--- a/src/hooks/auto-slash-command/processed-command-store.ts
++++ b/src/hooks/auto-slash-command/processed-command-store.ts
+@@ -1,16 +1,25 @@
+ const MAX_PROCESSED_ENTRY_COUNT = 10_000
++const PROCESSED_COMMAND_TTL_MS = 30_000
+ 
+-function trimProcessedEntries(entries: Set<string>): Set<string> {
++function pruneExpiredEntries(entries: Map<string, number>, now: number): Map<string, number> {
++  return new Map(Array.from(entries.entries()).filter(([, expiresAt]) => expiresAt > now))
++}
++
++function trimProcessedEntries(entries: Map<string, number>): Map<string, number> {
+   if (entries.size <= MAX_PROCESSED_ENTRY_COUNT) {
+     return entries
+   }
+ 
+-  return new Set(Array.from(entries).slice(Math.floor(entries.size / 2)))
++  return new Map(
++    Array.from(entries.entries())
++      .sort((left, right) => left[1] - right[1])
++      .slice(Math.floor(entries.size / 2))
++  )
+ }
+ 
+-function removeSessionEntries(entries: Set<string>, sessionID: string): Set<string> {
++function removeSessionEntries(entries: Map<string, number>, sessionID: string): Map<string, number> {
+   const sessionPrefix = `${sessionID}:`
+-  return new Set(Array.from(entries).filter((entry) => !entry.startsWith(sessionPrefix)))
++  return new Map(Array.from(entries.entries()).filter(([entry]) => !entry.startsWith(sessionPrefix)))
+ }
+ 
+ export interface ProcessedCommandStore {
+@@ -21,14 +30,19 @@ export interface ProcessedCommandStore {
+ }
+ 
+ export function createProcessedCommandStore(): ProcessedCommandStore {
+-  let entries = new Set<string>()
++  let entries = new Map<string, number>()
+ 
+   return {
+     has(commandKey: string): boolean {
++      const now = Date.now()
++      entries = pruneExpiredEntries(entries, now)
+       return entries.has(commandKey)
+     },
+     add(commandKey: string): void {
+-      entries.add(commandKey)
++      const now = Date.now()
++      entries = pruneExpiredEntries(entries, now)
++      entries.delete(commandKey)
++      entries.set(commandKey, now + PROCESSED_COMMAND_TTL_MS)
+       entries = trimProcessedEntries(entries)
+     },
+     cleanupSession(sessionID: string): void {
+-- 
+2.39.2
+

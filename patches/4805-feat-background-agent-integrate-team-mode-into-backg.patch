@@ -1,0 +1,376 @@
+From a0d122b1e6436ab08f5447e2048f692c38c3c404 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 28 Apr 2026 10:48:05 +0900
+Subject: [PATCH 4805/5749] feat(background-agent): integrate team-mode into
+ background manager
+
+---
+ src/features/background-agent/manager.test.ts | 181 +++++++++++++++++-
+ src/features/background-agent/manager.ts      |  20 +-
+ src/features/background-agent/types.ts        |  10 +-
+ 3 files changed, 197 insertions(+), 14 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 46bbbb76..a766b3bb 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -6,6 +6,7 @@ afterAll(() => { mock.restore() })
+ import { getSessionPromptParams, clearSessionPromptParams } from "../../shared/session-prompt-params-state"
+ import { tmpdir } from "node:os"
+ import type { PluginInput } from "@opencode-ai/plugin"
++import * as sharedModule from "../../shared"
+ import { _resetForTesting as resetClaudeCodeSessionState, subagentSessions } from "../claude-code-session-state"
+ import type { BackgroundTask, ResumeInput } from "./types"
+ import { MIN_IDLE_TIME_MS } from "./constants"
+@@ -195,7 +196,7 @@ function createBackgroundManager(): BackgroundManager {
+   return new BackgroundManager({ pluginContext: { client, directory: tmpdir() } as unknown as PluginInput })
+ }
+ 
+-function createBackgroundManagerWithOptions(options: unknown): BackgroundManager {
++function createBackgroundManagerWithOptions(options: Partial<ConstructorParameters<typeof BackgroundManager>[0]>): BackgroundManager {
+   const client = {
+     session: {
+       prompt: async () => ({}),
+@@ -203,9 +204,11 @@ function createBackgroundManagerWithOptions(options: unknown): BackgroundManager
+       abort: async () => ({}),
+     },
+   }
+-  return new BackgroundManager(
+-    { pluginContext: { client, directory: tmpdir() } as unknown as PluginInput, config: undefined, ...(options as Partial<import("./manager").BackgroundManagerConfig>) },
+-  )
++  return new BackgroundManager({
++    pluginContext: { client, directory: tmpdir() } as unknown as PluginInput,
++    config: undefined,
++    ...options,
++  })
+ }
+ 
+ function getConcurrencyManager(manager: BackgroundManager): ConcurrencyManager {
+@@ -295,7 +298,10 @@ describe("BackgroundManager session.error fallback hydration", () => {
+     )
+     const manager = createBackgroundManagerWithOptions({
+       modelFallbackControllerAccessor: {
++        register: () => {},
++        setSessionFallbackChain: () => {},
+         getSessionFallbackChain,
++        clearSessionFallbackChain: () => {},
+       },
+     })
+     const task = createMockTask({
+@@ -576,12 +582,12 @@ describe("BackgroundManager retry observability", () => {
+     type RetryReadyQueueItem = {
+       task: BackgroundTask
+       input: typeof taskInput
+-      attemptId: string
++      attemptID: string
+     }
+     const item: RetryReadyQueueItem = {
+       task,
+       input: taskInput,
+-      attemptId: task.currentAttemptID ?? "att_retry_ready",
++      attemptID: task.currentAttemptID ?? "att_retry_ready",
+     }
+ 
+     //#when
+@@ -4620,6 +4626,30 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+     { providers: ["anthropic"], model: "gpt-5.3-codex", variant: "high" },
+   ]
+ 
++  let logCalls: Array<{ message: string; data?: unknown }> = []
++  let logSpy: ReturnType<typeof spyOn> | undefined
++  let verifySessionExistsSpy: ReturnType<typeof spyOn> | undefined
++
++  beforeEach(() => {
++    logCalls = []
++    logSpy = spyOn(sharedModule, "log").mockImplementation((message: string, data?: unknown) => {
++      logCalls.push({ message, data })
++    })
++  })
++
++  afterEach(() => {
++    logSpy?.mockRestore()
++    verifySessionExistsSpy?.mockRestore()
++  })
++
++  const mockVerifySessionExists = (manager: BackgroundManager, sessionExists: boolean): void => {
++    verifySessionExistsSpy?.mockRestore()
++    verifySessionExistsSpy = spyOn(
++      manager as unknown as { verifySessionExists: (sessionID: string) => Promise<boolean> },
++      "verifySessionExists",
++    ).mockResolvedValue(sessionExists)
++  }
++
+   const stubProcessKey = (manager: BackgroundManager) => {
+     ;(manager as unknown as { processKey: (key: string) => Promise<void> }).processKey = async () => {}
+   }
+@@ -4651,6 +4681,7 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+   test("sets task to error, releases concurrency, and keeps it until delayed cleanup", async () => {
+     //#given
+     const manager = createBackgroundManager()
++    mockVerifySessionExists(manager, false)
+     const concurrencyManager = getConcurrencyManager(manager)
+     const concurrencyKey = "test-provider/test-model"
+     await concurrencyManager.acquire(concurrencyKey)
+@@ -4699,6 +4730,7 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+     //#given
+     const { removeTaskCalls, resetToastManager } = createToastRemoveTaskTracker()
+     const manager = createBackgroundManager()
++    mockVerifySessionExists(manager, false)
+     const sessionID = "ses_error_toast"
+     const task = createMockTask({
+       id: "task-session-error-toast",
+@@ -4770,7 +4802,7 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+       manager.handleEvent({
+         type: "session.error",
+         properties: {
+-          sessionID: "ses_unknown",
++          sessionId: "ses_unknown",
+           error: { name: "UnknownError", message: "Model not found" },
+         },
+       })
+@@ -4781,6 +4813,141 @@ describe("BackgroundManager.handleEvent - session.error", () => {
+     manager.shutdown()
+   })
+ 
++  test("does not terminate task on session.error when session is still alive", async () => {
++    //#given
++    const manager = createBackgroundManager()
++    mockVerifySessionExists(manager, true)
++
++    const task = createMockTask({
++      id: "task-session-error-alive",
++      sessionId: "ses-alive",
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-alive",
++      description: "task with transient session.error",
++      agent: "explore",
++      status: "running",
++    })
++    getTaskMap(manager).set(task.id, task)
++
++    //#when
++    manager.handleEvent({
++      type: "session.error",
++      properties: {
++        sessionId: task.sessionId,
++        error: {
++          name: "UnknownError",
++          message: "Out of memory",
++        },
++      },
++    })
++
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(task.status).toBe("running")
++    expect(task.error).toBeUndefined()
++    expect(
++      logCalls.some((call) => call.message.includes("session.error received but session still alive")),
++    ).toBe(true)
++
++    manager.shutdown()
++  })
++
++  test("terminates task on session.error when session is gone", async () => {
++    //#given
++    const manager = createBackgroundManager()
++    mockVerifySessionExists(manager, false)
++
++    const task = createMockTask({
++      id: "task-session-error-gone",
++      sessionId: "ses-gone",
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-gone",
++      description: "task with fatal session.error",
++      agent: "explore",
++      status: "running",
++    })
++    getTaskMap(manager).set(task.id, task)
++
++    //#when
++    manager.handleEvent({
++      type: "session.error",
++      properties: {
++        sessionId: task.sessionId,
++        error: {
++          name: "UnknownError",
++          message: "Out of memory",
++        },
++      },
++    })
++
++    await flushBackgroundNotifications()
++
++    //#then
++    expect(task.status).toBe("error")
++    expect(task.error).toBe("Out of memory")
++
++    manager.shutdown()
++  })
++
++  test("completes task on session.idle after transient session.error", async () => {
++    //#given
++    const sessionID = "ses-alive-idle"
++    const client = {
++      session: {
++        prompt: async () => ({}),
++        promptAsync: async () => ({}),
++        abort: async () => ({}),
++        messages: async () => ({
++          data: [
++            {
++              info: { role: "assistant" },
++              parts: [{ type: "text", text: "ok" }],
++            },
++          ],
++        }),
++        todo: async () => ({ data: [] }),
++      },
++    }
++
++    const manager = new BackgroundManager({ pluginContext: { client, directory: tmpdir() } as unknown as PluginInput })
++    stubNotifyParentSession(manager)
++    mockVerifySessionExists(manager, true)
++
++    const task = createMockTask({
++      id: "task-session-error-recovers",
++      sessionId: sessionID,
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-recovers",
++      description: "task that recovers after transient error",
++      agent: "explore",
++      status: "running",
++      startedAt: new Date(Date.now() - (MIN_IDLE_TIME_MS + 10)),
++    })
++    getTaskMap(manager).set(task.id, task)
++
++    //#when
++    manager.handleEvent({
++      type: "session.error",
++      properties: {
++        sessionID,
++        error: {
++          name: "UnknownError",
++          message: "Out of memory",
++        },
++      },
++    })
++    await flushBackgroundNotifications()
++    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
++    await new Promise((resolve) => setTimeout(resolve, 10))
++
++    //#then
++    expect(task.status).toBe("completed")
++    expect(task.error).toBeUndefined()
++
++    manager.shutdown()
++  })
++
+   test("retry path releases current concurrency slot and prefers current provider in fallback entry", async () => {
+     //#given
+     const manager = createBackgroundManager()
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 1148eaf3..b6a894c1 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -407,6 +407,7 @@ export class BackgroundManager {
+         spawnDepth: spawnReservation.spawnContext.childDepth,
+         parentSessionId: input.parentSessionId,
+         parentMessageId: input.parentMessageId,
++        teamRunId: input.teamRunId,
+         parentModel: input.parentModel,
+         parentAgent: input.parentAgent,
+         parentTools: input.parentTools,
+@@ -590,7 +591,7 @@ export class BackgroundManager {
+       parentID: input.parentSessionId,
+     })
+ 
+-    if (this.onSubagentSessionCreated && this.tmuxEnabled && isInsideTmux()) {
++    if (!input.suppressTmuxSpawn && this.onSubagentSessionCreated && this.tmuxEnabled && isInsideTmux()) {
+       log("[background-agent] Invoking tmux callback NOW", { sessionID })
+       await this.onSubagentSessionCreated({
+         sessionID,
+@@ -602,7 +603,9 @@ export class BackgroundManager {
+       log("[background-agent] tmux callback completed, waiting 200ms")
+       await new Promise(r => setTimeout(r, 200))
+     } else {
+-      log("[background-agent] SKIP tmux callback - conditions not met")
++      log("[background-agent] SKIP tmux callback - conditions not met", {
++        suppressTmuxSpawn: !!input.suppressTmuxSpawn,
++      })
+     }
+ 
+     if (this.tasks.get(task.id)?.status === "cancelled") {
+@@ -1507,6 +1510,19 @@ The fallback retry session is now created and can be inspected directly.
+       canRetry,
+     })
+ 
++    const sessionId = task.sessionId
++    if (sessionId) {
++      const sessionStillAlive = await this.verifySessionExists(sessionId)
++      if (sessionStillAlive) {
++        log("[background-agent] session.error received but session still alive, treating as transient:", {
++          taskId: task.id,
++          sessionId,
++          errorMessage: errorMsg?.slice(0, 200),
++        })
++        return
++      }
++    }
++
+     if (task.currentAttemptID) {
+       finalizeAttempt(task, task.currentAttemptID, "error", errorMsg)
+     } else {
+diff --git a/src/features/background-agent/types.ts b/src/features/background-agent/types.ts
+index e7b8631b..0851c179 100644
+--- a/src/features/background-agent/types.ts
++++ b/src/features/background-agent/types.ts
+@@ -59,7 +59,7 @@ export interface BackgroundTask {
+   result?: string
+   error?: string
+   progress?: TaskProgress
+-  parentModel?: { providerId: string; modelId: string }
++  parentModel?: { providerID: string; modelID: string }
+   model?: DelegatedModelConfig
+   /** Fallback chain for runtime retry on model errors */
+   fallbackChain?: FallbackEntry[]
+@@ -79,7 +79,7 @@ export interface BackgroundTask {
+   category?: string
+   /** Pending retry notification details for the next spawned retry session */
+   retryNotification?: {
+-    previousSessionId?: string
++    previousSessionID?: string
+     failedModel?: string
+     failedError?: string
+     nextModel: string
+@@ -88,7 +88,7 @@ export interface BackgroundTask {
+   /** Structured attempt history for retry observability */
+   attempts?: BackgroundTaskAttempt[]
+   /** ID of the currently active attempt */
+-  currentAttemptId?: string
++  currentAttemptID?: string
+ 
+   /** Last message count for stability detection */
+   lastMsgCount?: number
+@@ -106,7 +106,7 @@ export interface LaunchInput {
+   parentMessageId: string
+   teamRunId?: string
+   suppressTmuxSpawn?: boolean
+-  parentModel?: { providerId: string; modelId: string }
++  parentModel?: { providerID: string; modelID: string }
+   parentAgent?: string
+   parentTools?: Record<string, boolean>
+   model?: DelegatedModelConfig
+@@ -124,7 +124,7 @@ export interface ResumeInput {
+   prompt: string
+   parentSessionId: string
+   parentMessageId: string
+-  parentModel?: { providerId: string; modelId: string }
++  parentModel?: { providerID: string; modelID: string }
+   parentAgent?: string
+   parentTools?: Record<string, boolean>
+ }
+-- 
+2.39.2
+

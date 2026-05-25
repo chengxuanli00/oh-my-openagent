@@ -1,0 +1,1135 @@
+From 7090fca0fd6b7dccd4d2f5cc73cc75a2cde75245 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 4 Dec 2025 21:54:02 +0900
+Subject: [PATCH 0015/5749] feat(lsp): add LSP tools integration with
+ workspace/configuration support
+
+- Add 7 LSP tools: hover, goto_definition, find_references, document_symbols, workspace_symbols, diagnostics, servers
+- Support multiple LSP servers: typescript, gopls, pyrefly, basedpyright, ruff, rust-analyzer, clangd, sourcekit-lsp, ruby-lsp
+- Read LSP config from opencode.json with disabled server support
+- Handle server requests: workspace/configuration, client/registerCapability, window/workDoneProgress/create
+- Send workspace/didChangeConfiguration after initialized for basedpyright compatibility
+- Uint8Array-based buffer for reliable LSP message parsing
+---
+ src/index.ts               |   3 +
+ src/tools/index.ts         |  19 +++
+ src/tools/lsp/client.ts    | 267 +++++++++++++++++++++++++++++++++++++
+ src/tools/lsp/config.ts    | 168 +++++++++++++++++++++++
+ src/tools/lsp/constants.ts | 174 ++++++++++++++++++++++++
+ src/tools/lsp/index.ts     |   6 +
+ src/tools/lsp/tools.ts     | 192 ++++++++++++++++++++++++++
+ src/tools/lsp/types.ts     |  61 +++++++++
+ src/tools/lsp/utils.ts     | 144 ++++++++++++++++++++
+ 9 files changed, 1034 insertions(+)
+ create mode 100644 src/tools/index.ts
+ create mode 100644 src/tools/lsp/client.ts
+ create mode 100644 src/tools/lsp/config.ts
+ create mode 100644 src/tools/lsp/constants.ts
+ create mode 100644 src/tools/lsp/index.ts
+ create mode 100644 src/tools/lsp/tools.ts
+ create mode 100644 src/tools/lsp/types.ts
+ create mode 100644 src/tools/lsp/utils.ts
+
+diff --git a/src/index.ts b/src/index.ts
+index 23c1ad29..73863a6a 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin"
+ import { builtinAgents } from "./agents"
+ import { createTodoContinuationEnforcer, createContextWindowMonitorHook } from "./hooks"
+ import { updateTerminalTitle } from "./features/terminal"
++import { builtinTools } from "./tools"
+ 
+ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const todoContinuationEnforcer = createTodoContinuationEnforcer(ctx)
+@@ -14,6 +15,8 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   let currentSessionTitle: string | undefined
+ 
+   return {
++    tool: builtinTools,
++
+     config: async (config) => {
+       config.agent = {
+         ...config.agent,
+diff --git a/src/tools/index.ts b/src/tools/index.ts
+new file mode 100644
+index 00000000..4fca1e38
+--- /dev/null
++++ b/src/tools/index.ts
+@@ -0,0 +1,19 @@
++import {
++  lsp_hover,
++  lsp_goto_definition,
++  lsp_find_references,
++  lsp_document_symbols,
++  lsp_workspace_symbols,
++  lsp_diagnostics,
++  lsp_servers,
++} from "./lsp"
++
++export const builtinTools = {
++  lsp_hover,
++  lsp_goto_definition,
++  lsp_find_references,
++  lsp_document_symbols,
++  lsp_workspace_symbols,
++  lsp_diagnostics,
++  lsp_servers,
++}
+diff --git a/src/tools/lsp/client.ts b/src/tools/lsp/client.ts
+new file mode 100644
+index 00000000..976a54ab
+--- /dev/null
++++ b/src/tools/lsp/client.ts
+@@ -0,0 +1,267 @@
++import { spawn, type Subprocess } from "bun"
++import { readFileSync } from "fs"
++import { extname, resolve } from "path"
++import type { ResolvedServer } from "./config"
++import { getLanguageId } from "./config"
++
++export class LSPClient {
++  private proc: Subprocess<"pipe", "pipe", "pipe"> | null = null
++  private buffer: Uint8Array = new Uint8Array(0)
++  private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
++  private requestId = 0
++  private openedFiles = new Set<string>()
++
++  constructor(
++    private root: string,
++    private server: ResolvedServer
++  ) {}
++
++  async start(): Promise<void> {
++    this.proc = spawn(this.server.command, {
++      stdin: "pipe",
++      stdout: "pipe",
++      stderr: "pipe",
++      cwd: this.root,
++      env: {
++        ...process.env,
++        ...this.server.env,
++      },
++    })
++    this.startReading()
++  }
++
++  private startReading(): void {
++    if (!this.proc) return
++
++    const reader = this.proc.stdout.getReader()
++    const read = async () => {
++      try {
++        while (true) {
++          const { done, value } = await reader.read()
++          if (done) break
++          const newBuf = new Uint8Array(this.buffer.length + value.length)
++          newBuf.set(this.buffer)
++          newBuf.set(value, this.buffer.length)
++          this.buffer = newBuf
++          this.processBuffer()
++        }
++      } catch {
++      }
++    }
++    read()
++  }
++
++  private findSequence(haystack: Uint8Array, needle: number[]): number {
++    outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
++      for (let j = 0; j < needle.length; j++) {
++        if (haystack[i + j] !== needle[j]) continue outer
++      }
++      return i
++    }
++    return -1
++  }
++
++  private processBuffer(): void {
++    const decoder = new TextDecoder()
++    const CONTENT_LENGTH = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58]
++    const CRLF_CRLF = [13, 10, 13, 10]
++    const LF_LF = [10, 10]
++
++    while (true) {
++      const headerStart = this.findSequence(this.buffer, CONTENT_LENGTH)
++      if (headerStart === -1) break
++      if (headerStart > 0) this.buffer = this.buffer.slice(headerStart)
++
++      let headerEnd = this.findSequence(this.buffer, CRLF_CRLF)
++      let sepLen = 4
++      if (headerEnd === -1) {
++        headerEnd = this.findSequence(this.buffer, LF_LF)
++        sepLen = 2
++      }
++      if (headerEnd === -1) break
++
++      const header = decoder.decode(this.buffer.slice(0, headerEnd))
++      const match = header.match(/Content-Length:\s*(\d+)/i)
++      if (!match) break
++
++      const len = parseInt(match[1], 10)
++      const start = headerEnd + sepLen
++      const end = start + len
++      if (this.buffer.length < end) break
++
++      const content = decoder.decode(this.buffer.slice(start, end))
++      this.buffer = this.buffer.slice(end)
++
++      try {
++        const msg = JSON.parse(content)
++
++        // Handle server requests (has id AND method) - e.g., workspace/configuration
++        if ("id" in msg && "method" in msg) {
++          this.handleServerRequest(msg.id, msg.method, msg.params)
++        }
++        // Handle server responses (has id, no method)
++        else if ("id" in msg && this.pending.has(msg.id)) {
++          const handler = this.pending.get(msg.id)!
++          this.pending.delete(msg.id)
++          if ("error" in msg) {
++            handler.reject(new Error(msg.error.message))
++          } else {
++            handler.resolve(msg.result)
++          }
++        }
++      } catch {
++      }
++    }
++  }
++
++  private send(method: string, params?: unknown): Promise<unknown> {
++    if (!this.proc) throw new Error("LSP client not started")
++
++    const id = ++this.requestId
++    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params })
++    const header = `Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n`
++    this.proc.stdin.write(header + msg)
++
++    return new Promise((resolve, reject) => {
++      this.pending.set(id, { resolve, reject })
++      setTimeout(() => {
++        if (this.pending.has(id)) {
++          this.pending.delete(id)
++          reject(new Error("LSP request timeout"))
++        }
++      }, 30000)
++    })
++  }
++
++  private notify(method: string, params?: unknown): void {
++    if (!this.proc) return
++
++    const msg = JSON.stringify({ jsonrpc: "2.0", method, params })
++    this.proc.stdin.write(`Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`)
++  }
++
++  private respond(id: number | string, result: unknown): void {
++    if (!this.proc) return
++
++    const msg = JSON.stringify({ jsonrpc: "2.0", id, result })
++    this.proc.stdin.write(`Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`)
++  }
++
++  private handleServerRequest(id: number | string, method: string, _params?: unknown): void {
++    if (method === "workspace/configuration") {
++      this.respond(id, [{}])
++    } else if (method === "client/registerCapability") {
++      this.respond(id, null)
++    } else if (method === "window/workDoneProgress/create") {
++      this.respond(id, null)
++    }
++  }
++
++  async initialize(): Promise<void> {
++    const rootUri = `file://${this.root}`
++    await this.send("initialize", {
++      processId: process.pid,
++      rootUri,
++      rootPath: this.root,
++      workspaceFolders: [{ uri: rootUri, name: "workspace" }],
++      capabilities: {
++        textDocument: {
++          hover: { contentFormat: ["markdown", "plaintext"] },
++          definition: { linkSupport: true },
++          references: {},
++          documentSymbol: { hierarchicalDocumentSymbolSupport: true },
++          publishDiagnostics: {},
++        },
++        workspace: {
++          symbol: {},
++          workspaceFolders: true,
++          configuration: true,
++        },
++      },
++      ...this.server.initialization,
++    })
++    this.notify("initialized")
++    this.notify("workspace/didChangeConfiguration", { settings: {} })
++    await new Promise((r) => setTimeout(r, 500))
++  }
++
++  async openFile(filePath: string): Promise<void> {
++    const absPath = resolve(filePath)
++    if (this.openedFiles.has(absPath)) return
++
++    const text = readFileSync(absPath, "utf-8")
++    const ext = extname(absPath)
++    const languageId = getLanguageId(ext)
++
++    this.notify("textDocument/didOpen", {
++      textDocument: {
++        uri: `file://${absPath}`,
++        languageId,
++        version: 1,
++        text,
++      },
++    })
++    this.openedFiles.add(absPath)
++
++    await new Promise((r) => setTimeout(r, 2000))
++  }
++
++  async hover(filePath: string, line: number, character: number): Promise<unknown> {
++    const absPath = resolve(filePath)
++    await this.openFile(absPath)
++    return this.send("textDocument/hover", {
++      textDocument: { uri: `file://${absPath}` },
++      position: { line: line - 1, character },
++    })
++  }
++
++  async definition(filePath: string, line: number, character: number): Promise<unknown> {
++    const absPath = resolve(filePath)
++    await this.openFile(absPath)
++    return this.send("textDocument/definition", {
++      textDocument: { uri: `file://${absPath}` },
++      position: { line: line - 1, character },
++    })
++  }
++
++  async references(filePath: string, line: number, character: number, includeDeclaration = true): Promise<unknown> {
++    const absPath = resolve(filePath)
++    await this.openFile(absPath)
++    return this.send("textDocument/references", {
++      textDocument: { uri: `file://${absPath}` },
++      position: { line: line - 1, character },
++      context: { includeDeclaration },
++    })
++  }
++
++  async documentSymbols(filePath: string): Promise<unknown> {
++    const absPath = resolve(filePath)
++    await this.openFile(absPath)
++    return this.send("textDocument/documentSymbol", {
++      textDocument: { uri: `file://${absPath}` },
++    })
++  }
++
++  async workspaceSymbols(query: string): Promise<unknown> {
++    return this.send("workspace/symbol", { query })
++  }
++
++  async diagnostics(filePath: string): Promise<unknown> {
++    const absPath = resolve(filePath)
++    await this.openFile(absPath)
++    await new Promise((r) => setTimeout(r, 1000))
++    return this.send("textDocument/diagnostic", {
++      textDocument: { uri: `file://${absPath}` },
++    })
++  }
++
++  async stop(): Promise<void> {
++    try {
++      await this.send("shutdown", {})
++      this.notify("exit")
++    } catch {
++    }
++    this.proc?.kill()
++    this.proc = null
++  }
++}
+diff --git a/src/tools/lsp/config.ts b/src/tools/lsp/config.ts
+new file mode 100644
+index 00000000..5856795b
+--- /dev/null
++++ b/src/tools/lsp/config.ts
+@@ -0,0 +1,168 @@
++import { existsSync, readFileSync } from "fs"
++import { join } from "path"
++import { homedir } from "os"
++import { BUILTIN_SERVERS, EXT_TO_LANG } from "./constants"
++
++export interface ResolvedServer {
++  id: string
++  command: string[]
++  extensions: string[]
++  env?: Record<string, string>
++  initialization?: Record<string, unknown>
++}
++
++interface OpencodeJsonLspEntry {
++  disabled?: boolean
++  command?: string[]
++  extensions?: string[]
++  env?: Record<string, string>
++  initialization?: Record<string, unknown>
++}
++
++interface OpencodeJson {
++  lsp?: Record<string, OpencodeJsonLspEntry>
++}
++
++let cachedOpencodeConfig: OpencodeJson | null = null
++
++function loadOpencodeJson(): OpencodeJson {
++  if (cachedOpencodeConfig) return cachedOpencodeConfig
++
++  const configPath = join(homedir(), ".config", "opencode", "opencode.json")
++  if (existsSync(configPath)) {
++    try {
++      const content = readFileSync(configPath, "utf-8")
++      cachedOpencodeConfig = JSON.parse(content) as OpencodeJson
++      return cachedOpencodeConfig
++    } catch {
++    }
++  }
++
++  cachedOpencodeConfig = {}
++  return cachedOpencodeConfig
++}
++
++function getDisabledServers(): Set<string> {
++  const config = loadOpencodeJson()
++  const disabled = new Set<string>()
++
++  if (config.lsp) {
++    for (const [id, entry] of Object.entries(config.lsp)) {
++      if (entry.disabled) {
++        disabled.add(id)
++      }
++    }
++  }
++
++  return disabled
++}
++
++function getUserLspServers(): Map<string, ResolvedServer> {
++  const config = loadOpencodeJson()
++  const servers = new Map<string, ResolvedServer>()
++
++  if (config.lsp) {
++    for (const [id, entry] of Object.entries(config.lsp)) {
++      if (entry.disabled) continue
++      if (!entry.command || !entry.extensions) continue
++
++      servers.set(id, {
++        id,
++        command: entry.command,
++        extensions: entry.extensions,
++        env: entry.env,
++        initialization: entry.initialization,
++      })
++    }
++  }
++
++  return servers
++}
++
++export function findServerForExtension(ext: string): ResolvedServer | null {
++  const userServers = getUserLspServers()
++  const disabledServers = getDisabledServers()
++
++  for (const server of userServers.values()) {
++    if (server.extensions.includes(ext) && isServerInstalled(server.command)) {
++      return server
++    }
++  }
++
++  for (const [id, config] of Object.entries(BUILTIN_SERVERS)) {
++    if (disabledServers.has(id)) continue
++    if (userServers.has(id)) continue
++
++    if (config.extensions.includes(ext) && isServerInstalled(config.command)) {
++      return {
++        id,
++        command: config.command,
++        extensions: config.extensions,
++      }
++    }
++  }
++
++  return null
++}
++
++export function getLanguageId(ext: string): string {
++  return EXT_TO_LANG[ext] || "plaintext"
++}
++
++export function isServerInstalled(command: string[]): boolean {
++  if (command.length === 0) return false
++
++  const cmd = command[0]
++  const pathEnv = process.env.PATH || ""
++  const paths = pathEnv.split(":")
++
++  for (const p of paths) {
++    if (existsSync(join(p, cmd))) {
++      return true
++    }
++  }
++
++  return false
++}
++
++export function getAllServers(): Array<{ id: string; installed: boolean; extensions: string[]; disabled: boolean }> {
++  const result: Array<{ id: string; installed: boolean; extensions: string[]; disabled: boolean }> = []
++  const userServers = getUserLspServers()
++  const disabledServers = getDisabledServers()
++  const seen = new Set<string>()
++
++  for (const server of userServers.values()) {
++    result.push({
++      id: server.id,
++      installed: isServerInstalled(server.command),
++      extensions: server.extensions,
++      disabled: false,
++    })
++    seen.add(server.id)
++  }
++
++  for (const id of disabledServers) {
++    if (seen.has(id)) continue
++    const builtin = BUILTIN_SERVERS[id]
++    result.push({
++      id,
++      installed: builtin ? isServerInstalled(builtin.command) : false,
++      extensions: builtin?.extensions || [],
++      disabled: true,
++    })
++    seen.add(id)
++  }
++
++  for (const [id, config] of Object.entries(BUILTIN_SERVERS)) {
++    if (seen.has(id)) continue
++
++    result.push({
++      id,
++      installed: isServerInstalled(config.command),
++      extensions: config.extensions,
++      disabled: false,
++    })
++  }
++
++  return result
++}
+diff --git a/src/tools/lsp/constants.ts b/src/tools/lsp/constants.ts
+new file mode 100644
+index 00000000..a001a36b
+--- /dev/null
++++ b/src/tools/lsp/constants.ts
+@@ -0,0 +1,174 @@
++import type { LSPServerConfig } from "./types"
++
++export const SYMBOL_KIND_MAP: Record<number, string> = {
++  1: "File",
++  2: "Module",
++  3: "Namespace",
++  4: "Package",
++  5: "Class",
++  6: "Method",
++  7: "Property",
++  8: "Field",
++  9: "Constructor",
++  10: "Enum",
++  11: "Interface",
++  12: "Function",
++  13: "Variable",
++  14: "Constant",
++  15: "String",
++  16: "Number",
++  17: "Boolean",
++  18: "Array",
++  19: "Object",
++  20: "Key",
++  21: "Null",
++  22: "EnumMember",
++  23: "Struct",
++  24: "Event",
++  25: "Operator",
++  26: "TypeParameter",
++}
++
++export const SEVERITY_MAP: Record<number, string> = {
++  1: "error",
++  2: "warning",
++  3: "information",
++  4: "hint",
++}
++
++export const BUILTIN_SERVERS: Record<string, Omit<LSPServerConfig, "id">> = {
++  typescript: {
++    command: ["typescript-language-server", "--stdio"],
++    extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
++  },
++  deno: {
++    command: ["deno", "lsp"],
++    extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs"],
++  },
++  vue: {
++    command: ["vue-language-server", "--stdio"],
++    extensions: [".vue"],
++  },
++  eslint: {
++    command: ["vscode-eslint-language-server", "--stdio"],
++    extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue"],
++  },
++  gopls: {
++    command: ["gopls"],
++    extensions: [".go"],
++  },
++  "ruby-lsp": {
++    command: ["rubocop", "--lsp"],
++    extensions: [".rb", ".rake", ".gemspec", ".ru"],
++  },
++  basedpyright: {
++    command: ["basedpyright-langserver", "--stdio"],
++    extensions: [".py", ".pyi"],
++  },
++  pyright: {
++    command: ["pyright-langserver", "--stdio"],
++    extensions: [".py", ".pyi"],
++  },
++  ruff: {
++    command: ["ruff", "server"],
++    extensions: [".py", ".pyi"],
++  },
++  "elixir-ls": {
++    command: ["elixir-ls"],
++    extensions: [".ex", ".exs"],
++  },
++  zls: {
++    command: ["zls"],
++    extensions: [".zig", ".zon"],
++  },
++  csharp: {
++    command: ["csharp-ls"],
++    extensions: [".cs"],
++  },
++  "sourcekit-lsp": {
++    command: ["sourcekit-lsp"],
++    extensions: [".swift", ".objc", ".objcpp"],
++  },
++  rust: {
++    command: ["rust-analyzer"],
++    extensions: [".rs"],
++  },
++  clangd: {
++    command: ["clangd", "--background-index", "--clang-tidy"],
++    extensions: [".c", ".cpp", ".cc", ".cxx", ".c++", ".h", ".hpp", ".hh", ".hxx", ".h++"],
++  },
++  svelte: {
++    command: ["svelteserver", "--stdio"],
++    extensions: [".svelte"],
++  },
++  astro: {
++    command: ["astro-ls", "--stdio"],
++    extensions: [".astro"],
++  },
++  jdtls: {
++    command: ["jdtls"],
++    extensions: [".java"],
++  },
++  "yaml-ls": {
++    command: ["yaml-language-server", "--stdio"],
++    extensions: [".yaml", ".yml"],
++  },
++  "lua-ls": {
++    command: ["lua-language-server"],
++    extensions: [".lua"],
++  },
++  php: {
++    command: ["intelephense", "--stdio"],
++    extensions: [".php"],
++  },
++  dart: {
++    command: ["dart", "language-server", "--lsp"],
++    extensions: [".dart"],
++  },
++}
++
++export const EXT_TO_LANG: Record<string, string> = {
++  ".py": "python",
++  ".pyi": "python",
++  ".ts": "typescript",
++  ".tsx": "typescriptreact",
++  ".mts": "typescript",
++  ".cts": "typescript",
++  ".js": "javascript",
++  ".jsx": "javascriptreact",
++  ".mjs": "javascript",
++  ".cjs": "javascript",
++  ".go": "go",
++  ".rs": "rust",
++  ".c": "c",
++  ".cpp": "cpp",
++  ".cc": "cpp",
++  ".cxx": "cpp",
++  ".c++": "cpp",
++  ".h": "c",
++  ".hpp": "cpp",
++  ".hh": "cpp",
++  ".hxx": "cpp",
++  ".h++": "cpp",
++  ".objc": "objective-c",
++  ".objcpp": "objective-cpp",
++  ".java": "java",
++  ".rb": "ruby",
++  ".rake": "ruby",
++  ".gemspec": "ruby",
++  ".ru": "ruby",
++  ".lua": "lua",
++  ".swift": "swift",
++  ".cs": "csharp",
++  ".php": "php",
++  ".dart": "dart",
++  ".ex": "elixir",
++  ".exs": "elixir",
++  ".zig": "zig",
++  ".zon": "zig",
++  ".vue": "vue",
++  ".svelte": "svelte",
++  ".astro": "astro",
++  ".yaml": "yaml",
++  ".yml": "yaml",
++}
+diff --git a/src/tools/lsp/index.ts b/src/tools/lsp/index.ts
+new file mode 100644
+index 00000000..88b82656
+--- /dev/null
++++ b/src/tools/lsp/index.ts
+@@ -0,0 +1,6 @@
++export * from "./types"
++export * from "./constants"
++export * from "./config"
++export * from "./client"
++export * from "./utils"
++export * from "./tools"
+diff --git a/src/tools/lsp/tools.ts b/src/tools/lsp/tools.ts
+new file mode 100644
+index 00000000..b3636827
+--- /dev/null
++++ b/src/tools/lsp/tools.ts
+@@ -0,0 +1,192 @@
++import { tool } from "@opencode-ai/plugin/tool"
++import { getAllServers } from "./config"
++import {
++  withLspClient,
++  formatHoverResult,
++  formatLocation,
++  formatDocumentSymbol,
++  formatSymbolInfo,
++  formatDiagnostic,
++  filterDiagnosticsBySeverity,
++} from "./utils"
++import type { HoverResult, Location, LocationLink, DocumentSymbol, SymbolInfo, Diagnostic } from "./types"
++
++export const lsp_hover = tool({
++  description:
++    "Get type information, documentation, and signature for a symbol at a specific position in a file. Use this when you need to understand what a variable, function, class, or any identifier represents.",
++  args: {
++    filePath: tool.schema.string().describe("The absolute path to the file"),
++    line: tool.schema.number().min(1).describe("Line number (1-based)"),
++    character: tool.schema.number().min(0).describe("Character position (0-based)"),
++  },
++  execute: async (args) => {
++    try {
++      const result = await withLspClient(args.filePath, async (client) => {
++        return (await client.hover(args.filePath, args.line, args.character)) as HoverResult | null
++      })
++      return formatHoverResult(result)
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
++
++export const lsp_goto_definition = tool({
++  description:
++    "Jump to the source definition of a symbol (variable, function, class, type, import, etc.). Use this when you need to find WHERE something is defined.",
++  args: {
++    filePath: tool.schema.string().describe("The absolute path to the file"),
++    line: tool.schema.number().min(1).describe("Line number (1-based)"),
++    character: tool.schema.number().min(0).describe("Character position (0-based)"),
++  },
++  execute: async (args) => {
++    try {
++      const result = await withLspClient(args.filePath, async (client) => {
++        return (await client.definition(args.filePath, args.line, args.character)) as
++          | Location
++          | Location[]
++          | LocationLink[]
++          | null
++      })
++
++      if (!result) return "No definition found"
++
++      const locations = Array.isArray(result) ? result : [result]
++      if (locations.length === 0) return "No definition found"
++
++      return locations.map(formatLocation).join("\n")
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
++
++export const lsp_find_references = tool({
++  description:
++    "Find ALL usages/references of a symbol across the entire workspace. Use this when you need to understand the impact of changing something.",
++  args: {
++    filePath: tool.schema.string().describe("The absolute path to the file"),
++    line: tool.schema.number().min(1).describe("Line number (1-based)"),
++    character: tool.schema.number().min(0).describe("Character position (0-based)"),
++    includeDeclaration: tool.schema.boolean().optional().describe("Include the declaration itself"),
++  },
++  execute: async (args) => {
++    try {
++      const result = await withLspClient(args.filePath, async (client) => {
++        return (await client.references(args.filePath, args.line, args.character, args.includeDeclaration ?? true)) as
++          | Location[]
++          | null
++      })
++
++      if (!result || result.length === 0) return "No references found"
++
++      return result.map(formatLocation).join("\n")
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
++
++export const lsp_document_symbols = tool({
++  description:
++    "Get a hierarchical outline of all symbols (classes, functions, methods, variables, types, constants) in a single file. Use this to quickly understand a file's structure.",
++  args: {
++    filePath: tool.schema.string().describe("The absolute path to the file"),
++  },
++  execute: async (args) => {
++    try {
++      const result = await withLspClient(args.filePath, async (client) => {
++        return (await client.documentSymbols(args.filePath)) as DocumentSymbol[] | SymbolInfo[] | null
++      })
++
++      if (!result || result.length === 0) return "No symbols found"
++
++      if ("range" in result[0]) {
++        return (result as DocumentSymbol[]).map((s) => formatDocumentSymbol(s)).join("\n")
++      }
++      return (result as SymbolInfo[]).map(formatSymbolInfo).join("\n")
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
++
++export const lsp_workspace_symbols = tool({
++  description:
++    "Search for symbols by name across the ENTIRE workspace/project. Use this when you know (or partially know) a symbol's name but don't know which file it's in.",
++  args: {
++    filePath: tool.schema.string().describe("A file path in the workspace to determine the workspace root"),
++    query: tool.schema.string().describe("The symbol name to search for (supports fuzzy matching)"),
++    limit: tool.schema.number().optional().describe("Maximum number of results to return"),
++  },
++  execute: async (args) => {
++    try {
++      const result = await withLspClient(args.filePath, async (client) => {
++        return (await client.workspaceSymbols(args.query)) as SymbolInfo[] | null
++      })
++
++      if (!result || result.length === 0) return "No symbols found"
++
++      const limited = args.limit ? result.slice(0, args.limit) : result
++      return limited.map(formatSymbolInfo).join("\n")
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
++
++export const lsp_diagnostics = tool({
++  description:
++    "Get all errors, warnings, and hints for a file from the language server. Use this to check if code has type errors, syntax issues, or linting problems BEFORE running the build.",
++  args: {
++    filePath: tool.schema.string().describe("The absolute path to the file"),
++    severity: tool.schema
++      .enum(["error", "warning", "information", "hint", "all"])
++      .optional()
++      .describe("Filter by severity level"),
++  },
++  execute: async (args) => {
++    try {
++      const result = await withLspClient(args.filePath, async (client) => {
++        return (await client.diagnostics(args.filePath)) as { items?: Diagnostic[] } | Diagnostic[] | null
++      })
++
++      let diagnostics: Diagnostic[] = []
++      if (result) {
++        if (Array.isArray(result)) {
++          diagnostics = result
++        } else if (result.items) {
++          diagnostics = result.items
++        }
++      }
++
++      diagnostics = filterDiagnosticsBySeverity(diagnostics, args.severity)
++
++      if (diagnostics.length === 0) return "No diagnostics found"
++
++      return diagnostics.map(formatDiagnostic).join("\n")
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
++
++export const lsp_servers = tool({
++  description: "List all available LSP servers and check if they are installed. Use this to see what language support is available.",
++  args: {},
++  execute: async () => {
++    try {
++      const servers = getAllServers()
++      const lines = servers.map((s) => {
++        if (s.disabled) {
++          return `${s.id} [disabled] - ${s.extensions.join(", ")}`
++        }
++        const status = s.installed ? "[installed]" : "[not installed]"
++        return `${s.id} ${status} - ${s.extensions.join(", ")}`
++      })
++      return lines.join("\n")
++    } catch (e) {
++      return `Error: ${e instanceof Error ? e.message : String(e)}`
++    }
++  },
++})
+diff --git a/src/tools/lsp/types.ts b/src/tools/lsp/types.ts
+new file mode 100644
+index 00000000..d24a258c
+--- /dev/null
++++ b/src/tools/lsp/types.ts
+@@ -0,0 +1,61 @@
++export interface LSPServerConfig {
++  id: string
++  command: string[]
++  extensions: string[]
++  disabled?: boolean
++  env?: Record<string, string>
++  initialization?: Record<string, unknown>
++}
++
++export interface Position {
++  line: number
++  character: number
++}
++
++export interface Range {
++  start: Position
++  end: Position
++}
++
++export interface Location {
++  uri: string
++  range: Range
++}
++
++export interface LocationLink {
++  targetUri: string
++  targetRange: Range
++  targetSelectionRange: Range
++  originSelectionRange?: Range
++}
++
++export interface SymbolInfo {
++  name: string
++  kind: number
++  location: Location
++  containerName?: string
++}
++
++export interface DocumentSymbol {
++  name: string
++  kind: number
++  range: Range
++  selectionRange: Range
++  children?: DocumentSymbol[]
++}
++
++export interface Diagnostic {
++  range: Range
++  severity?: number
++  code?: string | number
++  source?: string
++  message: string
++}
++
++export interface HoverResult {
++  contents:
++    | { kind?: string; value: string }
++    | string
++    | Array<{ kind?: string; value: string } | string>
++  range?: Range
++}
+diff --git a/src/tools/lsp/utils.ts b/src/tools/lsp/utils.ts
+new file mode 100644
+index 00000000..085bc426
+--- /dev/null
++++ b/src/tools/lsp/utils.ts
+@@ -0,0 +1,144 @@
++import { extname, resolve } from "path"
++import { existsSync } from "fs"
++import { LSPClient } from "./client"
++import { findServerForExtension } from "./config"
++import { SYMBOL_KIND_MAP, SEVERITY_MAP } from "./constants"
++import type { HoverResult, DocumentSymbol, SymbolInfo, Location, LocationLink, Diagnostic } from "./types"
++
++export function findWorkspaceRoot(filePath: string): string {
++  let dir = resolve(filePath)
++
++  if (!existsSync(dir) || !require("fs").statSync(dir).isDirectory()) {
++    dir = require("path").dirname(dir)
++  }
++
++  const markers = [".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml", "build.gradle"]
++
++  while (dir !== "/") {
++    for (const marker of markers) {
++      if (existsSync(require("path").join(dir, marker))) {
++        return dir
++      }
++    }
++    dir = require("path").dirname(dir)
++  }
++
++  return require("path").dirname(resolve(filePath))
++}
++
++export async function withLspClient<T>(filePath: string, fn: (client: LSPClient) => Promise<T>): Promise<T> {
++  const absPath = resolve(filePath)
++  const ext = extname(absPath)
++  const server = findServerForExtension(ext)
++
++  if (!server) {
++    throw new Error(`No LSP server configured for extension: ${ext}`)
++  }
++
++  const root = findWorkspaceRoot(absPath)
++  const client = new LSPClient(root, server)
++
++  await client.start()
++  await client.initialize()
++
++  try {
++    return await fn(client)
++  } finally {
++    await client.stop()
++  }
++}
++
++export function formatHoverResult(result: HoverResult | null): string {
++  if (!result) return "No hover information available"
++
++  const contents = result.contents
++  if (typeof contents === "string") {
++    return contents
++  }
++
++  if (Array.isArray(contents)) {
++    return contents
++      .map((c) => (typeof c === "string" ? c : c.value))
++      .filter(Boolean)
++      .join("\n\n")
++  }
++
++  if (typeof contents === "object" && "value" in contents) {
++    return contents.value
++  }
++
++  return "No hover information available"
++}
++
++export function formatLocation(loc: Location | LocationLink): string {
++  if ("targetUri" in loc) {
++    const uri = loc.targetUri.replace("file://", "")
++    const line = loc.targetRange.start.line + 1
++    const char = loc.targetRange.start.character
++    return `${uri}:${line}:${char}`
++  }
++
++  const uri = loc.uri.replace("file://", "")
++  const line = loc.range.start.line + 1
++  const char = loc.range.start.character
++  return `${uri}:${line}:${char}`
++}
++
++export function formatSymbolKind(kind: number): string {
++  return SYMBOL_KIND_MAP[kind] || `Unknown(${kind})`
++}
++
++export function formatSeverity(severity: number | undefined): string {
++  if (!severity) return "unknown"
++  return SEVERITY_MAP[severity] || `unknown(${severity})`
++}
++
++export function formatDocumentSymbol(symbol: DocumentSymbol, indent = 0): string {
++  const prefix = "  ".repeat(indent)
++  const kind = formatSymbolKind(symbol.kind)
++  const line = symbol.range.start.line + 1
++  let result = `${prefix}${symbol.name} (${kind}) - line ${line}`
++
++  if (symbol.children && symbol.children.length > 0) {
++    for (const child of symbol.children) {
++      result += "\n" + formatDocumentSymbol(child, indent + 1)
++    }
++  }
++
++  return result
++}
++
++export function formatSymbolInfo(symbol: SymbolInfo): string {
++  const kind = formatSymbolKind(symbol.kind)
++  const loc = formatLocation(symbol.location)
++  const container = symbol.containerName ? ` (in ${symbol.containerName})` : ""
++  return `${symbol.name} (${kind})${container} - ${loc}`
++}
++
++export function formatDiagnostic(diag: Diagnostic): string {
++  const severity = formatSeverity(diag.severity)
++  const line = diag.range.start.line + 1
++  const char = diag.range.start.character
++  const source = diag.source ? `[${diag.source}]` : ""
++  const code = diag.code ? ` (${diag.code})` : ""
++  return `${severity}${source}${code} at ${line}:${char}: ${diag.message}`
++}
++
++export function filterDiagnosticsBySeverity(
++  diagnostics: Diagnostic[],
++  severityFilter?: "error" | "warning" | "information" | "hint" | "all"
++): Diagnostic[] {
++  if (!severityFilter || severityFilter === "all") {
++    return diagnostics
++  }
++
++  const severityMap: Record<string, number> = {
++    error: 1,
++    warning: 2,
++    information: 3,
++    hint: 4,
++  }
++
++  const targetSeverity = severityMap[severityFilter]
++  return diagnostics.filter((d) => d.severity === targetSeverity)
++}
+-- 
+2.39.2
+

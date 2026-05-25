@@ -1,0 +1,148 @@
+From 39aadbf9f09ff481e77542ca9d9cb6221eda042b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 20 May 2026 16:50:50 +0900
+Subject: [PATCH 5581/5749] fix(context-recovery): handle idle sessions
+
+---
+ .../executor.test.ts                          | 20 ++++++++++
+ .../executor.ts                               |  9 +++++
+ .../recovery-hook.test.ts                     | 37 +++++++++++++++++++
+ .../recovery-hook.ts                          |  9 +++++
+ 4 files changed, 75 insertions(+)
+
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts b/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
+index 9c529007..3ab93b48 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/executor.test.ts
+@@ -101,6 +101,7 @@ describe("executeCompact lock management", () => {
+ 
+     mockClient = {
+       session: {
++        status: mock(() => Promise.resolve({ data: { [sessionID]: { type: "idle" } } })),
+         messages: mock(() => Promise.resolve({ data: [] })),
+         summarize: mock(() => Promise.resolve()),
+         revert: mock(() => Promise.resolve()),
+@@ -141,6 +142,25 @@ describe("executeCompact lock management", () => {
+     expect(autoCompactState.compactionInProgress.has(sessionID)).toBe(false)
+   })
+ 
++  test("does not start summarize recovery while the original session loop is still busy", async () => {
++    // given: OpenCode is still processing the context-overflow turn
++    mockClient.session.status = mock(() => Promise.resolve({ data: { [sessionID]: { type: "busy" } } }))
++    autoCompactState.errorDataBySession.set(sessionID, {
++      errorType: "token_limit_exceeded_unknown",
++      currentTokens: 0,
++      maxTokens: 0,
++    })
++
++    // when: The delayed auto-compact callback fires before OpenCode reaches idle
++    await executeCompact(sessionID, msg, autoCompactState, mockClient, directory, pluginConfig)
++
++    // then: OMO leaves recovery pending for the real session.idle event instead of racing summarize
++    expect(mockClient.session.summarize).not.toHaveBeenCalled()
++    expect(autoCompactState.pendingCompact.has(sessionID)).toBe(true)
++    expect(autoCompactState.errorDataBySession.has(sessionID)).toBe(true)
++    expect(autoCompactState.compactionInProgress.has(sessionID)).toBe(false)
++  })
++
+   test("clears lock when summarize throws exception", async () => {
+     // given: Summarize will fail
+     mockClient.session.summarize = mock(() =>
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/executor.ts b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+index 02a2a06e..83dbf7ce 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/executor.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/executor.ts
+@@ -9,6 +9,8 @@ import {
+   runAggressiveTruncationStrategy,
+   runSummarizeRetryStrategy,
+ } from "./recovery-strategy";
++import { isSessionActive } from "../shared/session-idle-settle";
++import { log } from "../../shared/logger";
+ 
+ export { getLastAssistant } from "./message-builder";
+ 
+@@ -40,6 +42,13 @@ export async function executeCompact(
+   autoCompactState.compactionInProgress.add(sessionID);
+ 
+   try {
++    if (await isSessionActive(client, sessionID)) {
++      log("[auto-compact] delayed recovery skipped while session is still active", {
++        sessionID,
++      });
++      return;
++    }
++
+     const errorData = autoCompactState.errorDataBySession.get(sessionID);
+     const truncateState = getOrCreateTruncateState(autoCompactState, sessionID);
+ 
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.test.ts b/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.test.ts
+index 6300ab55..f15e7c00 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.test.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.test.ts
+@@ -52,6 +52,43 @@ describe("createAnthropicContextWindowLimitRecoveryHook", () => {
+     }
+   })
+ 
++  test("clears pending recovery when OpenCode core compaction succeeds first", async () => {
++    //#given
++    const { restore, getClearTimeoutCalls, getScheduledTimeouts } = setupDelayedTimeoutMocks()
++    const hook = createRecoveryHook()
++
++    try {
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: { sessionID: "session-core-compacted", error: "prompt is too long" },
++        },
++      })
++
++      //#when
++      await hook.event({
++        event: {
++          type: "session.compacted",
++          properties: { sessionID: "session-core-compacted" },
++        },
++      })
++
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "session-core-compacted" },
++        },
++      })
++
++      //#then
++      expect(getClearTimeoutCalls()).toEqual([getScheduledTimeouts()[0]])
++      expect(executeCompactMock).not.toHaveBeenCalled()
++      expect(getLastAssistantMock).toHaveBeenCalledTimes(1)
++    } finally {
++      restore()
++    }
++  })
++
+   test("does not treat empty summary assistant messages as successful compaction", async () => {
+     //#given
+     const { restore, getClearTimeoutCalls, getScheduledTimeouts } = setupDelayedTimeoutMocks()
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts b/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts
+index 862c3b8a..4aa9773b 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts
+@@ -63,6 +63,15 @@ export function createAnthropicContextWindowLimitRecoveryHook(
+       return
+     }
+ 
++    if (event.type === "session.compacted") {
++      const sessionID = resolveSessionEventID(props)
++      if (sessionID) {
++        clearSessionTimeout(pendingCompactionTimeoutBySession, sessionID)
++        clearSessionState(autoCompactState, sessionID)
++      }
++      return
++    }
++
+     if (event.type === "session.error") {
+       const sessionID = resolveSessionEventID(props)
+       dependencies.log("[auto-compact] session.error received", { sessionID, error: props?.error })
+-- 
+2.39.2
+

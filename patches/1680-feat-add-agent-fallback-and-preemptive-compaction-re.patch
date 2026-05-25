@@ -1,0 +1,515 @@
+From 62e1687474566d31ae91605495a7689c3b1702e7 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 2 Feb 2026 22:40:59 +0900
+Subject: [PATCH 1680/5749] feat: add agent fallback and preemptive-compaction
+ restoration
+
+- Add agent visibility fallback for first-run scenarios
+- Restore preemptive-compaction hook
+- Update migration and schema for preemptive-compaction restoration
+---
+ assets/oh-my-opencode.schema.json       |   4 +
+ src/agents/utils.test.ts                |  21 +++--
+ src/agents/utils.ts                     |  28 ++++++-
+ src/config/schema.ts                    |   2 +
+ src/hooks/index.ts                      |   1 +
+ src/hooks/preemptive-compaction.test.ts |  97 ++++++++++++++++++++++
+ src/hooks/preemptive-compaction.ts      | 103 ++++++++++++++++++++++++
+ src/index.ts                            |   7 ++
+ src/shared/migration.test.ts            |   9 +--
+ src/shared/migration.ts                 |   1 -
+ 10 files changed, 259 insertions(+), 14 deletions(-)
+ create mode 100644 src/hooks/preemptive-compaction.test.ts
+ create mode 100644 src/hooks/preemptive-compaction.ts
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index af48d80b..aa68bd73 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -68,6 +68,7 @@
+           "empty-task-response-detector",
+           "think-mode",
+           "anthropic-context-window-limit-recovery",
++          "preemptive-compaction",
+           "rules-injector",
+           "background-notification",
+           "auto-update-checker",
+@@ -2658,6 +2659,9 @@
+         "auto_resume": {
+           "type": "boolean"
+         },
++        "preemptive_compaction": {
++          "type": "boolean"
++        },
+         "truncate_all_tool_outputs": {
+           "type": "boolean"
+         },
+diff --git a/src/agents/utils.test.ts b/src/agents/utils.test.ts
+index 2dddf320..6e480e5a 100644
+--- a/src/agents/utils.test.ts
++++ b/src/agents/utils.test.ts
+@@ -49,9 +49,10 @@ describe("createBuiltinAgents with model overrides", () => {
+     expect(agents.sisyphus.thinking).toBeUndefined()
+   })
+ 
+-  test("Sisyphus is not created when no availableModels provided (requiresAnyModel)", async () => {
++  test("Sisyphus is created on first run when no availableModels or cache exist", async () => {
+     // #given
+     const systemDefaultModel = "anthropic/claude-opus-4-5"
++    const cacheSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(null)
+     const fetchSpy = spyOn(shared, "fetchAvailableModels").mockResolvedValue(new Set())
+ 
+     try {
+@@ -59,8 +60,10 @@ describe("createBuiltinAgents with model overrides", () => {
+       const agents = await createBuiltinAgents([], {}, undefined, systemDefaultModel, undefined, undefined, [], {})
+ 
+       // #then
+-      expect(agents.sisyphus).toBeUndefined()
++      expect(agents.sisyphus).toBeDefined()
++      expect(agents.sisyphus.model).toBe("anthropic/claude-opus-4-5")
+     } finally {
++      cacheSpy.mockRestore()
+       fetchSpy.mockRestore()
+     }
+   })
+@@ -229,8 +232,9 @@ describe("createBuiltinAgents with requiresModel gating", () => {
+     }
+   })
+ 
+-  test("hephaestus is not created when availableModels is empty", async () => {
++  test("hephaestus is created on first run when no availableModels or cache exist", async () => {
+     // #given
++    const cacheSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(null)
+     const fetchSpy = spyOn(shared, "fetchAvailableModels").mockResolvedValue(new Set())
+ 
+     try {
+@@ -238,8 +242,10 @@ describe("createBuiltinAgents with requiresModel gating", () => {
+       const agents = await createBuiltinAgents([], {}, undefined, TEST_DEFAULT_MODEL, undefined, undefined, [], {})
+ 
+       // #then
+-      expect(agents.hephaestus).toBeUndefined()
++      expect(agents.hephaestus).toBeDefined()
++      expect(agents.hephaestus.model).toBe("openai/gpt-5.2-codex")
+     } finally {
++      cacheSpy.mockRestore()
+       fetchSpy.mockRestore()
+     }
+   })
+@@ -283,8 +289,9 @@ describe("createBuiltinAgents with requiresAnyModel gating (sisyphus)", () => {
+     }
+   })
+ 
+-  test("sisyphus is not created when availableModels is empty", async () => {
++  test("sisyphus is created on first run when no availableModels or cache exist", async () => {
+     // #given
++    const cacheSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(null)
+     const fetchSpy = spyOn(shared, "fetchAvailableModels").mockResolvedValue(new Set())
+ 
+     try {
+@@ -292,8 +299,10 @@ describe("createBuiltinAgents with requiresAnyModel gating (sisyphus)", () => {
+       const agents = await createBuiltinAgents([], {}, undefined, TEST_DEFAULT_MODEL, undefined, undefined, [], {})
+ 
+       // #then
+-      expect(agents.sisyphus).toBeUndefined()
++      expect(agents.sisyphus).toBeDefined()
++      expect(agents.sisyphus.model).toBe("anthropic/claude-opus-4-5")
+     } finally {
++      cacheSpy.mockRestore()
+       fetchSpy.mockRestore()
+     }
+   })
+diff --git a/src/agents/utils.ts b/src/agents/utils.ts
+index bddc12b0..c9d99ffb 100644
+--- a/src/agents/utils.ts
++++ b/src/agents/utils.ts
+@@ -167,6 +167,18 @@ function applyModelResolution(input: {
+   })
+ }
+ 
++function getFirstFallbackModel(requirement?: {
++  fallbackChain?: { providers: string[]; model: string; variant?: string }[]
++}) {
++  const entry = requirement?.fallbackChain?.[0]
++  if (!entry || entry.providers.length === 0) return undefined
++  return {
++    model: `${entry.providers[0]}/${entry.model}`,
++    provenance: "provider-fallback" as const,
++    variant: entry.variant,
++  }
++}
++
+ function applyEnvironmentContext(config: AgentConfig, directory?: string): AgentConfig {
+   if (!directory || !config.prompt) return config
+   const envContext = createEnvContext()
+@@ -230,6 +242,8 @@ export async function createBuiltinAgents(
+   const availableModels = await fetchAvailableModels(undefined, {
+     connectedProviders: connectedProviders ?? undefined,
+   })
++  const isFirstRunNoCache =
++    availableModels.size === 0 && (!connectedProviders || connectedProviders.length === 0)
+ 
+   const result: Record<string, AgentConfig> = {}
+   const availableAgents: AvailableAgent[] = []
+@@ -334,10 +348,11 @@ export async function createBuiltinAgents(
+    const meetsSisyphusAnyModelRequirement =
+      !sisyphusRequirement?.requiresAnyModel ||
+      hasSisyphusExplicitConfig ||
++     isFirstRunNoCache ||
+      isAnyFallbackModelAvailable(sisyphusRequirement.fallbackChain, availableModels)
+ 
+    if (!disabledAgents.includes("sisyphus") && meetsSisyphusAnyModelRequirement) {
+-    const sisyphusResolution = applyModelResolution({
++    let sisyphusResolution = applyModelResolution({
+       uiSelectedModel,
+       userModel: sisyphusOverride?.model,
+       requirement: sisyphusRequirement,
+@@ -345,6 +360,10 @@ export async function createBuiltinAgents(
+       systemDefaultModel,
+     })
+ 
++    if (isFirstRunNoCache && !sisyphusOverride?.model && !uiSelectedModel) {
++      sisyphusResolution = getFirstFallbackModel(sisyphusRequirement)
++    }
++
+     if (sisyphusResolution) {
+       const { model: sisyphusModel, variant: sisyphusResolvedVariant } = sisyphusResolution
+ 
+@@ -375,16 +394,21 @@ export async function createBuiltinAgents(
+     const hasRequiredModel =
+       !hephaestusRequirement?.requiresModel ||
+       hasHephaestusExplicitConfig ||
++      isFirstRunNoCache ||
+       (availableModels.size > 0 && isModelAvailable(hephaestusRequirement.requiresModel, availableModels))
+ 
+     if (hasRequiredModel) {
+-      const hephaestusResolution = applyModelResolution({
++      let hephaestusResolution = applyModelResolution({
+         userModel: hephaestusOverride?.model,
+         requirement: hephaestusRequirement,
+         availableModels,
+         systemDefaultModel,
+       })
+ 
++      if (isFirstRunNoCache && !hephaestusOverride?.model) {
++        hephaestusResolution = getFirstFallbackModel(hephaestusRequirement)
++      }
++
+       if (hephaestusResolution) {
+         const { model: hephaestusModel, variant: hephaestusResolvedVariant } = hephaestusResolution
+ 
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index abdfd004..35d4ef4b 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -68,6 +68,7 @@ export const HookNameSchema = z.enum([
+   "empty-task-response-detector",
+   "think-mode",
+   "anthropic-context-window-limit-recovery",
++  "preemptive-compaction",
+   "rules-injector",
+   "background-notification",
+   "auto-update-checker",
+@@ -247,6 +248,7 @@ export const DynamicContextPruningConfigSchema = z.object({
+ export const ExperimentalConfigSchema = z.object({
+   aggressive_truncation: z.boolean().optional(),
+   auto_resume: z.boolean().optional(),
++  preemptive_compaction: z.boolean().optional(),
+   /** Truncate all tool outputs, not just whitelisted tools (default: false). Tool output truncator is enabled by default - disable via disabled_hooks. */
+   truncate_all_tool_outputs: z.boolean().optional(),
+   /** Dynamic context pruning configuration */
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 793f0732..b136fa87 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -36,3 +36,4 @@ export { createSubagentQuestionBlockerHook } from "./subagent-question-blocker";
+ export { createStopContinuationGuardHook, type StopContinuationGuard } from "./stop-continuation-guard";
+ export { createCompactionContextInjector, type SummarizeContext } from "./compaction-context-injector";
+ export { createUnstableAgentBabysitterHook } from "./unstable-agent-babysitter";
++export { createPreemptiveCompactionHook } from "./preemptive-compaction";
+diff --git a/src/hooks/preemptive-compaction.test.ts b/src/hooks/preemptive-compaction.test.ts
+new file mode 100644
+index 00000000..b48cccb6
+--- /dev/null
++++ b/src/hooks/preemptive-compaction.test.ts
+@@ -0,0 +1,97 @@
++import { describe, expect, mock, test } from "bun:test"
++import { createPreemptiveCompactionHook } from "./preemptive-compaction.ts"
++
++describe("preemptive-compaction", () => {
++  const sessionID = "preemptive-compaction-session"
++
++  function createMockCtx(overrides?: {
++    messages?: ReturnType<typeof mock>
++    summarize?: ReturnType<typeof mock>
++  }) {
++    const messages = overrides?.messages ?? mock(() => Promise.resolve({ data: [] }))
++    const summarize = overrides?.summarize ?? mock(() => Promise.resolve())
++
++    return {
++      client: {
++        session: {
++          messages,
++          summarize,
++        },
++        tui: {
++          showToast: mock(() => Promise.resolve()),
++        },
++      },
++      directory: "/tmp/test",
++    } as never
++  }
++
++  test("triggers summarize when usage exceeds threshold", async () => {
++    // #given
++    const messages = mock(() =>
++      Promise.resolve({
++        data: [
++          {
++            info: {
++              role: "assistant",
++              providerID: "anthropic",
++              modelID: "claude-opus-4-5",
++              tokens: {
++                input: 180000,
++                output: 0,
++                reasoning: 0,
++                cache: { read: 0, write: 0 },
++              },
++            },
++          },
++        ],
++      })
++    )
++    const summarize = mock(() => Promise.resolve())
++    const hook = createPreemptiveCompactionHook(createMockCtx({ messages, summarize }))
++    const output = { title: "", output: "", metadata: {} }
++
++    // #when
++    await hook["tool.execute.after"](
++      { tool: "Read", sessionID, callID: "call-1" },
++      output
++    )
++
++    // #then
++    expect(summarize).toHaveBeenCalled()
++  })
++
++  test("does not summarize when usage is below threshold", async () => {
++    // #given
++    const messages = mock(() =>
++      Promise.resolve({
++        data: [
++          {
++            info: {
++              role: "assistant",
++              providerID: "anthropic",
++              modelID: "claude-opus-4-5",
++              tokens: {
++                input: 100000,
++                output: 0,
++                reasoning: 0,
++                cache: { read: 0, write: 0 },
++              },
++            },
++          },
++        ],
++      })
++    )
++    const summarize = mock(() => Promise.resolve())
++    const hook = createPreemptiveCompactionHook(createMockCtx({ messages, summarize }))
++    const output = { title: "", output: "", metadata: {} }
++
++    // #when
++    await hook["tool.execute.after"](
++      { tool: "Read", sessionID, callID: "call-2" },
++      output
++    )
++
++    // #then
++    expect(summarize).not.toHaveBeenCalled()
++  })
++})
+diff --git a/src/hooks/preemptive-compaction.ts b/src/hooks/preemptive-compaction.ts
+new file mode 100644
+index 00000000..28c2a922
+--- /dev/null
++++ b/src/hooks/preemptive-compaction.ts
+@@ -0,0 +1,103 @@
++const ANTHROPIC_ACTUAL_LIMIT =
++  process.env.ANTHROPIC_1M_CONTEXT === "true" ||
++  process.env.VERTEX_ANTHROPIC_1M_CONTEXT === "true"
++    ? 1_000_000
++    : 200_000
++
++const PREEMPTIVE_COMPACTION_THRESHOLD = 0.78
++
++interface AssistantMessageInfo {
++  role: "assistant"
++  providerID: string
++  modelID?: string
++  tokens: {
++    input: number
++    output: number
++    reasoning: number
++    cache: { read: number; write: number }
++  }
++}
++
++interface MessageWrapper {
++  info: { role: string } & Partial<AssistantMessageInfo>
++}
++
++type PluginInput = {
++  client: {
++    session: {
++      messages: (...args: any[]) => any
++      summarize: (...args: any[]) => any
++    }
++    tui: {
++      showToast: (...args: any[]) => any
++    }
++  }
++  directory: string
++}
++
++export function createPreemptiveCompactionHook(ctx: PluginInput) {
++  const compactionInProgress = new Set<string>()
++  const compactedSessions = new Set<string>()
++
++  const toolExecuteAfter = async (
++    input: { tool: string; sessionID: string; callID: string },
++    _output: { title: string; output: string; metadata: unknown }
++  ) => {
++    const { sessionID } = input
++    if (compactedSessions.has(sessionID) || compactionInProgress.has(sessionID)) return
++
++    try {
++      const response = await ctx.client.session.messages({
++        path: { id: sessionID },
++      })
++      const payload = response as { data?: MessageWrapper[] } | MessageWrapper[]
++      const messages = Array.isArray(payload) ? payload : (payload.data ?? [])
++      const assistantMessages = messages
++        .filter((m) => m.info.role === "assistant")
++        .map((m) => m.info as AssistantMessageInfo)
++
++      if (assistantMessages.length === 0) return
++
++      const lastAssistant = assistantMessages[assistantMessages.length - 1]
++      if (lastAssistant.providerID !== "anthropic") return
++
++      const lastTokens = lastAssistant.tokens
++      const totalInputTokens = (lastTokens?.input ?? 0) + (lastTokens?.cache?.read ?? 0)
++      const usageRatio = totalInputTokens / ANTHROPIC_ACTUAL_LIMIT
++
++      if (usageRatio < PREEMPTIVE_COMPACTION_THRESHOLD) return
++
++      const modelID = lastAssistant.modelID
++      if (!modelID) return
++
++      compactionInProgress.add(sessionID)
++
++      await ctx.client.session.summarize({
++        path: { id: sessionID },
++        body: { providerID: lastAssistant.providerID, modelID, auto: true } as never,
++        query: { directory: ctx.directory },
++      })
++
++      compactedSessions.add(sessionID)
++    } catch {
++      // best-effort; do not disrupt tool execution
++    } finally {
++      compactionInProgress.delete(sessionID)
++    }
++  }
++
++  const eventHandler = async ({ event }: { event: { type: string; properties?: unknown } }) => {
++    if (event.type !== "session.deleted") return
++    const props = event.properties as Record<string, unknown> | undefined
++    const sessionInfo = props?.info as { id?: string } | undefined
++    if (sessionInfo?.id) {
++      compactionInProgress.delete(sessionInfo.id)
++      compactedSessions.delete(sessionInfo.id)
++    }
++  }
++
++  return {
++    "tool.execute.after": toolExecuteAfter,
++    event: eventHandler,
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 7c78f450..e5e2c059 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -35,6 +35,7 @@ import {
+   createStopContinuationGuardHook,
+   createCompactionContextInjector,
+   createUnstableAgentBabysitterHook,
++  createPreemptiveCompactionHook,
+ } from "./hooks";
+ import {
+   contextCollector,
+@@ -126,6 +127,11 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const contextWindowMonitor = isHookEnabled("context-window-monitor")
+     ? createContextWindowMonitorHook(ctx)
+     : null;
++  const preemptiveCompaction =
++    isHookEnabled("preemptive-compaction") &&
++    pluginConfig.experimental?.preemptive_compaction
++      ? createPreemptiveCompactionHook(ctx)
++      : null;
+   const sessionRecovery = isHookEnabled("session-recovery")
+     ? createSessionRecoveryHook(ctx, {
+         experimental: pluginConfig.experimental,
+@@ -805,6 +811,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       }
+       await claudeCodeHooks["tool.execute.after"](input, output);
+       await toolOutputTruncator?.["tool.execute.after"](input, output);
++      await preemptiveCompaction?.["tool.execute.after"](input, output);
+       await contextWindowMonitor?.["tool.execute.after"](input, output);
+       await commentChecker?.["tool.execute.after"](input, output);
+       await directoryAgentsInjector?.["tool.execute.after"](input, output);
+diff --git a/src/shared/migration.test.ts b/src/shared/migration.test.ts
+index aaba9200..b2a9836a 100644
+--- a/src/shared/migration.test.ts
++++ b/src/shared/migration.test.ts
+@@ -280,10 +280,9 @@ describe("migrateHookNames", () => {
+ 
+     // then: Removed hooks should be filtered out
+     expect(changed).toBe(true)
+-    expect(migrated).toEqual(["comment-checker"])
+-    expect(removed).toContain("preemptive-compaction")
++    expect(migrated).toEqual(["preemptive-compaction", "comment-checker"])
+     expect(removed).toContain("empty-message-sanitizer")
+-    expect(removed).toHaveLength(2)
++    expect(removed).toHaveLength(1)
+   })
+ 
+   test("handles mixed migration and removal", () => {
+@@ -297,8 +296,8 @@ describe("migrateHookNames", () => {
+     expect(changed).toBe(true)
+     expect(migrated).toContain("anthropic-context-window-limit-recovery")
+     expect(migrated).toContain("atlas")
+-    expect(migrated).not.toContain("preemptive-compaction")
+-    expect(removed).toEqual(["preemptive-compaction"])
++    expect(migrated).toContain("preemptive-compaction")
++    expect(removed).toEqual([])
+   })
+ })
+ 
+diff --git a/src/shared/migration.ts b/src/shared/migration.ts
+index 173d6015..6106e5c8 100644
+--- a/src/shared/migration.ts
++++ b/src/shared/migration.ts
+@@ -64,7 +64,6 @@ export const HOOK_NAME_MAP: Record<string, string | null> = {
+   "sisyphus-orchestrator": "atlas",
+ 
+   // Removed hooks (v3.0.0) - will be filtered out and user warned
+-  "preemptive-compaction": null,
+   "empty-message-sanitizer": null,
+ }
+ 
+-- 
+2.39.2
+

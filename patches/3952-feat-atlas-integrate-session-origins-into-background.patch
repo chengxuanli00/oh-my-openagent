@@ -1,0 +1,430 @@
+From b37bc4fb7892c2c4dc88e7274177f4d2f8486aee Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 5 Apr 2026 17:14:57 +0900
+Subject: [PATCH 3952/5749] feat(atlas): integrate session origins into
+ background launch tracking
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Update background-launch-session-tracking to track session origins
+- Add tests for lineage-aware retry scheduling
+- Update tool-execute-after to support new tracking
+- Add comprehensive tests for background launch continuation
+
+🤖 Generated with assistance of OhMyOpenCode
+---
+ .../background-launch-session-tracking.ts     |  56 ++++-
+ src/hooks/atlas/background-task-retry.test.ts |  63 ++++++
+ ...ol-execute-after-background-launch.test.ts | 204 ++++++++++++++++++
+ src/hooks/atlas/tool-execute-after.ts         |  12 +-
+ 4 files changed, 313 insertions(+), 22 deletions(-)
+
+diff --git a/src/hooks/atlas/background-launch-session-tracking.ts b/src/hooks/atlas/background-launch-session-tracking.ts
+index 0e7289ef..0e68d6a7 100644
+--- a/src/hooks/atlas/background-launch-session-tracking.ts
++++ b/src/hooks/atlas/background-launch-session-tracking.ts
+@@ -19,25 +19,24 @@ export async function syncBackgroundLaunchSessionTracking(input: {
+     return
+   }
+ 
+-  if (toolInput.sessionID && !boulderState.session_ids.includes(toolInput.sessionID)) {
+-    appendSessionId(ctx.directory, toolInput.sessionID)
+-  }
+-
+   const extractedSessionId = metadataSessionId ?? extractSessionIdFromOutput(toolOutput.output)
+-  const lineageSessionIDs = toolInput.sessionID && !boulderState.session_ids.includes(toolInput.sessionID)
+-    ? [...boulderState.session_ids, toolInput.sessionID]
+-    : boulderState.session_ids
++  const lineageSessionIDs = boulderState.session_ids
+   const subagentSessionId = await validateSubagentSessionId({
+     client: ctx.client,
+     sessionID: extractedSessionId,
+     lineageSessionIDs,
+   })
+ 
+-  if (!subagentSessionId) {
++  const trackedSessionId = subagentSessionId ?? await resolveFallbackTrackedSessionId({
++    ctx,
++    extractedSessionId,
++    lineageSessionIDs,
++  })
++  if (!trackedSessionId) {
+     return
+   }
+ 
+-  appendSessionId(ctx.directory, subagentSessionId)
++  appendSessionId(ctx.directory, trackedSessionId, "appended")
+ 
+   const { currentTask, shouldSkipTaskSessionUpdate } = resolveTaskContext(
+     pendingTaskRef,
+@@ -49,7 +48,7 @@ export async function syncBackgroundLaunchSessionTracking(input: {
+       taskKey: currentTask.key,
+       taskLabel: currentTask.label,
+       taskTitle: currentTask.title,
+-      sessionId: subagentSessionId,
++      sessionId: trackedSessionId,
+       agent: typeof toolOutput.metadata?.agent === "string" ? toolOutput.metadata.agent : undefined,
+       category: typeof toolOutput.metadata?.category === "string" ? toolOutput.metadata.category : undefined,
+     })
+@@ -57,7 +56,42 @@ export async function syncBackgroundLaunchSessionTracking(input: {
+ 
+   log(`[${HOOK_NAME}] Background launch session tracked`, {
+     sessionID: toolInput.sessionID,
+-    subagentSessionId,
++    subagentSessionId: trackedSessionId,
+     taskKey: currentTask?.key,
+   })
+ }
++
++async function resolveFallbackTrackedSessionId(input: {
++  ctx: PluginInput
++  extractedSessionId?: string
++  lineageSessionIDs: string[]
++}): Promise<string | undefined> {
++  if (!input.extractedSessionId) {
++    return undefined
++  }
++
++  try {
++    const session = await input.ctx.client.session.get({ path: { id: input.extractedSessionId } })
++    const parentSessionId = session.data?.parentID
++    if (typeof parentSessionId === "string" && input.lineageSessionIDs.includes(parentSessionId)) {
++      return input.extractedSessionId
++    }
++    return undefined
++  } catch {
++    return undefined
++  }
++}
++
++async function resolveSessionOrigin(
++  ctx: PluginInput,
++  sessionID: string,
++): Promise<"direct" | "appended"> {
++  try {
++    const session = await ctx.client.session.get({ path: { id: sessionID } })
++    return typeof session.data?.parentID === "string" && session.data.parentID.length > 0
++      ? "appended"
++      : "direct"
++  } catch {
++    return "appended"
++  }
++}
+diff --git a/src/hooks/atlas/background-task-retry.test.ts b/src/hooks/atlas/background-task-retry.test.ts
+index 72c7d291..afefd7e4 100644
+--- a/src/hooks/atlas/background-task-retry.test.ts
++++ b/src/hooks/atlas/background-task-retry.test.ts
+@@ -339,6 +339,69 @@ describe("atlas background task retry", () => {
+     expect(promptAsyncMock).toHaveBeenCalledTimes(1)
+   })
+ 
++  test("#given a persisted descendant becomes ineligible before retry fires #when retry runs #then atlas re-checks descendant eligibility and does not inject", async () => {
++    // given
++    const descendantSessionID = "ses_descendant_retry_mismatch"
++    const planPath = join(testDir, "test-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++    writeBoulderState(testDir, {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [sessionID, descendantSessionID],
++      session_origins: {
++        [sessionID]: "direct",
++        [descendantSessionID]: "appended",
++      },
++      plan_name: "test-plan",
++      agent: "atlas",
++    })
++
++    let backgroundRunning = true
++    let descendantAgent = "atlas"
++    const promptAsyncMock = mock(async () => ({}))
++    const hook = createAtlasHook({
++      directory: testDir,
++      client: {
++        session: {
++          get: async ({ path }: { path: { id: string } }) => ({
++            data: {
++              id: path.id,
++              parentID: path.id === descendantSessionID ? sessionID : undefined,
++            },
++          }),
++          promptAsync: promptAsyncMock,
++          messages: async ({ path }: { path: { id: string } }) => ({
++            data: path.id === descendantSessionID
++              ? [{ info: { agent: descendantAgent, providerID: "openai", modelID: "gpt-5.4" } }]
++              : [],
++          }),
++        },
++      },
++    } as unknown as PluginInput, {
++      directory: testDir,
++      backgroundManager: {
++        getTasksByParentSession: (currentSessionID: string) => {
++          if (currentSessionID !== descendantSessionID) {
++            return []
++          }
++          return backgroundRunning ? [{ status: "running" }] : []
++        },
++      } as unknown as NonNullable<Parameters<typeof createAtlasHook>[1]>["backgroundManager"] & {
++        getTasksByParentSession: (sessionID: string) => Array<{ status: string }>
++      },
++    })
++
++    // when
++    await hook.handler({ event: { type: "session.idle", properties: { sessionID: descendantSessionID } } })
++    expect(capturedTimers.size).toBe(1)
++    descendantAgent = "sisyphus-junior"
++    backgroundRunning = false
++    await firePendingTimers()
++
++    // then
++    expect(promptAsyncMock).toHaveBeenCalledTimes(0)
++  })
++
+   test("#given continuation injection is already in flight #when another idle event arrives #then atlas does not inject twice", async () => {
+     // given
+     const planPath = join(testDir, "test-plan.md")
+diff --git a/src/hooks/atlas/tool-execute-after-background-launch.test.ts b/src/hooks/atlas/tool-execute-after-background-launch.test.ts
+index f354134a..cede0a3a 100644
+--- a/src/hooks/atlas/tool-execute-after-background-launch.test.ts
++++ b/src/hooks/atlas/tool-execute-after-background-launch.test.ts
+@@ -193,8 +193,212 @@ describe("createToolExecuteAfterHandler background launch detection", () => {
+         expect(output.output).toContain("Background task launched.")
+         expect(collectGitDiffStatsMock).not.toHaveBeenCalled()
+         expect(readBoulderState(testDirectory)?.session_ids).toContain(childSessionID)
++        expect(readBoulderState(testDirectory)?.session_origins?.[childSessionID]).toBe("appended")
+         expect(readBoulderState(testDirectory)?.task_sessions?.["todo:1"]?.session_id).toBe(childSessionID)
+       })
++
++      it("#then it should not track spawned child when child lookup fails", async () => {
++        const sessionID = "ses_parent"
++        const childSessionID = "ses_child_lookup_failure"
++        const planPath = join(testDirectory, "background-launch-plan.md")
++        const project = createProject()
++        const client = createOpencodeClient()
++
++        spyOn(client.session, "get").mockImplementation((input) => {
++          if (input.path.id === childSessionID) {
++            return Promise.reject(new Error("lookup failed")) as never
++          }
++          return Promise.resolve(createSessionGetResult(undefined)) as never
++        })
++
++        writeFileSync(planPath, `# Plan
++
++## TODOs
++- [ ] 1. Implement auth flow
++`)
++
++        writeBoulderState(testDirectory, {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [sessionID],
++          plan_name: "background-launch-plan",
++        })
++
++        const pendingFilePaths = new Map<string, string>()
++        const pendingTaskRefs = new Map()
++        const ctx = {
++          client,
++          project,
++          directory: testDirectory,
++          worktree: testDirectory,
++          serverUrl: new URL("https://example.com"),
++          $: Bun.$,
++        } satisfies PluginInput
++        const beforeHandler = createToolExecuteBeforeHandler({ ctx, pendingFilePaths, pendingTaskRefs })
++        const afterHandler = createToolExecuteAfterHandler({
++          ctx,
++          pendingFilePaths,
++          pendingTaskRefs,
++          autoCommit: true,
++          getState: () => ({ promptFailureCount: 0 }),
++        })
++
++        await beforeHandler(
++          { tool: "task", sessionID, callID: "call-bg-task-lookup-failure" },
++          { args: { prompt: "Implement auth flow" } },
++        )
++
++        const output = {
++          title: "Sisyphus Task",
++          output: "Background task launched.\n\nBackground Task ID: bg_456\n\n<task_metadata>\nsession_id: ses_child_lookup_failure\n</task_metadata>",
++          metadata: {
++            sessionId: childSessionID,
++            agent: "sisyphus-junior",
++            category: "deep",
++          },
++        }
++
++        await afterHandler(
++          { tool: "task", sessionID, callID: "call-bg-task-lookup-failure" },
++          output,
++        )
++
++        expect(readBoulderState(testDirectory)?.session_ids).not.toContain(childSessionID)
++      })
++
++      it("#then it should not track an extracted child session outside active lineage", async () => {
++        const sessionID = "ses_parent"
++        const childSessionID = "ses_outside_lineage"
++        const planPath = join(testDirectory, "background-launch-plan.md")
++        const project = createProject()
++        const client = createOpencodeClient()
++
++        spyOn(client.session, "get").mockImplementation((input) => Promise.resolve(
++          createSessionGetResult(input.path.id === childSessionID ? "ses_unrelated_parent" : undefined),
++        ) as never)
++
++        writeFileSync(planPath, `# Plan
++
++## TODOs
++- [ ] 1. Implement auth flow
++`)
++
++        writeBoulderState(testDirectory, {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: [sessionID],
++          plan_name: "background-launch-plan",
++        })
++
++        const pendingFilePaths = new Map<string, string>()
++        const pendingTaskRefs = new Map()
++        const ctx = {
++          client,
++          project,
++          directory: testDirectory,
++          worktree: testDirectory,
++          serverUrl: new URL("https://example.com"),
++          $: Bun.$,
++        } satisfies PluginInput
++        const beforeHandler = createToolExecuteBeforeHandler({ ctx, pendingFilePaths, pendingTaskRefs })
++        const afterHandler = createToolExecuteAfterHandler({
++          ctx,
++          pendingFilePaths,
++          pendingTaskRefs,
++          autoCommit: true,
++          getState: () => ({ promptFailureCount: 0 }),
++        })
++
++        await beforeHandler(
++          { tool: "task", sessionID, callID: "call-bg-task-outside-lineage" },
++          { args: { prompt: "Implement auth flow" } },
++        )
++
++        const output = {
++          title: "Sisyphus Task",
++          output: "Background task launched.\n\nBackground Task ID: bg_789\n\n<task_metadata>\nsession_id: ses_outside_lineage\n</task_metadata>",
++          metadata: {
++            sessionId: childSessionID,
++            agent: "sisyphus-junior",
++            category: "deep",
++          },
++        }
++
++        await afterHandler(
++          { tool: "task", sessionID, callID: "call-bg-task-outside-lineage" },
++          output,
++        )
++
++        expect(readBoulderState(testDirectory)?.session_ids).not.toContain(childSessionID)
++      })
++
++      it("#then it should not append an unrelated launcher session into active boulder", async () => {
++        const sessionID = "ses_unrelated_parent"
++        const childSessionID = "ses_unrelated_child"
++        const planPath = join(testDirectory, "background-launch-plan.md")
++        const project = createProject()
++        const client = createOpencodeClient()
++
++        spyOn(client.session, "get").mockImplementation((input) => Promise.resolve(
++          createSessionGetResult(input.path.id === childSessionID ? sessionID : undefined),
++        ) as never)
++
++        writeFileSync(planPath, `# Plan
++
++## TODOs
++- [ ] 1. Implement auth flow
++`)
++
++        writeBoulderState(testDirectory, {
++          active_plan: planPath,
++          started_at: "2026-01-02T10:00:00Z",
++          session_ids: ["ses_boulder_root"],
++          session_origins: { "ses_boulder_root": "direct" },
++          plan_name: "background-launch-plan",
++        })
++
++        const pendingFilePaths = new Map<string, string>()
++        const pendingTaskRefs = new Map()
++        const ctx = {
++          client,
++          project,
++          directory: testDirectory,
++          worktree: testDirectory,
++          serverUrl: new URL("https://example.com"),
++          $: Bun.$,
++        } satisfies PluginInput
++        const beforeHandler = createToolExecuteBeforeHandler({ ctx, pendingFilePaths, pendingTaskRefs })
++        const afterHandler = createToolExecuteAfterHandler({
++          ctx,
++          pendingFilePaths,
++          pendingTaskRefs,
++          autoCommit: true,
++          getState: () => ({ promptFailureCount: 0 }),
++        })
++
++        await beforeHandler(
++          { tool: "task", sessionID, callID: "call-bg-task-unrelated-launcher" },
++          { args: { prompt: "Implement auth flow" } },
++        )
++
++        const output = {
++          title: "Sisyphus Task",
++          output: "Background task launched.\n\nBackground Task ID: bg_999\n\n<task_metadata>\nsession_id: ses_unrelated_child\n</task_metadata>",
++          metadata: {
++            sessionId: childSessionID,
++            agent: "sisyphus-junior",
++            category: "deep",
++          },
++        }
++
++        await afterHandler(
++          { tool: "task", sessionID, callID: "call-bg-task-unrelated-launcher" },
++          output,
++        )
++
++        expect(readBoulderState(testDirectory)?.session_ids).not.toContain(sessionID)
++        expect(readBoulderState(testDirectory)?.session_ids).not.toContain(childSessionID)
++      })
+     })
+   })
+ })
+diff --git a/src/hooks/atlas/tool-execute-after.ts b/src/hooks/atlas/tool-execute-after.ts
+index 3fca29fe..5fd5808e 100644
+--- a/src/hooks/atlas/tool-execute-after.ts
++++ b/src/hooks/atlas/tool-execute-after.ts
+@@ -109,17 +109,7 @@ export function createToolExecuteAfterHandler(input: {
+           : null
+         const sessionState = toolInput.sessionID ? getState(toolInput.sessionID) : undefined
+ 
+-        if (toolInput.sessionID && !boulderState.session_ids?.includes(toolInput.sessionID)) {
+-          appendSessionId(ctx.directory, toolInput.sessionID)
+-          log(`[${HOOK_NAME}] Appended session to boulder`, {
+-            sessionID: toolInput.sessionID,
+-            plan: boulderState.plan_name,
+-          })
+-        }
+-
+-        const lineageSessionIDs = toolInput.sessionID && !boulderState.session_ids.includes(toolInput.sessionID)
+-          ? [...boulderState.session_ids, toolInput.sessionID]
+-          : boulderState.session_ids
++        const lineageSessionIDs = boulderState.session_ids
+         const subagentSessionId = await validateSubagentSessionId({
+           client: ctx.client,
+           sessionID: extractedSessionId,
+-- 
+2.39.2
+

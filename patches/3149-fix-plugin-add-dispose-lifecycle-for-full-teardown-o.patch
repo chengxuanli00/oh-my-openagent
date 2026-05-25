@@ -1,0 +1,287 @@
+From deaac8cb39ca6191965f2d0dbe99362f098e23fd Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 20:12:56 +0900
+Subject: [PATCH 3149/5749] fix(plugin): add dispose lifecycle for full
+ teardown on reload
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Plugin created managers, hooks, intervals, and process listeners on
+every load but had no teardown mechanism. On plugin reload, old
+instances remained alive causing cumulative memory leaks.
+
+- Add createPluginDispose() orchestrating shutdown sequence:
+  backgroundManager.shutdown() → skillMcpManager.disconnectAll() →
+  disposeHooks()
+- Add disposeHooks() aggregator with safe optional chaining
+- Wire dispose into index.ts to clean previous instance on reload
+- Make dispose idempotent (safe to call multiple times)
+
+Tests: 4 pass, 8 expects
+---
+ src/create-hooks.ts        |  23 ++++++-
+ src/index.ts               |  12 ++++
+ src/plugin-dispose.test.ts | 119 +++++++++++++++++++++++++++++++++++++
+ src/plugin-dispose.ts      |  29 +++++++++
+ 4 files changed, 182 insertions(+), 1 deletion(-)
+ create mode 100644 src/plugin-dispose.test.ts
+ create mode 100644 src/plugin-dispose.ts
+
+diff --git a/src/create-hooks.ts b/src/create-hooks.ts
+index 121b0f53..e49f08c9 100644
+--- a/src/create-hooks.ts
++++ b/src/create-hooks.ts
+@@ -11,6 +11,20 @@ import { createSkillHooks } from "./plugin/hooks/create-skill-hooks"
+ 
+ export type CreatedHooks = ReturnType<typeof createHooks>
+ 
++type DisposableHook = { dispose?: () => void } | null | undefined
++
++export type DisposableCreatedHooks = {
++  runtimeFallback?: DisposableHook
++  todoContinuationEnforcer?: DisposableHook
++  autoSlashCommand?: DisposableHook
++}
++
++export function disposeCreatedHooks(hooks: DisposableCreatedHooks): void {
++  hooks.runtimeFallback?.dispose?.()
++  hooks.todoContinuationEnforcer?.dispose?.()
++  hooks.autoSlashCommand?.dispose?.()
++}
++
+ export function createHooks(args: {
+   ctx: PluginContext
+   pluginConfig: OhMyOpenCodeConfig
+@@ -58,9 +72,16 @@ export function createHooks(args: {
+     availableSkills,
+   })
+ 
+-  return {
++  const hooks = {
+     ...core,
+     ...continuation,
+     ...skill,
+   }
++
++  return {
++    ...hooks,
++    disposeHooks: (): void => {
++      disposeCreatedHooks(hooks)
++    },
++  }
+ }
+diff --git a/src/index.ts b/src/index.ts
+index 4b6f54dd..70156f10 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -7,6 +7,7 @@ import { createHooks } from "./create-hooks"
+ import { createManagers } from "./create-managers"
+ import { createTools } from "./create-tools"
+ import { createPluginInterface } from "./plugin-interface"
++import { createPluginDispose, type PluginDispose } from "./plugin-dispose"
+ 
+ import { loadPluginConfig } from "./plugin-config"
+ import { createModelCacheState } from "./plugin-state"
+@@ -14,6 +15,8 @@ import { createFirstMessageVariantGate } from "./shared/first-message-variant"
+ import { injectServerAuthIntoClient, log } from "./shared"
+ import { startTmuxCheck } from "./tools"
+ 
++let activePluginDispose: PluginDispose | null = null
++
+ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   // Initialize config context for plugin runtime (prevents warnings from hooks)
+   initConfigContext("opencode", null)
+@@ -23,6 +26,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+ 
+   injectServerAuthIntoClient(ctx.client)
+   startTmuxCheck()
++  await activePluginDispose?.()
+ 
+   const pluginConfig = loadPluginConfig(ctx.directory, ctx)
+   const disabledHooks = new Set(pluginConfig.disabled_hooks ?? [])
+@@ -67,6 +71,12 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     availableSkills: toolsResult.availableSkills,
+   })
+ 
++  const dispose = createPluginDispose({
++    backgroundManager: managers.backgroundManager,
++    skillMcpManager: managers.skillMcpManager,
++    disposeHooks: hooks.disposeHooks,
++  })
++
+   const pluginInterface = createPluginInterface({
+     ctx,
+     pluginConfig,
+@@ -76,6 +86,8 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     tools: toolsResult.filteredTools,
+   })
+ 
++  activePluginDispose = dispose
++
+   return {
+     ...pluginInterface,
+ 
+diff --git a/src/plugin-dispose.test.ts b/src/plugin-dispose.test.ts
+new file mode 100644
+index 00000000..17ca88fe
+--- /dev/null
++++ b/src/plugin-dispose.test.ts
+@@ -0,0 +1,119 @@
++import { describe, expect, spyOn, test } from "bun:test"
++
++import { disposeCreatedHooks } from "./create-hooks"
++import { createPluginDispose } from "./plugin-dispose"
++
++describe("createPluginDispose", () => {
++  test("#given plugin with active managers and hooks #when dispose() is called #then backgroundManager.shutdown() is called", async () => {
++    // given
++    const backgroundManager = {
++      shutdown: (): void => {},
++    }
++    const skillMcpManager = {
++      disconnectAll: async (): Promise<void> => {},
++    }
++    const shutdownSpy = spyOn(backgroundManager, "shutdown")
++    const dispose = createPluginDispose({
++      backgroundManager,
++      skillMcpManager,
++      disposeHooks: (): void => {},
++    })
++
++    // when
++    await dispose()
++
++    // then
++    expect(shutdownSpy).toHaveBeenCalledTimes(1)
++  })
++
++  test("#given plugin with active MCP connections #when dispose() is called #then skillMcpManager.disconnectAll() is called", async () => {
++    // given
++    const backgroundManager = {
++      shutdown: (): void => {},
++    }
++    const skillMcpManager = {
++      disconnectAll: async (): Promise<void> => {},
++    }
++    const disconnectAllSpy = spyOn(skillMcpManager, "disconnectAll")
++    const dispose = createPluginDispose({
++      backgroundManager,
++      skillMcpManager,
++      disposeHooks: (): void => {},
++    })
++
++    // when
++    await dispose()
++
++    // then
++    expect(disconnectAllSpy).toHaveBeenCalledTimes(1)
++  })
++
++  test("#given plugin with hooks that have dispose #when dispose() is called #then each hook's dispose is called", async () => {
++    // given
++    const runtimeFallback = {
++      dispose: (): void => {},
++    }
++    const todoContinuationEnforcer = {
++      dispose: (): void => {},
++    }
++    const autoSlashCommand = {
++      dispose: (): void => {},
++    }
++    const runtimeFallbackDisposeSpy = spyOn(runtimeFallback, "dispose")
++    const todoContinuationEnforcerDisposeSpy = spyOn(todoContinuationEnforcer, "dispose")
++    const autoSlashCommandDisposeSpy = spyOn(autoSlashCommand, "dispose")
++    const dispose = createPluginDispose({
++      backgroundManager: {
++        shutdown: (): void => {},
++      },
++      skillMcpManager: {
++        disconnectAll: async (): Promise<void> => {},
++      },
++      disposeHooks: (): void => {
++        disposeCreatedHooks({
++          runtimeFallback,
++          todoContinuationEnforcer,
++          autoSlashCommand,
++        })
++      },
++    })
++
++    // when
++    await dispose()
++
++    // then
++    expect(runtimeFallbackDisposeSpy).toHaveBeenCalledTimes(1)
++    expect(todoContinuationEnforcerDisposeSpy).toHaveBeenCalledTimes(1)
++    expect(autoSlashCommandDisposeSpy).toHaveBeenCalledTimes(1)
++  })
++
++  test("#given dispose already called #when dispose() called again #then no errors", async () => {
++    // given
++    const backgroundManager = {
++      shutdown: (): void => {},
++    }
++    const skillMcpManager = {
++      disconnectAll: async (): Promise<void> => {},
++    }
++    const disposeHooks = {
++      run: (): void => {},
++    }
++    const shutdownSpy = spyOn(backgroundManager, "shutdown")
++    const disconnectAllSpy = spyOn(skillMcpManager, "disconnectAll")
++    const disposeHooksSpy = spyOn(disposeHooks, "run")
++    const dispose = createPluginDispose({
++      backgroundManager,
++      skillMcpManager,
++      disposeHooks: disposeHooks.run,
++    })
++
++    // when
++    await dispose()
++    await dispose()
++
++    // then
++    expect(shutdownSpy).toHaveBeenCalledTimes(1)
++    expect(disconnectAllSpy).toHaveBeenCalledTimes(1)
++    expect(disposeHooksSpy).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/src/plugin-dispose.ts b/src/plugin-dispose.ts
+new file mode 100644
+index 00000000..7b718bbe
+--- /dev/null
++++ b/src/plugin-dispose.ts
+@@ -0,0 +1,29 @@
++export type PluginDispose = () => Promise<void>
++
++export function createPluginDispose(args: {
++  backgroundManager: {
++    shutdown: () => void
++  }
++  skillMcpManager: {
++    disconnectAll: () => Promise<void>
++  }
++  disposeHooks: () => void
++}): PluginDispose {
++  const { backgroundManager, skillMcpManager, disposeHooks } = args
++  let disposePromise: Promise<void> | null = null
++
++  return async (): Promise<void> => {
++    if (disposePromise) {
++      await disposePromise
++      return
++    }
++
++    disposePromise = (async (): Promise<void> => {
++      backgroundManager.shutdown()
++      await skillMcpManager.disconnectAll()
++      disposeHooks()
++    })()
++
++    await disposePromise
++  }
++}
+-- 
+2.39.2
+

@@ -1,0 +1,258 @@
+From 03eaa429ceb8758ece6541c3ea7523e3b76eac61 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 20:39:03 +0900
+Subject: [PATCH 3151/5749] fix: address 5 edge cases from review-work findings
+
+- C3: include command args in auto-slash-command dedup key
+- H2: track completed task summaries for ALL COMPLETE message
+- H9: increment tmux close retry count on re-mark
+- H8: detect stale MCP connections after disconnect+reconnect race
+- H8: guard disconnectedSessions growth for non-MCP sessions
+- C1: await tmux cleanup in plugin dispose lifecycle
+---
+ src/features/background-agent/manager.ts        | 17 +++++++++++++++--
+ src/features/skill-mcp-manager/cleanup.ts       | 11 ++++++++++-
+ .../skill-mcp-manager/connection-race.test.ts   |  4 ++--
+ src/features/skill-mcp-manager/connection.ts    | 15 +++++++++++----
+ .../tmux-subagent/tracked-session-state.ts      |  1 +
+ src/hooks/auto-slash-command/hook.ts            |  2 +-
+ src/index.ts                                    |  1 +
+ src/plugin-dispose.test.ts                      |  4 ++++
+ src/plugin-dispose.ts                           | 10 ++++++++--
+ 9 files changed, 53 insertions(+), 12 deletions(-)
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 0ecc68e3..eb48a9bd 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -121,6 +121,7 @@ export class BackgroundManager {
+   private queuesByKey: Map<string, QueueItem[]> = new Map()
+   private processingKeys: Set<string> = new Set()
+   private completionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
++  private completedTaskSummaries: Map<string, Array<{id: string, description: string}>> = new Map()
+   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
+   private rootDescendantCounts: Map<string, number>
+@@ -1379,6 +1380,14 @@ export class BackgroundManager {
+       })
+     }
+ 
++    if (!this.completedTaskSummaries.has(task.parentSessionID)) {
++      this.completedTaskSummaries.set(task.parentSessionID, [])
++    }
++    this.completedTaskSummaries.get(task.parentSessionID)!.push({
++      id: task.id,
++      description: task.description,
++    })
++
+     // Update pending tracking and check if all tasks complete
+     const pendingSet = this.pendingByParent.get(task.parentSessionID)
+     let allComplete = false
+@@ -1398,10 +1407,13 @@ export class BackgroundManager {
+     }
+ 
+     const completedTasks = allComplete
+-      ? Array.from(this.tasks.values())
+-        .filter(t => t.parentSessionID === task.parentSessionID && t.status !== "running" && t.status !== "pending")
++      ? (this.completedTaskSummaries.get(task.parentSessionID) ?? [{ id: task.id, description: task.description }])
+       : []
+ 
++    if (allComplete) {
++      this.completedTaskSummaries.delete(task.parentSessionID)
++    }
++
+     const statusText = task.status === "completed"
+       ? "COMPLETED"
+       : task.status === "interrupt"
+@@ -1740,6 +1752,7 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+     this.queuesByKey.clear()
+     this.processingKeys.clear()
+     this.taskHistory.clearAll()
++    this.completedTaskSummaries.clear()
+     this.unregisterProcessCleanup()
+     log("[background-agent] Shutdown complete")
+ 
+diff --git a/src/features/skill-mcp-manager/cleanup.ts b/src/features/skill-mcp-manager/cleanup.ts
+index bbfe68ba..bd34c693 100644
+--- a/src/features/skill-mcp-manager/cleanup.ts
++++ b/src/features/skill-mcp-manager/cleanup.ts
+@@ -87,7 +87,16 @@ async function cleanupIdleClients(state: SkillMcpManagerState): Promise<void> {
+ }
+ 
+ export async function disconnectSession(state: SkillMcpManagerState, sessionID: string): Promise<void> {
+-  state.disconnectedSessions.add(sessionID)
++  let hasPendingForSession = false
++  for (const key of state.pendingConnections.keys()) {
++    if (key.startsWith(`${sessionID}:`)) {
++      hasPendingForSession = true
++      break
++    }
++  }
++  if (hasPendingForSession) {
++    state.disconnectedSessions.add(sessionID)
++  }
+   const keysToRemove: string[] = []
+ 
+   for (const [key, managed] of state.clients.entries()) {
+diff --git a/src/features/skill-mcp-manager/connection-race.test.ts b/src/features/skill-mcp-manager/connection-race.test.ts
+index f08750c2..70cf650a 100644
+--- a/src/features/skill-mcp-manager/connection-race.test.ts
++++ b/src/features/skill-mcp-manager/connection-race.test.ts
+@@ -154,11 +154,11 @@ describe("getOrCreateClient disconnect race", () => {
+     expect(createdClients[0]?.close).not.toHaveBeenCalled()
+   })
+ 
+-  it("#given no pending connections #when disconnectSession is called #then no errors occur and the session is added to disconnectedSessions", async () => {
++  it("#given no pending connections #when disconnectSession is called #then no errors occur and session is not added to disconnectedSessions", async () => {
+     const state = createState()
+ 
+     await expect(disconnectSession(state, "session-a")).resolves.toBeUndefined()
+-    expect(state.disconnectedSessions.has("session-a")).toBe(true)
++    expect(state.disconnectedSessions.has("session-a")).toBe(false)
+     expect(state.pendingConnections.size).toBe(0)
+     expect(state.clients.size).toBe(0)
+   })
+diff --git a/src/features/skill-mcp-manager/connection.ts b/src/features/skill-mcp-manager/connection.ts
+index e3521570..3ffe2e5f 100644
+--- a/src/features/skill-mcp-manager/connection.ts
++++ b/src/features/skill-mcp-manager/connection.ts
+@@ -29,9 +29,16 @@ export async function getOrCreateClient(params: {
+   }
+ 
+   const expandedConfig = expandEnvVarsInObject(config)
+-  const connectionPromise = (async () => {
++  let currentConnectionPromise!: Promise<Client>
++  currentConnectionPromise = (async () => {
+     const client = await createClient({ state, clientKey, info, config: expandedConfig })
+ 
++    const isStale = state.pendingConnections.has(clientKey) && state.pendingConnections.get(clientKey) !== currentConnectionPromise
++    if (isStale) {
++      try { await client.close() } catch {}
++      throw new Error(`Connection for "${info.sessionID}" was superseded by a newer connection attempt.`)
++    }
++
+     if (state.disconnectedSessions.has(info.sessionID)) {
+       await forceReconnect(state, clientKey)
+       throw new Error(`Session "${info.sessionID}" disconnected during MCP connection setup.`)
+@@ -40,13 +47,13 @@ export async function getOrCreateClient(params: {
+     return client
+   })()
+ 
+-  state.pendingConnections.set(clientKey, connectionPromise)
++  state.pendingConnections.set(clientKey, currentConnectionPromise)
+ 
+   try {
+-    const client = await connectionPromise
++    const client = await currentConnectionPromise
+     return client
+   } finally {
+-    if (state.pendingConnections.get(clientKey) === connectionPromise) {
++    if (state.pendingConnections.get(clientKey) === currentConnectionPromise) {
+       state.pendingConnections.delete(clientKey)
+     }
+   }
+diff --git a/src/features/tmux-subagent/tracked-session-state.ts b/src/features/tmux-subagent/tracked-session-state.ts
+index e18f6a82..87ba19f5 100644
+--- a/src/features/tmux-subagent/tracked-session-state.ts
++++ b/src/features/tmux-subagent/tracked-session-state.ts
+@@ -23,5 +23,6 @@ export function markTrackedSessionClosePending(tracked: TrackedSession): Tracked
+   return {
+     ...tracked,
+     closePending: true,
++    closeRetryCount: tracked.closePending ? tracked.closeRetryCount + 1 : tracked.closeRetryCount,
+   }
+ }
+diff --git a/src/hooks/auto-slash-command/hook.ts b/src/hooks/auto-slash-command/hook.ts
+index 8438dcf3..715b6748 100644
+--- a/src/hooks/auto-slash-command/hook.ts
++++ b/src/hooks/auto-slash-command/hook.ts
+@@ -125,7 +125,7 @@ export function createAutoSlashCommandHook(options?: AutoSlashCommandHookOptions
+       input: CommandExecuteBeforeInput,
+       output: CommandExecuteBeforeOutput
+     ): Promise<void> => {
+-      const commandKey = `${input.sessionID}:${input.command.toLowerCase()}`
++      const commandKey = `${input.sessionID}:${input.command.toLowerCase()}:${input.arguments || ""}`
+       if (sessionProcessedCommandExecutions.has(commandKey)) {
+         return
+       }
+diff --git a/src/index.ts b/src/index.ts
+index 70156f10..1b80d8c7 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -74,6 +74,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const dispose = createPluginDispose({
+     backgroundManager: managers.backgroundManager,
+     skillMcpManager: managers.skillMcpManager,
++    tmuxSessionManager: managers.tmuxSessionManager,
+     disposeHooks: hooks.disposeHooks,
+   })
+ 
+diff --git a/src/plugin-dispose.test.ts b/src/plugin-dispose.test.ts
+index 17ca88fe..b3739c6c 100644
+--- a/src/plugin-dispose.test.ts
++++ b/src/plugin-dispose.test.ts
+@@ -16,6 +16,7 @@ describe("createPluginDispose", () => {
+     const dispose = createPluginDispose({
+       backgroundManager,
+       skillMcpManager,
++      tmuxSessionManager: { cleanup: async (): Promise<void> => {} },
+       disposeHooks: (): void => {},
+     })
+ 
+@@ -38,6 +39,7 @@ describe("createPluginDispose", () => {
+     const dispose = createPluginDispose({
+       backgroundManager,
+       skillMcpManager,
++      tmuxSessionManager: { cleanup: async (): Promise<void> => {} },
+       disposeHooks: (): void => {},
+     })
+ 
+@@ -69,6 +71,7 @@ describe("createPluginDispose", () => {
+       skillMcpManager: {
+         disconnectAll: async (): Promise<void> => {},
+       },
++      tmuxSessionManager: { cleanup: async (): Promise<void> => {} },
+       disposeHooks: (): void => {
+         disposeCreatedHooks({
+           runtimeFallback,
+@@ -104,6 +107,7 @@ describe("createPluginDispose", () => {
+     const dispose = createPluginDispose({
+       backgroundManager,
+       skillMcpManager,
++      tmuxSessionManager: { cleanup: async (): Promise<void> => {} },
+       disposeHooks: disposeHooks.run,
+     })
+ 
+diff --git a/src/plugin-dispose.ts b/src/plugin-dispose.ts
+index 7b718bbe..c813fa41 100644
+--- a/src/plugin-dispose.ts
++++ b/src/plugin-dispose.ts
+@@ -7,9 +7,12 @@ export function createPluginDispose(args: {
+   skillMcpManager: {
+     disconnectAll: () => Promise<void>
+   }
++  tmuxSessionManager: {
++    cleanup: () => Promise<void>
++  }
+   disposeHooks: () => void
+ }): PluginDispose {
+-  const { backgroundManager, skillMcpManager, disposeHooks } = args
++  const { backgroundManager, skillMcpManager, tmuxSessionManager, disposeHooks } = args
+   let disposePromise: Promise<void> | null = null
+ 
+   return async (): Promise<void> => {
+@@ -20,7 +23,10 @@ export function createPluginDispose(args: {
+ 
+     disposePromise = (async (): Promise<void> => {
+       backgroundManager.shutdown()
+-      await skillMcpManager.disconnectAll()
++      await Promise.all([
++        skillMcpManager.disconnectAll(),
++        tmuxSessionManager.cleanup(),
++      ])
+       disposeHooks()
+     })()
+ 
+-- 
+2.39.2
+

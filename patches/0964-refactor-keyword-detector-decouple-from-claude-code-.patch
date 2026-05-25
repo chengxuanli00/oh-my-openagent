@@ -1,0 +1,286 @@
+From ce5315fbd01458c726cdd6636d850998b90df628 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 11 Jan 2026 12:06:16 +0900
+Subject: [PATCH 0964/5749] refactor(keyword-detector): decouple from
+ claude-code-hooks via ContextCollector pipeline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- keyword-detector now registers keywords to ContextCollector
+- context-injector consumes and injects via chat.message hook
+- Removed keyword detection logic from claude-code-hooks
+- Hook order: keyword-detector → context-injector → claude-code-hooks
+- ultrawork now works even when claude-code-hooks is disabled
+---
+ .../context-injector/injector.test.ts         |  7 +-
+ src/features/context-injector/injector.ts     | 12 ++-
+ src/hooks/claude-code-hooks/index.ts          | 23 +----
+ src/hooks/keyword-detector/index.test.ts      | 88 +++++++++++++++++++
+ src/hooks/keyword-detector/index.ts           | 16 +++-
+ src/index.ts                                  |  4 +-
+ 6 files changed, 119 insertions(+), 31 deletions(-)
+
+diff --git a/src/features/context-injector/injector.test.ts b/src/features/context-injector/injector.test.ts
+index 97d377b0..d84d54d1 100644
+--- a/src/features/context-injector/injector.test.ts
++++ b/src/features/context-injector/injector.test.ts
+@@ -133,7 +133,7 @@ describe("createContextInjectorHook", () => {
+   })
+ 
+   describe("chat.message handler", () => {
+-    it("is a no-op (context injection moved to messages transform)", async () => {
++    it("injects pending context into output parts", async () => {
+       // #given
+       const hook = createContextInjectorHook(collector)
+       const sessionID = "ses_hook1"
+@@ -152,8 +152,9 @@ describe("createContextInjectorHook", () => {
+       await hook["chat.message"](input, output)
+ 
+       // #then
+-      expect(output.parts[0].text).toBe("User message")
+-      expect(collector.hasPending(sessionID)).toBe(true)
++      expect(output.parts[0].text).toContain("Hook context")
++      expect(output.parts[0].text).toContain("User message")
++      expect(collector.hasPending(sessionID)).toBe(false)
+     })
+ 
+     it("does nothing when no pending context", async () => {
+diff --git a/src/features/context-injector/injector.ts b/src/features/context-injector/injector.ts
+index 5be6ded0..b2d77158 100644
+--- a/src/features/context-injector/injector.ts
++++ b/src/features/context-injector/injector.ts
+@@ -52,10 +52,16 @@ interface ChatMessageOutput {
+ export function createContextInjectorHook(collector: ContextCollector) {
+   return {
+     "chat.message": async (
+-      _input: ChatMessageInput,
+-      _output: ChatMessageOutput
++      input: ChatMessageInput,
++      output: ChatMessageOutput
+     ): Promise<void> => {
+-      void collector
++      const result = injectPendingContext(collector, input.sessionID, output.parts)
++      if (result.injected) {
++        log("[context-injector] Injected pending context via chat.message", {
++          sessionID: input.sessionID,
++          contextLength: result.contextLength,
++        })
++      }
+     },
+   }
+ }
+diff --git a/src/hooks/claude-code-hooks/index.ts b/src/hooks/claude-code-hooks/index.ts
+index 09572ad9..4ed5dac7 100644
+--- a/src/hooks/claude-code-hooks/index.ts
++++ b/src/hooks/claude-code-hooks/index.ts
+@@ -27,7 +27,6 @@ import { cacheToolInput, getToolInput } from "./tool-input-cache"
+ import { recordToolUse, recordToolResult, getTranscriptPath, recordUserMessage } from "./transcript"
+ import type { PluginConfig } from "./types"
+ import { log, isHookDisabled } from "../../shared"
+-import { detectKeywordsWithType, removeCodeBlocks } from "../keyword-detector"
+ import type { ContextCollector } from "../../features/context-injector"
+ 
+ const sessionFirstMessageProcessed = new Set<string>()
+@@ -142,25 +141,9 @@ export function createClaudeCodeHooksHook(
+           return
+         }
+ 
+-        const keywordMessages: string[] = []
+-        if (!config.keywordDetectorDisabled) {
+-          const detectedKeywords = detectKeywordsWithType(removeCodeBlocks(prompt), input.agent)
+-          keywordMessages.push(...detectedKeywords.map((k) => k.message))
+-
+-          if (keywordMessages.length > 0) {
+-            log("[claude-code-hooks] Detected keywords", {
+-              sessionID: input.sessionID,
+-              keywordCount: keywordMessages.length,
+-              types: detectedKeywords.map((k) => k.type),
+-            })
+-          }
+-        }
+-
+-        const allMessages = [...keywordMessages, ...result.messages]
+-
+-        if (allMessages.length > 0) {
+-          const hookContent = allMessages.join("\n\n")
+-          log(`[claude-code-hooks] Injecting ${allMessages.length} messages (${keywordMessages.length} keyword + ${result.messages.length} hook)`, { sessionID: input.sessionID, contentLength: hookContent.length, isFirstMessage })
++        if (result.messages.length > 0) {
++          const hookContent = result.messages.join("\n\n")
++          log(`[claude-code-hooks] Injecting ${result.messages.length} hook messages`, { sessionID: input.sessionID, contentLength: hookContent.length, isFirstMessage })
+ 
+           if (isFirstMessage) {
+             const idx = output.parts.findIndex((p) => p.type === "text" && p.text)
+diff --git a/src/hooks/keyword-detector/index.test.ts b/src/hooks/keyword-detector/index.test.ts
+index 83dc08b2..022ffe1e 100644
+--- a/src/hooks/keyword-detector/index.test.ts
++++ b/src/hooks/keyword-detector/index.test.ts
+@@ -1,7 +1,95 @@
+ import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test"
+ import { createKeywordDetectorHook } from "./index"
+ import { setMainSession } from "../../features/claude-code-session-state"
++import { ContextCollector } from "../../features/context-injector"
+ import * as sharedModule from "../../shared"
++import * as sessionState from "../../features/claude-code-session-state"
++
++describe("keyword-detector registers to ContextCollector", () => {
++  let logCalls: Array<{ msg: string; data?: unknown }>
++  let logSpy: ReturnType<typeof spyOn>
++  let getMainSessionSpy: ReturnType<typeof spyOn>
++
++  beforeEach(() => {
++    logCalls = []
++    logSpy = spyOn(sharedModule, "log").mockImplementation((msg: string, data?: unknown) => {
++      logCalls.push({ msg, data })
++    })
++  })
++
++  afterEach(() => {
++    logSpy?.mockRestore()
++    getMainSessionSpy?.mockRestore()
++  })
++
++  function createMockPluginInput() {
++    return {
++      client: {
++        tui: {
++          showToast: async () => {},
++        },
++      },
++    } as any
++  }
++
++  test("should register ultrawork keyword to ContextCollector", async () => {
++    // #given - a fresh ContextCollector and keyword-detector hook
++    const collector = new ContextCollector()
++    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
++    const sessionID = "test-session-123"
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "ultrawork do something" }],
++    }
++
++    // #when - keyword detection runs
++    await hook["chat.message"]({ sessionID }, output)
++
++    // #then - ultrawork context should be registered in collector
++    expect(collector.hasPending(sessionID)).toBe(true)
++    const pending = collector.getPending(sessionID)
++    expect(pending.entries.length).toBeGreaterThan(0)
++    expect(pending.entries[0].source).toBe("keyword-detector")
++    expect(pending.entries[0].id).toBe("keyword-ultrawork")
++  })
++
++  test("should register search keyword to ContextCollector", async () => {
++    // #given - mock getMainSessionID to return our session (isolate from global state)
++    const collector = new ContextCollector()
++    const sessionID = "search-test-session"
++    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
++    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "search for the bug" }],
++    }
++
++    // #when - keyword detection runs
++    await hook["chat.message"]({ sessionID }, output)
++
++    // #then - search context should be registered in collector
++    expect(collector.hasPending(sessionID)).toBe(true)
++    const pending = collector.getPending(sessionID)
++    expect(pending.entries.some((e) => e.id === "keyword-search")).toBe(true)
++  })
++
++  test("should NOT register to collector when no keywords detected", async () => {
++    // #given - no keywords in message
++    const collector = new ContextCollector()
++    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
++    const sessionID = "test-session"
++    const output = {
++      message: {} as Record<string, unknown>,
++      parts: [{ type: "text", text: "just a normal message" }],
++    }
++
++    // #when - keyword detection runs
++    await hook["chat.message"]({ sessionID }, output)
++
++    // #then - nothing should be registered
++    expect(collector.hasPending(sessionID)).toBe(false)
++  })
++})
+ 
+ describe("keyword-detector session filtering", () => {
+   let logCalls: Array<{ msg: string; data?: unknown }>
+diff --git a/src/hooks/keyword-detector/index.ts b/src/hooks/keyword-detector/index.ts
+index efd632ca..e79f17b4 100644
+--- a/src/hooks/keyword-detector/index.ts
++++ b/src/hooks/keyword-detector/index.ts
+@@ -2,12 +2,13 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { detectKeywordsWithType, extractPromptText, removeCodeBlocks } from "./detector"
+ import { log } from "../../shared"
+ import { getMainSessionID } from "../../features/claude-code-session-state"
++import type { ContextCollector } from "../../features/context-injector"
+ 
+ export * from "./detector"
+ export * from "./constants"
+ export * from "./types"
+ 
+-export function createKeywordDetectorHook(ctx: PluginInput) {
++export function createKeywordDetectorHook(ctx: PluginInput, collector?: ContextCollector) {
+   return {
+     "chat.message": async (
+       input: {
+@@ -28,8 +29,6 @@ export function createKeywordDetectorHook(ctx: PluginInput) {
+         return
+       }
+ 
+-      // Only ultrawork keywords work in non-main sessions
+-      // Other keywords (search, analyze, etc.) only work in main sessions
+       const mainSessionID = getMainSessionID()
+       const isNonMainSession = mainSessionID && input.sessionID !== mainSessionID
+ 
+@@ -64,6 +63,17 @@ export function createKeywordDetectorHook(ctx: PluginInput) {
+           )
+       }
+ 
++      if (collector) {
++        for (const keyword of detectedKeywords) {
++          collector.register(input.sessionID, {
++            id: `keyword-${keyword.type}`,
++            source: "keyword-detector",
++            content: keyword.message,
++            priority: keyword.type === "ultrawork" ? "critical" : "high",
++          })
++        }
++      }
++
+       log(`[keyword-detector] Detected ${detectedKeywords.length} keywords`, {
+         sessionID: input.sessionID,
+         types: detectedKeywords.map((k) => k.type),
+diff --git a/src/index.ts b/src/index.ts
+index 0db25384..48b2e688 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -165,7 +165,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+       })
+     : null;
+   const keywordDetector = isHookEnabled("keyword-detector")
+-    ? createKeywordDetectorHook(ctx)
++    ? createKeywordDetectorHook(ctx, contextCollector)
+     : null;
+   const contextInjector = createContextInjectorHook(contextCollector);
+   const contextInjectorMessagesTransform =
+@@ -313,9 +313,9 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     },
+ 
+     "chat.message": async (input, output) => {
+-      await claudeCodeHooks["chat.message"]?.(input, output);
+       await keywordDetector?.["chat.message"]?.(input, output);
+       await contextInjector["chat.message"]?.(input, output);
++      await claudeCodeHooks["chat.message"]?.(input, output);
+       await autoSlashCommand?.["chat.message"]?.(input, output);
+       await startWork?.["chat.message"]?.(input, output);
+ 
+-- 
+2.39.2
+

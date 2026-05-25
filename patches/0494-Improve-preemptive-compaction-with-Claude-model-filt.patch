@@ -1,0 +1,176 @@
+From a9459c04bf4ae28f3f4589f6eed1dc28457fc977 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 21 Dec 2025 17:03:08 +0900
+Subject: [PATCH 0494/5749] Improve preemptive compaction with Claude model
+ filtering and configurable context limits
+
+- Limit preemptive compaction to Claude models only (opus, sonnet, haiku pattern)
+- Add support for detecting `anthropic-beta: context-1m-*` header to use 1M context limit for Sonnet models
+- Add `getModelLimit` callback to read model limits from OpenCode config (`provider.*.models.*.limit.context`)
+- Remove hardcoded MODEL_CONTEXT_LIMITS and replace with pattern-based model detection
+- Cache model context limits from config at startup for performance
+
+This enables flexible per-model context limit configuration without hardcoding limits in the plugin.
+
+Generated with assistance of OhMyOpenCode
+---
+ src/hooks/preemptive-compaction/index.ts | 45 +++++++++---------------
+ src/index.ts                             | 40 +++++++++++++++++++++
+ 2 files changed, 57 insertions(+), 28 deletions(-)
+
+diff --git a/src/hooks/preemptive-compaction/index.ts b/src/hooks/preemptive-compaction/index.ts
+index d5a75605..c5c650b7 100644
+--- a/src/hooks/preemptive-compaction/index.ts
++++ b/src/hooks/preemptive-compaction/index.ts
+@@ -18,9 +18,12 @@ export interface SummarizeContext {
+ 
+ export type BeforeSummarizeCallback = (ctx: SummarizeContext) => Promise<void> | void
+ 
++export type GetModelLimitCallback = (providerID: string, modelID: string) => number | undefined
++
+ export interface PreemptiveCompactionOptions {
+   experimental?: ExperimentalConfig
+   onBeforeSummarize?: BeforeSummarizeCallback
++  getModelLimit?: GetModelLimitCallback
+ }
+ 
+ interface MessageInfo {
+@@ -38,33 +41,11 @@ interface MessageWrapper {
+   info: MessageInfo
+ }
+ 
+-const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+-  "claude-opus-4": 200_000,
+-  "claude-sonnet-4": 200_000,
+-  "claude-haiku-4": 200_000,
+-  "gpt-4o": 128_000,
+-  "gpt-4o-mini": 128_000,
+-  "gpt-4-turbo": 128_000,
+-  "gpt-4": 8_192,
+-  "gpt-5": 1_000_000,
+-  "o1": 200_000,
+-  "o1-mini": 128_000,
+-  "o1-preview": 128_000,
+-  "o3": 200_000,
+-  "o3-mini": 200_000,
+-  "gemini-2.0-flash": 1_000_000,
+-  "gemini-2.5-flash": 1_000_000,
+-  "gemini-2.5-pro": 2_000_000,
+-  "gemini-3-pro": 2_000_000,
+-}
++const CLAUDE_MODEL_PATTERN = /claude-(opus|sonnet|haiku)/i
++const CLAUDE_DEFAULT_CONTEXT_LIMIT = 200_000
+ 
+-function getContextLimit(modelID: string): number {
+-  for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
+-    if (modelID.includes(key)) {
+-      return limit
+-    }
+-  }
+-  return 200_000
++function isSupportedModel(modelID: string): boolean {
++  return CLAUDE_MODEL_PATTERN.test(modelID)
+ }
+ 
+ function createState(): PreemptiveCompactionState {
+@@ -80,6 +61,7 @@ export function createPreemptiveCompactionHook(
+ ) {
+   const experimental = options?.experimental
+   const onBeforeSummarize = options?.onBeforeSummarize
++  const getModelLimit = options?.getModelLimit
+   const enabled = experimental?.preemptive_compaction !== false
+   const threshold = experimental?.preemptive_compaction_threshold ?? DEFAULT_THRESHOLD
+ 
+@@ -104,7 +86,15 @@ export function createPreemptiveCompactionHook(
+     if (!tokens) return
+ 
+     const modelID = lastAssistant.modelID ?? ""
+-    const contextLimit = getContextLimit(modelID)
++    const providerID = lastAssistant.providerID ?? ""
++
++    if (!isSupportedModel(modelID)) {
++      log("[preemptive-compaction] skipping unsupported model", { modelID })
++      return
++    }
++
++    const configLimit = getModelLimit?.(providerID, modelID)
++    const contextLimit = configLimit ?? CLAUDE_DEFAULT_CONTEXT_LIMIT
+     const totalUsed = tokens.input + tokens.cache.read + tokens.output
+ 
+     if (totalUsed < MIN_TOKENS_FOR_COMPACTION) return
+@@ -124,7 +114,6 @@ export function createPreemptiveCompactionHook(
+     state.compactionInProgress.add(sessionID)
+     state.lastCompactionTime.set(sessionID, Date.now())
+ 
+-    const providerID = lastAssistant.providerID
+     if (!providerID || !modelID) {
+       state.compactionInProgress.delete(sessionID)
+       return
+diff --git a/src/index.ts b/src/index.ts
+index 88306f01..72607ea2 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -213,6 +213,20 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const disabledHooks = new Set(pluginConfig.disabled_hooks ?? []);
+   const isHookEnabled = (hookName: HookName) => !disabledHooks.has(hookName);
+ 
++  const modelContextLimitsCache = new Map<string, number>();
++  let anthropicContext1MEnabled = false;
++
++  const getModelLimit = (providerID: string, modelID: string): number | undefined => {
++    const key = `${providerID}/${modelID}`;
++    const cached = modelContextLimitsCache.get(key);
++    if (cached) return cached;
++
++    if (providerID === "anthropic" && anthropicContext1MEnabled && modelID.includes("sonnet")) {
++      return 1_000_000;
++    }
++    return undefined;
++  };
++
+   const todoContinuationEnforcer = isHookEnabled("todo-continuation-enforcer")
+     ? createTodoContinuationEnforcer(ctx)
+     : null;
+@@ -261,6 +275,7 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+   const preemptiveCompaction = createPreemptiveCompactionHook(ctx, {
+     experimental: pluginConfig.experimental,
+     onBeforeSummarize: compactionContextInjector,
++    getModelLimit,
+   });
+   const rulesInjector = isHookEnabled("rules-injector")
+     ? createRulesInjectorHook(ctx)
+@@ -329,6 +344,31 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     },
+ 
+     config: async (config) => {
++      type ProviderConfig = {
++        options?: { headers?: Record<string, string> }
++        models?: Record<string, { limit?: { context?: number } }>
++      }
++      const providers = config.provider as Record<string, ProviderConfig> | undefined;
++
++      const anthropicBeta = providers?.anthropic?.options?.headers?.["anthropic-beta"];
++      anthropicContext1MEnabled = anthropicBeta?.includes("context-1m") ?? false;
++
++      if (providers) {
++        for (const [providerID, providerConfig] of Object.entries(providers)) {
++          const models = providerConfig?.models;
++          if (models) {
++            for (const [modelID, modelConfig] of Object.entries(models)) {
++              const contextLimit = modelConfig?.limit?.context;
++              if (contextLimit) {
++                modelContextLimitsCache.set(`${providerID}/${modelID}`, contextLimit);
++              }
++            }
++          }
++
++
++        }
++      }
++
+       const builtinAgents = createBuiltinAgents(
+         pluginConfig.disabled_agents,
+         pluginConfig.agents,
+-- 
+2.39.2
+

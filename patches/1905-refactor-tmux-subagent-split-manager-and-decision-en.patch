@@ -1,0 +1,2069 @@
+From f8b57714435663bb802ba877428b6deef0de791d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 8 Feb 2026 16:21:04 +0900
+Subject: [PATCH 1905/5749] refactor(tmux-subagent): split manager and
+ decision-engine into focused modules
+
+Extract session lifecycle, polling, grid planning, and event handling:
+- polling.ts: session polling controller with stability detection
+- event-handlers.ts: session created/deleted handlers
+- grid-planning.ts, spawn-action-decider.ts, spawn-target-finder.ts
+- session-status-parser.ts, session-message-count.ts
+- cleanup.ts, polling-constants.ts, tmux-grid-constants.ts
+---
+ src/features/tmux-subagent/cleanup.ts         |  42 ++
+ src/features/tmux-subagent/decision-engine.ts | 408 +---------------
+ src/features/tmux-subagent/event-handlers.ts  |   6 +
+ src/features/tmux-subagent/grid-planning.ts   | 107 +++++
+ src/features/tmux-subagent/index.ts           |  10 +
+ src/features/tmux-subagent/manager.ts         | 438 +++---------------
+ .../tmux-subagent/oldest-agent-pane.ts        |  37 ++
+ .../tmux-subagent/pane-split-availability.ts  |  60 +++
+ .../tmux-subagent/polling-constants.ts        |   6 +
+ src/features/tmux-subagent/polling.ts         | 183 ++++++++
+ .../tmux-subagent/session-created-event.ts    |  44 ++
+ .../tmux-subagent/session-created-handler.ts  | 163 +++++++
+ .../tmux-subagent/session-deleted-handler.ts  |  50 ++
+ .../tmux-subagent/session-message-count.ts    |   3 +
+ .../tmux-subagent/session-ready-waiter.ts     |  44 ++
+ .../tmux-subagent/session-status-parser.ts    |  17 +
+ .../tmux-subagent/spawn-action-decider.ts     | 135 ++++++
+ .../tmux-subagent/spawn-target-finder.ts      |  86 ++++
+ .../tmux-subagent/tmux-grid-constants.ts      |  10 +
+ 19 files changed, 1083 insertions(+), 766 deletions(-)
+ create mode 100644 src/features/tmux-subagent/cleanup.ts
+ create mode 100644 src/features/tmux-subagent/event-handlers.ts
+ create mode 100644 src/features/tmux-subagent/grid-planning.ts
+ create mode 100644 src/features/tmux-subagent/oldest-agent-pane.ts
+ create mode 100644 src/features/tmux-subagent/pane-split-availability.ts
+ create mode 100644 src/features/tmux-subagent/polling-constants.ts
+ create mode 100644 src/features/tmux-subagent/polling.ts
+ create mode 100644 src/features/tmux-subagent/session-created-event.ts
+ create mode 100644 src/features/tmux-subagent/session-created-handler.ts
+ create mode 100644 src/features/tmux-subagent/session-deleted-handler.ts
+ create mode 100644 src/features/tmux-subagent/session-message-count.ts
+ create mode 100644 src/features/tmux-subagent/session-ready-waiter.ts
+ create mode 100644 src/features/tmux-subagent/session-status-parser.ts
+ create mode 100644 src/features/tmux-subagent/spawn-action-decider.ts
+ create mode 100644 src/features/tmux-subagent/spawn-target-finder.ts
+ create mode 100644 src/features/tmux-subagent/tmux-grid-constants.ts
+
+diff --git a/src/features/tmux-subagent/cleanup.ts b/src/features/tmux-subagent/cleanup.ts
+new file mode 100644
+index 00000000..414ad00b
+--- /dev/null
++++ b/src/features/tmux-subagent/cleanup.ts
+@@ -0,0 +1,42 @@
++import type { TmuxConfig } from "../../config/schema"
++import { log } from "../../shared"
++import type { TrackedSession } from "./types"
++import { queryWindowState } from "./pane-state-querier"
++import { executeAction } from "./action-executor"
++
++export async function cleanupTmuxSessions(params: {
++  tmuxConfig: TmuxConfig
++  serverUrl: string
++  sourcePaneId: string | undefined
++  sessions: Map<string, TrackedSession>
++  stopPolling: () => void
++}): Promise<void> {
++  params.stopPolling()
++
++  if (params.sessions.size === 0) {
++    log("[tmux-session-manager] cleanup complete")
++    return
++  }
++
++  log("[tmux-session-manager] closing all panes", { count: params.sessions.size })
++  const state = params.sourcePaneId ? await queryWindowState(params.sourcePaneId) : null
++
++  if (state) {
++    const closePromises = Array.from(params.sessions.values()).map((tracked) =>
++      executeAction(
++        { type: "close", paneId: tracked.paneId, sessionId: tracked.sessionId },
++        { config: params.tmuxConfig, serverUrl: params.serverUrl, windowState: state },
++      ).catch((error) =>
++        log("[tmux-session-manager] cleanup error for pane", {
++          paneId: tracked.paneId,
++          error: String(error),
++        }),
++      ),
++    )
++
++    await Promise.all(closePromises)
++  }
++
++  params.sessions.clear()
++  log("[tmux-session-manager] cleanup complete")
++}
+diff --git a/src/features/tmux-subagent/decision-engine.ts b/src/features/tmux-subagent/decision-engine.ts
+index b6761bf6..c820468e 100644
+--- a/src/features/tmux-subagent/decision-engine.ts
++++ b/src/features/tmux-subagent/decision-engine.ts
+@@ -1,386 +1,22 @@
+-import type { WindowState, PaneAction, SpawnDecision, CapacityConfig, TmuxPaneInfo, SplitDirection } from "./types"
+-import { MIN_PANE_WIDTH, MIN_PANE_HEIGHT } from "./types"
+-
+-export interface SessionMapping {
+-  sessionId: string
+-  paneId: string
+-  createdAt: Date
+-}
+-
+-export interface GridCapacity {
+-  cols: number
+-  rows: number
+-  total: number
+-}
+-
+-export interface GridSlot {
+-  row: number
+-  col: number
+-}
+-
+-export interface GridPlan {
+-  cols: number
+-  rows: number
+-  slotWidth: number
+-  slotHeight: number
+-}
+-
+-export interface SpawnTarget {
+-  targetPaneId: string
+-  splitDirection: SplitDirection
+-}
+-
+-const MAIN_PANE_RATIO = 0.5
+-const MAX_COLS = 2
+-const MAX_ROWS = 3
+-const MAX_GRID_SIZE = 4
+-const DIVIDER_SIZE = 1
+-const MIN_SPLIT_WIDTH = 2 * MIN_PANE_WIDTH + DIVIDER_SIZE
+-const MIN_SPLIT_HEIGHT = 2 * MIN_PANE_HEIGHT + DIVIDER_SIZE
+-
+-export function getColumnCount(paneCount: number): number {
+-  if (paneCount <= 0) return 1
+-  return Math.min(MAX_COLS, Math.max(1, Math.ceil(paneCount / MAX_ROWS)))
+-}
+-
+-export function getColumnWidth(agentAreaWidth: number, paneCount: number): number {
+-  const cols = getColumnCount(paneCount)
+-  const dividersWidth = (cols - 1) * DIVIDER_SIZE
+-  return Math.floor((agentAreaWidth - dividersWidth) / cols)
+-}
+-
+-export function isSplittableAtCount(agentAreaWidth: number, paneCount: number): boolean {
+-  const columnWidth = getColumnWidth(agentAreaWidth, paneCount)
+-  return columnWidth >= MIN_SPLIT_WIDTH
+-}
+-
+-export function findMinimalEvictions(agentAreaWidth: number, currentCount: number): number | null {
+-  for (let k = 1; k <= currentCount; k++) {
+-    if (isSplittableAtCount(agentAreaWidth, currentCount - k)) {
+-      return k
+-    }
+-  }
+-  return null
+-}
+-
+-export function canSplitPane(pane: TmuxPaneInfo, direction: SplitDirection): boolean {
+-  if (direction === "-h") {
+-    return pane.width >= MIN_SPLIT_WIDTH
+-  }
+-  return pane.height >= MIN_SPLIT_HEIGHT
+-}
+-
+-export function canSplitPaneAnyDirection(pane: TmuxPaneInfo): boolean {
+-  return pane.width >= MIN_SPLIT_WIDTH || pane.height >= MIN_SPLIT_HEIGHT
+-}
+-
+-export function getBestSplitDirection(pane: TmuxPaneInfo): SplitDirection | null {
+-  const canH = pane.width >= MIN_SPLIT_WIDTH
+-  const canV = pane.height >= MIN_SPLIT_HEIGHT
+-  
+-  if (!canH && !canV) return null
+-  if (canH && !canV) return "-h"
+-  if (!canH && canV) return "-v"
+-  return pane.width >= pane.height ? "-h" : "-v"
+-}
+-
+-export function calculateCapacity(
+-  windowWidth: number,
+-  windowHeight: number
+-): GridCapacity {
+-  const availableWidth = Math.floor(windowWidth * (1 - MAIN_PANE_RATIO))
+-  const cols = Math.min(MAX_GRID_SIZE, Math.max(0, Math.floor((availableWidth + DIVIDER_SIZE) / (MIN_PANE_WIDTH + DIVIDER_SIZE))))
+-  const rows = Math.min(MAX_GRID_SIZE, Math.max(0, Math.floor((windowHeight + DIVIDER_SIZE) / (MIN_PANE_HEIGHT + DIVIDER_SIZE))))
+-  const total = cols * rows
+-  return { cols, rows, total }
+-}
+-
+-export function computeGridPlan(
+-  windowWidth: number,
+-  windowHeight: number,
+-  paneCount: number
+-): GridPlan {
+-  const capacity = calculateCapacity(windowWidth, windowHeight)
+-  const { cols: maxCols, rows: maxRows } = capacity
+-  
+-  if (maxCols === 0 || maxRows === 0 || paneCount === 0) {
+-    return { cols: 1, rows: 1, slotWidth: 0, slotHeight: 0 }
+-  }
+-
+-  let bestCols = 1
+-  let bestRows = 1
+-  let bestArea = Infinity
+-
+-  for (let rows = 1; rows <= maxRows; rows++) {
+-    for (let cols = 1; cols <= maxCols; cols++) {
+-      if (cols * rows >= paneCount) {
+-        const area = cols * rows
+-        if (area < bestArea || (area === bestArea && rows < bestRows)) {
+-          bestCols = cols
+-          bestRows = rows
+-          bestArea = area
+-        }
+-      }
+-    }
+-  }
+-
+-  const availableWidth = Math.floor(windowWidth * (1 - MAIN_PANE_RATIO))
+-  const slotWidth = Math.floor(availableWidth / bestCols)
+-  const slotHeight = Math.floor(windowHeight / bestRows)
+-
+-  return { cols: bestCols, rows: bestRows, slotWidth, slotHeight }
+-}
+-
+-export function mapPaneToSlot(
+-  pane: TmuxPaneInfo,
+-  plan: GridPlan,
+-  mainPaneWidth: number
+-): GridSlot {
+-  const rightAreaX = mainPaneWidth
+-  const relativeX = Math.max(0, pane.left - rightAreaX)
+-  const relativeY = pane.top
+-
+-  const col = plan.slotWidth > 0 
+-    ? Math.min(plan.cols - 1, Math.floor(relativeX / plan.slotWidth))
+-    : 0
+-  const row = plan.slotHeight > 0
+-    ? Math.min(plan.rows - 1, Math.floor(relativeY / plan.slotHeight))
+-    : 0
+-
+-  return { row, col }
+-}
+-
+-function buildOccupancy(
+-  agentPanes: TmuxPaneInfo[],
+-  plan: GridPlan,
+-  mainPaneWidth: number
+-): Map<string, TmuxPaneInfo> {
+-  const occupancy = new Map<string, TmuxPaneInfo>()
+-  for (const pane of agentPanes) {
+-    const slot = mapPaneToSlot(pane, plan, mainPaneWidth)
+-    const key = `${slot.row}:${slot.col}`
+-    occupancy.set(key, pane)
+-  }
+-  return occupancy
+-}
+-
+-function findFirstEmptySlot(
+-  occupancy: Map<string, TmuxPaneInfo>,
+-  plan: GridPlan
+-): GridSlot {
+-  for (let row = 0; row < plan.rows; row++) {
+-    for (let col = 0; col < plan.cols; col++) {
+-      const key = `${row}:${col}`
+-      if (!occupancy.has(key)) {
+-        return { row, col }
+-      }
+-    }
+-  }
+-  return { row: plan.rows - 1, col: plan.cols - 1 }
+-}
+-
+-function findSplittableTarget(
+-  state: WindowState,
+-  preferredDirection?: SplitDirection
+-): SpawnTarget | null {
+-  if (!state.mainPane) return null
+-
+-  const existingCount = state.agentPanes.length
+-
+-  if (existingCount === 0) {
+-    const virtualMainPane: TmuxPaneInfo = {
+-      ...state.mainPane,
+-      width: state.windowWidth,
+-    }
+-    if (canSplitPane(virtualMainPane, "-h")) {
+-      return { targetPaneId: state.mainPane.paneId, splitDirection: "-h" }
+-    }
+-    return null
+-  }
+-
+-  const plan = computeGridPlan(state.windowWidth, state.windowHeight, existingCount + 1)
+-  const mainPaneWidth = Math.floor(state.windowWidth * MAIN_PANE_RATIO)
+-  const occupancy = buildOccupancy(state.agentPanes, plan, mainPaneWidth)
+-  const targetSlot = findFirstEmptySlot(occupancy, plan)
+-
+-  const leftKey = `${targetSlot.row}:${targetSlot.col - 1}`
+-  const leftPane = occupancy.get(leftKey)
+-  if (leftPane && canSplitPane(leftPane, "-h")) {
+-    return { targetPaneId: leftPane.paneId, splitDirection: "-h" }
+-  }
+-
+-  const aboveKey = `${targetSlot.row - 1}:${targetSlot.col}`
+-  const abovePane = occupancy.get(aboveKey)
+-  if (abovePane && canSplitPane(abovePane, "-v")) {
+-    return { targetPaneId: abovePane.paneId, splitDirection: "-v" }
+-  }
+-
+-  const splittablePanes = state.agentPanes
+-    .map(p => ({ pane: p, direction: getBestSplitDirection(p) }))
+-    .filter(({ direction }) => direction !== null)
+-    .sort((a, b) => (b.pane.width * b.pane.height) - (a.pane.width * a.pane.height))
+-
+-  if (splittablePanes.length > 0) {
+-    const best = splittablePanes[0]
+-    return { targetPaneId: best.pane.paneId, splitDirection: best.direction! }
+-  }
+-
+-  return null
+-}
+-
+-export function findSpawnTarget(state: WindowState): SpawnTarget | null {
+-  return findSplittableTarget(state)
+-}
+-
+-function findOldestSession(mappings: SessionMapping[]): SessionMapping | null {
+-  if (mappings.length === 0) return null
+-  return mappings.reduce((oldest, current) =>
+-    current.createdAt < oldest.createdAt ? current : oldest
+-  )
+-}
+-
+-function findOldestAgentPane(
+-  agentPanes: TmuxPaneInfo[],
+-  sessionMappings: SessionMapping[]
+-): TmuxPaneInfo | null {
+-  if (agentPanes.length === 0) return null
+-  
+-  const paneIdToAge = new Map<string, Date>()
+-  for (const mapping of sessionMappings) {
+-    paneIdToAge.set(mapping.paneId, mapping.createdAt)
+-  }
+-  
+-  const panesWithAge = agentPanes
+-    .map(p => ({ pane: p, age: paneIdToAge.get(p.paneId) }))
+-    .filter(({ age }) => age !== undefined)
+-    .sort((a, b) => a.age!.getTime() - b.age!.getTime())
+-  
+-  if (panesWithAge.length > 0) {
+-    return panesWithAge[0].pane
+-  }
+-  
+-  return agentPanes.reduce((oldest, p) => {
+-    if (p.top < oldest.top || (p.top === oldest.top && p.left < oldest.left)) {
+-      return p
+-    }
+-    return oldest
+-  })
+-}
+-
+-export function decideSpawnActions(
+-  state: WindowState,
+-  sessionId: string,
+-  description: string,
+-  _config: CapacityConfig,
+-  sessionMappings: SessionMapping[]
+-): SpawnDecision {
+-  if (!state.mainPane) {
+-    return { canSpawn: false, actions: [], reason: "no main pane found" }
+-  }
+-
+-  const agentAreaWidth = Math.floor(state.windowWidth * (1 - MAIN_PANE_RATIO))
+-  const currentCount = state.agentPanes.length
+-
+-  if (agentAreaWidth < MIN_PANE_WIDTH) {
+-    return {
+-      canSpawn: false,
+-      actions: [],
+-      reason: `window too small for agent panes: ${state.windowWidth}x${state.windowHeight}`,
+-    }
+-  }
+-
+-  const oldestPane = findOldestAgentPane(state.agentPanes, sessionMappings)
+-  const oldestMapping = oldestPane 
+-    ? sessionMappings.find(m => m.paneId === oldestPane.paneId)
+-    : null
+-
+-  if (currentCount === 0) {
+-    const virtualMainPane: TmuxPaneInfo = { ...state.mainPane, width: state.windowWidth }
+-    if (canSplitPane(virtualMainPane, "-h")) {
+-      return {
+-        canSpawn: true,
+-        actions: [{
+-          type: "spawn",
+-          sessionId,
+-          description,
+-          targetPaneId: state.mainPane.paneId,
+-          splitDirection: "-h"
+-        }]
+-      }
+-    }
+-    return { canSpawn: false, actions: [], reason: "mainPane too small to split" }
+-  }
+-
+-  if (isSplittableAtCount(agentAreaWidth, currentCount)) {
+-    const spawnTarget = findSplittableTarget(state)
+-    if (spawnTarget) {
+-      return {
+-        canSpawn: true,
+-        actions: [{
+-          type: "spawn",
+-          sessionId,
+-          description,
+-          targetPaneId: spawnTarget.targetPaneId,
+-          splitDirection: spawnTarget.splitDirection
+-        }]
+-      }
+-    }
+-  }
+-
+-  const minEvictions = findMinimalEvictions(agentAreaWidth, currentCount)
+-
+-  if (minEvictions === 1 && oldestPane) {
+-    return {
+-      canSpawn: true,
+-      actions: [
+-        {
+-          type: "close",
+-          paneId: oldestPane.paneId,
+-          sessionId: oldestMapping?.sessionId || ""
+-        },
+-        {
+-          type: "spawn",
+-          sessionId,
+-          description,
+-          targetPaneId: state.mainPane.paneId,
+-          splitDirection: "-h"
+-        }
+-      ],
+-      reason: "closed 1 pane to make room for split"
+-    }
+-  }
+-
+-  if (oldestPane) {
+-    return {
+-      canSpawn: true,
+-      actions: [{
+-        type: "replace",
+-        paneId: oldestPane.paneId,
+-        oldSessionId: oldestMapping?.sessionId || "",
+-        newSessionId: sessionId,
+-        description
+-      }],
+-      reason: "replaced oldest pane (no split possible)"
+-    }
+-  }
+-
+-  return {
+-    canSpawn: false,
+-    actions: [],
+-    reason: "no pane available to replace"
+-  }
+-}
+-
+-export function decideCloseAction(
+-  state: WindowState,
+-  sessionId: string,
+-  sessionMappings: SessionMapping[]
+-): PaneAction | null {
+-  const mapping = sessionMappings.find((m) => m.sessionId === sessionId)
+-  if (!mapping) return null
+-
+-  const paneExists = state.agentPanes.some((p) => p.paneId === mapping.paneId)
+-  if (!paneExists) return null
+-
+-  return { type: "close", paneId: mapping.paneId, sessionId }
+-}
++export type { SessionMapping } from "./oldest-agent-pane"
++export type { GridCapacity, GridPlan, GridSlot } from "./grid-planning"
++export type { SpawnTarget } from "./spawn-target-finder"
++
++export {
++	calculateCapacity,
++	computeGridPlan,
++	mapPaneToSlot,
++} from "./grid-planning"
++
++export {
++	canSplitPane,
++	canSplitPaneAnyDirection,
++	findMinimalEvictions,
++	getBestSplitDirection,
++	getColumnCount,
++	getColumnWidth,
++	isSplittableAtCount,
++} from "./pane-split-availability"
++
++export { findSpawnTarget } from "./spawn-target-finder"
++export { decideCloseAction, decideSpawnActions } from "./spawn-action-decider"
+diff --git a/src/features/tmux-subagent/event-handlers.ts b/src/features/tmux-subagent/event-handlers.ts
+new file mode 100644
+index 00000000..0991d10e
+--- /dev/null
++++ b/src/features/tmux-subagent/event-handlers.ts
+@@ -0,0 +1,6 @@
++export { coerceSessionCreatedEvent } from "./session-created-event"
++export type { SessionCreatedEvent } from "./session-created-event"
++export { handleSessionCreated } from "./session-created-handler"
++export type { SessionCreatedHandlerDeps } from "./session-created-handler"
++export { handleSessionDeleted } from "./session-deleted-handler"
++export type { SessionDeletedHandlerDeps } from "./session-deleted-handler"
+diff --git a/src/features/tmux-subagent/grid-planning.ts b/src/features/tmux-subagent/grid-planning.ts
+new file mode 100644
+index 00000000..9e0fcb91
+--- /dev/null
++++ b/src/features/tmux-subagent/grid-planning.ts
+@@ -0,0 +1,107 @@
++import type { TmuxPaneInfo } from "./types"
++import {
++	DIVIDER_SIZE,
++	MAIN_PANE_RATIO,
++	MAX_GRID_SIZE,
++} from "./tmux-grid-constants"
++import { MIN_PANE_HEIGHT, MIN_PANE_WIDTH } from "./types"
++
++export interface GridCapacity {
++	cols: number
++	rows: number
++	total: number
++}
++
++export interface GridSlot {
++	row: number
++	col: number
++}
++
++export interface GridPlan {
++	cols: number
++	rows: number
++	slotWidth: number
++	slotHeight: number
++}
++
++export function calculateCapacity(
++	windowWidth: number,
++	windowHeight: number,
++): GridCapacity {
++	const availableWidth = Math.floor(windowWidth * (1 - MAIN_PANE_RATIO))
++	const cols = Math.min(
++		MAX_GRID_SIZE,
++		Math.max(
++			0,
++			Math.floor(
++				(availableWidth + DIVIDER_SIZE) / (MIN_PANE_WIDTH + DIVIDER_SIZE),
++			),
++		),
++	)
++	const rows = Math.min(
++		MAX_GRID_SIZE,
++		Math.max(
++			0,
++			Math.floor(
++				(windowHeight + DIVIDER_SIZE) / (MIN_PANE_HEIGHT + DIVIDER_SIZE),
++			),
++		),
++	)
++	return { cols, rows, total: cols * rows }
++}
++
++export function computeGridPlan(
++	windowWidth: number,
++	windowHeight: number,
++	paneCount: number,
++): GridPlan {
++	const capacity = calculateCapacity(windowWidth, windowHeight)
++	const { cols: maxCols, rows: maxRows } = capacity
++
++	if (maxCols === 0 || maxRows === 0 || paneCount === 0) {
++		return { cols: 1, rows: 1, slotWidth: 0, slotHeight: 0 }
++	}
++
++	let bestCols = 1
++	let bestRows = 1
++	let bestArea = Infinity
++
++	for (let rows = 1; rows <= maxRows; rows++) {
++		for (let cols = 1; cols <= maxCols; cols++) {
++			if (cols * rows < paneCount) continue
++			const area = cols * rows
++			if (area < bestArea || (area === bestArea && rows < bestRows)) {
++				bestCols = cols
++				bestRows = rows
++				bestArea = area
++			}
++		}
++	}
++
++	const availableWidth = Math.floor(windowWidth * (1 - MAIN_PANE_RATIO))
++	const slotWidth = Math.floor(availableWidth / bestCols)
++	const slotHeight = Math.floor(windowHeight / bestRows)
++
++	return { cols: bestCols, rows: bestRows, slotWidth, slotHeight }
++}
++
++export function mapPaneToSlot(
++	pane: TmuxPaneInfo,
++	plan: GridPlan,
++	mainPaneWidth: number,
++): GridSlot {
++	const rightAreaX = mainPaneWidth
++	const relativeX = Math.max(0, pane.left - rightAreaX)
++	const relativeY = pane.top
++
++	const col =
++		plan.slotWidth > 0
++			? Math.min(plan.cols - 1, Math.floor(relativeX / plan.slotWidth))
++			: 0
++	const row =
++		plan.slotHeight > 0
++			? Math.min(plan.rows - 1, Math.floor(relativeY / plan.slotHeight))
++			: 0
++
++	return { row, col }
++}
+diff --git a/src/features/tmux-subagent/index.ts b/src/features/tmux-subagent/index.ts
+index 2b250087..254edac9 100644
+--- a/src/features/tmux-subagent/index.ts
++++ b/src/features/tmux-subagent/index.ts
+@@ -1,4 +1,14 @@
+ export * from "./manager"
++export * from "./event-handlers"
++export * from "./polling"
++export * from "./cleanup"
++export * from "./session-created-event"
++export * from "./session-created-handler"
++export * from "./session-deleted-handler"
++export * from "./polling-constants"
++export * from "./session-status-parser"
++export * from "./session-message-count"
++export * from "./session-ready-waiter"
+ export * from "./types"
+ export * from "./pane-state-querier"
+ export * from "./decision-engine"
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index ad600dc5..bc973eec 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -4,23 +4,20 @@ import type { TrackedSession, CapacityConfig } from "./types"
+ import {
+   isInsideTmux as defaultIsInsideTmux,
+   getCurrentPaneId as defaultGetCurrentPaneId,
+-  POLL_INTERVAL_BACKGROUND_MS,
+-  SESSION_MISSING_GRACE_MS,
+-  SESSION_READY_POLL_INTERVAL_MS,
+-  SESSION_READY_TIMEOUT_MS,
+ } from "../../shared/tmux"
+ import { log } from "../../shared"
+-import { queryWindowState } from "./pane-state-querier"
+-import { decideSpawnActions, decideCloseAction, type SessionMapping } from "./decision-engine"
+-import { executeActions, executeAction } from "./action-executor"
++import type { SessionMapping } from "./decision-engine"
++import {
++  coerceSessionCreatedEvent,
++  handleSessionCreated,
++  handleSessionDeleted,
++  type SessionCreatedEvent,
++} from "./event-handlers"
++import { createSessionPollingController, type SessionPollingController } from "./polling"
++import { cleanupTmuxSessions } from "./cleanup"
+ 
+ type OpencodeClient = PluginInput["client"]
+ 
+-interface SessionCreatedEvent {
+-  type: string
+-  properties?: { info?: { id?: string; parentID?: string; title?: string } }
+-}
+-
+ export interface TmuxUtilDeps {
+   isInsideTmux: () => boolean
+   getCurrentPaneId: () => string | undefined
+@@ -31,13 +28,6 @@ const defaultTmuxDeps: TmuxUtilDeps = {
+   getCurrentPaneId: defaultGetCurrentPaneId,
+ }
+ 
+-const SESSION_TIMEOUT_MS = 10 * 60 * 1000
+-
+-// Stability detection constants (prevents premature closure - see issue #1330)
+-// Mirrors the proven pattern from background-agent/manager.ts
+-const MIN_STABILITY_TIME_MS = 10 * 1000  // Must run at least 10s before stability detection kicks in
+-const STABLE_POLLS_REQUIRED = 3          // 3 consecutive idle polls (~6s with 2s poll interval)
+-
+ /**
+  * State-first Tmux Session Manager
+  * 
+@@ -57,8 +47,8 @@ export class TmuxSessionManager {
+   private sourcePaneId: string | undefined
+   private sessions = new Map<string, TrackedSession>()
+   private pendingSessions = new Set<string>()
+-  private pollInterval?: ReturnType<typeof setInterval>
+   private deps: TmuxUtilDeps
++  private polling: SessionPollingController
+ 
+   constructor(ctx: PluginInput, tmuxConfig: TmuxConfig, deps: TmuxUtilDeps = defaultTmuxDeps) {
+     this.client = ctx.client
+@@ -68,6 +58,14 @@ export class TmuxSessionManager {
+     this.serverUrl = ctx.serverUrl?.toString() ?? `http://localhost:${defaultPort}`
+     this.sourcePaneId = deps.getCurrentPaneId()
+ 
++    this.polling = createSessionPollingController({
++      client: this.client,
++      tmuxConfig: this.tmuxConfig,
++      serverUrl: this.serverUrl,
++      sourcePaneId: this.sourcePaneId,
++      sessions: this.sessions,
++    })
++
+     log("[tmux-session-manager] initialized", {
+       configEnabled: this.tmuxConfig.enabled,
+       tmuxConfig: this.tmuxConfig,
+@@ -95,378 +93,58 @@ export class TmuxSessionManager {
+     }))
+   }
+ 
+-  private async waitForSessionReady(sessionId: string): Promise<boolean> {
+-    const startTime = Date.now()
+-    
+-    while (Date.now() - startTime < SESSION_READY_TIMEOUT_MS) {
+-      try {
+-        const statusResult = await this.client.session.status({ path: undefined })
+-        const allStatuses = (statusResult.data ?? {}) as Record<string, { type: string }>
+-        
+-        if (allStatuses[sessionId]) {
+-          log("[tmux-session-manager] session ready", {
+-            sessionId,
+-            status: allStatuses[sessionId].type,
+-            waitedMs: Date.now() - startTime,
+-          })
+-          return true
+-        }
+-      } catch (err) {
+-        log("[tmux-session-manager] session status check error", { error: String(err) })
+-      }
+-      
+-      await new Promise((resolve) => setTimeout(resolve, SESSION_READY_POLL_INTERVAL_MS))
+-    }
+-    
+-    log("[tmux-session-manager] session ready timeout", {
+-      sessionId,
+-      timeoutMs: SESSION_READY_TIMEOUT_MS,
+-    })
+-    return false
+-  }
+-
+   async onSessionCreated(event: SessionCreatedEvent): Promise<void> {
+-    const enabled = this.isEnabled()
+-    log("[tmux-session-manager] onSessionCreated called", {
+-      enabled,
+-      tmuxConfigEnabled: this.tmuxConfig.enabled,
+-      isInsideTmux: this.deps.isInsideTmux(),
+-      eventType: event.type,
+-      infoId: event.properties?.info?.id,
+-      infoParentID: event.properties?.info?.parentID,
+-    })
+-
+-    if (!enabled) return
+-    if (event.type !== "session.created") return
+-
+-    const info = event.properties?.info
+-    if (!info?.id || !info?.parentID) return
+-
+-    const sessionId = info.id
+-    const title = info.title ?? "Subagent"
+-
+-    if (this.sessions.has(sessionId) || this.pendingSessions.has(sessionId)) {
+-      log("[tmux-session-manager] session already tracked or pending", { sessionId })
+-      return
+-    }
+-
+-    if (!this.sourcePaneId) {
+-      log("[tmux-session-manager] no source pane id")
+-      return
+-    }
+-
+-    this.pendingSessions.add(sessionId)
+-
+-    try {
+-      const state = await queryWindowState(this.sourcePaneId)
+-      if (!state) {
+-        log("[tmux-session-manager] failed to query window state")
+-        return
+-      }
+-
+-      log("[tmux-session-manager] window state queried", {
+-        windowWidth: state.windowWidth,
+-        mainPane: state.mainPane?.paneId,
+-        agentPaneCount: state.agentPanes.length,
+-        agentPanes: state.agentPanes.map((p) => p.paneId),
+-      })
+-
+-      const decision = decideSpawnActions(
+-        state,
+-        sessionId,
+-        title,
+-        this.getCapacityConfig(),
+-        this.getSessionMappings()
+-      )
+-
+-      log("[tmux-session-manager] spawn decision", {
+-        canSpawn: decision.canSpawn,
+-        reason: decision.reason,
+-        actionCount: decision.actions.length,
+-        actions: decision.actions.map((a) => {
+-          if (a.type === "close") return { type: "close", paneId: a.paneId }
+-          if (a.type === "replace") return { type: "replace", paneId: a.paneId, newSessionId: a.newSessionId }
+-          return { type: "spawn", sessionId: a.sessionId }
+-        }),
+-      })
+-
+-      if (!decision.canSpawn) {
+-        log("[tmux-session-manager] cannot spawn", { reason: decision.reason })
+-        return
+-      }
+-
+-      const result = await executeActions(
+-        decision.actions,
+-        { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state }
+-      )
+-
+-      for (const { action, result: actionResult } of result.results) {
+-        if (action.type === "close" && actionResult.success) {
+-          this.sessions.delete(action.sessionId)
+-          log("[tmux-session-manager] removed closed session from cache", {
+-            sessionId: action.sessionId,
+-          })
+-        }
+-        if (action.type === "replace" && actionResult.success) {
+-          this.sessions.delete(action.oldSessionId)
+-          log("[tmux-session-manager] removed replaced session from cache", {
+-            oldSessionId: action.oldSessionId,
+-            newSessionId: action.newSessionId,
+-          })
+-        }
+-      }
+-
+-      if (result.success && result.spawnedPaneId) {
+-        const sessionReady = await this.waitForSessionReady(sessionId)
+-        
+-        if (!sessionReady) {
+-          log("[tmux-session-manager] session not ready after timeout, tracking anyway", {
+-            sessionId,
+-            paneId: result.spawnedPaneId,
+-          })
+-        }
+-        
+-        const now = Date.now()
+-        this.sessions.set(sessionId, {
+-          sessionId,
+-          paneId: result.spawnedPaneId,
+-          description: title,
+-          createdAt: new Date(now),
+-          lastSeenAt: new Date(now),
+-        })
+-        log("[tmux-session-manager] pane spawned and tracked", {
+-          sessionId,
+-          paneId: result.spawnedPaneId,
+-          sessionReady,
+-        })
+-        this.startPolling()
+-      } else {
+-        log("[tmux-session-manager] spawn failed", {
+-          success: result.success,
+-          results: result.results.map((r) => ({
+-            type: r.action.type,
+-            success: r.result.success,
+-            error: r.result.error,
+-          })),
+-        })
+-      }
+-    } finally {
+-      this.pendingSessions.delete(sessionId)
+-    }
++    await handleSessionCreated(
++      {
++        client: this.client,
++        tmuxConfig: this.tmuxConfig,
++        serverUrl: this.serverUrl,
++        sourcePaneId: this.sourcePaneId,
++        sessions: this.sessions,
++        pendingSessions: this.pendingSessions,
++        isInsideTmux: this.deps.isInsideTmux,
++        isEnabled: () => this.isEnabled(),
++        getCapacityConfig: () => this.getCapacityConfig(),
++        getSessionMappings: () => this.getSessionMappings(),
++        waitForSessionReady: (sessionId) => this.polling.waitForSessionReady(sessionId),
++        startPolling: () => this.polling.startPolling(),
++      },
++      event,
++    )
+   }
+ 
+   async onSessionDeleted(event: { sessionID: string }): Promise<void> {
+-    if (!this.isEnabled()) return
+-    if (!this.sourcePaneId) return
+-
+-    const tracked = this.sessions.get(event.sessionID)
+-    if (!tracked) return
+-
+-    log("[tmux-session-manager] onSessionDeleted", { sessionId: event.sessionID })
+-
+-    const state = await queryWindowState(this.sourcePaneId)
+-    if (!state) {
+-      this.sessions.delete(event.sessionID)
+-      return
+-    }
+-
+-    const closeAction = decideCloseAction(state, event.sessionID, this.getSessionMappings())
+-    if (closeAction) {
+-      await executeAction(closeAction, { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state })
+-    }
+-
+-    this.sessions.delete(event.sessionID)
+-
+-    if (this.sessions.size === 0) {
+-      this.stopPolling()
+-    }
+-  }
+-
+-  private startPolling(): void {
+-    if (this.pollInterval) return
+-
+-    this.pollInterval = setInterval(
+-      () => this.pollSessions(),
+-      POLL_INTERVAL_BACKGROUND_MS,
++    await handleSessionDeleted(
++      {
++        tmuxConfig: this.tmuxConfig,
++        serverUrl: this.serverUrl,
++        sourcePaneId: this.sourcePaneId,
++        sessions: this.sessions,
++        isEnabled: () => this.isEnabled(),
++        getSessionMappings: () => this.getSessionMappings(),
++        stopPolling: () => this.polling.stopPolling(),
++      },
++      event,
+     )
+-    log("[tmux-session-manager] polling started")
+-  }
+-
+-  private stopPolling(): void {
+-    if (this.pollInterval) {
+-      clearInterval(this.pollInterval)
+-      this.pollInterval = undefined
+-      log("[tmux-session-manager] polling stopped")
+-    }
+-  }
+-
+-  private async pollSessions(): Promise<void> {
+-    if (this.sessions.size === 0) {
+-      this.stopPolling()
+-      return
+-    }
+-
+-    try {
+-      const statusResult = await this.client.session.status({ path: undefined })
+-      const allStatuses = (statusResult.data ?? {}) as Record<string, { type: string }>
+-
+-      log("[tmux-session-manager] pollSessions", {
+-        trackedSessions: Array.from(this.sessions.keys()),
+-        allStatusKeys: Object.keys(allStatuses),
+-      })
+-
+-      const now = Date.now()
+-      const sessionsToClose: string[] = []
+-
+-      for (const [sessionId, tracked] of this.sessions.entries()) {
+-        const status = allStatuses[sessionId]
+-        const isIdle = status?.type === "idle"
+-
+-        if (status) {
+-          tracked.lastSeenAt = new Date(now)
+-        }
+-
+-        const missingSince = !status ? now - tracked.lastSeenAt.getTime() : 0
+-        const missingTooLong = missingSince >= SESSION_MISSING_GRACE_MS
+-        const isTimedOut = now - tracked.createdAt.getTime() > SESSION_TIMEOUT_MS
+-        const elapsedMs = now - tracked.createdAt.getTime()
+-
+-        // Stability detection: Don't close immediately on idle
+-        // Wait for STABLE_POLLS_REQUIRED consecutive polls with same message count
+-        let shouldCloseViaStability = false
+-
+-        if (isIdle && elapsedMs >= MIN_STABILITY_TIME_MS) {
+-          // Fetch message count to detect if agent is still producing output
+-          try {
+-            const messagesResult = await this.client.session.messages({ 
+-              path: { id: sessionId } 
+-            })
+-            const currentMsgCount = Array.isArray(messagesResult.data) 
+-              ? messagesResult.data.length 
+-              : 0
+-
+-            if (tracked.lastMessageCount === currentMsgCount) {
+-              // Message count unchanged - increment stable polls
+-              tracked.stableIdlePolls = (tracked.stableIdlePolls ?? 0) + 1
+-              
+-              if (tracked.stableIdlePolls >= STABLE_POLLS_REQUIRED) {
+-                // Double-check status before closing
+-                const recheckResult = await this.client.session.status({ path: undefined })
+-                const recheckStatuses = (recheckResult.data ?? {}) as Record<string, { type: string }>
+-                const recheckStatus = recheckStatuses[sessionId]
+-                
+-                if (recheckStatus?.type === "idle") {
+-                  shouldCloseViaStability = true
+-                } else {
+-                  // Status changed - reset stability counter
+-                  tracked.stableIdlePolls = 0
+-                  log("[tmux-session-manager] stability reached but session not idle on recheck, resetting", {
+-                    sessionId,
+-                    recheckStatus: recheckStatus?.type,
+-                  })
+-                }
+-              }
+-            } else {
+-              // New messages - agent is still working, reset stability counter
+-              tracked.stableIdlePolls = 0
+-            }
+-            
+-            tracked.lastMessageCount = currentMsgCount
+-          } catch (msgErr) {
+-            log("[tmux-session-manager] failed to fetch messages for stability check", {
+-              sessionId,
+-              error: String(msgErr),
+-            })
+-            // On error, don't close - be conservative
+-          }
+-        } else if (!isIdle) {
+-          // Not idle - reset stability counter
+-          tracked.stableIdlePolls = 0
+-        }
+-
+-        log("[tmux-session-manager] session check", {
+-          sessionId,
+-          statusType: status?.type,
+-          isIdle,
+-          elapsedMs,
+-          stableIdlePolls: tracked.stableIdlePolls,
+-          lastMessageCount: tracked.lastMessageCount,
+-          missingSince,
+-          missingTooLong,
+-          isTimedOut,
+-          shouldCloseViaStability,
+-        })
+-
+-        // Close if: stability detection confirmed OR missing too long OR timed out
+-        // Note: We no longer close immediately on idle - stability detection handles that
+-        if (shouldCloseViaStability || missingTooLong || isTimedOut) {
+-          sessionsToClose.push(sessionId)
+-        }
+-      }
+-
+-      for (const sessionId of sessionsToClose) {
+-        log("[tmux-session-manager] closing session due to poll", { sessionId })
+-        await this.closeSessionById(sessionId)
+-      }
+-    } catch (err) {
+-      log("[tmux-session-manager] poll error", { error: String(err) })
+-    }
+-  }
+-
+-  private async closeSessionById(sessionId: string): Promise<void> {
+-    const tracked = this.sessions.get(sessionId)
+-    if (!tracked) return
+-
+-    log("[tmux-session-manager] closing session pane", {
+-      sessionId,
+-      paneId: tracked.paneId,
+-    })
+-
+-    const state = this.sourcePaneId ? await queryWindowState(this.sourcePaneId) : null
+-    if (state) {
+-      await executeAction(
+-        { type: "close", paneId: tracked.paneId, sessionId },
+-        { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state }
+-      )
+-    }
+-
+-    this.sessions.delete(sessionId)
+-
+-    if (this.sessions.size === 0) {
+-      this.stopPolling()
+-    }
+   }
+ 
+   createEventHandler(): (input: { event: { type: string; properties?: unknown } }) => Promise<void> {
+     return async (input) => {
+-      await this.onSessionCreated(input.event as SessionCreatedEvent)
++      await this.onSessionCreated(coerceSessionCreatedEvent(input.event))
+     }
+   }
+ 
+-  async cleanup(): Promise<void> {
+-    this.stopPolling()
+-
+-    if (this.sessions.size > 0) {
+-      log("[tmux-session-manager] closing all panes", { count: this.sessions.size })
+-      const state = this.sourcePaneId ? await queryWindowState(this.sourcePaneId) : null
+-      
+-      if (state) {
+-        const closePromises = Array.from(this.sessions.values()).map((s) =>
+-          executeAction(
+-            { type: "close", paneId: s.paneId, sessionId: s.sessionId },
+-            { config: this.tmuxConfig, serverUrl: this.serverUrl, windowState: state }
+-          ).catch((err) =>
+-            log("[tmux-session-manager] cleanup error for pane", {
+-              paneId: s.paneId,
+-              error: String(err),
+-            }),
+-          ),
+-        )
+-        await Promise.all(closePromises)
+-      }
+-      this.sessions.clear()
+-    }
++  async pollSessions(): Promise<void> {
++    return this.polling.pollSessions()
++  }
+ 
+-    log("[tmux-session-manager] cleanup complete")
++  async cleanup(): Promise<void> {
++    await cleanupTmuxSessions({
++      tmuxConfig: this.tmuxConfig,
++      serverUrl: this.serverUrl,
++      sourcePaneId: this.sourcePaneId,
++      sessions: this.sessions,
++      stopPolling: () => this.polling.stopPolling(),
++    })
+   }
+ }
+diff --git a/src/features/tmux-subagent/oldest-agent-pane.ts b/src/features/tmux-subagent/oldest-agent-pane.ts
+new file mode 100644
+index 00000000..e48ba015
+--- /dev/null
++++ b/src/features/tmux-subagent/oldest-agent-pane.ts
+@@ -0,0 +1,37 @@
++import type { TmuxPaneInfo } from "./types"
++
++export interface SessionMapping {
++	sessionId: string
++	paneId: string
++	createdAt: Date
++}
++
++export function findOldestAgentPane(
++	agentPanes: TmuxPaneInfo[],
++	sessionMappings: SessionMapping[],
++): TmuxPaneInfo | null {
++	if (agentPanes.length === 0) return null
++
++	const paneIdToAge = new Map<string, Date>()
++	for (const mapping of sessionMappings) {
++		paneIdToAge.set(mapping.paneId, mapping.createdAt)
++	}
++
++	const panesWithAge = agentPanes
++		.map((pane) => ({ pane, age: paneIdToAge.get(pane.paneId) }))
++		.filter(
++			(item): item is { pane: TmuxPaneInfo; age: Date } => item.age !== undefined,
++		)
++		.sort((a, b) => a.age.getTime() - b.age.getTime())
++
++	if (panesWithAge.length > 0) {
++		return panesWithAge[0].pane
++	}
++
++	return agentPanes.reduce((oldest, pane) => {
++		if (pane.top < oldest.top || (pane.top === oldest.top && pane.left < oldest.left)) {
++			return pane
++		}
++		return oldest
++	})
++}
+diff --git a/src/features/tmux-subagent/pane-split-availability.ts b/src/features/tmux-subagent/pane-split-availability.ts
+new file mode 100644
+index 00000000..fd9d34ec
+--- /dev/null
++++ b/src/features/tmux-subagent/pane-split-availability.ts
+@@ -0,0 +1,60 @@
++import type { SplitDirection, TmuxPaneInfo } from "./types"
++import {
++	DIVIDER_SIZE,
++	MAX_COLS,
++	MAX_ROWS,
++	MIN_SPLIT_HEIGHT,
++	MIN_SPLIT_WIDTH,
++} from "./tmux-grid-constants"
++
++export function getColumnCount(paneCount: number): number {
++	if (paneCount <= 0) return 1
++	return Math.min(MAX_COLS, Math.max(1, Math.ceil(paneCount / MAX_ROWS)))
++}
++
++export function getColumnWidth(agentAreaWidth: number, paneCount: number): number {
++	const cols = getColumnCount(paneCount)
++	const dividersWidth = (cols - 1) * DIVIDER_SIZE
++	return Math.floor((agentAreaWidth - dividersWidth) / cols)
++}
++
++export function isSplittableAtCount(
++	agentAreaWidth: number,
++	paneCount: number,
++): boolean {
++	const columnWidth = getColumnWidth(agentAreaWidth, paneCount)
++	return columnWidth >= MIN_SPLIT_WIDTH
++}
++
++export function findMinimalEvictions(
++	agentAreaWidth: number,
++	currentCount: number,
++): number | null {
++	for (let k = 1; k <= currentCount; k++) {
++		if (isSplittableAtCount(agentAreaWidth, currentCount - k)) {
++			return k
++		}
++	}
++	return null
++}
++
++export function canSplitPane(pane: TmuxPaneInfo, direction: SplitDirection): boolean {
++	if (direction === "-h") {
++		return pane.width >= MIN_SPLIT_WIDTH
++	}
++	return pane.height >= MIN_SPLIT_HEIGHT
++}
++
++export function canSplitPaneAnyDirection(pane: TmuxPaneInfo): boolean {
++	return pane.width >= MIN_SPLIT_WIDTH || pane.height >= MIN_SPLIT_HEIGHT
++}
++
++export function getBestSplitDirection(pane: TmuxPaneInfo): SplitDirection | null {
++	const canH = pane.width >= MIN_SPLIT_WIDTH
++	const canV = pane.height >= MIN_SPLIT_HEIGHT
++
++	if (!canH && !canV) return null
++	if (canH && !canV) return "-h"
++	if (!canH && canV) return "-v"
++	return pane.width >= pane.height ? "-h" : "-v"
++}
+diff --git a/src/features/tmux-subagent/polling-constants.ts b/src/features/tmux-subagent/polling-constants.ts
+new file mode 100644
+index 00000000..bf9f4b8e
+--- /dev/null
++++ b/src/features/tmux-subagent/polling-constants.ts
+@@ -0,0 +1,6 @@
++export const SESSION_TIMEOUT_MS = 10 * 60 * 1000
++
++// Stability detection constants (prevents premature closure - see issue #1330)
++// Mirrors the proven pattern from background-agent/manager.ts
++export const MIN_STABILITY_TIME_MS = 10 * 1000
++export const STABLE_POLLS_REQUIRED = 3
+diff --git a/src/features/tmux-subagent/polling.ts b/src/features/tmux-subagent/polling.ts
+new file mode 100644
+index 00000000..a438be48
+--- /dev/null
++++ b/src/features/tmux-subagent/polling.ts
+@@ -0,0 +1,183 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import type { TmuxConfig } from "../../config/schema"
++import {
++  POLL_INTERVAL_BACKGROUND_MS,
++  SESSION_MISSING_GRACE_MS,
++} from "../../shared/tmux"
++import { log } from "../../shared"
++import type { TrackedSession } from "./types"
++import { queryWindowState } from "./pane-state-querier"
++import { executeAction } from "./action-executor"
++import {
++  MIN_STABILITY_TIME_MS,
++  SESSION_TIMEOUT_MS,
++  STABLE_POLLS_REQUIRED,
++} from "./polling-constants"
++import { parseSessionStatusMap } from "./session-status-parser"
++import { getMessageCount } from "./session-message-count"
++import { waitForSessionReady as waitForSessionReadyFromClient } from "./session-ready-waiter"
++
++type OpencodeClient = PluginInput["client"]
++
++export interface SessionPollingController {
++  startPolling: () => void
++  stopPolling: () => void
++  closeSessionById: (sessionId: string) => Promise<void>
++  waitForSessionReady: (sessionId: string) => Promise<boolean>
++  pollSessions: () => Promise<void>
++}
++
++export function createSessionPollingController(params: {
++  client: OpencodeClient
++  tmuxConfig: TmuxConfig
++  serverUrl: string
++  sourcePaneId: string | undefined
++  sessions: Map<string, TrackedSession>
++}): SessionPollingController {
++  let pollInterval: ReturnType<typeof setInterval> | undefined
++
++  async function closeSessionById(sessionId: string): Promise<void> {
++    const tracked = params.sessions.get(sessionId)
++    if (!tracked) return
++
++    log("[tmux-session-manager] closing session pane", {
++      sessionId,
++      paneId: tracked.paneId,
++    })
++
++    const state = params.sourcePaneId ? await queryWindowState(params.sourcePaneId) : null
++    if (state) {
++      await executeAction(
++        { type: "close", paneId: tracked.paneId, sessionId },
++        { config: params.tmuxConfig, serverUrl: params.serverUrl, windowState: state },
++      )
++    }
++
++    params.sessions.delete(sessionId)
++
++    if (params.sessions.size === 0) {
++      stopPolling()
++    }
++  }
++
++  async function pollSessions(): Promise<void> {
++    if (params.sessions.size === 0) {
++      stopPolling()
++      return
++    }
++
++    try {
++      const statusResult = await params.client.session.status({ path: undefined })
++      const allStatuses = parseSessionStatusMap(statusResult.data)
++
++      log("[tmux-session-manager] pollSessions", {
++        trackedSessions: Array.from(params.sessions.keys()),
++        allStatusKeys: Object.keys(allStatuses),
++      })
++
++      const now = Date.now()
++      const sessionsToClose: string[] = []
++
++      for (const [sessionId, tracked] of params.sessions.entries()) {
++        const status = allStatuses[sessionId]
++        const isIdle = status?.type === "idle"
++
++        if (status) {
++          tracked.lastSeenAt = new Date(now)
++        }
++
++        const missingSince = !status ? now - tracked.lastSeenAt.getTime() : 0
++        const missingTooLong = missingSince >= SESSION_MISSING_GRACE_MS
++        const isTimedOut = now - tracked.createdAt.getTime() > SESSION_TIMEOUT_MS
++        const elapsedMs = now - tracked.createdAt.getTime()
++
++        let shouldCloseViaStability = false
++
++        if (isIdle && elapsedMs >= MIN_STABILITY_TIME_MS) {
++          try {
++            const messagesResult = await params.client.session.messages({
++              path: { id: sessionId },
++            })
++            const currentMessageCount = getMessageCount(messagesResult.data)
++
++            if (tracked.lastMessageCount === currentMessageCount) {
++              tracked.stableIdlePolls = (tracked.stableIdlePolls ?? 0) + 1
++
++              if (tracked.stableIdlePolls >= STABLE_POLLS_REQUIRED) {
++                const recheckResult = await params.client.session.status({ path: undefined })
++                const recheckStatuses = parseSessionStatusMap(recheckResult.data)
++                const recheckStatus = recheckStatuses[sessionId]
++
++                if (recheckStatus?.type === "idle") {
++                  shouldCloseViaStability = true
++                } else {
++                  tracked.stableIdlePolls = 0
++                  log(
++                    "[tmux-session-manager] stability reached but session not idle on recheck, resetting",
++                    { sessionId, recheckStatus: recheckStatus?.type },
++                  )
++                }
++              }
++            } else {
++              tracked.stableIdlePolls = 0
++            }
++
++            tracked.lastMessageCount = currentMessageCount
++          } catch (messageError) {
++            log("[tmux-session-manager] failed to fetch messages for stability check", {
++              sessionId,
++              error: String(messageError),
++            })
++          }
++        } else if (!isIdle) {
++          tracked.stableIdlePolls = 0
++        }
++
++        log("[tmux-session-manager] session check", {
++          sessionId,
++          statusType: status?.type,
++          isIdle,
++          elapsedMs,
++          stableIdlePolls: tracked.stableIdlePolls,
++          lastMessageCount: tracked.lastMessageCount,
++          missingSince,
++          missingTooLong,
++          isTimedOut,
++          shouldCloseViaStability,
++        })
++
++        if (shouldCloseViaStability || missingTooLong || isTimedOut) {
++          sessionsToClose.push(sessionId)
++        }
++      }
++
++      for (const sessionId of sessionsToClose) {
++        log("[tmux-session-manager] closing session due to poll", { sessionId })
++        await closeSessionById(sessionId)
++      }
++    } catch (error) {
++      log("[tmux-session-manager] poll error", { error: String(error) })
++    }
++  }
++
++  function startPolling(): void {
++    if (pollInterval) return
++    pollInterval = setInterval(() => {
++      void pollSessions()
++    }, POLL_INTERVAL_BACKGROUND_MS)
++    log("[tmux-session-manager] polling started")
++  }
++
++  function stopPolling(): void {
++    if (!pollInterval) return
++    clearInterval(pollInterval)
++    pollInterval = undefined
++    log("[tmux-session-manager] polling stopped")
++  }
++
++  async function waitForSessionReady(sessionId: string): Promise<boolean> {
++    return waitForSessionReadyFromClient({ client: params.client, sessionId })
++  }
++
++  return { startPolling, stopPolling, closeSessionById, waitForSessionReady, pollSessions }
++}
+diff --git a/src/features/tmux-subagent/session-created-event.ts b/src/features/tmux-subagent/session-created-event.ts
+new file mode 100644
+index 00000000..53440a2d
+--- /dev/null
++++ b/src/features/tmux-subagent/session-created-event.ts
+@@ -0,0 +1,44 @@
++type UnknownRecord = Record<string, unknown>
++
++function isRecord(value: unknown): value is UnknownRecord {
++  return typeof value === "object" && value !== null
++}
++
++function getNestedRecord(value: unknown, key: string): UnknownRecord | undefined {
++  if (!isRecord(value)) return undefined
++  const nested = value[key]
++  return isRecord(nested) ? nested : undefined
++}
++
++function getNestedString(value: unknown, key: string): string | undefined {
++  if (!isRecord(value)) return undefined
++  const nested = value[key]
++  return typeof nested === "string" ? nested : undefined
++}
++
++export interface SessionCreatedEvent {
++  type: string
++  properties?: { info?: { id?: string; parentID?: string; title?: string } }
++}
++
++export function coerceSessionCreatedEvent(input: {
++  type: string
++  properties?: unknown
++}): SessionCreatedEvent {
++  const properties = isRecord(input.properties) ? input.properties : undefined
++  const info = getNestedRecord(properties, "info")
++
++  return {
++    type: input.type,
++    properties:
++      info || properties
++        ? {
++            info: {
++              id: getNestedString(info, "id"),
++              parentID: getNestedString(info, "parentID"),
++              title: getNestedString(info, "title"),
++            },
++          }
++        : undefined,
++  }
++}
+diff --git a/src/features/tmux-subagent/session-created-handler.ts b/src/features/tmux-subagent/session-created-handler.ts
+new file mode 100644
+index 00000000..18afb0d9
+--- /dev/null
++++ b/src/features/tmux-subagent/session-created-handler.ts
+@@ -0,0 +1,163 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import type { TmuxConfig } from "../../config/schema"
++import type { CapacityConfig, TrackedSession } from "./types"
++import { log } from "../../shared"
++import { queryWindowState } from "./pane-state-querier"
++import { decideSpawnActions, type SessionMapping } from "./decision-engine"
++import { executeActions } from "./action-executor"
++import type { SessionCreatedEvent } from "./session-created-event"
++
++type OpencodeClient = PluginInput["client"]
++
++export interface SessionCreatedHandlerDeps {
++  client: OpencodeClient
++  tmuxConfig: TmuxConfig
++  serverUrl: string
++  sourcePaneId: string | undefined
++  sessions: Map<string, TrackedSession>
++  pendingSessions: Set<string>
++  isInsideTmux: () => boolean
++  isEnabled: () => boolean
++  getCapacityConfig: () => CapacityConfig
++  getSessionMappings: () => SessionMapping[]
++  waitForSessionReady: (sessionId: string) => Promise<boolean>
++  startPolling: () => void
++}
++
++export async function handleSessionCreated(
++  deps: SessionCreatedHandlerDeps,
++  event: SessionCreatedEvent,
++): Promise<void> {
++  const enabled = deps.isEnabled()
++  log("[tmux-session-manager] onSessionCreated called", {
++    enabled,
++    tmuxConfigEnabled: deps.tmuxConfig.enabled,
++    isInsideTmux: deps.isInsideTmux(),
++    eventType: event.type,
++    infoId: event.properties?.info?.id,
++    infoParentID: event.properties?.info?.parentID,
++  })
++
++  if (!enabled) return
++  if (event.type !== "session.created") return
++
++  const info = event.properties?.info
++  if (!info?.id || !info?.parentID) return
++
++  const sessionId = info.id
++  const title = info.title ?? "Subagent"
++
++  if (deps.sessions.has(sessionId) || deps.pendingSessions.has(sessionId)) {
++    log("[tmux-session-manager] session already tracked or pending", { sessionId })
++    return
++  }
++
++  if (!deps.sourcePaneId) {
++    log("[tmux-session-manager] no source pane id")
++    return
++  }
++
++  deps.pendingSessions.add(sessionId)
++
++  try {
++    const state = await queryWindowState(deps.sourcePaneId)
++    if (!state) {
++      log("[tmux-session-manager] failed to query window state")
++      return
++    }
++
++    log("[tmux-session-manager] window state queried", {
++      windowWidth: state.windowWidth,
++      mainPane: state.mainPane?.paneId,
++      agentPaneCount: state.agentPanes.length,
++      agentPanes: state.agentPanes.map((p) => p.paneId),
++    })
++
++    const decision = decideSpawnActions(
++      state,
++      sessionId,
++      title,
++      deps.getCapacityConfig(),
++      deps.getSessionMappings(),
++    )
++
++    log("[tmux-session-manager] spawn decision", {
++      canSpawn: decision.canSpawn,
++      reason: decision.reason,
++      actionCount: decision.actions.length,
++      actions: decision.actions.map((a) => {
++        if (a.type === "close") return { type: "close", paneId: a.paneId }
++        if (a.type === "replace") {
++          return { type: "replace", paneId: a.paneId, newSessionId: a.newSessionId }
++        }
++        return { type: "spawn", sessionId: a.sessionId }
++      }),
++    })
++
++    if (!decision.canSpawn) {
++      log("[tmux-session-manager] cannot spawn", { reason: decision.reason })
++      return
++    }
++
++    const result = await executeActions(decision.actions, {
++      config: deps.tmuxConfig,
++      serverUrl: deps.serverUrl,
++      windowState: state,
++    })
++
++    for (const { action, result: actionResult } of result.results) {
++      if (action.type === "close" && actionResult.success) {
++        deps.sessions.delete(action.sessionId)
++        log("[tmux-session-manager] removed closed session from cache", {
++          sessionId: action.sessionId,
++        })
++      }
++      if (action.type === "replace" && actionResult.success) {
++        deps.sessions.delete(action.oldSessionId)
++        log("[tmux-session-manager] removed replaced session from cache", {
++          oldSessionId: action.oldSessionId,
++          newSessionId: action.newSessionId,
++        })
++      }
++    }
++
++    if (!result.success || !result.spawnedPaneId) {
++      log("[tmux-session-manager] spawn failed", {
++        success: result.success,
++        results: result.results.map((r) => ({
++          type: r.action.type,
++          success: r.result.success,
++          error: r.result.error,
++        })),
++      })
++      return
++    }
++
++    const sessionReady = await deps.waitForSessionReady(sessionId)
++    if (!sessionReady) {
++      log("[tmux-session-manager] session not ready after timeout, tracking anyway", {
++        sessionId,
++        paneId: result.spawnedPaneId,
++      })
++    }
++
++    const now = Date.now()
++    deps.sessions.set(sessionId, {
++      sessionId,
++      paneId: result.spawnedPaneId,
++      description: title,
++      createdAt: new Date(now),
++      lastSeenAt: new Date(now),
++    })
++
++    log("[tmux-session-manager] pane spawned and tracked", {
++      sessionId,
++      paneId: result.spawnedPaneId,
++      sessionReady,
++    })
++
++    deps.startPolling()
++  } finally {
++    deps.pendingSessions.delete(sessionId)
++  }
++}
+diff --git a/src/features/tmux-subagent/session-deleted-handler.ts b/src/features/tmux-subagent/session-deleted-handler.ts
+new file mode 100644
+index 00000000..f832cf48
+--- /dev/null
++++ b/src/features/tmux-subagent/session-deleted-handler.ts
+@@ -0,0 +1,50 @@
++import type { TmuxConfig } from "../../config/schema"
++import type { TrackedSession } from "./types"
++import { log } from "../../shared"
++import { queryWindowState } from "./pane-state-querier"
++import { decideCloseAction, type SessionMapping } from "./decision-engine"
++import { executeAction } from "./action-executor"
++
++export interface SessionDeletedHandlerDeps {
++  tmuxConfig: TmuxConfig
++  serverUrl: string
++  sourcePaneId: string | undefined
++  sessions: Map<string, TrackedSession>
++  isEnabled: () => boolean
++  getSessionMappings: () => SessionMapping[]
++  stopPolling: () => void
++}
++
++export async function handleSessionDeleted(
++  deps: SessionDeletedHandlerDeps,
++  event: { sessionID: string },
++): Promise<void> {
++  if (!deps.isEnabled()) return
++  if (!deps.sourcePaneId) return
++
++  const tracked = deps.sessions.get(event.sessionID)
++  if (!tracked) return
++
++  log("[tmux-session-manager] onSessionDeleted", { sessionId: event.sessionID })
++
++  const state = await queryWindowState(deps.sourcePaneId)
++  if (!state) {
++    deps.sessions.delete(event.sessionID)
++    return
++  }
++
++  const closeAction = decideCloseAction(state, event.sessionID, deps.getSessionMappings())
++  if (closeAction) {
++    await executeAction(closeAction, {
++      config: deps.tmuxConfig,
++      serverUrl: deps.serverUrl,
++      windowState: state,
++    })
++  }
++
++  deps.sessions.delete(event.sessionID)
++
++  if (deps.sessions.size === 0) {
++    deps.stopPolling()
++  }
++}
+diff --git a/src/features/tmux-subagent/session-message-count.ts b/src/features/tmux-subagent/session-message-count.ts
+new file mode 100644
+index 00000000..a634208c
+--- /dev/null
++++ b/src/features/tmux-subagent/session-message-count.ts
+@@ -0,0 +1,3 @@
++export function getMessageCount(data: unknown): number {
++  return Array.isArray(data) ? data.length : 0
++}
+diff --git a/src/features/tmux-subagent/session-ready-waiter.ts b/src/features/tmux-subagent/session-ready-waiter.ts
+new file mode 100644
+index 00000000..d98757c5
+--- /dev/null
++++ b/src/features/tmux-subagent/session-ready-waiter.ts
+@@ -0,0 +1,44 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import {
++  SESSION_READY_POLL_INTERVAL_MS,
++  SESSION_READY_TIMEOUT_MS,
++} from "../../shared/tmux"
++import { log } from "../../shared"
++import { parseSessionStatusMap } from "./session-status-parser"
++
++type OpencodeClient = PluginInput["client"]
++
++export async function waitForSessionReady(params: {
++  client: OpencodeClient
++  sessionId: string
++}): Promise<boolean> {
++  const startTime = Date.now()
++
++  while (Date.now() - startTime < SESSION_READY_TIMEOUT_MS) {
++    try {
++      const statusResult = await params.client.session.status({ path: undefined })
++      const allStatuses = parseSessionStatusMap(statusResult.data)
++
++      if (allStatuses[params.sessionId]) {
++        log("[tmux-session-manager] session ready", {
++          sessionId: params.sessionId,
++          status: allStatuses[params.sessionId].type,
++          waitedMs: Date.now() - startTime,
++        })
++        return true
++      }
++    } catch (error) {
++      log("[tmux-session-manager] session status check error", { error: String(error) })
++    }
++
++    await new Promise<void>((resolve) => {
++      setTimeout(resolve, SESSION_READY_POLL_INTERVAL_MS)
++    })
++  }
++
++  log("[tmux-session-manager] session ready timeout", {
++    sessionId: params.sessionId,
++    timeoutMs: SESSION_READY_TIMEOUT_MS,
++  })
++  return false
++}
+diff --git a/src/features/tmux-subagent/session-status-parser.ts b/src/features/tmux-subagent/session-status-parser.ts
+new file mode 100644
+index 00000000..7c401d14
+--- /dev/null
++++ b/src/features/tmux-subagent/session-status-parser.ts
+@@ -0,0 +1,17 @@
++type SessionStatus = { type: string }
++
++export function parseSessionStatusMap(data: unknown): Record<string, SessionStatus> {
++  if (typeof data !== "object" || data === null) return {}
++  const record = data as Record<string, unknown>
++
++  const result: Record<string, SessionStatus> = {}
++  for (const [sessionId, value] of Object.entries(record)) {
++    if (typeof value !== "object" || value === null) continue
++    const valueRecord = value as Record<string, unknown>
++    const type = valueRecord["type"]
++    if (typeof type !== "string") continue
++    result[sessionId] = { type }
++  }
++
++  return result
++}
+diff --git a/src/features/tmux-subagent/spawn-action-decider.ts b/src/features/tmux-subagent/spawn-action-decider.ts
+new file mode 100644
+index 00000000..1a279b65
+--- /dev/null
++++ b/src/features/tmux-subagent/spawn-action-decider.ts
+@@ -0,0 +1,135 @@
++import type {
++	CapacityConfig,
++	PaneAction,
++	SpawnDecision,
++	TmuxPaneInfo,
++	WindowState,
++} from "./types"
++import { MAIN_PANE_RATIO } from "./tmux-grid-constants"
++import {
++	canSplitPane,
++	findMinimalEvictions,
++	isSplittableAtCount,
++} from "./pane-split-availability"
++import { findSpawnTarget } from "./spawn-target-finder"
++import { findOldestAgentPane, type SessionMapping } from "./oldest-agent-pane"
++import { MIN_PANE_WIDTH } from "./types"
++
++export function decideSpawnActions(
++	state: WindowState,
++	sessionId: string,
++	description: string,
++	_config: CapacityConfig,
++	sessionMappings: SessionMapping[],
++): SpawnDecision {
++	if (!state.mainPane) {
++		return { canSpawn: false, actions: [], reason: "no main pane found" }
++	}
++
++	const agentAreaWidth = Math.floor(state.windowWidth * (1 - MAIN_PANE_RATIO))
++	const currentCount = state.agentPanes.length
++
++	if (agentAreaWidth < MIN_PANE_WIDTH) {
++		return {
++			canSpawn: false,
++			actions: [],
++			reason: `window too small for agent panes: ${state.windowWidth}x${state.windowHeight}`,
++		}
++	}
++
++	const oldestPane = findOldestAgentPane(state.agentPanes, sessionMappings)
++	const oldestMapping = oldestPane
++		? sessionMappings.find((m) => m.paneId === oldestPane.paneId) ?? null
++		: null
++
++	if (currentCount === 0) {
++		const virtualMainPane: TmuxPaneInfo = { ...state.mainPane, width: state.windowWidth }
++		if (canSplitPane(virtualMainPane, "-h")) {
++			return {
++				canSpawn: true,
++				actions: [
++					{
++						type: "spawn",
++						sessionId,
++						description,
++						targetPaneId: state.mainPane.paneId,
++						splitDirection: "-h",
++					},
++				],
++			}
++		}
++		return { canSpawn: false, actions: [], reason: "mainPane too small to split" }
++	}
++
++	if (isSplittableAtCount(agentAreaWidth, currentCount)) {
++		const spawnTarget = findSpawnTarget(state)
++		if (spawnTarget) {
++			return {
++				canSpawn: true,
++				actions: [
++					{
++						type: "spawn",
++						sessionId,
++						description,
++						targetPaneId: spawnTarget.targetPaneId,
++						splitDirection: spawnTarget.splitDirection,
++					},
++				],
++			}
++		}
++	}
++
++	const minEvictions = findMinimalEvictions(agentAreaWidth, currentCount)
++	if (minEvictions === 1 && oldestPane) {
++		return {
++			canSpawn: true,
++			actions: [
++				{
++					type: "close",
++					paneId: oldestPane.paneId,
++					sessionId: oldestMapping?.sessionId || "",
++				},
++				{
++					type: "spawn",
++					sessionId,
++					description,
++					targetPaneId: state.mainPane.paneId,
++					splitDirection: "-h",
++				},
++			],
++			reason: "closed 1 pane to make room for split",
++		}
++	}
++
++	if (oldestPane) {
++		return {
++			canSpawn: true,
++			actions: [
++				{
++					type: "replace",
++					paneId: oldestPane.paneId,
++					oldSessionId: oldestMapping?.sessionId || "",
++					newSessionId: sessionId,
++					description,
++				},
++			],
++			reason: "replaced oldest pane (no split possible)",
++		}
++	}
++
++	return { canSpawn: false, actions: [], reason: "no pane available to replace" }
++}
++
++export function decideCloseAction(
++	state: WindowState,
++	sessionId: string,
++	sessionMappings: SessionMapping[],
++): PaneAction | null {
++	const mapping = sessionMappings.find((m) => m.sessionId === sessionId)
++	if (!mapping) return null
++
++	const paneExists = state.agentPanes.some((pane) => pane.paneId === mapping.paneId)
++	if (!paneExists) return null
++
++	return { type: "close", paneId: mapping.paneId, sessionId }
++}
+diff --git a/src/features/tmux-subagent/spawn-target-finder.ts b/src/features/tmux-subagent/spawn-target-finder.ts
+new file mode 100644
+index 00000000..592f4c2f
+--- /dev/null
++++ b/src/features/tmux-subagent/spawn-target-finder.ts
+@@ -0,0 +1,86 @@
++import type { SplitDirection, TmuxPaneInfo, WindowState } from "./types"
++import { MAIN_PANE_RATIO } from "./tmux-grid-constants"
++import { computeGridPlan, mapPaneToSlot } from "./grid-planning"
++import { canSplitPane, getBestSplitDirection } from "./pane-split-availability"
++
++export interface SpawnTarget {
++	targetPaneId: string
++	splitDirection: SplitDirection
++}
++
++function buildOccupancy(
++	agentPanes: TmuxPaneInfo[],
++	plan: ReturnType<typeof computeGridPlan>,
++	mainPaneWidth: number,
++): Map<string, TmuxPaneInfo> {
++	const occupancy = new Map<string, TmuxPaneInfo>()
++	for (const pane of agentPanes) {
++		const slot = mapPaneToSlot(pane, plan, mainPaneWidth)
++		occupancy.set(`${slot.row}:${slot.col}`, pane)
++	}
++	return occupancy
++}
++
++function findFirstEmptySlot(
++	occupancy: Map<string, TmuxPaneInfo>,
++	plan: ReturnType<typeof computeGridPlan>,
++): { row: number; col: number } {
++	for (let row = 0; row < plan.rows; row++) {
++		for (let col = 0; col < plan.cols; col++) {
++			if (!occupancy.has(`${row}:${col}`)) {
++				return { row, col }
++			}
++		}
++	}
++	return { row: plan.rows - 1, col: plan.cols - 1 }
++}
++
++function findSplittableTarget(
++	state: WindowState,
++	_preferredDirection?: SplitDirection,
++): SpawnTarget | null {
++	if (!state.mainPane) return null
++	const existingCount = state.agentPanes.length
++
++	if (existingCount === 0) {
++		const virtualMainPane: TmuxPaneInfo = { ...state.mainPane, width: state.windowWidth }
++		if (canSplitPane(virtualMainPane, "-h")) {
++			return { targetPaneId: state.mainPane.paneId, splitDirection: "-h" }
++		}
++		return null
++	}
++
++	const plan = computeGridPlan(state.windowWidth, state.windowHeight, existingCount + 1)
++	const mainPaneWidth = Math.floor(state.windowWidth * MAIN_PANE_RATIO)
++	const occupancy = buildOccupancy(state.agentPanes, plan, mainPaneWidth)
++	const targetSlot = findFirstEmptySlot(occupancy, plan)
++
++	const leftPane = occupancy.get(`${targetSlot.row}:${targetSlot.col - 1}`)
++	if (leftPane && canSplitPane(leftPane, "-h")) {
++		return { targetPaneId: leftPane.paneId, splitDirection: "-h" }
++	}
++
++	const abovePane = occupancy.get(`${targetSlot.row - 1}:${targetSlot.col}`)
++	if (abovePane && canSplitPane(abovePane, "-v")) {
++		return { targetPaneId: abovePane.paneId, splitDirection: "-v" }
++	}
++
++	const splittablePanes = state.agentPanes
++		.map((pane) => ({ pane, direction: getBestSplitDirection(pane) }))
++		.filter(
++			(item): item is { pane: TmuxPaneInfo; direction: SplitDirection } =>
++				item.direction !== null,
++		)
++		.sort((a, b) => b.pane.width * b.pane.height - a.pane.width * a.pane.height)
++
++	const best = splittablePanes[0]
++	if (best) {
++		return { targetPaneId: best.pane.paneId, splitDirection: best.direction }
++	}
++
++	return null
++}
++
++export function findSpawnTarget(state: WindowState): SpawnTarget | null {
++	return findSplittableTarget(state)
++}
+diff --git a/src/features/tmux-subagent/tmux-grid-constants.ts b/src/features/tmux-subagent/tmux-grid-constants.ts
+new file mode 100644
+index 00000000..778c5e3a
+--- /dev/null
++++ b/src/features/tmux-subagent/tmux-grid-constants.ts
+@@ -0,0 +1,10 @@
++import { MIN_PANE_HEIGHT, MIN_PANE_WIDTH } from "./types"
++
++export const MAIN_PANE_RATIO = 0.5
++export const MAX_COLS = 2
++export const MAX_ROWS = 3
++export const MAX_GRID_SIZE = 4
++export const DIVIDER_SIZE = 1
++
++export const MIN_SPLIT_WIDTH = 2 * MIN_PANE_WIDTH + DIVIDER_SIZE
++export const MIN_SPLIT_HEIGHT = 2 * MIN_PANE_HEIGHT + DIVIDER_SIZE
+-- 
+2.39.2
+

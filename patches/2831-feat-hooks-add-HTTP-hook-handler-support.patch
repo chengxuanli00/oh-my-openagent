@@ -1,0 +1,680 @@
+From 43dfdb23803395c376b4d2ffdc3d8c0b98368b2c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 28 Feb 2026 11:38:34 +0900
+Subject: [PATCH 2831/5749] feat(hooks): add HTTP hook handler support
+
+Add type: "http" hook support matching Claude Code's HTTP hook specification.
+HTTP hooks send POST requests with JSON body, support env var interpolation
+in headers via allowedEnvVars, and configurable timeout.
+
+New files:
+- execute-http-hook.ts: HTTP hook execution with env var interpolation
+- dispatch-hook.ts: Unified dispatcher for command and HTTP hooks
+- execute-http-hook.test.ts: 14 tests covering all HTTP hook scenarios
+
+Modified files:
+- types.ts: Added HookHttp interface, HookAction union type
+- config.ts: Updated to accept HookAction in raw hook matchers
+- pre-tool-use/post-tool-use/stop/user-prompt-submit/pre-compact:
+  Updated all 5 executors to dispatch HTTP hooks via dispatchHook()
+- plugin-loader/types.ts: Added "http" to HookEntry type union
+---
+ .../claude-code-plugin-loader/types.ts        |   6 +-
+ src/hooks/claude-code-hooks/config.ts         |   4 +-
+ src/hooks/claude-code-hooks/dispatch-hook.ts  |  27 ++
+ .../execute-http-hook.test.ts                 | 237 ++++++++++++++++++
+ .../claude-code-hooks/execute-http-hook.ts    |  87 +++++++
+ src/hooks/claude-code-hooks/post-tool-use.ts  |  17 +-
+ src/hooks/claude-code-hooks/pre-compact.ts    |  17 +-
+ src/hooks/claude-code-hooks/pre-tool-use.ts   |  17 +-
+ src/hooks/claude-code-hooks/stop.ts           |  15 +-
+ src/hooks/claude-code-hooks/types.ts          |  12 +-
+ .../claude-code-hooks/user-prompt-submit.ts   |  15 +-
+ 11 files changed, 397 insertions(+), 57 deletions(-)
+ create mode 100644 src/hooks/claude-code-hooks/dispatch-hook.ts
+ create mode 100644 src/hooks/claude-code-hooks/execute-http-hook.test.ts
+ create mode 100644 src/hooks/claude-code-hooks/execute-http-hook.ts
+
+diff --git a/src/features/claude-code-plugin-loader/types.ts b/src/features/claude-code-plugin-loader/types.ts
+index 34e01937..ff511fd5 100644
+--- a/src/features/claude-code-plugin-loader/types.ts
++++ b/src/features/claude-code-plugin-loader/types.ts
+@@ -81,10 +81,14 @@ export interface PluginManifest {
+  * Hooks configuration
+  */
+ export interface HookEntry {
+-  type: "command" | "prompt" | "agent"
++  type: "command" | "prompt" | "agent" | "http"
+   command?: string
+   prompt?: string
+   agent?: string
++  url?: string
++  headers?: Record<string, string>
++  allowedEnvVars?: string[]
++  timeout?: number
+ }
+ 
+ export interface HookMatcher {
+diff --git a/src/hooks/claude-code-hooks/config.ts b/src/hooks/claude-code-hooks/config.ts
+index 3a03d200..a2daf003 100644
+--- a/src/hooks/claude-code-hooks/config.ts
++++ b/src/hooks/claude-code-hooks/config.ts
+@@ -1,12 +1,12 @@
+ import { join } from "path"
+ import { existsSync } from "fs"
+ import { getClaudeConfigDir } from "../../shared"
+-import type { ClaudeHooksConfig, HookMatcher, HookCommand } from "./types"
++import type { ClaudeHooksConfig, HookMatcher, HookAction } from "./types"
+ 
+ interface RawHookMatcher {
+   matcher?: string
+   pattern?: string
+-  hooks: HookCommand[]
++  hooks: HookAction[]
+ }
+ 
+ interface RawClaudeHooksConfig {
+diff --git a/src/hooks/claude-code-hooks/dispatch-hook.ts b/src/hooks/claude-code-hooks/dispatch-hook.ts
+new file mode 100644
+index 00000000..5feeabb6
+--- /dev/null
++++ b/src/hooks/claude-code-hooks/dispatch-hook.ts
+@@ -0,0 +1,27 @@
++import type { HookAction } from "./types"
++import type { CommandResult } from "../../shared/command-executor/execute-hook-command"
++import { executeHookCommand } from "../../shared"
++import { executeHttpHook } from "./execute-http-hook"
++import { DEFAULT_CONFIG } from "./plugin-config"
++
++export function getHookIdentifier(hook: HookAction): string {
++  if (hook.type === "http") return hook.url
++  return hook.command.split("/").pop() || hook.command
++}
++
++export async function dispatchHook(
++  hook: HookAction,
++  stdinJson: string,
++  cwd: string
++): Promise<CommandResult> {
++  if (hook.type === "http") {
++    return executeHttpHook(hook, stdinJson)
++  }
++
++  return executeHookCommand(
++    hook.command,
++    stdinJson,
++    cwd,
++    { forceZsh: DEFAULT_CONFIG.forceZsh, zshPath: DEFAULT_CONFIG.zshPath }
++  )
++}
+diff --git a/src/hooks/claude-code-hooks/execute-http-hook.test.ts b/src/hooks/claude-code-hooks/execute-http-hook.test.ts
+new file mode 100644
+index 00000000..a51b0b50
+--- /dev/null
++++ b/src/hooks/claude-code-hooks/execute-http-hook.test.ts
+@@ -0,0 +1,237 @@
++import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
++import type { HookHttp } from "./types"
++
++const mockFetch = mock(() =>
++  Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
++)
++
++const originalFetch = globalThis.fetch
++
++describe("executeHttpHook", () => {
++  beforeEach(() => {
++    globalThis.fetch = mockFetch as unknown as typeof fetch
++    mockFetch.mockReset()
++    mockFetch.mockImplementation(() =>
++      Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
++    )
++  })
++
++  afterEach(() => {
++    globalThis.fetch = originalFetch
++  })
++
++  describe("#given a basic HTTP hook", () => {
++    const hook: HookHttp = {
++      type: "http",
++      url: "http://localhost:8080/hooks/pre-tool-use",
++    }
++    const stdinData = JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash" })
++
++    it("#when executed #then sends POST request with correct body", async () => {
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      await executeHttpHook(hook, stdinData)
++
++      expect(mockFetch).toHaveBeenCalledTimes(1)
++      const [url, options] = mockFetch.mock.calls[0] as [string, RequestInit]
++      expect(url).toBe("http://localhost:8080/hooks/pre-tool-use")
++      expect(options.method).toBe("POST")
++      expect(options.body).toBe(stdinData)
++    })
++
++    it("#when executed #then sets content-type to application/json", async () => {
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      await executeHttpHook(hook, stdinData)
++
++      const [, options] = mockFetch.mock.calls[0] as [string, RequestInit]
++      const headers = options.headers as Record<string, string>
++      expect(headers["Content-Type"]).toBe("application/json")
++    })
++  })
++
++  describe("#given an HTTP hook with headers and env var interpolation", () => {
++    const originalEnv = process.env
++
++    beforeEach(() => {
++      process.env = { ...originalEnv, MY_TOKEN: "secret-123", OTHER_VAR: "other-value" }
++    })
++
++    afterEach(() => {
++      process.env = originalEnv
++    })
++
++    it("#when allowedEnvVars includes the var #then interpolates env var in headers", async () => {
++      const hook: HookHttp = {
++        type: "http",
++        url: "http://localhost:8080/hooks",
++        headers: { Authorization: "Bearer $MY_TOKEN" },
++        allowedEnvVars: ["MY_TOKEN"],
++      }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      await executeHttpHook(hook, "{}")
++
++      const [, options] = mockFetch.mock.calls[0] as [string, RequestInit]
++      const headers = options.headers as Record<string, string>
++      expect(headers["Authorization"]).toBe("Bearer secret-123")
++    })
++
++    it("#when env var uses ${VAR} syntax #then interpolates correctly", async () => {
++      const hook: HookHttp = {
++        type: "http",
++        url: "http://localhost:8080/hooks",
++        headers: { Authorization: "Bearer ${MY_TOKEN}" },
++        allowedEnvVars: ["MY_TOKEN"],
++      }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      await executeHttpHook(hook, "{}")
++
++      const [, options] = mockFetch.mock.calls[0] as [string, RequestInit]
++      const headers = options.headers as Record<string, string>
++      expect(headers["Authorization"]).toBe("Bearer secret-123")
++    })
++
++    it("#when env var not in allowedEnvVars #then replaces with empty string", async () => {
++      const hook: HookHttp = {
++        type: "http",
++        url: "http://localhost:8080/hooks",
++        headers: { Authorization: "Bearer $OTHER_VAR" },
++        allowedEnvVars: ["MY_TOKEN"],
++      }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      await executeHttpHook(hook, "{}")
++
++      const [, options] = mockFetch.mock.calls[0] as [string, RequestInit]
++      const headers = options.headers as Record<string, string>
++      expect(headers["Authorization"]).toBe("Bearer ")
++    })
++  })
++
++  describe("#given an HTTP hook with timeout", () => {
++    it("#when timeout specified #then passes AbortSignal with timeout", async () => {
++      const hook: HookHttp = {
++        type: "http",
++        url: "http://localhost:8080/hooks",
++        timeout: 10,
++      }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      await executeHttpHook(hook, "{}")
++
++      const [, options] = mockFetch.mock.calls[0] as [string, RequestInit]
++      expect(options.signal).toBeDefined()
++    })
++  })
++
++  describe("#given a successful HTTP response", () => {
++    it("#when response has JSON body #then returns parsed output", async () => {
++      mockFetch.mockImplementation(() =>
++        Promise.resolve(
++          new Response(JSON.stringify({ decision: "allow", reason: "ok" }), {
++            status: 200,
++            headers: { "Content-Type": "application/json" },
++          })
++        )
++      )
++      const hook: HookHttp = { type: "http", url: "http://localhost:8080/hooks" }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      const result = await executeHttpHook(hook, "{}")
++
++      expect(result.exitCode).toBe(0)
++      expect(result.stdout).toContain('"decision":"allow"')
++    })
++  })
++
++  describe("#given a failing HTTP response", () => {
++    it("#when response status is 4xx #then returns exit code 1", async () => {
++      mockFetch.mockImplementation(() =>
++        Promise.resolve(new Response("Bad Request", { status: 400 }))
++      )
++      const hook: HookHttp = { type: "http", url: "http://localhost:8080/hooks" }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      const result = await executeHttpHook(hook, "{}")
++
++      expect(result.exitCode).toBe(1)
++      expect(result.stderr).toContain("400")
++    })
++
++    it("#when fetch throws network error #then returns exit code 1", async () => {
++      mockFetch.mockImplementation(() => Promise.reject(new Error("ECONNREFUSED")))
++      const hook: HookHttp = { type: "http", url: "http://localhost:8080/hooks" }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      const result = await executeHttpHook(hook, "{}")
++
++      expect(result.exitCode).toBe(1)
++      expect(result.stderr).toContain("ECONNREFUSED")
++    })
++  })
++
++  describe("#given response with exit code in JSON", () => {
++    it("#when JSON contains exitCode 2 #then uses that exit code", async () => {
++      mockFetch.mockImplementation(() =>
++        Promise.resolve(
++          new Response(JSON.stringify({ exitCode: 2, stderr: "blocked" }), {
++            status: 200,
++            headers: { "Content-Type": "application/json" },
++          })
++        )
++      )
++      const hook: HookHttp = { type: "http", url: "http://localhost:8080/hooks" }
++      const { executeHttpHook } = await import("./execute-http-hook")
++
++      const result = await executeHttpHook(hook, "{}")
++
++      expect(result.exitCode).toBe(2)
++    })
++  })
++})
++
++describe("interpolateEnvVars", () => {
++  const originalEnv = process.env
++
++  beforeEach(() => {
++    process.env = { ...originalEnv, TOKEN: "abc", SECRET: "xyz" }
++  })
++
++  afterEach(() => {
++    process.env = originalEnv
++  })
++
++  it("#given $VAR syntax #when var is allowed #then interpolates", async () => {
++    const { interpolateEnvVars } = await import("./execute-http-hook")
++
++    const result = interpolateEnvVars("Bearer $TOKEN", ["TOKEN"])
++
++    expect(result).toBe("Bearer abc")
++  })
++
++  it("#given ${VAR} syntax #when var is allowed #then interpolates", async () => {
++    const { interpolateEnvVars } = await import("./execute-http-hook")
++
++    const result = interpolateEnvVars("Bearer ${TOKEN}", ["TOKEN"])
++
++    expect(result).toBe("Bearer abc")
++  })
++
++  it("#given multiple vars #when some not allowed #then only interpolates allowed ones", async () => {
++    const { interpolateEnvVars } = await import("./execute-http-hook")
++
++    const result = interpolateEnvVars("$TOKEN:$SECRET", ["TOKEN"])
++
++    expect(result).toBe("abc:")
++  })
++
++  it("#given no allowedEnvVars #when called #then replaces all with empty", async () => {
++    const { interpolateEnvVars } = await import("./execute-http-hook")
++
++    const result = interpolateEnvVars("Bearer $TOKEN", [])
++
++    expect(result).toBe("Bearer ")
++  })
++})
+diff --git a/src/hooks/claude-code-hooks/execute-http-hook.ts b/src/hooks/claude-code-hooks/execute-http-hook.ts
+new file mode 100644
+index 00000000..43d65bba
+--- /dev/null
++++ b/src/hooks/claude-code-hooks/execute-http-hook.ts
+@@ -0,0 +1,87 @@
++import type { HookHttp } from "./types"
++import type { CommandResult } from "../../shared/command-executor/execute-hook-command"
++
++const DEFAULT_HTTP_HOOK_TIMEOUT_S = 30
++
++export function interpolateEnvVars(
++  value: string,
++  allowedEnvVars: string[]
++): string {
++  const allowedSet = new Set(allowedEnvVars)
++
++  let result = value.replace(/\$\{(\w+)\}/g, (_match, varName: string) => {
++    if (allowedSet.has(varName)) {
++      return process.env[varName] ?? ""
++    }
++    return ""
++  })
++
++  result = result.replace(/\$(\w+)/g, (_match, varName: string) => {
++    if (allowedSet.has(varName)) {
++      return process.env[varName] ?? ""
++    }
++    return ""
++  })
++
++  return result
++}
++
++function resolveHeaders(
++  hook: HookHttp
++): Record<string, string> {
++  const headers: Record<string, string> = {
++    "Content-Type": "application/json",
++  }
++
++  if (!hook.headers) return headers
++
++  const allowedEnvVars = hook.allowedEnvVars ?? []
++  for (const [key, value] of Object.entries(hook.headers)) {
++    headers[key] = interpolateEnvVars(value, allowedEnvVars)
++  }
++
++  return headers
++}
++
++export async function executeHttpHook(
++  hook: HookHttp,
++  stdin: string
++): Promise<CommandResult> {
++  const timeoutS = hook.timeout ?? DEFAULT_HTTP_HOOK_TIMEOUT_S
++  const headers = resolveHeaders(hook)
++
++  try {
++    const response = await fetch(hook.url, {
++      method: "POST",
++      headers,
++      body: stdin,
++      signal: AbortSignal.timeout(timeoutS * 1000),
++    })
++
++    if (!response.ok) {
++      return {
++        exitCode: 1,
++        stderr: `HTTP hook returned status ${response.status}: ${response.statusText}`,
++        stdout: await response.text().catch(() => ""),
++      }
++    }
++
++    const body = await response.text()
++    if (!body) {
++      return { exitCode: 0, stdout: "", stderr: "" }
++    }
++
++    try {
++      const parsed = JSON.parse(body) as { exitCode?: number }
++      if (typeof parsed.exitCode === "number") {
++        return { exitCode: parsed.exitCode, stdout: body, stderr: "" }
++      }
++    } catch {
++    }
++
++    return { exitCode: 0, stdout: body, stderr: "" }
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error)
++    return { exitCode: 1, stderr: `HTTP hook error: ${message}` }
++  }
++}
+diff --git a/src/hooks/claude-code-hooks/post-tool-use.ts b/src/hooks/claude-code-hooks/post-tool-use.ts
+index 31b88dc0..b119252c 100644
+--- a/src/hooks/claude-code-hooks/post-tool-use.ts
++++ b/src/hooks/claude-code-hooks/post-tool-use.ts
+@@ -3,8 +3,8 @@ import type {
+   PostToolUseOutput,
+   ClaudeHooksConfig,
+ } from "./types"
+-import { findMatchingHooks, executeHookCommand, objectToSnakeCase, transformToolName, log } from "../../shared"
+-import { DEFAULT_CONFIG } from "./plugin-config"
++import { findMatchingHooks, objectToSnakeCase, transformToolName, log } from "../../shared"
++import { dispatchHook, getHookIdentifier } from "./dispatch-hook"
+ import { buildTranscriptFromSession, deleteTempTranscript } from "./transcript"
+ import { isHookCommandDisabled, type PluginExtendedConfig } from "./config-loader"
+ 
+@@ -94,22 +94,17 @@ export async function executePostToolUseHooks(
+      for (const matcher of matchers) {
+        if (!matcher.hooks || matcher.hooks.length === 0) continue
+        for (const hook of matcher.hooks) {
+-         if (hook.type !== "command") continue
++         if (hook.type !== "command" && hook.type !== "http") continue
+ 
+-         if (isHookCommandDisabled("PostToolUse", hook.command, extendedConfig ?? null)) {
++         if (hook.type === "command" && isHookCommandDisabled("PostToolUse", hook.command, extendedConfig ?? null)) {
+           log("PostToolUse hook command skipped (disabled by config)", { command: hook.command, toolName: ctx.toolName })
+           continue
+         }
+ 
+-        const hookName = hook.command.split("/").pop() || hook.command
++        const hookName = getHookIdentifier(hook)
+         if (!firstHookName) firstHookName = hookName
+ 
+-        const result = await executeHookCommand(
+-          hook.command,
+-          JSON.stringify(stdinData),
+-          ctx.cwd,
+-          { forceZsh: DEFAULT_CONFIG.forceZsh, zshPath: DEFAULT_CONFIG.zshPath }
+-        )
++        const result = await dispatchHook(hook, JSON.stringify(stdinData), ctx.cwd)
+ 
+         if (result.stdout) {
+           messages.push(result.stdout)
+diff --git a/src/hooks/claude-code-hooks/pre-compact.ts b/src/hooks/claude-code-hooks/pre-compact.ts
+index e2d87739..09d2425e 100644
+--- a/src/hooks/claude-code-hooks/pre-compact.ts
++++ b/src/hooks/claude-code-hooks/pre-compact.ts
+@@ -3,8 +3,8 @@ import type {
+   PreCompactOutput,
+   ClaudeHooksConfig,
+ } from "./types"
+-import { findMatchingHooks, executeHookCommand, log } from "../../shared"
+-import { DEFAULT_CONFIG } from "./plugin-config"
++import { findMatchingHooks, log } from "../../shared"
++import { dispatchHook, getHookIdentifier } from "./dispatch-hook"
+ import { isHookCommandDisabled, type PluginExtendedConfig } from "./config-loader"
+ 
+ export interface PreCompactContext {
+@@ -50,22 +50,17 @@ export async function executePreCompactHooks(
+    for (const matcher of matchers) {
+      if (!matcher.hooks || matcher.hooks.length === 0) continue
+      for (const hook of matcher.hooks) {
+-       if (hook.type !== "command") continue
++       if (hook.type !== "command" && hook.type !== "http") continue
+ 
+-       if (isHookCommandDisabled("PreCompact", hook.command, extendedConfig ?? null)) {
++       if (hook.type === "command" && isHookCommandDisabled("PreCompact", hook.command, extendedConfig ?? null)) {
+         log("PreCompact hook command skipped (disabled by config)", { command: hook.command })
+         continue
+       }
+ 
+-      const hookName = hook.command.split("/").pop() || hook.command
++      const hookName = getHookIdentifier(hook)
+       if (!firstHookName) firstHookName = hookName
+ 
+-      const result = await executeHookCommand(
+-        hook.command,
+-        JSON.stringify(stdinData),
+-        ctx.cwd,
+-        { forceZsh: DEFAULT_CONFIG.forceZsh, zshPath: DEFAULT_CONFIG.zshPath }
+-      )
++      const result = await dispatchHook(hook, JSON.stringify(stdinData), ctx.cwd)
+ 
+       if (result.exitCode === 2) {
+         log("PreCompact hook blocked", { hookName, stderr: result.stderr })
+diff --git a/src/hooks/claude-code-hooks/pre-tool-use.ts b/src/hooks/claude-code-hooks/pre-tool-use.ts
+index 2b5a33c5..ec16369e 100644
+--- a/src/hooks/claude-code-hooks/pre-tool-use.ts
++++ b/src/hooks/claude-code-hooks/pre-tool-use.ts
+@@ -4,8 +4,8 @@ import type {
+   PermissionDecision,
+   ClaudeHooksConfig,
+ } from "./types"
+-import { findMatchingHooks, executeHookCommand, objectToSnakeCase, transformToolName, log } from "../../shared"
+-import { DEFAULT_CONFIG } from "./plugin-config"
++import { findMatchingHooks, objectToSnakeCase, transformToolName, log } from "../../shared"
++import { dispatchHook, getHookIdentifier } from "./dispatch-hook"
+ import { isHookCommandDisabled, type PluginExtendedConfig } from "./config-loader"
+ 
+ export interface PreToolUseContext {
+@@ -77,22 +77,17 @@ export async function executePreToolUseHooks(
+    for (const matcher of matchers) {
+      if (!matcher.hooks || matcher.hooks.length === 0) continue
+      for (const hook of matcher.hooks) {
+-       if (hook.type !== "command") continue
++       if (hook.type !== "command" && hook.type !== "http") continue
+ 
+-       if (isHookCommandDisabled("PreToolUse", hook.command, extendedConfig ?? null)) {
++       if (hook.type === "command" && isHookCommandDisabled("PreToolUse", hook.command, extendedConfig ?? null)) {
+         log("PreToolUse hook command skipped (disabled by config)", { command: hook.command, toolName: ctx.toolName })
+         continue
+       }
+ 
+-      const hookName = hook.command.split("/").pop() || hook.command
++      const hookName = getHookIdentifier(hook)
+       if (!firstHookName) firstHookName = hookName
+ 
+-      const result = await executeHookCommand(
+-        hook.command,
+-        JSON.stringify(stdinData),
+-        ctx.cwd,
+-        { forceZsh: DEFAULT_CONFIG.forceZsh, zshPath: DEFAULT_CONFIG.zshPath }
+-      )
++      const result = await dispatchHook(hook, JSON.stringify(stdinData), ctx.cwd)
+ 
+       if (result.exitCode === 2) {
+         return {
+diff --git a/src/hooks/claude-code-hooks/stop.ts b/src/hooks/claude-code-hooks/stop.ts
+index 0073613b..81cf821b 100644
+--- a/src/hooks/claude-code-hooks/stop.ts
++++ b/src/hooks/claude-code-hooks/stop.ts
+@@ -3,8 +3,8 @@ import type {
+   StopOutput,
+   ClaudeHooksConfig,
+ } from "./types"
+-import { findMatchingHooks, executeHookCommand, log } from "../../shared"
+-import { DEFAULT_CONFIG } from "./plugin-config"
++import { findMatchingHooks, log } from "../../shared"
++import { dispatchHook } from "./dispatch-hook"
+ import { getTodoPath } from "./todo"
+ import { isHookCommandDisabled, type PluginExtendedConfig } from "./config-loader"
+ 
+@@ -68,19 +68,14 @@ export async function executeStopHooks(
+    for (const matcher of matchers) {
+      if (!matcher.hooks || matcher.hooks.length === 0) continue
+      for (const hook of matcher.hooks) {
+-       if (hook.type !== "command") continue
++       if (hook.type !== "command" && hook.type !== "http") continue
+ 
+-       if (isHookCommandDisabled("Stop", hook.command, extendedConfig ?? null)) {
++       if (hook.type === "command" && isHookCommandDisabled("Stop", hook.command, extendedConfig ?? null)) {
+         log("Stop hook command skipped (disabled by config)", { command: hook.command })
+         continue
+       }
+ 
+-      const result = await executeHookCommand(
+-        hook.command,
+-        JSON.stringify(stdinData),
+-        ctx.cwd,
+-        { forceZsh: DEFAULT_CONFIG.forceZsh, zshPath: DEFAULT_CONFIG.zshPath }
+-      )
++      const result = await dispatchHook(hook, JSON.stringify(stdinData), ctx.cwd)
+ 
+       // Check exit code first - exit code 2 means block
+       if (result.exitCode === 2) {
+diff --git a/src/hooks/claude-code-hooks/types.ts b/src/hooks/claude-code-hooks/types.ts
+index 5d287f6e..28924de1 100644
+--- a/src/hooks/claude-code-hooks/types.ts
++++ b/src/hooks/claude-code-hooks/types.ts
+@@ -12,7 +12,7 @@ export type ClaudeHookEvent =
+ 
+ export interface HookMatcher {
+   matcher: string
+-  hooks: HookCommand[]
++  hooks: HookAction[]
+ }
+ 
+ export interface HookCommand {
+@@ -20,6 +20,16 @@ export interface HookCommand {
+   command: string
+ }
+ 
++export interface HookHttp {
++  type: "http"
++  url: string
++  headers?: Record<string, string>
++  allowedEnvVars?: string[]
++  timeout?: number
++}
++
++export type HookAction = HookCommand | HookHttp
++
+ export interface ClaudeHooksConfig {
+   PreToolUse?: HookMatcher[]
+   PostToolUse?: HookMatcher[]
+diff --git a/src/hooks/claude-code-hooks/user-prompt-submit.ts b/src/hooks/claude-code-hooks/user-prompt-submit.ts
+index 4fa732ae..5f1cbc2e 100644
+--- a/src/hooks/claude-code-hooks/user-prompt-submit.ts
++++ b/src/hooks/claude-code-hooks/user-prompt-submit.ts
+@@ -3,8 +3,8 @@ import type {
+   PostToolUseOutput,
+   ClaudeHooksConfig,
+ } from "./types"
+-import { findMatchingHooks, executeHookCommand, log } from "../../shared"
+-import { DEFAULT_CONFIG } from "./plugin-config"
++import { findMatchingHooks, log } from "../../shared"
++import { dispatchHook } from "./dispatch-hook"
+ import { isHookCommandDisabled, type PluginExtendedConfig } from "./config-loader"
+ 
+ const USER_PROMPT_SUBMIT_TAG_OPEN = "<user-prompt-submit-hook>"
+@@ -80,19 +80,14 @@ export async function executeUserPromptSubmitHooks(
+    for (const matcher of matchers) {
+      if (!matcher.hooks || matcher.hooks.length === 0) continue
+      for (const hook of matcher.hooks) {
+-       if (hook.type !== "command") continue
++       if (hook.type !== "command" && hook.type !== "http") continue
+ 
+-      if (isHookCommandDisabled("UserPromptSubmit", hook.command, extendedConfig ?? null)) {
++      if (hook.type === "command" && isHookCommandDisabled("UserPromptSubmit", hook.command, extendedConfig ?? null)) {
+         log("UserPromptSubmit hook command skipped (disabled by config)", { command: hook.command })
+         continue
+       }
+ 
+-      const result = await executeHookCommand(
+-        hook.command,
+-        JSON.stringify(stdinData),
+-        ctx.cwd,
+-        { forceZsh: DEFAULT_CONFIG.forceZsh, zshPath: DEFAULT_CONFIG.zshPath }
+-      )
++      const result = await dispatchHook(hook, JSON.stringify(stdinData), ctx.cwd)
+ 
+       if (result.stdout) {
+         const output = result.stdout.trim()
+-- 
+2.39.2
+

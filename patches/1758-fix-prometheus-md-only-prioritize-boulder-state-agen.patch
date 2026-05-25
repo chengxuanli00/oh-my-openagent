@@ -1,0 +1,207 @@
+From 38b40bca04e37976cc39089ca04da39ad03cfb1f Mon Sep 17 00:00:00 2001
+From: Rishi Vhavle <rishivhavle21@gmail.com>
+Date: Wed, 4 Feb 2026 21:27:23 +0530
+Subject: [PATCH 1758/5749] fix(prometheus-md-only): prioritize boulder state
+ agent over message files
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause fix for issue #927:
+- After /plan → /start-work → interruption, in-memory sessionAgentMap is cleared
+- getAgentFromMessageFiles() returns 'prometheus' (oldest message from /plan)
+- But boulder.json has agent: 'atlas' (set by /start-work)
+
+Fix: Check boulder state agent BEFORE falling back to message files
+Priority: in-memory → boulder state → message files
+
+Test: 3 new tests covering the priority logic
+---
+ src/hooks/prometheus-md-only/index.test.ts | 115 +++++++++++++++++++++
+ src/hooks/prometheus-md-only/index.ts      |  30 +++++-
+ 2 files changed, 142 insertions(+), 3 deletions(-)
+
+diff --git a/src/hooks/prometheus-md-only/index.test.ts b/src/hooks/prometheus-md-only/index.test.ts
+index d5644240..07dff9bf 100644
+--- a/src/hooks/prometheus-md-only/index.test.ts
++++ b/src/hooks/prometheus-md-only/index.test.ts
+@@ -352,6 +352,121 @@ describe("prometheus-md-only", () => {
+     })
+   })
+ 
++  describe("boulder state priority over message files (fixes #927)", () => {
++    const BOULDER_DIR = join(tmpdir(), `boulder-test-${randomUUID()}`)
++    const BOULDER_FILE = join(BOULDER_DIR, ".sisyphus", "boulder.json")
++
++    beforeEach(() => {
++      mkdirSync(join(BOULDER_DIR, ".sisyphus"), { recursive: true })
++    })
++
++    afterEach(() => {
++      rmSync(BOULDER_DIR, { recursive: true, force: true })
++    })
++
++    //#given session was started with prometheus (first message), but /start-work set boulder agent to atlas
++    //#when user types "continue" after interruption (memory cleared, falls back to message files)
++    //#then should use boulder state agent (atlas), not message file agent (prometheus)
++    test("should prioritize boulder agent over message file agent", async () => {
++      // given - prometheus in message files (from /plan)
++      setupMessageStorage(TEST_SESSION_ID, "prometheus")
++      
++      // given - atlas in boulder state (from /start-work)
++      writeFileSync(BOULDER_FILE, JSON.stringify({
++        active_plan: "/test/plan.md",
++        started_at: new Date().toISOString(),
++        session_ids: [TEST_SESSION_ID],
++        plan_name: "test-plan",
++        agent: "atlas"
++      }))
++
++      const hook = createPrometheusMdOnlyHook({
++        client: {},
++        directory: BOULDER_DIR,
++      } as never)
++
++      const input = {
++        tool: "Write",
++        sessionID: TEST_SESSION_ID,
++        callID: "call-1",
++      }
++      const output = {
++        args: { filePath: "/path/to/code.ts" },
++      }
++
++      // when / then - should NOT block because boulder says atlas, not prometheus
++      await expect(
++        hook["tool.execute.before"](input, output)
++      ).resolves.toBeUndefined()
++    })
++
++    test("should use prometheus from boulder state when set", async () => {
++      // given - atlas in message files (from some other agent)
++      setupMessageStorage(TEST_SESSION_ID, "atlas")
++      
++      // given - prometheus in boulder state (edge case, but should honor it)
++      writeFileSync(BOULDER_FILE, JSON.stringify({
++        active_plan: "/test/plan.md",
++        started_at: new Date().toISOString(),
++        session_ids: [TEST_SESSION_ID],
++        plan_name: "test-plan",
++        agent: "prometheus"
++      }))
++
++      const hook = createPrometheusMdOnlyHook({
++        client: {},
++        directory: BOULDER_DIR,
++      } as never)
++
++      const input = {
++        tool: "Write",
++        sessionID: TEST_SESSION_ID,
++        callID: "call-1",
++      }
++      const output = {
++        args: { filePath: "/path/to/code.ts" },
++      }
++
++      // when / then - should block because boulder says prometheus
++      await expect(
++        hook["tool.execute.before"](input, output)
++      ).rejects.toThrow("can only write/edit .md files")
++    })
++
++    test("should fall back to message files when session not in boulder", async () => {
++      // given - prometheus in message files
++      setupMessageStorage(TEST_SESSION_ID, "prometheus")
++      
++      // given - boulder state exists but for different session
++      writeFileSync(BOULDER_FILE, JSON.stringify({
++        active_plan: "/test/plan.md",
++        started_at: new Date().toISOString(),
++        session_ids: ["other-session-id"],
++        plan_name: "test-plan",
++        agent: "atlas"
++      }))
++
++      const hook = createPrometheusMdOnlyHook({
++        client: {},
++        directory: BOULDER_DIR,
++      } as never)
++
++      const input = {
++        tool: "Write",
++        sessionID: TEST_SESSION_ID,
++        callID: "call-1",
++      }
++      const output = {
++        args: { filePath: "/path/to/code.ts" },
++      }
++
++      // when / then - should block because falls back to message files (prometheus)
++      await expect(
++        hook["tool.execute.before"](input, output)
++      ).rejects.toThrow("can only write/edit .md files")
++    })
++  })
++
+   describe("without message storage", () => {
+     test("should handle missing session gracefully (no agent found)", async () => {
+       // given
+diff --git a/src/hooks/prometheus-md-only/index.ts b/src/hooks/prometheus-md-only/index.ts
+index 1c311dc0..7c9131f9 100644
+--- a/src/hooks/prometheus-md-only/index.ts
++++ b/src/hooks/prometheus-md-only/index.ts
+@@ -4,6 +4,7 @@ import { join, resolve, relative, isAbsolute } from "node:path"
+ import { HOOK_NAME, PROMETHEUS_AGENT, ALLOWED_EXTENSIONS, ALLOWED_PATH_PREFIX, BLOCKED_TOOLS, PLANNING_CONSULT_WARNING, PROMETHEUS_WORKFLOW_REMINDER } from "./constants"
+ import { findNearestMessageWithFields, findFirstMessageWithAgent, MESSAGE_STORAGE } from "../../features/hook-message-injector"
+ import { getSessionAgent } from "../../features/claude-code-session-state"
++import { readBoulderState } from "../../features/boulder-state"
+ import { log } from "../../shared/logger"
+ import { SYSTEM_DIRECTIVE_PREFIX } from "../../shared/system-directive"
+ import { getAgentDisplayName } from "../../shared/agent-display-names"
+@@ -70,8 +71,31 @@ function getAgentFromMessageFiles(sessionID: string): string | undefined {
+   return findFirstMessageWithAgent(messageDir) ?? findNearestMessageWithFields(messageDir)?.agent
+ }
+ 
+-function getAgentFromSession(sessionID: string): string | undefined {
+-  return getSessionAgent(sessionID) ?? getAgentFromMessageFiles(sessionID)
++/**
++ * Get the effective agent for the session.
++ * Priority order:
++ * 1. In-memory session agent (most recent, set by /start-work)
++ * 2. Boulder state agent (persisted across restarts, fixes #927)
++ * 3. Message files (fallback for sessions without boulder state)
++ *
++ * This fixes issue #927 where after interruption:
++ * - In-memory map is cleared (process restart)
++ * - Message files return "prometheus" (oldest message from /plan)
++ * - But boulder.json has agent: "atlas" (set by /start-work)
++ */
++function getAgentFromSession(sessionID: string, directory: string): string | undefined {
++  // Check in-memory first (current session)
++  const memoryAgent = getSessionAgent(sessionID)
++  if (memoryAgent) return memoryAgent
++
++  // Check boulder state (persisted across restarts) - fixes #927
++  const boulderState = readBoulderState(directory)
++  if (boulderState?.session_ids.includes(sessionID) && boulderState.agent) {
++    return boulderState.agent
++  }
++
++  // Fallback to message files
++  return getAgentFromMessageFiles(sessionID)
+ }
+ 
+ export function createPrometheusMdOnlyHook(ctx: PluginInput) {
+@@ -80,7 +104,7 @@ export function createPrometheusMdOnlyHook(ctx: PluginInput) {
+       input: { tool: string; sessionID: string; callID: string },
+       output: { args: Record<string, unknown>; message?: string }
+     ): Promise<void> => {
+-      const agentName = getAgentFromSession(input.sessionID)
++      const agentName = getAgentFromSession(input.sessionID, ctx.directory)
+ 
+       if (agentName !== PROMETHEUS_AGENT) {
+         return
+-- 
+2.39.2
+

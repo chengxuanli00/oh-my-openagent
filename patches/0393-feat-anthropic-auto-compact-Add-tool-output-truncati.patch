@@ -1,0 +1,641 @@
+From b461ef4496fe1632e3cebc97f6f6211e55ef819f Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 16 Dec 2025 21:02:38 +0900
+Subject: [PATCH 0393/5749] feat(anthropic-auto-compact): Add tool output
+ truncation recovery layer for token limit handling (#63)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add storage.ts: Functions to find and truncate largest tool results
+- Add TruncateState and TRUNCATE_CONFIG for truncation tracking
+- Implement truncate-first recovery: truncate largest output -> retry (10x) -> compact (2x) -> revert (3x)
+- Move session error handling to immediate recovery instead of session.idle wait
+- Add compactionInProgress tracking to prevent concurrent execution
+
+This fixes GitHub issue #63: "prompt is too long" errors now trigger immediate recovery by truncating the largest tool outputs first before attempting compaction.
+
+🤖 Generated with assistance of OhMyOpenCode (https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/hooks/anthropic-auto-compact/executor.ts | 279 ++++++++++---------
+ src/hooks/anthropic-auto-compact/index.ts    |  37 ++-
+ src/hooks/anthropic-auto-compact/storage.ts  | 163 +++++++++++
+ src/hooks/anthropic-auto-compact/types.ts    |  12 +
+ 4 files changed, 359 insertions(+), 132 deletions(-)
+ create mode 100644 src/hooks/anthropic-auto-compact/storage.ts
+
+diff --git a/src/hooks/anthropic-auto-compact/executor.ts b/src/hooks/anthropic-auto-compact/executor.ts
+index 80e17916..daeabb17 100644
+--- a/src/hooks/anthropic-auto-compact/executor.ts
++++ b/src/hooks/anthropic-auto-compact/executor.ts
+@@ -1,5 +1,6 @@
+-import type { AutoCompactState, FallbackState, RetryState } from "./types"
+-import { FALLBACK_CONFIG, RETRY_CONFIG } from "./types"
++import type { AutoCompactState, FallbackState, RetryState, TruncateState } from "./types"
++import { FALLBACK_CONFIG, RETRY_CONFIG, TRUNCATE_CONFIG } from "./types"
++import { findLargestToolResult, truncateToolResult } from "./storage"
+ 
+ type Client = {
+   session: {
+@@ -23,16 +24,6 @@ type Client = {
+   }
+ }
+ 
+-function calculateRetryDelay(attempt: number): number {
+-  const delay = RETRY_CONFIG.initialDelayMs * Math.pow(RETRY_CONFIG.backoffFactor, attempt - 1)
+-  return Math.min(delay, RETRY_CONFIG.maxDelayMs)
+-}
+-
+-function shouldRetry(retryState: RetryState | undefined): boolean {
+-  if (!retryState) return true
+-  return retryState.attempt < RETRY_CONFIG.maxAttempts
+-}
+-
+ function getOrCreateRetryState(
+   autoCompactState: AutoCompactState,
+   sessionID: string
+@@ -57,6 +48,18 @@ function getOrCreateFallbackState(
+   return state
+ }
+ 
++function getOrCreateTruncateState(
++  autoCompactState: AutoCompactState,
++  sessionID: string
++): TruncateState {
++  let state = autoCompactState.truncateStateBySession.get(sessionID)
++  if (!state) {
++    state = { truncateAttempt: 0 }
++    autoCompactState.truncateStateBySession.set(sessionID, state)
++  }
++  return state
++}
++
+ async function getLastMessagePair(
+   sessionID: string,
+   client: Client,
+@@ -104,61 +107,10 @@ async function getLastMessagePair(
+   }
+ }
+ 
+-async function executeRevertFallback(
+-  sessionID: string,
+-  autoCompactState: AutoCompactState,
+-  client: Client,
+-  directory: string
+-): Promise<boolean> {
+-  const fallbackState = getOrCreateFallbackState(autoCompactState, sessionID)
+-
+-  if (fallbackState.revertAttempt >= FALLBACK_CONFIG.maxRevertAttempts) {
+-    return false
+-  }
+-
+-  const pair = await getLastMessagePair(sessionID, client, directory)
+-  if (!pair) {
+-    return false
+-  }
+-
+-  await client.tui
+-    .showToast({
+-      body: {
+-        title: "⚠️ Emergency Recovery",
+-        message: `Context too large. Removing last message pair to recover session...`,
+-        variant: "warning",
+-        duration: 4000,
+-      },
+-    })
+-    .catch(() => {})
+-
+-  try {
+-    if (pair.assistantMessageID) {
+-      await client.session.revert({
+-        path: { id: sessionID },
+-        body: { messageID: pair.assistantMessageID },
+-        query: { directory },
+-      })
+-    }
+-
+-    await client.session.revert({
+-      path: { id: sessionID },
+-      body: { messageID: pair.userMessageID },
+-      query: { directory },
+-    })
+-
+-    fallbackState.revertAttempt++
+-    fallbackState.lastRevertedMessageID = pair.userMessageID
+-
+-    const retryState = autoCompactState.retryStateBySession.get(sessionID)
+-    if (retryState) {
+-      retryState.attempt = 0
+-    }
+-
+-    return true
+-  } catch {
+-    return false
+-  }
++function formatBytes(bytes: number): string {
++  if (bytes < 1024) return `${bytes}B`
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
++  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+ }
+ 
+ export async function getLastAssistant(
+@@ -194,6 +146,8 @@ function clearSessionState(autoCompactState: AutoCompactState, sessionID: string
+   autoCompactState.errorDataBySession.delete(sessionID)
+   autoCompactState.retryStateBySession.delete(sessionID)
+   autoCompactState.fallbackStateBySession.delete(sessionID)
++  autoCompactState.truncateStateBySession.delete(sessionID)
++  autoCompactState.compactionInProgress.delete(sessionID)
+ }
+ 
+ export async function executeCompact(
+@@ -204,91 +158,154 @@ export async function executeCompact(
+   client: any,
+   directory: string
+ ): Promise<void> {
+-  const retryState = getOrCreateRetryState(autoCompactState, sessionID)
++  if (autoCompactState.compactionInProgress.has(sessionID)) {
++    return
++  }
++  autoCompactState.compactionInProgress.add(sessionID)
+ 
+-  if (!shouldRetry(retryState)) {
+-    const fallbackState = getOrCreateFallbackState(autoCompactState, sessionID)
++  const truncateState = getOrCreateTruncateState(autoCompactState, sessionID)
+ 
+-    if (fallbackState.revertAttempt < FALLBACK_CONFIG.maxRevertAttempts) {
+-      const reverted = await executeRevertFallback(
+-        sessionID,
+-        autoCompactState,
+-        client as Client,
+-        directory
+-      )
++  if (truncateState.truncateAttempt < TRUNCATE_CONFIG.maxTruncateAttempts) {
++    const largest = findLargestToolResult(sessionID)
++
++    if (largest && largest.outputSize >= TRUNCATE_CONFIG.minOutputSizeToTruncate) {
++      const result = truncateToolResult(largest.partPath)
++
++      if (result.success) {
++        truncateState.truncateAttempt++
++        truncateState.lastTruncatedPartId = largest.partId
+ 
+-      if (reverted) {
+         await (client as Client).tui
+           .showToast({
+             body: {
+-              title: "Recovery Attempt",
+-              message: "Message removed. Retrying compaction...",
+-              variant: "info",
++              title: "Truncating Large Output",
++              message: `Truncated ${result.toolName} (${formatBytes(result.originalSize ?? 0)}). Retrying...`,
++              variant: "warning",
+               duration: 3000,
+             },
+           })
+           .catch(() => {})
+ 
+-        setTimeout(() => {
+-          executeCompact(sessionID, msg, autoCompactState, client, directory)
+-        }, 1000)
++        autoCompactState.compactionInProgress.delete(sessionID)
++
++        setTimeout(async () => {
++          try {
++            await (client as Client).tui.submitPrompt({ query: { directory } })
++          } catch {}
++        }, 500)
+         return
+       }
+     }
+-
+-    clearSessionState(autoCompactState, sessionID)
+-
+-    await (client as Client).tui
+-      .showToast({
+-        body: {
+-          title: "Auto Compact Failed",
+-          message: `Failed after ${RETRY_CONFIG.maxAttempts} retries and ${FALLBACK_CONFIG.maxRevertAttempts} message removals. Please start a new session.`,
+-          variant: "error",
+-          duration: 5000,
+-        },
+-      })
+-      .catch(() => {})
+-    return
+   }
+ 
+-  retryState.attempt++
+-  retryState.lastAttemptTime = Date.now()
++  const retryState = getOrCreateRetryState(autoCompactState, sessionID)
++
++  if (retryState.attempt < RETRY_CONFIG.maxAttempts) {
++    retryState.attempt++
++    retryState.lastAttemptTime = Date.now()
+ 
+-  try {
+     const providerID = msg.providerID as string | undefined
+     const modelID = msg.modelID as string | undefined
+ 
+     if (providerID && modelID) {
+-      await (client as Client).session.summarize({
+-        path: { id: sessionID },
+-        body: { providerID, modelID },
+-        query: { directory },
+-      })
+-
+-      clearSessionState(autoCompactState, sessionID)
+-
+-      setTimeout(async () => {
+-        try {
+-          await (client as Client).tui.submitPrompt({ query: { directory } })
+-        } catch {}
+-      }, 500)
++      try {
++        await (client as Client).tui
++          .showToast({
++            body: {
++              title: "Auto Compact",
++              message: `Summarizing session (attempt ${retryState.attempt}/${RETRY_CONFIG.maxAttempts})...`,
++              variant: "warning",
++              duration: 3000,
++            },
++          })
++          .catch(() => {})
++
++        await (client as Client).session.summarize({
++          path: { id: sessionID },
++          body: { providerID, modelID },
++          query: { directory },
++        })
++
++        clearSessionState(autoCompactState, sessionID)
++
++        setTimeout(async () => {
++          try {
++            await (client as Client).tui.submitPrompt({ query: { directory } })
++          } catch {}
++        }, 500)
++        return
++      } catch {
++        autoCompactState.compactionInProgress.delete(sessionID)
++
++        const delay = RETRY_CONFIG.initialDelayMs * Math.pow(RETRY_CONFIG.backoffFactor, retryState.attempt - 1)
++        const cappedDelay = Math.min(delay, RETRY_CONFIG.maxDelayMs)
++
++        setTimeout(() => {
++          executeCompact(sessionID, msg, autoCompactState, client, directory)
++        }, cappedDelay)
++        return
++      }
+     }
+-  } catch {
+-    const delay = calculateRetryDelay(retryState.attempt)
+-
+-    await (client as Client).tui
+-      .showToast({
+-        body: {
+-          title: "Auto Compact Retry",
+-          message: `Attempt ${retryState.attempt}/${RETRY_CONFIG.maxAttempts} failed. Retrying in ${Math.round(delay / 1000)}s...`,
+-          variant: "warning",
+-          duration: delay,
+-        },
+-      })
+-      .catch(() => {})
+-
+-    setTimeout(() => {
+-      executeCompact(sessionID, msg, autoCompactState, client, directory)
+-    }, delay)
+   }
++
++  const fallbackState = getOrCreateFallbackState(autoCompactState, sessionID)
++
++  if (fallbackState.revertAttempt < FALLBACK_CONFIG.maxRevertAttempts) {
++    const pair = await getLastMessagePair(sessionID, client as Client, directory)
++
++    if (pair) {
++      try {
++        await (client as Client).tui
++          .showToast({
++            body: {
++              title: "Emergency Recovery",
++              message: "Removing last message pair...",
++              variant: "warning",
++              duration: 3000,
++            },
++          })
++          .catch(() => {})
++
++        if (pair.assistantMessageID) {
++          await (client as Client).session.revert({
++            path: { id: sessionID },
++            body: { messageID: pair.assistantMessageID },
++            query: { directory },
++          })
++        }
++
++        await (client as Client).session.revert({
++          path: { id: sessionID },
++          body: { messageID: pair.userMessageID },
++          query: { directory },
++        })
++
++        fallbackState.revertAttempt++
++        fallbackState.lastRevertedMessageID = pair.userMessageID
++
++        retryState.attempt = 0
++        truncateState.truncateAttempt = 0
++
++        autoCompactState.compactionInProgress.delete(sessionID)
++
++        setTimeout(() => {
++          executeCompact(sessionID, msg, autoCompactState, client, directory)
++        }, 1000)
++        return
++      } catch {}
++    }
++  }
++
++  clearSessionState(autoCompactState, sessionID)
++
++  await (client as Client).tui
++    .showToast({
++      body: {
++        title: "Auto Compact Failed",
++        message: "All recovery attempts failed. Please start a new session.",
++        variant: "error",
++        duration: 5000,
++      },
++    })
++    .catch(() => {})
+ }
+diff --git a/src/hooks/anthropic-auto-compact/index.ts b/src/hooks/anthropic-auto-compact/index.ts
+index 54807637..3e4b560f 100644
+--- a/src/hooks/anthropic-auto-compact/index.ts
++++ b/src/hooks/anthropic-auto-compact/index.ts
+@@ -9,6 +9,8 @@ function createAutoCompactState(): AutoCompactState {
+     errorDataBySession: new Map<string, ParsedTokenLimitError>(),
+     retryStateBySession: new Map(),
+     fallbackStateBySession: new Map(),
++    truncateStateBySession: new Map(),
++    compactionInProgress: new Set<string>(),
+   }
+ }
+ 
+@@ -25,6 +27,8 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+         autoCompactState.errorDataBySession.delete(sessionInfo.id)
+         autoCompactState.retryStateBySession.delete(sessionInfo.id)
+         autoCompactState.fallbackStateBySession.delete(sessionInfo.id)
++        autoCompactState.truncateStateBySession.delete(sessionInfo.id)
++        autoCompactState.compactionInProgress.delete(sessionInfo.id)
+       }
+       return
+     }
+@@ -37,6 +41,37 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+       if (parsed) {
+         autoCompactState.pendingCompact.add(sessionID)
+         autoCompactState.errorDataBySession.set(sessionID, parsed)
++
++        if (autoCompactState.compactionInProgress.has(sessionID)) {
++          return
++        }
++
++        const lastAssistant = await getLastAssistant(sessionID, ctx.client, ctx.directory)
++        const providerID = parsed.providerID ?? (lastAssistant?.providerID as string | undefined)
++        const modelID = parsed.modelID ?? (lastAssistant?.modelID as string | undefined)
++
++        if (providerID && modelID) {
++          await ctx.client.tui
++            .showToast({
++              body: {
++                title: "Context Limit Hit",
++                message: "Truncating large tool outputs and recovering...",
++                variant: "warning" as const,
++                duration: 3000,
++              },
++            })
++            .catch(() => {})
++
++          setTimeout(() => {
++            executeCompact(
++              sessionID,
++              { providerID, modelID },
++              autoCompactState,
++              ctx.client,
++              ctx.directory
++            )
++          }, 300)
++        }
+       }
+       return
+     }
+@@ -122,6 +157,6 @@ export function createAnthropicAutoCompactHook(ctx: PluginInput) {
+   }
+ }
+ 
+-export type { AutoCompactState, FallbackState, ParsedTokenLimitError } from "./types"
++export type { AutoCompactState, FallbackState, ParsedTokenLimitError, TruncateState } from "./types"
+ export { parseAnthropicTokenLimitError } from "./parser"
+ export { executeCompact, getLastAssistant } from "./executor"
+diff --git a/src/hooks/anthropic-auto-compact/storage.ts b/src/hooks/anthropic-auto-compact/storage.ts
+new file mode 100644
+index 00000000..8b2e93b4
+--- /dev/null
++++ b/src/hooks/anthropic-auto-compact/storage.ts
+@@ -0,0 +1,163 @@
++import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
++import { join } from "node:path"
++import { xdgData } from "xdg-basedir"
++
++const OPENCODE_STORAGE = join(xdgData ?? "", "opencode", "storage")
++const MESSAGE_STORAGE = join(OPENCODE_STORAGE, "message")
++const PART_STORAGE = join(OPENCODE_STORAGE, "part")
++
++const TRUNCATION_MESSAGE =
++  "[TOOL RESULT TRUNCATED - Context limit exceeded. Original output was too large and has been truncated to recover the session. Please re-run this tool if you need the full output.]"
++
++interface StoredToolPart {
++  id: string
++  sessionID: string
++  messageID: string
++  type: "tool"
++  callID: string
++  tool: string
++  state: {
++    status: "pending" | "running" | "completed" | "error"
++    input: Record<string, unknown>
++    output?: string
++    error?: string
++  }
++  truncated?: boolean
++  originalSize?: number
++}
++
++export interface ToolResultInfo {
++  partPath: string
++  partId: string
++  messageID: string
++  toolName: string
++  outputSize: number
++}
++
++function getMessageDir(sessionID: string): string {
++  if (!existsSync(MESSAGE_STORAGE)) return ""
++
++  const directPath = join(MESSAGE_STORAGE, sessionID)
++  if (existsSync(directPath)) {
++    return directPath
++  }
++
++  for (const dir of readdirSync(MESSAGE_STORAGE)) {
++    const sessionPath = join(MESSAGE_STORAGE, dir, sessionID)
++    if (existsSync(sessionPath)) {
++      return sessionPath
++    }
++  }
++
++  return ""
++}
++
++function getMessageIds(sessionID: string): string[] {
++  const messageDir = getMessageDir(sessionID)
++  if (!messageDir || !existsSync(messageDir)) return []
++
++  const messageIds: string[] = []
++  for (const file of readdirSync(messageDir)) {
++    if (!file.endsWith(".json")) continue
++    const messageId = file.replace(".json", "")
++    messageIds.push(messageId)
++  }
++
++  return messageIds
++}
++
++export function findToolResultsBySize(sessionID: string): ToolResultInfo[] {
++  const messageIds = getMessageIds(sessionID)
++  const results: ToolResultInfo[] = []
++
++  for (const messageID of messageIds) {
++    const partDir = join(PART_STORAGE, messageID)
++    if (!existsSync(partDir)) continue
++
++    for (const file of readdirSync(partDir)) {
++      if (!file.endsWith(".json")) continue
++      try {
++        const partPath = join(partDir, file)
++        const content = readFileSync(partPath, "utf-8")
++        const part = JSON.parse(content) as StoredToolPart
++
++        if (part.type === "tool" && part.state?.output && !part.truncated) {
++          results.push({
++            partPath,
++            partId: part.id,
++            messageID,
++            toolName: part.tool,
++            outputSize: part.state.output.length,
++          })
++        }
++      } catch {
++        continue
++      }
++    }
++  }
++
++  return results.sort((a, b) => b.outputSize - a.outputSize)
++}
++
++export function findLargestToolResult(sessionID: string): ToolResultInfo | null {
++  const results = findToolResultsBySize(sessionID)
++  return results.length > 0 ? results[0] : null
++}
++
++export function truncateToolResult(partPath: string): {
++  success: boolean
++  toolName?: string
++  originalSize?: number
++} {
++  try {
++    const content = readFileSync(partPath, "utf-8")
++    const part = JSON.parse(content) as StoredToolPart
++
++    if (!part.state?.output) {
++      return { success: false }
++    }
++
++    const originalSize = part.state.output.length
++    const toolName = part.tool
++
++    part.truncated = true
++    part.originalSize = originalSize
++    part.state.output = TRUNCATION_MESSAGE
++
++    writeFileSync(partPath, JSON.stringify(part, null, 2))
++
++    return { success: true, toolName, originalSize }
++  } catch {
++    return { success: false }
++  }
++}
++
++export function getTotalToolOutputSize(sessionID: string): number {
++  const results = findToolResultsBySize(sessionID)
++  return results.reduce((sum, r) => sum + r.outputSize, 0)
++}
++
++export function countTruncatedResults(sessionID: string): number {
++  const messageIds = getMessageIds(sessionID)
++  let count = 0
++
++  for (const messageID of messageIds) {
++    const partDir = join(PART_STORAGE, messageID)
++    if (!existsSync(partDir)) continue
++
++    for (const file of readdirSync(partDir)) {
++      if (!file.endsWith(".json")) continue
++      try {
++        const content = readFileSync(join(partDir, file), "utf-8")
++        const part = JSON.parse(content)
++        if (part.truncated === true) {
++          count++
++        }
++      } catch {
++        continue
++      }
++    }
++  }
++
++  return count
++}
+diff --git a/src/hooks/anthropic-auto-compact/types.ts b/src/hooks/anthropic-auto-compact/types.ts
+index b76d09cd..7d58e1a7 100644
+--- a/src/hooks/anthropic-auto-compact/types.ts
++++ b/src/hooks/anthropic-auto-compact/types.ts
+@@ -17,11 +17,18 @@ export interface FallbackState {
+   lastRevertedMessageID?: string
+ }
+ 
++export interface TruncateState {
++  truncateAttempt: number
++  lastTruncatedPartId?: string
++}
++
+ export interface AutoCompactState {
+   pendingCompact: Set<string>
+   errorDataBySession: Map<string, ParsedTokenLimitError>
+   retryStateBySession: Map<string, RetryState>
+   fallbackStateBySession: Map<string, FallbackState>
++  truncateStateBySession: Map<string, TruncateState>
++  compactionInProgress: Set<string>
+ }
+ 
+ export const RETRY_CONFIG = {
+@@ -35,3 +42,8 @@ export const FALLBACK_CONFIG = {
+   maxRevertAttempts: 3,
+   minMessagesRequired: 2,
+ } as const
++
++export const TRUNCATE_CONFIG = {
++  maxTruncateAttempts: 10,
++  minOutputSizeToTruncate: 1000,
++} as const
+-- 
+2.39.2
+

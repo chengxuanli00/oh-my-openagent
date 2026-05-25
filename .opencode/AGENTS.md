@@ -43,6 +43,10 @@ Each skill follows the standard layout (`SKILL.md` + optional `scripts/`, `refer
 - **Trigger words** in the skill description determine when OpenCode loads the skill. Be specific.
 - **Commands are user-visible.** Name them with a leading `/` (the loader normalizes filename → command).
 
+## Skill 触发
+
+用户提及 "fork oh-my-openagent"、"OmO 安全检查"、"upstream tracking"、"prompt_append 路径拦截"、"resolve-file-uri 移除" 等话题时 → 加载 `omo-fork-maintenance` skill。该 skill 包含 OmO fork 维护全流程：代码修改、构建、插件切换、upstream 同步。
+
 ## ANTI-PATTERNS
 
 - Never duplicate a built-in skill from `src/features/builtin-skills/` here without a clear reason.

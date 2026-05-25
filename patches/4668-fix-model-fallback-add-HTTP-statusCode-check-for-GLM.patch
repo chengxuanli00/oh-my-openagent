@@ -1,0 +1,339 @@
+From 61d2f1195ba76719e57d207558324920cce89200 Mon Sep 17 00:00:00 2001
+From: cailgarrisk-collab <cailgarrisk-collab@users.noreply.github.com>
+Date: Sun, 3 May 2026 11:59:13 +0200
+Subject: [PATCH 4668/5749] fix(model-fallback): add HTTP statusCode check for
+ GLM rate limit fallback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+isRetryableModelError() now checks the HTTP status code (429/503/529)
+in addition to existing message pattern matching. This ensures rate
+limit errors trigger model fallback regardless of error message format
+or language (e.g., Chinese GLM errors).
+
+Changes:
+- ErrorInfo interface extended with statusCode?: number
+- isRetryableModelError() checks statusCode after STOP patterns, before
+  message pattern fallback
+- extractErrorStatusCode() added to error-classifier.ts (supports
+  statusCode, status, code, response.status fields)
+- GLM-specific STOP patterns added: daily call limit, in arrears,
+  fair use policy, recharge and try — these prevent quota/billing 429s
+  from being treated as transient rate limits
+- statusCode propagated through tryFallbackRetry and manager.ts
+
+400 intentionally excluded from statusCode check (permanent client error).
+---
+ .../background-agent/error-classifier.ts      |  27 ++++
+ .../fallback-retry-handler.ts                 |   2 +-
+ src/features/background-agent/manager.ts      |   8 +-
+ src/shared/model-error-classifier.test.ts     | 135 +++++++++++++++++-
+ src/shared/model-error-classifier.ts          |  19 +++
+ 5 files changed, 187 insertions(+), 4 deletions(-)
+
+diff --git a/src/features/background-agent/error-classifier.ts b/src/features/background-agent/error-classifier.ts
+index 523f61bc..7fbfd031 100644
+--- a/src/features/background-agent/error-classifier.ts
++++ b/src/features/background-agent/error-classifier.ts
+@@ -65,6 +65,33 @@ export function extractErrorMessage(error: unknown): string | undefined {
+   }
+ }
+ 
++export function extractErrorStatusCode(error: unknown): number | undefined {
++  if (!isRecord(error)) return undefined
++
++  for (const key of ["statusCode", "status", "code"]) {
++    const val = (error as Record<string, unknown>)[key]
++    if (typeof val === "number" && val >= 100 && val < 600) return val
++  }
++
++  const statusVal = (error as Record<string, unknown>)["status"]
++  if (typeof statusVal === "string") {
++    const parsed = parseInt(statusVal, 10)
++    if (parsed >= 100 && parsed < 600) return parsed
++  }
++
++  const responseRaw = (error as Record<string, unknown>)["response"]
++  if (isRecord(responseRaw)) {
++    const respStatus = responseRaw["status"]
++    if (typeof respStatus === "number" && respStatus >= 100 && respStatus < 600) return respStatus
++    if (typeof respStatus === "string") {
++      const parsed = parseInt(respStatus, 10)
++      if (parsed >= 100 && parsed < 600) return parsed
++    }
++  }
++
++  return undefined
++}
++
+ interface EventPropertiesLike {
+   [key: string]: unknown
+ }
+diff --git a/src/features/background-agent/fallback-retry-handler.ts b/src/features/background-agent/fallback-retry-handler.ts
+index f5f31a6a..ab8bba91 100644
+--- a/src/features/background-agent/fallback-retry-handler.ts
++++ b/src/features/background-agent/fallback-retry-handler.ts
+@@ -19,7 +19,7 @@ function canonicalizeModelID(modelID: string): string {
+ 
+ export async function tryFallbackRetry(args: {
+   task: BackgroundTask
+-  errorInfo: { name?: string; message?: string }
++  errorInfo: { name?: string; message?: string; statusCode?: number }
+   source: string
+   concurrencyManager: ConcurrencyManager
+   client: OpencodeClient
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 9442c23d..d033b350 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -46,6 +46,7 @@ import {
+   isAbortedSessionError,
+   extractErrorName,
+   extractErrorMessage,
++  extractErrorStatusCode,
+   getSessionErrorMessage,
+   isRecord,
+ } from "./error-classifier"
+@@ -749,6 +750,7 @@ The fallback retry session is now created and can be inspected directly.
+         const errorInfo = {
+           name: extractErrorName(error),
+           message: extractErrorMessage(error),
++          statusCode: extractErrorStatusCode(error),
+         }
+         if (await this.tryFallbackRetry(existingTask, errorInfo, "promptAsync.launch")) {
+           return
+@@ -1079,6 +1081,7 @@ The fallback retry session is now created and can be inspected directly.
+       const errorInfo = {
+         name: extractErrorName(error),
+         message: extractErrorMessage(error),
++        statusCode: extractErrorStatusCode(error),
+       }
+       if (await this.tryFallbackRetry(existingTask, errorInfo, "promptAsync.resume")) {
+         return
+@@ -1199,6 +1202,7 @@ The fallback retry session is now created and can be inspected directly.
+       const errorInfo = {
+         name: extractErrorName(assistantError),
+         message: extractErrorMessage(assistantError),
++        statusCode: extractErrorStatusCode(assistantError),
+       }
+       void this.tryFallbackRetry(task, errorInfo, "message.updated").catch((error) => {
+         log("[background-agent] Error handling message.updated fallback retry:", {
+@@ -1444,7 +1448,7 @@ The fallback retry session is now created and can be inspected directly.
+ 
+   private async handleSessionErrorEvent(args: {
+     task: BackgroundTask
+-    errorInfo: { name?: string; message?: string }
++    errorInfo: { name?: string; message?: string; statusCode?: number }
+     errorName: string | undefined
+     errorMessage: string | undefined
+   }): Promise<void> {
+@@ -1532,7 +1536,7 @@ The fallback retry session is now created and can be inspected directly.
+ 
+   private tryFallbackRetry(
+     task: BackgroundTask,
+-    errorInfo: { name?: string; message?: string },
++    errorInfo: { name?: string; message?: string; statusCode?: number },
+     source: string,
+   ): Promise<boolean> {
+     const previousSessionID = task.sessionId
+diff --git a/src/shared/model-error-classifier.test.ts b/src/shared/model-error-classifier.test.ts
+index c7f41ef4..33fd3f4c 100644
+--- a/src/shared/model-error-classifier.test.ts
++++ b/src/shared/model-error-classifier.test.ts
+@@ -3,7 +3,7 @@ const { describe, expect, test, beforeEach, afterEach, mock, spyOn } = require("
+ import * as connectedProvidersCache from "./connected-providers-cache"
+ 
+ let readConnectedProvidersCacheSpy: ReturnType<typeof spyOn> | undefined
+-const { shouldRetryError, selectFallbackProvider } = await import("./model-error-classifier")
++const { shouldRetryError, selectFallbackProvider, isRetryableModelError } = await import("./model-error-classifier")
+ 
+ describe("model-error-classifier", () => {
+   beforeEach(() => {
+@@ -270,6 +270,139 @@ describe("model-error-classifier", () => {
+     //#then
+     expect(result).toBe(false)
+   })
++
++  test("GLM 429 rate limit with statusCode and Chinese message triggers fallback (statusCode check)", () => {
++    //#given
++    const error = { statusCode: 429, message: "请求频率过高" }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(true)
++  })
++
++  test("GLM 429 rate limit with statusCode and no message at all triggers fallback", () => {
++    //#given
++    const error = { statusCode: 429 }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(true)
++  })
++
++  test("GLM 503 service unavailable with statusCode triggers fallback", () => {
++    //#given
++    const error = { statusCode: 503, message: "Service Unavailable" }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(true)
++  })
++
++  test("GLM 529 overloaded with statusCode triggers fallback", () => {
++    //#given
++    const error = { statusCode: 529 }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(true)
++  })
++
++  test("HTTP 400 with statusCode does NOT trigger fallback via statusCode alone (400 excluded)", () => {
++    //#given — message does NOT match any retryable pattern
++    const error = { statusCode: 400, message: "Invalid parameter: model_name" }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(false)
++  })
++
++  test("HTTP 401 with statusCode does NOT trigger fallback (not a rate limit)", () => {
++    //#given
++    const error = { statusCode: 401, message: "Unauthorized" }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(false)
++  })
++
++  test("GLM code 1304 daily quota 429 does NOT trigger fallback (STOP pattern wins)", () => {
++    //#given
++    const error = {
++      statusCode: 429,
++      message: "Daily call limit for this API key has been reached. Limit will reset at midnight UTC.",
++    }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(false)
++  })
++
++  test("GLM account in arrears 429 does NOT trigger fallback (STOP pattern wins)", () => {
++    //#given
++    const error = {
++      statusCode: 429,
++      message: "Your account is in arrears, please recharge and try again.",
++    }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(false)
++  })
++
++  test("GLM fair use policy violation 429 does NOT trigger fallback (STOP pattern wins)", () => {
++    //#given
++    const error = {
++      statusCode: 429,
++      message: "Request blocked under Fair Use Policy. Your request rate has been restricted.",
++    }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(false)
++  })
++
++  test("STOP message pattern takes precedence over 429 statusCode", () => {
++    //#given
++    const error = {
++      statusCode: 429,
++      message: "quota exceeded for this account, usage limit has been reached",
++    }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(false)
++  })
++
++  test("rate limit message without statusCode still works (backward compat)", () => {
++    //#given
++    const error = { message: "rate limit reached for requests" }
++
++    //#when
++    const result = isRetryableModelError(error)
++
++    //#then
++    expect(result).toBe(true)
++  })
+ })
+ 
+ export {}
+diff --git a/src/shared/model-error-classifier.ts b/src/shared/model-error-classifier.ts
+index 2c74d083..fb3fdf48 100644
+--- a/src/shared/model-error-classifier.ts
++++ b/src/shared/model-error-classifier.ts
+@@ -99,6 +99,13 @@ const STOP_MESSAGE_PATTERNS = [
+   "credit balance",
+   "usage limit for this month",
+   "exhausted your capacity",
++  // GLM/Z.ai business error codes that indicate permanent quota/billing exhaustion
++  "daily call limit",
++  "daily limit",
++  "usage limit reached for",
++  "in arrears",
++  "fair use policy",
++  "recharge and try",
+ ]
+ 
+ const AUTO_RETRY_GATE_PATTERNS = [
+@@ -117,6 +124,8 @@ function hasProviderAutoRetrySignal(message: string): boolean {
+ export interface ErrorInfo {
+   name?: string
+   message?: string
++  /** HTTP status code from the provider response (e.g., 429 for rate limit) */
++  statusCode?: number
+ }
+ 
+ /**
+@@ -151,6 +160,16 @@ export function isRetryableModelError(error: ErrorInfo): boolean {
+   if (hasProviderAutoRetrySignal(msg)) {
+     return true
+   }
++
++  // HTTP status code check: catches rate-limit errors regardless of message format/language.
++  // Uses the same codes as runtime-fallback config (400 excluded as it is a permanent client error).
++  if (
++    error.statusCode != null &&
++    (error.statusCode === 429 || error.statusCode === 503 || error.statusCode === 529)
++  ) {
++    return true
++  }
++
+   return RETRYABLE_MESSAGE_PATTERNS.some((pattern) => msg.includes(pattern))
+ }
+ 
+-- 
+2.39.2
+

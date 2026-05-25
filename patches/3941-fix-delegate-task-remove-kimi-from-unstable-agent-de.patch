@@ -1,0 +1,463 @@
+From d5dfaaa3ad496d260111b6a0b5142742893016aa Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 5 Apr 2026 15:30:36 +0900
+Subject: [PATCH 3941/5749] fix(delegate-task): remove kimi from unstable agent
+ detection, harden callID resolution for metadata store
+
+- Remove kimi from auto-detected unstable agents in category-resolver (only gemini/minimax remain)
+- Add resolveCallID() to safely resolve callID/callId/call_id variants from tool context
+- Use resolveCallID across all 5 delegate task execution paths (sync, background, unstable, continuations)
+- Update writing category test to verify kimi runs sync when kimi provider is available
+- Add atlas metadata preservation tests confirming tool-execute-after does not clobber metadata
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/hooks/atlas/index.test.ts                 | 91 +++++++++++++++++++
+ .../delegate-task/background-continuation.ts  |  6 +-
+ src/tools/delegate-task/background-task.ts    |  6 +-
+ src/tools/delegate-task/category-resolver.ts  |  2 +-
+ .../delegate-task/resolve-call-id.test.ts     | 40 ++++++++
+ src/tools/delegate-task/resolve-call-id.ts    |  5 +
+ src/tools/delegate-task/sync-continuation.ts  |  6 +-
+ src/tools/delegate-task/sync-task.ts          |  6 +-
+ src/tools/delegate-task/tools.test.ts         | 70 +++++++-------
+ .../delegate-task/unstable-agent-task.ts      |  6 +-
+ 10 files changed, 196 insertions(+), 42 deletions(-)
+ create mode 100644 src/tools/delegate-task/resolve-call-id.test.ts
+ create mode 100644 src/tools/delegate-task/resolve-call-id.ts
+
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index 9f10b101..a336ad24 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -248,6 +248,91 @@ describe("atlas hook", () => {
+       cleanupMessageStorage(sessionID)
+     })
+ 
++    test("should preserve metadata when transforming output for boulder orchestrator", async () => {
++      // given - Atlas caller with boulder state and metadata containing sessionId
++      const sessionID = "session-metadata-preserve-test"
++      setupMessageStorage(sessionID, "atlas")
++
++      const planPath = join(TEST_DIR, "metadata-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: ["session-1"],
++        plan_name: "metadata-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const hook = createAtlasHook(createMockPluginInput())
++      const output = {
++        title: "Sisyphus Task",
++        output: `Task completed
++
++<task_metadata>
++session_id: ses_subagent_abc
++</task_metadata>`,
++        metadata: {
++          sessionId: "ses_subagent_abc",
++          agent: "sisyphus-junior",
++          category: "quick",
++          truncated: false,
++        } as Record<string, unknown>,
++      }
++
++      // when
++      await hook["tool.execute.after"](
++        { tool: "task", sessionID },
++        output
++      )
++
++      // then - output is transformed but metadata is preserved
++      expect(output.output).toContain("SUBAGENT WORK COMPLETED")
++      expect(output.metadata.sessionId).toBe("ses_subagent_abc")
++      expect(output.metadata.agent).toBe("sisyphus-junior")
++      expect(output.metadata.category).toBe("quick")
++      expect(output.metadata.truncated).toBe(false)
++
++      cleanupMessageStorage(sessionID)
++    })
++
++    test("should preserve metadata when appending standalone verification reminder", async () => {
++      // given - Atlas caller without boulder state, metadata containing sessionId
++      const sessionID = "session-standalone-metadata-test"
++      setupMessageStorage(sessionID, "atlas")
++
++      const hook = createAtlasHook(createMockPluginInput())
++      const output = {
++        title: "Sisyphus Task",
++        output: `Task completed
++
++<task_metadata>
++session_id: ses_standalone_def
++</task_metadata>`,
++        metadata: {
++          sessionId: "ses_standalone_def",
++          agent: "sisyphus-junior",
++          model: { providerID: "openai", modelID: "gpt-5.4" },
++          truncated: false,
++        } as Record<string, unknown>,
++      }
++
++      // when
++      await hook["tool.execute.after"](
++        { tool: "task", sessionID },
++        output
++      )
++
++      // then - standalone verification appended but metadata preserved
++      expect(output.output).toContain("LYING")
++      expect(output.metadata.sessionId).toBe("ses_standalone_def")
++      expect(output.metadata.agent).toBe("sisyphus-junior")
++      expect(output.metadata.model).toEqual({ providerID: "openai", modelID: "gpt-5.4" })
++      expect(output.metadata.truncated).toBe(false)
++
++      cleanupMessageStorage(sessionID)
++    })
++
+      test("should still transform when plan is complete (shows progress)", async () => {
+        // given - boulder state with complete plan, Atlas caller
+        const sessionID = "session-complete-plan-test"
+@@ -2103,10 +2188,14 @@ session_id: ses_untrusted_999
+       let nextFakeId = 99000
+       const originalSetTimeout = globalThis.setTimeout
+       const originalClearTimeout = globalThis.clearTimeout
++      const originalDateNow = Date.now
++      let fakeNow = 0
+ 
+       beforeEach(() => {
+         capturedTimers.clear()
+         nextFakeId = 99000
++        fakeNow = 10000
++        Date.now = () => fakeNow
+ 
+         globalThis.setTimeout = ((callback: Function, delay?: number, ...args: unknown[]) => {
+           const normalized = typeof delay === "number" ? delay : 0
+@@ -2131,12 +2220,14 @@ session_id: ses_untrusted_999
+       afterEach(() => {
+         globalThis.setTimeout = originalSetTimeout
+         globalThis.clearTimeout = originalClearTimeout
++        Date.now = originalDateNow
+       })
+ 
+       async function firePendingTimers(): Promise<void> {
+         for (const [id, entry] of capturedTimers) {
+           if (!entry.cleared) {
+             capturedTimers.delete(id)
++            fakeNow += 6000
+             await entry.callback()
+           }
+         }
+diff --git a/src/tools/delegate-task/background-continuation.ts b/src/tools/delegate-task/background-continuation.ts
+index f7f79390..aa8fecc3 100644
+--- a/src/tools/delegate-task/background-continuation.ts
++++ b/src/tools/delegate-task/background-continuation.ts
+@@ -3,6 +3,7 @@ import type { ExecutorContext, ParentContext } from "./executor-types"
+ import { storeToolMetadata } from "../../features/tool-metadata-store"
+ import { formatDetailedError } from "./error-formatting"
+ import { getSessionTools } from "../../shared/session-tools-store"
++import { resolveCallID } from "./resolve-call-id"
+ 
+ export async function executeBackgroundContinuation(
+   args: DelegateTaskArgs,
+@@ -37,8 +38,9 @@ export async function executeBackgroundContinuation(
+       },
+     }
+     await ctx.metadata?.(bgContMeta)
+-    if (ctx.callID) {
+-      storeToolMetadata(ctx.sessionID, ctx.callID, bgContMeta)
++    const callID = resolveCallID(ctx)
++    if (callID) {
++      storeToolMetadata(ctx.sessionID, callID, bgContMeta)
+     }
+ 
+     return `Background task continued.
+diff --git a/src/tools/delegate-task/background-task.ts b/src/tools/delegate-task/background-task.ts
+index 9b4842cb..937de5c3 100644
+--- a/src/tools/delegate-task/background-task.ts
++++ b/src/tools/delegate-task/background-task.ts
+@@ -4,6 +4,7 @@ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { getTimingConfig } from "./timing"
+ import { buildTaskPrompt } from "./prompt-builder"
+ import { storeToolMetadata } from "../../features/tool-metadata-store"
++import { resolveCallID } from "./resolve-call-id"
+ import { formatDetailedError } from "./error-formatting"
+ import { getSessionTools } from "../../shared/session-tools-store"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+@@ -132,8 +133,9 @@ export async function executeBackgroundTask(
+       metadata,
+     }
+     await ctx.metadata?.(unstableMeta)
+-    if (ctx.callID) {
+-      storeToolMetadata(ctx.sessionID, ctx.callID, unstableMeta)
++    const callID = resolveCallID(ctx)
++    if (callID) {
++      storeToolMetadata(ctx.sessionID, callID, unstableMeta)
+     }
+ 
+     const taskMetadataBlock = sessionId
+diff --git a/src/tools/delegate-task/category-resolver.ts b/src/tools/delegate-task/category-resolver.ts
+index ffcfd188..366c7756 100644
+--- a/src/tools/delegate-task/category-resolver.ts
++++ b/src/tools/delegate-task/category-resolver.ts
+@@ -234,7 +234,7 @@ Available categories: ${categoryNames.join(", ")}`,
+   }
+ 
+   const resolvedModel = actualModel?.toLowerCase()
+-  const isUnstableAgent = resolved.config.is_unstable_agent ?? (resolvedModel ? resolvedModel.includes("gemini") || resolvedModel.includes("minimax") || resolvedModel.includes("kimi") : false)
++  const isUnstableAgent = resolved.config.is_unstable_agent ?? (resolvedModel ? resolvedModel.includes("gemini") || resolvedModel.includes("minimax") : false)
+ 
+   const defaultProviderID = categoryModel?.providerID
+     ?? parseModelString(actualModel ?? "")?.providerID
+diff --git a/src/tools/delegate-task/resolve-call-id.test.ts b/src/tools/delegate-task/resolve-call-id.test.ts
+new file mode 100644
+index 00000000..7b4da140
+--- /dev/null
++++ b/src/tools/delegate-task/resolve-call-id.test.ts
+@@ -0,0 +1,40 @@
++import { describe, test, expect } from "bun:test"
++import { resolveCallID } from "./resolve-call-id"
++import type { ToolContextWithMetadata } from "./types"
++
++describe("resolveCallID", () => {
++  function makeCtx(overrides: Partial<ToolContextWithMetadata> = {}): ToolContextWithMetadata {
++    return {
++      sessionID: "ses_test",
++      messageID: "msg_test",
++      agent: "sisyphus",
++      abort: new AbortController().signal,
++      ...overrides,
++    }
++  }
++
++  test("#given callID is set #then returns callID", () => {
++    const ctx = makeCtx({ callID: "call_abc" })
++    expect(resolveCallID(ctx)).toBe("call_abc")
++  })
++
++  test("#given only callId is set #then returns callId", () => {
++    const ctx = makeCtx({ callId: "call_def" })
++    expect(resolveCallID(ctx)).toBe("call_def")
++  })
++
++  test("#given only call_id is set #then returns call_id", () => {
++    const ctx = makeCtx({ call_id: "call_ghi" })
++    expect(resolveCallID(ctx)).toBe("call_ghi")
++  })
++
++  test("#given callID and callId are both set #then prefers callID", () => {
++    const ctx = makeCtx({ callID: "preferred", callId: "fallback" })
++    expect(resolveCallID(ctx)).toBe("preferred")
++  })
++
++  test("#given no call ID variants are set #then returns undefined", () => {
++    const ctx = makeCtx()
++    expect(resolveCallID(ctx)).toBeUndefined()
++  })
++})
+diff --git a/src/tools/delegate-task/resolve-call-id.ts b/src/tools/delegate-task/resolve-call-id.ts
+new file mode 100644
+index 00000000..cfa3b747
+--- /dev/null
++++ b/src/tools/delegate-task/resolve-call-id.ts
+@@ -0,0 +1,5 @@
++import type { ToolContextWithMetadata } from "./types"
++
++export function resolveCallID(ctx: ToolContextWithMetadata): string | undefined {
++  return ctx.callID ?? ctx.callId ?? ctx.call_id
++}
+diff --git a/src/tools/delegate-task/sync-continuation.ts b/src/tools/delegate-task/sync-continuation.ts
+index 5abe635c..fa6f9f02 100644
+--- a/src/tools/delegate-task/sync-continuation.ts
++++ b/src/tools/delegate-task/sync-continuation.ts
+@@ -2,6 +2,7 @@ import type { DelegateTaskArgs, ToolContextWithMetadata } from "./types"
+ import type { ExecutorContext, SessionMessage } from "./executor-types"
+ import { isPlanFamily } from "./constants"
+ import { storeToolMetadata } from "../../features/tool-metadata-store"
++import { resolveCallID } from "./resolve-call-id"
+ import { getTaskToastManager } from "../../features/task-toast-manager"
+ import { getAgentToolRestrictions } from "../../shared/agent-tool-restrictions"
+ import { getMessageDir } from "../../shared"
+@@ -78,8 +79,9 @@ export async function executeSyncContinuation(
+       },
+     }
+     await ctx.metadata?.(syncContMeta)
+-    if (ctx.callID) {
+-      storeToolMetadata(ctx.sessionID, ctx.callID, syncContMeta)
++    const callID = resolveCallID(ctx)
++    if (callID) {
++      storeToolMetadata(ctx.sessionID, callID, syncContMeta)
+     }
+ 
+     const allowTask = isPlanFamily(resumeAgent)
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index b8700154..07372d8a 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -3,6 +3,7 @@ import type { DelegateTaskArgs, ToolContextWithMetadata, DelegatedModelConfig }
+ import type { ExecutorContext, ParentContext } from "./executor-types"
+ import { getTaskToastManager } from "../../features/task-toast-manager"
+ import { storeToolMetadata } from "../../features/tool-metadata-store"
++import { resolveCallID } from "./resolve-call-id"
+ import { subagentSessions, syncSubagentSessions, setSessionAgent } from "../../features/claude-code-session-state"
+ import { log } from "../../shared/logger"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+@@ -114,8 +115,9 @@ export async function executeSyncTask(
+       },
+     }
+     await ctx.metadata?.(syncTaskMeta)
+-    if (ctx.callID) {
+-      storeToolMetadata(ctx.sessionID, ctx.callID, syncTaskMeta)
++    const callID = resolveCallID(ctx)
++    if (callID) {
++      storeToolMetadata(ctx.sessionID, callID, syncTaskMeta)
+     }
+ 
+     const promptError = await deps.sendSyncPrompt(client, {
+diff --git a/src/tools/delegate-task/tools.test.ts b/src/tools/delegate-task/tools.test.ts
+index 761aaf7a..ac2fc1b2 100644
+--- a/src/tools/delegate-task/tools.test.ts
++++ b/src/tools/delegate-task/tools.test.ts
+@@ -2368,60 +2368,68 @@ describe("sisyphus-task", () => {
+       expect(result).toContain("Artistry result here")
+     }, { timeout: 20000 })
+ 
+-    test("writing category (kimi) with run_in_background=false should force background but wait for result", async () => {
+-      // given - writing uses kimi-for-coding/k2p5
++    test("writing category (kimi) with run_in_background=false should run sync when kimi provider is available", async () => {
++      // given - writing uses kimi model which is no longer considered unstable
++      // Override provider cache to include kimi-for-coding provider
++      providerModelsSpy.mockReturnValue({
++        models: {
++          anthropic: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
++          google: ["gemini-3.1-pro", "gemini-3-flash"],
++          openai: ["gpt-5.4", "gpt-5.3-codex"],
++          "kimi-for-coding": ["k2p5"],
++        },
++        connected: ["anthropic", "google", "openai", "kimi-for-coding"],
++        updatedAt: "2026-01-01T00:00:00.000Z",
++      })
++      cacheSpy.mockReturnValue(["anthropic", "google", "openai", "kimi-for-coding"])
++
+       const { createDelegateTask } = require("./tools")
+       let launchCalled = false
+-      
+-      const launchedTask = {
+-        id: "task-writing",
+-        sessionID: "ses_writing_gemini",
+-        description: "Writing gemini task",
+-        agent: "sisyphus-junior",
+-        status: "running",
+-      }
++      let promptCalled = false
++
+       const mockManager = {
+         launch: async () => {
+           launchCalled = true
+-          return launchedTask
++          return { id: "should-not-be-called", sessionID: "x", description: "x", agent: "x", status: "running" }
+         },
+-        getTask: () => launchedTask,
+       }
+-      
++
++       const promptMock = async () => {
++         promptCalled = true
++         return { data: {} }
++       }
++
+        const mockClient = {
+          app: { agents: async () => ({ data: [] }) },
+          config: { get: async () => ({ data: { model: SYSTEM_DEFAULT_MODEL } }) },
+-         model: { list: async () => [{ provider: "google", id: "gemini-3-flash" }] },
+          session: {
+            get: async () => ({ data: { directory: "/project" } }),
+-           create: async () => ({ data: { id: "ses_writing_gemini" } }),
+-           prompt: async () => ({ data: {} }),
+-           promptAsync: async () => ({ data: {} }),
++           create: async () => ({ data: { id: "ses_writing_kimi" } }),
++           prompt: promptMock,
++           promptAsync: promptMock,
+            messages: async () => ({
+-             data: [
+-               { info: { role: "assistant", time: { created: Date.now() } }, parts: [{ type: "text", text: "Writing result here" }] }
+-             ]
++             data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "Writing result here" }] }]
+            }),
+-           status: async () => ({ data: { "ses_writing_gemini": { type: "idle" } } }),
++           status: async () => ({ data: { "ses_writing_kimi": { type: "idle" } } }),
+          },
+        }
+-       
++
+        const tool = createDelegateTask({
+          manager: mockManager,
+          client: mockClient,
+        })
+-      
++
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+         agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+-      
+-      // when - writing category (gemini-3-flash)
++
++      // when - writing category (kimi) with run_in_background=false
+       const result = await tool.execute(
+         {
+-          description: "Test writing forced background",
++          description: "Test writing sync",
+           prompt: "Write something",
+           category: "writing",
+           run_in_background: false,
+@@ -2429,11 +2437,11 @@ describe("sisyphus-task", () => {
+         },
+         toolContext
+       )
+-      
+-      // then - should launch as background BUT wait for and return actual result
+-      expect(launchCalled).toBe(true)
+-      expect(result).toContain("SUPERVISED TASK COMPLETED")
+-      expect(result).toContain("Writing result here")
++
++      // then - should run sync, NOT forced to background (kimi is not unstable)
++      expect(launchCalled).toBe(false)
++      expect(promptCalled).toBe(true)
++      expect(result).not.toContain("SUPERVISED TASK COMPLETED")
+     }, { timeout: 20000 })
+ 
+     test("is_unstable_agent=true should force background but wait for result", async () => {
+diff --git a/src/tools/delegate-task/unstable-agent-task.ts b/src/tools/delegate-task/unstable-agent-task.ts
+index 57f517e1..7d10780c 100644
+--- a/src/tools/delegate-task/unstable-agent-task.ts
++++ b/src/tools/delegate-task/unstable-agent-task.ts
+@@ -4,6 +4,7 @@ import { DEFAULT_SYNC_POLL_TIMEOUT_MS, getTimingConfig } from "./timing"
+ import { buildTaskPrompt } from "./prompt-builder"
+ import { cancelUnstableAgentTask } from "./cancel-unstable-agent-task"
+ import { storeToolMetadata } from "../../features/tool-metadata-store"
++import { resolveCallID } from "./resolve-call-id"
+ import { formatDuration } from "./time-formatter"
+ import { formatDetailedError } from "./error-formatting"
+ import { getSessionTools } from "../../shared/session-tools-store"
+@@ -81,8 +82,9 @@ export async function executeUnstableAgentTask(
+       },
+     }
+     await ctx.metadata?.(bgTaskMeta)
+-    if (ctx.callID) {
+-      storeToolMetadata(ctx.sessionID, ctx.callID, bgTaskMeta)
++    const callID = resolveCallID(ctx)
++    if (callID) {
++      storeToolMetadata(ctx.sessionID, callID, bgTaskMeta)
+     }
+ 
+     const startTime = new Date()
+-- 
+2.39.2
+

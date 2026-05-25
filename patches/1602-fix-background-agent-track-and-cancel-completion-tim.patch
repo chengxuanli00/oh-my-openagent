@@ -1,0 +1,178 @@
+From bb181ee572537bc3f075a7ad8839a6429dd47cba Mon Sep 17 00:00:00 2001
+From: Sisyphus <sisyphus@mengmota.com>
+Date: Sat, 31 Jan 2026 16:26:01 +0900
+Subject: [PATCH 1602/5749] fix(background-agent): track and cancel completion
+ timers to prevent memory leaks (#1058)
+
+Track setTimeout timers in notifyParentSession using a completionTimers Map.
+Clear all timers on shutdown() and when tasks are deleted via session.deleted.
+This prevents the BackgroundManager instance from being held in memory by
+uncancelled timer callbacks.
+
+Fixes #1043
+
+Co-authored-by: sisyphus-dev-ai <sisyphus-dev-ai@users.noreply.github.com>
+---
+ src/features/background-agent/manager.test.ts | 92 +++++++++++++++++++
+ src/features/background-agent/manager.ts      | 18 +++-
+ 2 files changed, 106 insertions(+), 4 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 0ae1c266..af67852d 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -2087,3 +2087,95 @@ describe("BackgroundManager.shutdown session abort", () => {
+   })
+ })
+ 
++describe("BackgroundManager.completionTimers - Memory Leak Fix", () => {
++  function getCompletionTimers(manager: BackgroundManager): Map<string, ReturnType<typeof setTimeout>> {
++    return (manager as unknown as { completionTimers: Map<string, ReturnType<typeof setTimeout>> }).completionTimers
++  }
++
++  function setCompletionTimer(manager: BackgroundManager, taskId: string): void {
++    const completionTimers = getCompletionTimers(manager)
++    const timer = setTimeout(() => {
++      completionTimers.delete(taskId)
++    }, 5 * 60 * 1000)
++    completionTimers.set(taskId, timer)
++  }
++
++  test("should have completionTimers Map initialized", () => {
++    // #given
++    const manager = createBackgroundManager()
++
++    // #when
++    const completionTimers = getCompletionTimers(manager)
++
++    // #then
++    expect(completionTimers).toBeDefined()
++    expect(completionTimers).toBeInstanceOf(Map)
++    expect(completionTimers.size).toBe(0)
++
++    manager.shutdown()
++  })
++
++  test("should clear all completion timers on shutdown", () => {
++    // #given
++    const manager = createBackgroundManager()
++    setCompletionTimer(manager, "task-1")
++    setCompletionTimer(manager, "task-2")
++
++    const completionTimers = getCompletionTimers(manager)
++    expect(completionTimers.size).toBe(2)
++
++    // #when
++    manager.shutdown()
++
++    // #then
++    expect(completionTimers.size).toBe(0)
++  })
++
++  test("should cancel timer when task is deleted via session.deleted", () => {
++    // #given
++    const manager = createBackgroundManager()
++    const task: BackgroundTask = {
++      id: "task-timer-4",
++      sessionID: "session-timer-4",
++      parentSessionID: "parent-session",
++      parentMessageID: "msg-1",
++      description: "Test task",
++      prompt: "test",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(),
++    }
++    getTaskMap(manager).set(task.id, task)
++    setCompletionTimer(manager, task.id)
++
++    const completionTimers = getCompletionTimers(manager)
++    expect(completionTimers.size).toBe(1)
++
++    // #when
++    manager.handleEvent({
++      type: "session.deleted",
++      properties: {
++        info: { id: "session-timer-4" },
++      },
++    })
++
++    // #then
++    expect(completionTimers.has(task.id)).toBe(false)
++
++    manager.shutdown()
++  })
++
++  test("should not leak timers across multiple shutdown calls", () => {
++    // #given
++    const manager = createBackgroundManager()
++    setCompletionTimer(manager, "task-1")
++
++    // #when
++    manager.shutdown()
++    manager.shutdown()
++
++    // #then
++    const completionTimers = getCompletionTimers(manager)
++    expect(completionTimers.size).toBe(0)
++  })
++})
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index a9c6b701..de385fe8 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -83,6 +83,7 @@ export class BackgroundManager {
+ 
+   private queuesByKey: Map<string, QueueItem[]> = new Map()
+   private processingKeys: Set<string> = new Set()
++  private completionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+ 
+   constructor(
+     ctx: PluginInput,
+@@ -708,7 +709,11 @@ export class BackgroundManager {
+          this.concurrencyManager.release(task.concurrencyKey)
+          task.concurrencyKey = undefined
+        }
+-      // Clean up pendingByParent to prevent stale entries
++      const existingTimer = this.completionTimers.get(task.id)
++      if (existingTimer) {
++        clearTimeout(existingTimer)
++        this.completionTimers.delete(task.id)
++      }
+       this.cleanupPendingByParent(task)
+       this.tasks.delete(task.id)
+       this.clearNotificationsForTask(task.id)
+@@ -1073,14 +1078,15 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+     }
+ 
+     const taskId = task.id
+-    setTimeout(() => {
+-      // Guard: Only delete if task still exists (could have been deleted by session.deleted event)
++    const timer = setTimeout(() => {
++      this.completionTimers.delete(taskId)
+       if (this.tasks.has(taskId)) {
+         this.clearNotificationsForTask(taskId)
+         this.tasks.delete(taskId)
+         log("[background-agent] Removed completed task from memory:", taskId)
+       }
+     }, 5 * 60 * 1000)
++    this.completionTimers.set(taskId, timer)
+   }
+ 
+   private formatDuration(start: Date, end?: Date): string {
+@@ -1375,7 +1381,11 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+       }
+     }
+ 
+-    // Then clear all state (cancels any remaining waiters)
++    for (const timer of this.completionTimers.values()) {
++      clearTimeout(timer)
++    }
++    this.completionTimers.clear()
++
+     this.concurrencyManager.clear()
+     this.tasks.clear()
+     this.notifications.clear()
+-- 
+2.39.2
+

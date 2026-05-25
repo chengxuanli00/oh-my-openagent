@@ -1,0 +1,196 @@
+From fd71c89b95dce1b110d6b4db779f55effcd480d0 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 13 Mar 2026 12:37:33 +0900
+Subject: [PATCH 3244/5749] fix(background-agent): release descendant quota on
+ pre-start task cancellation and creation failure
+
+---
+ src/features/background-agent/manager.test.ts | 84 +++++++++++++++++++
+ src/features/background-agent/manager.ts      | 27 ++++++
+ 2 files changed, 111 insertions(+)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 67ddd8b4..78a7b64f 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -2111,6 +2111,90 @@ describe("BackgroundManager - Non-blocking Queue Integration", () => {
+       // then
+       await expect(result).rejects.toThrow("background_task.maxDescendants cannot be enforced safely")
+     })
++
++    test("should release descendant quota when queued task is cancelled before session starts", async () => {
++      // given
++      manager.shutdown()
++      manager = new BackgroundManager(
++        {
++          client: createMockClientWithSessionChain({
++            "session-root": { directory: "/test/dir" },
++          }),
++          directory: tmpdir(),
++        } as unknown as PluginInput,
++        { defaultConcurrency: 1, maxDescendants: 2 },
++      )
++
++      const input = {
++        description: "Test task",
++        prompt: "Do something",
++        agent: "test-agent",
++        parentSessionID: "session-root",
++        parentMessageID: "parent-message",
++      }
++
++      await manager.launch(input)
++      const queuedTask = await manager.launch(input)
++      await new Promise(resolve => setTimeout(resolve, 50))
++      expect(manager.getTask(queuedTask.id)?.status).toBe("pending")
++
++      // when
++      const cancelled = manager.cancelPendingTask(queuedTask.id)
++      const replacementTask = await manager.launch(input)
++
++      // then
++      expect(cancelled).toBe(true)
++      expect(replacementTask.status).toBe("pending")
++    })
++
++    test("should release descendant quota when session creation fails before session starts", async () => {
++      // given
++      let createAttempts = 0
++      manager.shutdown()
++      manager = new BackgroundManager(
++        {
++          client: {
++            session: {
++              create: async () => {
++                createAttempts += 1
++                if (createAttempts === 1) {
++                  return { error: "session create failed", data: undefined }
++                }
++
++                return { data: { id: `ses_${crypto.randomUUID()}` } }
++              },
++              get: async () => ({ data: { directory: "/test/dir" } }),
++              prompt: async () => ({}),
++              promptAsync: async () => ({}),
++              messages: async () => ({ data: [] }),
++              todo: async () => ({ data: [] }),
++              status: async () => ({ data: {} }),
++              abort: async () => ({}),
++            },
++          },
++          directory: tmpdir(),
++        } as unknown as PluginInput,
++        { maxDescendants: 1 },
++      )
++
++      const input = {
++        description: "Test task",
++        prompt: "Do something",
++        agent: "test-agent",
++        parentSessionID: "session-root",
++        parentMessageID: "parent-message",
++      }
++
++      await manager.launch(input)
++      await new Promise(resolve => setTimeout(resolve, 50))
++      expect(createAttempts).toBe(1)
++
++      // when
++      const retryTask = await manager.launch(input)
++
++      // then
++      expect(retryTask.status).toBe("pending")
++    })
+   })
+ 
+   describe("pending task can be cancelled", () => {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 130bf6fd..137c6485 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -125,6 +125,7 @@ export class BackgroundManager {
+   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
+   private rootDescendantCounts: Map<string, number>
++  private preStartDescendantReservations: Set<string>
+   private enableParentSessionNotifications: boolean
+   readonly taskHistory = new TaskHistory()
+ 
+@@ -150,6 +151,7 @@ export class BackgroundManager {
+     this.onSubagentSessionCreated = options?.onSubagentSessionCreated
+     this.onShutdown = options?.onShutdown
+     this.rootDescendantCounts = new Map()
++    this.preStartDescendantReservations = new Set()
+     this.enableParentSessionNotifications = options?.enableParentSessionNotifications ?? true
+     this.registerProcessCleanup()
+   }
+@@ -220,6 +222,26 @@ export class BackgroundManager {
+     this.rootDescendantCounts.set(rootSessionID, currentCount - 1)
+   }
+ 
++  private markPreStartDescendantReservation(task: BackgroundTask): void {
++    this.preStartDescendantReservations.add(task.id)
++  }
++
++  private settlePreStartDescendantReservation(task: BackgroundTask): void {
++    this.preStartDescendantReservations.delete(task.id)
++  }
++
++  private rollbackPreStartDescendantReservation(task: BackgroundTask): void {
++    if (!this.preStartDescendantReservations.delete(task.id)) {
++      return
++    }
++
++    if (!task.rootSessionID) {
++      return
++    }
++
++    this.unregisterRootDescendant(task.rootSessionID)
++  }
++
+   async launch(input: LaunchInput): Promise<BackgroundTask> {
+     log("[background-agent] launch() called with:", {
+       agent: input.agent,
+@@ -296,6 +318,7 @@ export class BackgroundManager {
+       }
+ 
+       spawnReservation.commit()
++      this.markPreStartDescendantReservation(task)
+ 
+       // Trigger processing (fire-and-forget)
+       this.processKey(key)
+@@ -322,6 +345,7 @@ export class BackgroundManager {
+         await this.concurrencyManager.acquire(key)
+ 
+         if (item.task.status === "cancelled" || item.task.status === "error" || item.task.status === "interrupt") {
++          this.rollbackPreStartDescendantReservation(item.task)
+           this.concurrencyManager.release(key)
+           queue.shift()
+           continue
+@@ -331,6 +355,7 @@ export class BackgroundManager {
+           await this.startTask(item)
+         } catch (error) {
+           log("[background-agent] Error starting task:", error)
++          this.rollbackPreStartDescendantReservation(item.task)
+           if (item.task.concurrencyKey) {
+             this.concurrencyManager.release(item.task.concurrencyKey)
+             item.task.concurrencyKey = undefined
+@@ -386,6 +411,7 @@ export class BackgroundManager {
+     }
+ 
+     const sessionID = createResult.data.id
++    this.settlePreStartDescendantReservation(task)
+     subagentSessions.add(sessionID)
+ 
+     log("[background-agent] tmux callback check", {
+@@ -1204,6 +1230,7 @@ export class BackgroundManager {
+           }
+         }
+       }
++      this.rollbackPreStartDescendantReservation(task)
+       log("[background-agent] Cancelled pending task:", { taskId, key })
+     }
+ 
+-- 
+2.39.2
+

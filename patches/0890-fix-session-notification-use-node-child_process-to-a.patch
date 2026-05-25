@@ -1,0 +1,178 @@
+From 4a38e70fa8474af42bb7df7fac5dad12085f1b9c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jo=C3=A3o=20Carlos=20Magalh=C3=A3es=20de=20Castro?=
+ <88864312+JohnC0de@users.noreply.github.com>
+Date: Tue, 6 Jan 2026 13:37:15 -0300
+Subject: [PATCH 0890/5749] fix(session-notification): use node:child_process
+ to avoid Bun shell GC crash (#543)
+
+Replace Bun shell template literals (ctx.$) with node:child_process.spawn
+to work around Bun's ShellInterpreter garbage collection bug on Windows.
+
+This bug causes segmentation faults in deinitFromFinalizer during heap
+sweeping when shell operations are used repeatedly over time.
+
+Bug references:
+- oven-sh/bun#23177 (closed incomplete)
+- oven-sh/bun#24368 (still open)
+- Pending fix: oven-sh/bun#24093
+
+The fix applies to all platforms for consistency and safety.
+---
+ src/hooks/session-notification.test.ts | 29 ++++++++++++--------
+ src/hooks/session-notification.ts      | 38 +++++++++++++++++++++-----
+ 2 files changed, 48 insertions(+), 19 deletions(-)
+
+diff --git a/src/hooks/session-notification.test.ts b/src/hooks/session-notification.test.ts
+index ad6eb538..a169477e 100644
+--- a/src/hooks/session-notification.test.ts
++++ b/src/hooks/session-notification.test.ts
+@@ -1,4 +1,6 @@
+-import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test"
++import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:test"
++import { EventEmitter } from "node:events"
++import * as childProcess from "node:child_process"
+ 
+ import { createSessionNotification } from "./session-notification"
+ import { setMainSession, subagentSessions } from "../features/claude-code-session-state"
+@@ -6,20 +8,11 @@ import * as utils from "./session-notification-utils"
+ 
+ describe("session-notification", () => {
+   let notificationCalls: string[]
++  let spawnMock: ReturnType<typeof spyOn>
+ 
+   function createMockPluginInput() {
+     return {
+-      $: async (cmd: TemplateStringsArray | string, ...values: any[]) => {
+-        // #given - track notification commands (osascript, notify-send, powershell)
+-        const cmdStr = typeof cmd === "string" 
+-          ? cmd 
+-          : cmd.reduce((acc, part, i) => acc + part + (values[i] ?? ""), "")
+-        
+-        if (cmdStr.includes("osascript") || cmdStr.includes("notify-send") || cmdStr.includes("powershell")) {
+-          notificationCalls.push(cmdStr)
+-        }
+-        return { stdout: "", stderr: "", exitCode: 0 }
+-      },
++      $: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+       client: {
+         session: {
+           todo: async () => ({ data: [] }),
+@@ -32,6 +25,18 @@ describe("session-notification", () => {
+   beforeEach(() => {
+     notificationCalls = []
+     
++    // Mock spawn to track notification commands
++    // Uses node:child_process.spawn instead of Bun shell to avoid GC crash
++    spawnMock = spyOn(childProcess, "spawn").mockImplementation((cmd: string, args?: string[]) => {
++      // Track notification commands (osascript, notify-send, powershell)
++      if (cmd.includes("osascript") || cmd.includes("notify-send") || cmd.includes("powershell")) {
++        notificationCalls.push(`${cmd} ${(args ?? []).join(" ")}`)
++      }
++      const emitter = new EventEmitter()
++      setTimeout(() => emitter.emit("close", 0), 0)
++      return emitter as any
++    })
++    
+     spyOn(utils, "getOsascriptPath").mockResolvedValue("/usr/bin/osascript")
+     spyOn(utils, "getNotifySendPath").mockResolvedValue("/usr/bin/notify-send")
+     spyOn(utils, "getPowershellPath").mockResolvedValue("powershell")
+diff --git a/src/hooks/session-notification.ts b/src/hooks/session-notification.ts
+index 44b01427..0f7e3751 100644
+--- a/src/hooks/session-notification.ts
++++ b/src/hooks/session-notification.ts
+@@ -1,5 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { platform } from "os"
++import { spawn } from "node:child_process"
+ import { subagentSessions, getMainSessionID } from "../features/claude-code-session-state"
+ import {
+   getOsascriptPath,
+@@ -11,6 +12,21 @@ import {
+   startBackgroundCheck,
+ } from "./session-notification-utils"
+ 
++/**
++ * Execute a command using node:child_process instead of Bun shell.
++ * This avoids Bun's ShellInterpreter GC bug on Windows (oven-sh/bun#23177, #24368).
++ */
++function execCommand(command: string, args: string[]): Promise<void> {
++  return new Promise((resolve) => {
++    const proc = spawn(command, args, {
++      stdio: "ignore",
++      detached: false,
++    })
++    proc.on("close", () => resolve())
++    proc.on("error", () => resolve())
++  })
++}
++
+ interface Todo {
+   content: string
+   status: string
+@@ -65,14 +81,17 @@ async function sendNotification(
+ 
+       const esTitle = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+       const esMessage = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+-      await ctx.$`${osascriptPath} -e ${"display notification \"" + esMessage + "\" with title \"" + esTitle + "\""}`.catch(() => {})
++      const script = `display notification "${esMessage}" with title "${esTitle}"`
++      // Use node:child_process instead of Bun shell to avoid potential GC issues
++      await execCommand(osascriptPath, ["-e", script]).catch(() => {})
+       break
+     }
+     case "linux": {
+       const notifySendPath = await getNotifySendPath()
+       if (!notifySendPath) return
+ 
+-      await ctx.$`${notifySendPath} ${title} ${message} 2>/dev/null`.catch(() => {})
++      // Use node:child_process instead of Bun shell to avoid potential GC issues
++      await execCommand(notifySendPath, [title, message]).catch(() => {})
+       break
+     }
+     case "win32": {
+@@ -93,7 +112,8 @@ $Toast = [Windows.UI.Notifications.ToastNotification]::new($SerializedXml)
+ $Notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('OpenCode')
+ $Notifier.Show($Toast)
+ `.trim().replace(/\n/g, "; ")
+-      await ctx.$`${powershellPath} -Command ${toastScript}`.catch(() => {})
++      // Use node:child_process instead of Bun shell to avoid GC crash (oven-sh/bun#23177)
++      await execCommand(powershellPath, ["-Command", toastScript]).catch(() => {})
+       break
+     }
+   }
+@@ -104,17 +124,19 @@ async function playSound(ctx: PluginInput, p: Platform, soundPath: string): Prom
+     case "darwin": {
+       const afplayPath = await getAfplayPath()
+       if (!afplayPath) return
+-      ctx.$`${afplayPath} ${soundPath}`.catch(() => {})
++      // Use node:child_process instead of Bun shell to avoid potential GC issues
++      execCommand(afplayPath, [soundPath]).catch(() => {})
+       break
+     }
+     case "linux": {
+       const paplayPath = await getPaplayPath()
+       if (paplayPath) {
+-        ctx.$`${paplayPath} ${soundPath} 2>/dev/null`.catch(() => {})
++        // Use node:child_process instead of Bun shell to avoid potential GC issues
++        execCommand(paplayPath, [soundPath]).catch(() => {})
+       } else {
+         const aplayPath = await getAplayPath()
+         if (aplayPath) {
+-          ctx.$`${aplayPath} ${soundPath} 2>/dev/null`.catch(() => {})
++          execCommand(aplayPath, [soundPath]).catch(() => {})
+         }
+       }
+       break
+@@ -122,7 +144,9 @@ async function playSound(ctx: PluginInput, p: Platform, soundPath: string): Prom
+     case "win32": {
+       const powershellPath = await getPowershellPath()
+       if (!powershellPath) return
+-      ctx.$`${powershellPath} -Command ${"(New-Object Media.SoundPlayer '" + soundPath + "').PlaySync()"}`.catch(() => {})
++      // Use node:child_process instead of Bun shell to avoid GC crash (oven-sh/bun#23177)
++      const soundScript = `(New-Object Media.SoundPlayer '${soundPath.replace(/'/g, "''")}').PlaySync()`
++      execCommand(powershellPath, ["-Command", soundScript]).catch(() => {})
+       break
+     }
+   }
+-- 
+2.39.2
+

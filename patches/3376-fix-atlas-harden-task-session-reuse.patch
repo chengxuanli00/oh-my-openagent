@@ -1,0 +1,660 @@
+From 8859da5fef0a5c2a3eea69dfd7c3fb33e7736f60 Mon Sep 17 00:00:00 2001
+From: HaD0Yun <102889891+HaD0Yun@users.noreply.github.com>
+Date: Wed, 18 Mar 2026 17:31:27 +0900
+Subject: [PATCH 3376/5749] fix(atlas): harden task session reuse
+
+---
+ src/hooks/atlas/atlas-hook.ts                 |   4 +-
+ ...inal-wave-approval-gate-regression.test.ts |  19 +-
+ .../atlas/final-wave-approval-gate.test.ts    |  14 +-
+ src/hooks/atlas/index.test.ts                 | 225 +++++++++++++++++-
+ src/hooks/atlas/subagent-session-id.ts        |  31 +++
+ src/hooks/atlas/tool-execute-after.ts         |  82 ++++++-
+ src/hooks/atlas/tool-execute-before.ts        |  34 ++-
+ src/hooks/atlas/types.ts                      |   8 +
+ 8 files changed, 383 insertions(+), 34 deletions(-)
+
+diff --git a/src/hooks/atlas/atlas-hook.ts b/src/hooks/atlas/atlas-hook.ts
+index a814cfe2..ca71bb8d 100644
+--- a/src/hooks/atlas/atlas-hook.ts
++++ b/src/hooks/atlas/atlas-hook.ts
+@@ -2,12 +2,12 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import { createAtlasEventHandler } from "./event-handler"
+ import { createToolExecuteAfterHandler } from "./tool-execute-after"
+ import { createToolExecuteBeforeHandler } from "./tool-execute-before"
+-import type { AtlasHookOptions, SessionState } from "./types"
++import type { AtlasHookOptions, PendingTaskRef, SessionState } from "./types"
+ 
+ export function createAtlasHook(ctx: PluginInput, options?: AtlasHookOptions) {
+   const sessions = new Map<string, SessionState>()
+   const pendingFilePaths = new Map<string, string>()
+-  const pendingTaskRefs = new Map<string, { key: string; label: string; title: string } | null>()
++  const pendingTaskRefs = new Map<string, PendingTaskRef>()
+   const autoCommit = options?.autoCommit ?? true
+ 
+   function getState(sessionID: string): SessionState {
+diff --git a/src/hooks/atlas/final-wave-approval-gate-regression.test.ts b/src/hooks/atlas/final-wave-approval-gate-regression.test.ts
+index b653c66d..ab509d82 100644
+--- a/src/hooks/atlas/final-wave-approval-gate-regression.test.ts
++++ b/src/hooks/atlas/final-wave-approval-gate-regression.test.ts
+@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+ import { tmpdir } from "node:os"
+ import { join } from "node:path"
+ import { createOpencodeClient } from "@opencode-ai/sdk"
+-import type { AssistantMessage } from "@opencode-ai/sdk"
++import type { AssistantMessage, Session } from "@opencode-ai/sdk"
+ import type { BoulderState } from "../../features/boulder-state"
+ import { clearBoulderState, writeBoulderState } from "../../features/boulder-state"
+ 
+@@ -52,6 +52,23 @@ describe("Atlas final-wave approval gate regressions", () => {
+       response: new Response(),
+     }))
+ 
++    Reflect.set(client.session, "get", async ({ path }: { path: { id: string } }) => {
++      const parentID = path.id === "ses_nested_scope_review"
++        ? "atlas-nested-final-wave-session"
++        : path.id.startsWith("ses_parallel_review_")
++          ? "atlas-parallel-final-wave-session"
++          : "main-session-123"
++
++      return {
++        data: {
++          id: path.id,
++          parentID,
++        } as Session,
++        request: new Request(`http://localhost/session/${path.id}`),
++        response: new Response(),
++      }
++    })
++
+     return {
+       directory: testDirectory,
+       project: {} as AtlasHookContext["project"],
+diff --git a/src/hooks/atlas/final-wave-approval-gate.test.ts b/src/hooks/atlas/final-wave-approval-gate.test.ts
+index 5812c4ba..5c0e4449 100644
+--- a/src/hooks/atlas/final-wave-approval-gate.test.ts
++++ b/src/hooks/atlas/final-wave-approval-gate.test.ts
+@@ -60,10 +60,18 @@ describe("Atlas final verification approval gate", () => {
+       }
+     })
+ 
+-    Reflect.set(client.session, "get", async () => {
++    Reflect.set(client.session, "get", async ({ path }: { path: { id: string } }) => {
++      const parentID = path.id === "ses_final_wave_review"
++        ? "atlas-final-wave-session"
++        : path.id === "ses_feature_task"
++          ? "atlas-non-final-session"
++          : "main-session-123"
+       return {
+-        data: { parentID: "main-session-123" } as Session,
+-        request: new Request("http://localhost/session/main-session-123"),
++        data: {
++          id: path.id,
++          parentID,
++        } as Session,
++        request: new Request(`http://localhost/session/${path.id}`),
+         response: new Response(),
+       }
+     })
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index 917d0079..9cc78579 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -10,6 +10,7 @@ import {
+ } from "../../features/boulder-state"
+ import type { BoulderState } from "../../features/boulder-state"
+ import { _resetForTesting, subagentSessions, updateSessionAgent } from "../../features/claude-code-session-state"
++import type { PendingTaskRef } from "./types"
+ 
+ const TEST_STORAGE_ROOT = join(tmpdir(), `atlas-message-storage-${randomUUID()}`)
+ const TEST_MESSAGE_STORAGE = join(TEST_STORAGE_ROOT, "message")
+@@ -41,19 +42,32 @@ describe("atlas hook", () => {
+   let TEST_DIR: string
+   let SISYPHUS_DIR: string
+ 
+-  function createMockPluginInput(overrides?: { promptMock?: ReturnType<typeof mock> }) {
++  function createMockPluginInput(overrides?: {
++    promptMock?: ReturnType<typeof mock>
++    sessionGetMock?: ReturnType<typeof mock>
++  }) {
+     const promptMock = overrides?.promptMock ?? mock(() => Promise.resolve())
++    const sessionGetMock = overrides?.sessionGetMock ?? mock(async ({ path }: { path: { id: string } }) => ({
++      data: {
++        id: path.id,
++        parentID: path.id.startsWith("ses_") ? "session-1" : "main-session-123",
++      },
++    }))
+     return {
+       directory: TEST_DIR,
+       client: {
+         session: {
+-          get: async () => ({ data: { parentID: "main-session-123" } }),
++          get: sessionGetMock,
+           prompt: promptMock,
+           promptAsync: promptMock,
+         },
+       },
+       _promptMock: promptMock,
+-    } as unknown as Parameters<typeof createAtlasHook>[0] & { _promptMock: ReturnType<typeof mock> }
++      _sessionGetMock: sessionGetMock,
++    } as unknown as Parameters<typeof createAtlasHook>[0] & {
++      _promptMock: ReturnType<typeof mock>
++      _sessionGetMock: ReturnType<typeof mock>
++    }
+   }
+ 
+   function setupMessageStorage(sessionID: string, agent: string): void {
+@@ -431,7 +445,7 @@ describe("atlas hook", () => {
+       })
+ 
+       const pendingFilePaths = new Map<string, string>()
+-      const pendingTaskRefs = new Map<string, { key: string; label: string; title: string } | null>()
++      const pendingTaskRefs = new Map<string, PendingTaskRef>()
+       const beforeHandler = createToolExecuteBeforeHandler({
+         ctx: createMockPluginInput(),
+         pendingFilePaths,
+@@ -607,25 +621,212 @@ session_id: ses_auth_flow_123
+         { args: { prompt: "Follow up on previous task", session_id: "ses_old_task_111" } }
+       )
+ 
++      const output = {
++        title: "Sisyphus Task",
++        output: `Task continued successfully
++
++<task_metadata>
++session_id: ses_old_task_111
++</task_metadata>`,
++        metadata: {
++          agent: "sisyphus-junior",
++          category: "deep",
++        },
++      }
+       await hook["tool.execute.after"](
+         { tool: "task", sessionID, callID: "call-resume-old-task" },
++        output
++      )
++
++      // then - Atlas does not poison task 2's preferred session mapping
++      const updatedState = readBoulderState(TEST_DIR)
++      expect(updatedState?.task_sessions?.["todo:2"]).toBeUndefined()
++      expect(output.output).not.toContain('task(session_id="ses_old_task_111"')
++
++      cleanupMessageStorage(sessionID)
++    })
++
++    test("should not reuse an explicitly resumed session id in completion reminders", async () => {
++      // given - current plan is on task 2 with an existing tracked session
++      const sessionID = "session-explicit-resume-reminder-test"
++      setupMessageStorage(sessionID, "atlas")
++
++      const planPath = join(TEST_DIR, "explicit-resume-reminder-plan.md")
++      writeFileSync(planPath, `# Plan
++
++## TODOs
++- [x] 1. Implement auth flow
++- [ ] 2. Add API validation
++`)
++
++      writeBoulderState(TEST_DIR, {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: ["session-1"],
++        plan_name: "explicit-resume-reminder-plan",
++        task_sessions: {
++          "todo:2": {
++            task_key: "todo:2",
++            task_label: "2",
++            task_title: "Add API validation",
++            session_id: "ses_tracked_current_task",
++            updated_at: "2026-01-02T10:00:00Z",
++          },
++        },
++      })
++
++      const hook = createAtlasHook(createMockPluginInput())
++      const output = {
++        title: "Sisyphus Task",
++        output: `Task continued successfully
++
++<task_metadata>
++session_id: ses_old_task_111
++</task_metadata>`,
++        metadata: {},
++      }
++
++      // when
++      await hook["tool.execute.before"](
++        { tool: "task", sessionID, callID: "call-explicit-resume-reminder" },
++        { args: { prompt: "Follow up on previous task", session_id: "ses_old_task_111" } }
++      )
++      await hook["tool.execute.after"](
++        { tool: "task", sessionID, callID: "call-explicit-resume-reminder" },
++        output
++      )
++
++      // then
++      expect(output.output).not.toContain('task(session_id="ses_old_task_111"')
++      expect(output.output).toContain("ses_tracked_current_task")
++
++      cleanupMessageStorage(sessionID)
++    })
++
++    test("should skip persistence when multiple in-flight task calls claim the same top-level task", async () => {
++      // given
++      const sessionID = "session-parallel-task-collision-test"
++      setupMessageStorage(sessionID, "atlas")
++
++      const planPath = join(TEST_DIR, "parallel-task-collision-plan.md")
++      writeFileSync(planPath, `# Plan
++
++## TODOs
++- [ ] 1. Implement auth flow
++- [ ] 2. Add API validation
++`)
++
++      writeBoulderState(TEST_DIR, {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: ["session-1"],
++        plan_name: "parallel-task-collision-plan",
++      })
++
++      const pendingFilePaths = new Map<string, string>()
++      const pendingTaskRefs = new Map<string, PendingTaskRef>()
++      const beforeHandler = createToolExecuteBeforeHandler({
++        ctx: createMockPluginInput(),
++        pendingFilePaths,
++        pendingTaskRefs,
++      })
++      const afterHandler = createToolExecuteAfterHandler({
++        ctx: createMockPluginInput(),
++        pendingFilePaths,
++        pendingTaskRefs,
++        autoCommit: true,
++        getState: () => ({ promptFailureCount: 0 }),
++      })
++
++      // when - two task() calls start before either one completes
++      await beforeHandler(
++        { tool: "task", sessionID, callID: "call-task-first" },
++        { args: { prompt: "Implement auth flow part 1" } }
++      )
++      await beforeHandler(
++        { tool: "task", sessionID, callID: "call-task-second" },
++        { args: { prompt: "Implement auth flow part 2" } }
++      )
++
++      const secondPendingTaskRef = pendingTaskRefs.get("call-task-second")
++
++      await afterHandler(
++        { tool: "task", sessionID, callID: "call-task-second" },
+         {
+           title: "Sisyphus Task",
+-          output: `Task continued successfully
++          output: `Task completed successfully
+ 
+ <task_metadata>
+-session_id: ses_old_task_111
++session_id: ses_parallel_collision_222
+ </task_metadata>`,
+-          metadata: {
+-            agent: "sisyphus-junior",
+-            category: "deep",
+-          },
++          metadata: {},
+         }
+       )
+ 
+-      // then - Atlas does not poison task 2's preferred session mapping
++      // then
++      expect(secondPendingTaskRef).toEqual({
++        kind: "skip",
++        reason: "ambiguous_task_key",
++        task: {
++          key: "todo:1",
++          label: "1",
++          title: "Implement auth flow",
++        },
++      })
+       const updatedState = readBoulderState(TEST_DIR)
+-      expect(updatedState?.task_sessions?.["todo:2"]).toBeUndefined()
++      expect(updatedState?.task_sessions?.["todo:1"]).toBeUndefined()
++
++      cleanupMessageStorage(sessionID)
++    })
++
++    test("should ignore extracted session ids that are outside the active boulder lineage", async () => {
++      // given
++      const sessionID = "session-untrusted-session-id-test"
++      setupMessageStorage(sessionID, "atlas")
++
++      const planPath = join(TEST_DIR, "untrusted-session-id-plan.md")
++      writeFileSync(planPath, `# Plan
++
++## TODOs
++- [ ] 1. Implement auth flow
++`)
++
++      writeBoulderState(TEST_DIR, {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: ["session-1"],
++        plan_name: "untrusted-session-id-plan",
++      })
++
++      const hook = createAtlasHook(createMockPluginInput({
++        sessionGetMock: mock(async ({ path }: { path: { id: string } }) => ({
++          data: {
++            id: path.id,
++            parentID: path.id === "ses_untrusted_999" ? "session-outside-lineage" : "main-session-123",
++          },
++        })),
++      }))
++      const output = {
++        title: "Sisyphus Task",
++        output: `Task completed successfully
++
++<task_metadata>
++session_id: ses_untrusted_999
++</task_metadata>`,
++        metadata: {},
++      }
++
++      // when
++      await hook["tool.execute.after"](
++        { tool: "task", sessionID },
++        output
++      )
++
++      // then
++      const updatedState = readBoulderState(TEST_DIR)
++      expect(updatedState?.task_sessions?.["todo:1"]).toBeUndefined()
++      expect(output.output).not.toContain('task(session_id="ses_untrusted_999"')
++      expect(output.output).toContain('task(session_id="<session_id>"')
+ 
+       cleanupMessageStorage(sessionID)
+     })
+diff --git a/src/hooks/atlas/subagent-session-id.ts b/src/hooks/atlas/subagent-session-id.ts
+index d4c5d870..4ce8886f 100644
+--- a/src/hooks/atlas/subagent-session-id.ts
++++ b/src/hooks/atlas/subagent-session-id.ts
+@@ -1,3 +1,8 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared/logger"
++import { isSessionInBoulderLineage } from "./boulder-session-lineage"
++import { HOOK_NAME } from "./hook-name"
++
+ export function extractSessionIdFromOutput(output: string): string | undefined {
+   const taskMetadataBlocks = [...output.matchAll(/<task_metadata>([\s\S]*?)<\/task_metadata>/gi)]
+   const lastTaskMetadataBlock = taskMetadataBlocks.at(-1)?.[1]
+@@ -11,3 +16,29 @@ export function extractSessionIdFromOutput(output: string): string | undefined {
+   const explicitSessionMatches = [...output.matchAll(/Session ID:\s*(ses_[a-zA-Z0-9_]+)/g)]
+   return explicitSessionMatches.at(-1)?.[1]
+ }
++
++export async function validateSubagentSessionId(input: {
++  client: PluginInput["client"]
++  sessionID?: string
++  lineageSessionIDs: string[]
++}): Promise<string | undefined> {
++  if (!input.sessionID || input.lineageSessionIDs.length === 0) {
++    return undefined
++  }
++
++  const belongsToLineage = await isSessionInBoulderLineage({
++    client: input.client,
++    sessionID: input.sessionID,
++    boulderSessionIDs: input.lineageSessionIDs,
++  })
++
++  if (!belongsToLineage) {
++    log(`[${HOOK_NAME}] Ignoring extracted session id outside active lineage`, {
++      sessionID: input.sessionID,
++      lineageSessionIDs: input.lineageSessionIDs,
++    })
++    return undefined
++  }
++
++  return input.sessionID
++}
+diff --git a/src/hooks/atlas/tool-execute-after.ts b/src/hooks/atlas/tool-execute-after.ts
+index a598e92d..7be1b14d 100644
+--- a/src/hooks/atlas/tool-execute-after.ts
++++ b/src/hooks/atlas/tool-execute-after.ts
+@@ -14,7 +14,7 @@ import { shouldPauseForFinalWaveApproval } from "./final-wave-approval-gate"
+ import { HOOK_NAME } from "./hook-name"
+ import { DIRECT_WORK_REMINDER } from "./system-reminder-templates"
+ import { isSisyphusPath } from "./sisyphus-path"
+-import { extractSessionIdFromOutput } from "./subagent-session-id"
++import { extractSessionIdFromOutput, validateSubagentSessionId } from "./subagent-session-id"
+ import {
+   buildCompletionGate,
+   buildFinalWaveApprovalReminder,
+@@ -22,17 +22,56 @@ import {
+   buildStandaloneVerificationReminder,
+ } from "./verification-reminders"
+ import { isWriteOrEditToolName } from "./write-edit-tool-policy"
+-import type { SessionState } from "./types"
+-import type { ToolExecuteAfterInput, ToolExecuteAfterOutput } from "./types"
++import type { PendingTaskRef, SessionState } from "./types"
++import type { ToolExecuteAfterInput, ToolExecuteAfterOutput, TrackedTopLevelTaskRef } from "./types"
+ 
+ function resolvePreferredSessionId(currentSessionId?: string, trackedSessionId?: string): string {
+   return currentSessionId ?? trackedSessionId ?? "<session_id>"
+ }
+ 
++function resolveTaskContext(
++  pendingTaskRef: PendingTaskRef | undefined,
++  planPath: string,
++): {
++  currentTask: TrackedTopLevelTaskRef | null
++  shouldSkipTaskSessionUpdate: boolean
++  shouldIgnoreCurrentSessionId: boolean
++} {
++  if (!pendingTaskRef) {
++    return {
++      currentTask: readCurrentTopLevelTask(planPath),
++      shouldSkipTaskSessionUpdate: false,
++      shouldIgnoreCurrentSessionId: false,
++    }
++  }
++
++  if (pendingTaskRef.kind === "track") {
++    return {
++      currentTask: pendingTaskRef.task,
++      shouldSkipTaskSessionUpdate: false,
++      shouldIgnoreCurrentSessionId: false,
++    }
++  }
++
++  if (pendingTaskRef.reason === "explicit_resume") {
++    return {
++      currentTask: readCurrentTopLevelTask(planPath),
++      shouldSkipTaskSessionUpdate: true,
++      shouldIgnoreCurrentSessionId: true,
++    }
++  }
++
++  return {
++    currentTask: pendingTaskRef.task,
++    shouldSkipTaskSessionUpdate: true,
++    shouldIgnoreCurrentSessionId: true,
++  }
++}
++
+ export function createToolExecuteAfterHandler(input: {
+   ctx: PluginInput
+   pendingFilePaths: Map<string, string>
+-  pendingTaskRefs: Map<string, { key: string; label: string; title: string } | null>
++  pendingTaskRefs: Map<string, PendingTaskRef>
+   autoCommit: boolean
+   getState: (sessionID: string) => SessionState
+ }): (toolInput: ToolExecuteAfterInput, toolOutput: ToolExecuteAfterOutput) => Promise<void> {
+@@ -83,15 +122,16 @@ export function createToolExecuteAfterHandler(input: {
+     if (toolOutput.output && typeof toolOutput.output === "string") {
+       const gitStats = collectGitDiffStats(ctx.directory)
+       const fileChanges = formatFileChanges(gitStats)
+-      const subagentSessionId = extractSessionIdFromOutput(toolOutput.output)
++      const extractedSessionId = extractSessionIdFromOutput(toolOutput.output)
+ 
+       const boulderState = readBoulderState(ctx.directory)
+       if (boulderState) {
+         const progress = getPlanProgress(boulderState.active_plan)
+-        const shouldSkipTaskSessionUpdate = pendingTaskRef === null
+-        const currentTask = shouldSkipTaskSessionUpdate
+-          ? null
+-          : pendingTaskRef ?? readCurrentTopLevelTask(boulderState.active_plan)
++        const {
++          currentTask,
++          shouldSkipTaskSessionUpdate,
++          shouldIgnoreCurrentSessionId,
++        } = resolveTaskContext(pendingTaskRef, boulderState.active_plan)
+         const trackedTaskSession = currentTask
+           ? getTaskSessionState(ctx.directory, currentTask.key)
+           : null
+@@ -105,7 +145,16 @@ export function createToolExecuteAfterHandler(input: {
+           })
+         }
+ 
+-        if (currentTask && subagentSessionId) {
++        const lineageSessionIDs = toolInput.sessionID && !boulderState.session_ids.includes(toolInput.sessionID)
++          ? [...boulderState.session_ids, toolInput.sessionID]
++          : boulderState.session_ids
++        const subagentSessionId = await validateSubagentSessionId({
++          client: ctx.client,
++          sessionID: extractedSessionId,
++          lineageSessionIDs,
++        })
++
++        if (currentTask && subagentSessionId && !shouldSkipTaskSessionUpdate) {
+           upsertTaskSessionState(ctx.directory, {
+             taskKey: currentTask.key,
+             taskLabel: currentTask.label,
+@@ -117,7 +166,7 @@ export function createToolExecuteAfterHandler(input: {
+         }
+ 
+         const preferredSessionId = resolvePreferredSessionId(
+-          subagentSessionId,
++          shouldIgnoreCurrentSessionId ? undefined : subagentSessionId,
+           trackedTaskSession?.session_id,
+         )
+ 
+@@ -175,8 +224,17 @@ ${
+           waitingForFinalWaveApproval: shouldPauseForApproval,
+         })
+       } else {
++        const lineageSessionIDs = toolInput.sessionID ? [toolInput.sessionID] : []
++        const subagentSessionId = await validateSubagentSessionId({
++          client: ctx.client,
++          sessionID: extractedSessionId,
++          lineageSessionIDs,
++        })
++        const preferredSessionId = pendingTaskRef?.kind === "skip"
++          ? undefined
++          : subagentSessionId
+         toolOutput.output += `\n<system-reminder>\n${buildStandaloneVerificationReminder(
+-          resolvePreferredSessionId(subagentSessionId),
++          resolvePreferredSessionId(preferredSessionId),
+         )}\n</system-reminder>`
+ 
+         log(`[${HOOK_NAME}] Verification reminder appended for orchestrator`, {
+diff --git a/src/hooks/atlas/tool-execute-before.ts b/src/hooks/atlas/tool-execute-before.ts
+index d020adac..e00224d8 100644
+--- a/src/hooks/atlas/tool-execute-before.ts
++++ b/src/hooks/atlas/tool-execute-before.ts
+@@ -6,18 +6,23 @@ import { readBoulderState, readCurrentTopLevelTask } from "../../features/boulde
+ import { HOOK_NAME } from "./hook-name"
+ import { ORCHESTRATOR_DELEGATION_REQUIRED, SINGLE_TASK_DIRECTIVE } from "./system-reminder-templates"
+ import { isSisyphusPath } from "./sisyphus-path"
++import type { PendingTaskRef, TrackedTopLevelTaskRef } from "./types"
+ import { isWriteOrEditToolName } from "./write-edit-tool-policy"
+ 
+ export function createToolExecuteBeforeHandler(input: {
+   ctx: PluginInput
+   pendingFilePaths: Map<string, string>
+-  pendingTaskRefs: Map<string, { key: string; label: string; title: string } | null>
++  pendingTaskRefs: Map<string, PendingTaskRef>
+ }): (
+   toolInput: { tool: string; sessionID?: string; callID?: string },
+   toolOutput: { args: Record<string, unknown>; message?: string }
+ ) => Promise<void> {
+   const { ctx, pendingFilePaths, pendingTaskRefs } = input
+ 
++  function trackTask(callID: string, task: TrackedTopLevelTaskRef): void {
++    pendingTaskRefs.set(callID, { kind: "track", task })
++  }
++
+   return async (toolInput, toolOutput): Promise<void> => {
+     if (!(await isCallerOrchestrator(toolInput.sessionID, ctx.client))) {
+       return
+@@ -48,18 +53,39 @@ export function createToolExecuteBeforeHandler(input: {
+       if (toolInput.callID) {
+         const requestedSessionId = toolOutput.args.session_id as string | undefined
+         if (requestedSessionId) {
+-          pendingTaskRefs.set(toolInput.callID, null)
++          pendingTaskRefs.set(toolInput.callID, {
++            kind: "skip",
++            reason: "explicit_resume",
++          })
+         } else {
+           const boulderState = readBoulderState(ctx.directory)
+           const currentTask = boulderState
+             ? readCurrentTopLevelTask(boulderState.active_plan)
+             : null
+           if (currentTask) {
+-            pendingTaskRefs.set(toolInput.callID, {
++            const task = {
+               key: currentTask.key,
+               label: currentTask.label,
+               title: currentTask.title,
+-            })
++            }
++            const hasExistingClaim = [...pendingTaskRefs.values()].some((pendingTaskRef) => (
++              pendingTaskRef.kind === "track" && pendingTaskRef.task.key === task.key
++            ))
++
++            if (hasExistingClaim) {
++              pendingTaskRefs.set(toolInput.callID, {
++                kind: "skip",
++                reason: "ambiguous_task_key",
++                task,
++              })
++              log(`[${HOOK_NAME}] Skipping task session persistence for ambiguous task key`, {
++                sessionID: toolInput.sessionID,
++                callID: toolInput.callID,
++                taskKey: task.key,
++              })
++            } else {
++              trackTask(toolInput.callID, task)
++            }
+           }
+         }
+       }
+diff --git a/src/hooks/atlas/types.ts b/src/hooks/atlas/types.ts
+index c3aa9bbc..bd5402e9 100644
+--- a/src/hooks/atlas/types.ts
++++ b/src/hooks/atlas/types.ts
+@@ -1,5 +1,6 @@
+ import type { AgentOverrides } from "../../config"
+ import type { BackgroundManager } from "../../features/background-agent"
++import type { TopLevelTaskRef } from "../../features/boulder-state"
+ 
+ export type ModelInfo = { providerID: string; modelID: string }
+ 
+@@ -25,6 +26,13 @@ export interface ToolExecuteAfterOutput {
+   metadata: Record<string, unknown>
+ }
+ 
++export type TrackedTopLevelTaskRef = Pick<TopLevelTaskRef, "key" | "label" | "title">
++
++export type PendingTaskRef =
++  | { kind: "track"; task: TrackedTopLevelTaskRef }
++  | { kind: "skip"; reason: "explicit_resume" }
++  | { kind: "skip"; reason: "ambiguous_task_key"; task: TrackedTopLevelTaskRef }
++
+ export interface SessionState {
+   lastEventWasAbortError?: boolean
+   lastContinuationInjectedAt?: number
+-- 
+2.39.2
+

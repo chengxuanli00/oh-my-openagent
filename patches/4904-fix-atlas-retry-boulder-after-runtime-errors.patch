@@ -1,0 +1,378 @@
+From 6a2d19d605557f6f4c4aa2f50bdfc078bfc576ee Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 7 May 2026 11:27:44 +0900
+Subject: [PATCH 4904/5749] fix(atlas): retry boulder after runtime errors
+
+---
+ .../atlas/boulder-continuation-injector.ts    |   5 +-
+ src/hooks/atlas/event-handler.ts              |  13 ++
+ src/hooks/atlas/idle-event.ts                 |   6 +
+ src/hooks/atlas/index.test.ts                 | 171 ++++++++++++++++--
+ src/hooks/atlas/tool-execute-after.ts         |   2 +-
+ src/hooks/atlas/types.ts                      |   8 +-
+ 6 files changed, 183 insertions(+), 22 deletions(-)
+
+diff --git a/src/hooks/atlas/boulder-continuation-injector.ts b/src/hooks/atlas/boulder-continuation-injector.ts
+index 9e340e69..8fc401b0 100644
+--- a/src/hooks/atlas/boulder-continuation-injector.ts
++++ b/src/hooks/atlas/boulder-continuation-injector.ts
+@@ -1,5 +1,4 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+-import type { BackgroundManager } from "../../features/background-agent"
+ import {
+   isAgentRegistered,
+   resolveRegisteredAgentName,
+@@ -9,7 +8,7 @@ import { createInternalAgentTextPart, resolveInheritedPromptTools } from "../../
+ import { HOOK_NAME } from "./hook-name"
+ import { BOULDER_CONTINUATION_PROMPT } from "./system-reminder-templates"
+ import { resolveRecentPromptContextForSession } from "./recent-model-resolver"
+-import type { SessionState } from "./types"
++import type { BackgroundTaskStatusProvider, SessionState } from "./types"
+ 
+ export type BoulderContinuationResult = "injected" | "skipped_background_tasks" | "skipped_agent_unavailable" | "failed"
+ 
+@@ -25,7 +24,7 @@ export async function injectBoulderContinuation(input: {
+   worktreePath?: string
+   preferredTaskSessionId?: string
+   preferredTaskTitle?: string
+-  backgroundManager?: BackgroundManager
++  backgroundManager?: BackgroundTaskStatusProvider
+   sessionState: SessionState
+ }): Promise<BoulderContinuationResult> {
+   const {
+diff --git a/src/hooks/atlas/event-handler.ts b/src/hooks/atlas/event-handler.ts
+index 95cdbe53..e9358b7a 100644
+--- a/src/hooks/atlas/event-handler.ts
++++ b/src/hooks/atlas/event-handler.ts
+@@ -25,6 +25,16 @@ export function createAtlasEventHandler(input: {
+       state.lastEventWasAbortError = isAbort
+ 
+       log(`[${HOOK_NAME}] session.error`, { sessionID, isAbort })
++      if (!isAbort) {
++        const previousInjectedAt = state.lastContinuationInjectedAt
++        await handleAtlasSessionIdle({ ctx, options, getState, sessionID })
++        if (
++          state.lastContinuationInjectedAt !== undefined
++          && state.lastContinuationInjectedAt !== previousInjectedAt
++        ) {
++          state.skipNextIdleAfterRuntimeErrorRetry = true
++        }
++      }
+       return
+     }
+ 
+@@ -44,6 +54,7 @@ export function createAtlasEventHandler(input: {
+       const state = sessions.get(sessionID)
+       if (state) {
+         state.lastEventWasAbortError = false
++        state.skipNextIdleAfterRuntimeErrorRetry = false
+         if (role === "user") {
+           state.waitingForFinalWaveApproval = false
+         }
+@@ -60,6 +71,7 @@ export function createAtlasEventHandler(input: {
+         const state = sessions.get(sessionID)
+         if (state) {
+           state.lastEventWasAbortError = false
++          state.skipNextIdleAfterRuntimeErrorRetry = false
+         }
+       }
+       return
+@@ -71,6 +83,7 @@ export function createAtlasEventHandler(input: {
+         const state = sessions.get(sessionID)
+         if (state) {
+           state.lastEventWasAbortError = false
++          state.skipNextIdleAfterRuntimeErrorRetry = false
+         }
+       }
+       return
+diff --git a/src/hooks/atlas/idle-event.ts b/src/hooks/atlas/idle-event.ts
+index 41df724b..af148838 100644
+--- a/src/hooks/atlas/idle-event.ts
++++ b/src/hooks/atlas/idle-event.ts
+@@ -254,6 +254,12 @@ export async function handleAtlasSessionIdle(input: {
+     return
+   }
+ 
++  if (sessionState.skipNextIdleAfterRuntimeErrorRetry) {
++    sessionState.skipNextIdleAfterRuntimeErrorRetry = false
++    log(`[${HOOK_NAME}] Skipped: stale idle after runtime error retry`, { sessionID })
++    return
++  }
++
+   if (sessionState.promptFailureCount >= MAX_CONSECUTIVE_PROMPT_FAILURES) {
+     const timeSinceLastFailure =
+       sessionState.lastFailureAt !== undefined ? now - sessionState.lastFailureAt : Number.POSITIVE_INFINITY
+diff --git a/src/hooks/atlas/index.test.ts b/src/hooks/atlas/index.test.ts
+index a2e80cf7..4162f179 100644
+--- a/src/hooks/atlas/index.test.ts
++++ b/src/hooks/atlas/index.test.ts
+@@ -66,7 +66,7 @@ describe("atlas hook", () => {
+       },
+       _promptMock: promptMock,
+       _sessionGetMock: sessionGetMock,
+-    } as unknown as Parameters<typeof createAtlasHook>[0] & {
++    } as Parameters<typeof createAtlasHook>[0] & {
+       _promptMock: ReturnType<typeof mock>
+       _sessionGetMock: ReturnType<typeof mock>
+     }
+@@ -122,7 +122,7 @@ describe("atlas hook", () => {
+       // when - calling with undefined output
+       const result = await hook["tool.execute.after"](
+         { tool: "task", sessionID: "session-123" },
+-        undefined as unknown as { title: string; output: string; metadata: Record<string, unknown> }
++        undefined
+       )
+ 
+       // then - returns undefined without throwing
+@@ -1531,6 +1531,142 @@ session_id: ses_untrusted_999
+       expect(mockInput._promptMock).not.toHaveBeenCalled()
+     })
+ 
++    test("#given boulder has incomplete tasks #when non-abort session error fires #then continuation injects immediately", async () => {
++      // given - boulder state with incomplete plan
++      const planPath = join(TEST_DIR, "test-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: [MAIN_SESSION_ID],
++        plan_name: "test-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const mockInput = createMockPluginInput()
++      const hook = createAtlasHook(mockInput)
++
++      // when - a recoverable runtime error fires without waiting for idle
++      await hook.handler({
++        event: {
++          type: "session.error",
++          properties: {
++            sessionID: MAIN_SESSION_ID,
++            error: { name: "RuntimeError", message: "provider overloaded" },
++          },
++        },
++      })
++
++      // then - boulder resumes work immediately
++      expect(mockInput._promptMock).toHaveBeenCalledTimes(1)
++      const callArgs = mockInput._promptMock.mock.calls[0][0]
++      expect(callArgs.path.id).toBe(MAIN_SESSION_ID)
++      expect(callArgs.body.parts[0].text).toContain("incomplete tasks")
++      expect(callArgs.body.parts[0].text).toContain("2 remaining")
++    })
++
++    test("#given boulder retried a runtime error #when stale idle follows #then no delayed duplicate retry is scheduled", async () => {
++      // given - boulder state with incomplete plan
++      const planPath = join(TEST_DIR, "test-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: [MAIN_SESSION_ID],
++        plan_name: "test-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const originalSetTimeout = globalThis.setTimeout
++      const scheduledDelays: number[] = []
++      globalThis.setTimeout = ((_handler: TimerHandler, timeout?: number, ..._args: unknown[]) => {
++        scheduledDelays.push(timeout ?? 0)
++        return originalSetTimeout(() => undefined, 0)
++      }) as typeof setTimeout
++
++      try {
++        const mockInput = createMockPluginInput()
++        const hook = createAtlasHook(mockInput)
++
++        // when - runtime error resumes immediately and OpenCode later emits stale idle
++        await hook.handler({
++          event: {
++            type: "session.error",
++            properties: {
++              sessionID: MAIN_SESSION_ID,
++              error: { name: "RuntimeError", message: "provider overloaded" },
++            },
++          },
++        })
++        await hook.handler({
++          event: {
++            type: "session.idle",
++            properties: { sessionID: MAIN_SESSION_ID },
++          },
++        })
++
++        // then - stale idle is consumed, not converted into another scheduled continuation
++        expect(mockInput._promptMock).toHaveBeenCalledTimes(1)
++        expect(scheduledDelays).toHaveLength(0)
++      } finally {
++        globalThis.setTimeout = originalSetTimeout
++      }
++    })
++
++    test("#given boulder retried a runtime error #when assistant activity arrives #then next idle can continue", async () => {
++      // given - boulder state with incomplete plan
++      const planPath = join(TEST_DIR, "test-plan.md")
++      writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++      const state: BoulderState = {
++        active_plan: planPath,
++        started_at: "2026-01-02T10:00:00Z",
++        session_ids: [MAIN_SESSION_ID],
++        plan_name: "test-plan",
++      }
++      writeBoulderState(TEST_DIR, state)
++
++      const originalDateNow = Date.now
++      let now = 1000
++      Date.now = () => now
++
++      try {
++        const mockInput = createMockPluginInput()
++        const hook = createAtlasHook(mockInput)
++
++        // when - runtime error resumes immediately and then the retry run emits assistant activity
++        await hook.handler({
++          event: {
++            type: "session.error",
++            properties: {
++              sessionID: MAIN_SESSION_ID,
++              error: { name: "RuntimeError", message: "provider overloaded" },
++            },
++          },
++        })
++        await hook.handler({
++          event: {
++            type: "message.updated",
++            properties: { info: { sessionID: MAIN_SESSION_ID, role: "assistant" } },
++          },
++        })
++        now = 7000
++        await hook.handler({
++          event: {
++            type: "session.idle",
++            properties: { sessionID: MAIN_SESSION_ID },
++          },
++        })
++
++        // then - assistant activity marks the following idle as real work completion
++        expect(mockInput._promptMock).toHaveBeenCalledTimes(2)
++      } finally {
++        Date.now = originalDateNow
++      }
++    })
++
+      test("should skip when background tasks are running", async () => {
+        // given - boulder state with incomplete plan
+        const planPath = join(TEST_DIR, "test-plan.md")
+@@ -1551,7 +1687,7 @@ session_id: ses_untrusted_999
+        const mockInput = createMockPluginInput()
+        const hook = createAtlasHook(mockInput, {
+          directory: TEST_DIR,
+-         backgroundManager: mockBackgroundManager as any,
++         backgroundManager: mockBackgroundManager,
+        })
+ 
+        // when
+@@ -2223,8 +2359,7 @@ session_id: ses_untrusted_999
+     })
+ 
+     describe("delayed retry timer (abort-stuck fix)", () => {
+-      const capturedTimers = new Map<number, { callback: Function; cleared: boolean }>()
+-      let nextFakeId = 99000
++      const capturedTimers = new Map<ReturnType<typeof setTimeout>, { callback: () => void | Promise<void>; cleared: boolean }>()
+       const originalSetTimeout = globalThis.setTimeout
+       const originalClearTimeout = globalThis.clearTimeout
+       const originalDateNow = Date.now
+@@ -2232,28 +2367,32 @@ session_id: ses_untrusted_999
+ 
+       beforeEach(() => {
+         capturedTimers.clear()
+-        nextFakeId = 99000
+         fakeNow = 10000
+         Date.now = () => fakeNow
+ 
+-        globalThis.setTimeout = ((callback: Function, delay?: number, ...args: unknown[]) => {
++        globalThis.setTimeout = ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+           const normalized = typeof delay === "number" ? delay : 0
+           if (normalized >= 5000) {
+-            const id = nextFakeId++
+-            capturedTimers.set(id, { callback: () => callback(...args), cleared: false })
+-            return id as unknown as ReturnType<typeof setTimeout>
++            const timerID = originalSetTimeout(() => undefined, 0)
++            const capturedCallback = typeof callback === "function"
++              ? () => callback(...args)
++              : () => undefined
++            capturedTimers.set(timerID, { callback: capturedCallback, cleared: false })
++            return timerID
+           }
+-          return originalSetTimeout(callback as Parameters<typeof originalSetTimeout>[0], delay)
+-        }) as unknown as typeof setTimeout
++          return typeof callback === "function"
++            ? originalSetTimeout(callback, delay, ...args)
++            : originalSetTimeout(() => undefined, delay)
++        }) as typeof setTimeout
+ 
+-        globalThis.clearTimeout = ((id?: number | ReturnType<typeof setTimeout>) => {
+-          if (typeof id === "number" && capturedTimers.has(id)) {
++        globalThis.clearTimeout = ((id?: ReturnType<typeof setTimeout>) => {
++          if (id && capturedTimers.has(id)) {
+             capturedTimers.get(id)!.cleared = true
+             capturedTimers.delete(id)
+             return
+           }
+-          originalClearTimeout(id as Parameters<typeof originalClearTimeout>[0])
+-        }) as unknown as typeof clearTimeout
++          originalClearTimeout(id)
++        }) as typeof clearTimeout
+       })
+ 
+       afterEach(() => {
+diff --git a/src/hooks/atlas/tool-execute-after.ts b/src/hooks/atlas/tool-execute-after.ts
+index 5fd5808e..a2d9c9e0 100644
+--- a/src/hooks/atlas/tool-execute-after.ts
++++ b/src/hooks/atlas/tool-execute-after.ts
+@@ -32,7 +32,7 @@ export function createToolExecuteAfterHandler(input: {
+   pendingTaskRefs: Map<string, PendingTaskRef>
+   autoCommit: boolean
+   getState: (sessionID: string) => SessionState
+-}): (toolInput: ToolExecuteAfterInput, toolOutput: ToolExecuteAfterOutput) => Promise<void> {
++}): (toolInput: ToolExecuteAfterInput, toolOutput: ToolExecuteAfterOutput | undefined) => Promise<void> {
+   const { ctx, pendingFilePaths, pendingTaskRefs, autoCommit, getState } = input
+   return async (toolInput, toolOutput): Promise<void> => {
+     // Guard against undefined output (e.g., from /review command - see issue #1035)
+diff --git a/src/hooks/atlas/types.ts b/src/hooks/atlas/types.ts
+index 534478da..f82f8ca1 100644
+--- a/src/hooks/atlas/types.ts
++++ b/src/hooks/atlas/types.ts
+@@ -1,12 +1,15 @@
+ import type { AgentOverrides } from "../../config"
+-import type { BackgroundManager } from "../../features/background-agent"
+ import type { TopLevelTaskRef } from "../../features/boulder-state"
+ 
+ export type ModelInfo = { providerID: string; modelID: string; variant?: string }
+ 
++export interface BackgroundTaskStatusProvider {
++  getTasksByParentSession: (sessionID: string) => Array<{ status: string }>
++}
++
+ export interface AtlasHookOptions {
+   directory: string
+-  backgroundManager?: BackgroundManager
++  backgroundManager?: BackgroundTaskStatusProvider
+   isContinuationStopped?: (sessionID: string) => boolean
+   agentOverrides?: AgentOverrides
+   /** Enable auto-commit after each atomic task completion (default: true) */
+@@ -34,6 +37,7 @@ export type PendingTaskRef =
+ 
+ export interface SessionState {
+   lastEventWasAbortError?: boolean
++  skipNextIdleAfterRuntimeErrorRetry?: boolean
+   lastContinuationInjectedAt?: number
+   isInjectingContinuation?: boolean
+   promptFailureCount: number
+-- 
+2.39.2
+

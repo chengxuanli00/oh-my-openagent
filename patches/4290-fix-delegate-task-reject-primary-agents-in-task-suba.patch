@@ -1,0 +1,477 @@
+From 01a1b141e9c489d9f506afc6da79897416ac15ba Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 13 Apr 2026 15:52:44 +0900
+Subject: [PATCH 4290/5749] fix(delegate-task): reject primary agents in task
+ subagent resolution
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../delegate-task/delegated-model-config.ts   |  20 +++
+ .../fallback-entry-resolution.ts              |  27 ++++
+ .../delegate-task/fallback-entry-settings.ts  |  20 +++
+ src/tools/delegate-task/subagent-discovery.ts |  85 +++++++++++
+ src/tools/delegate-task/subagent-resolver.ts  | 144 +++++-------------
+ src/tools/delegate-task/task-schema.test.ts   |  16 ++
+ src/tools/delegate-task/tools.test.ts         |   2 +-
+ .../subagent-resolver.test.ts                 |  21 ++-
+ 8 files changed, 222 insertions(+), 113 deletions(-)
+ create mode 100644 src/tools/delegate-task/delegated-model-config.ts
+ create mode 100644 src/tools/delegate-task/fallback-entry-resolution.ts
+ create mode 100644 src/tools/delegate-task/fallback-entry-settings.ts
+ create mode 100644 src/tools/delegate-task/subagent-discovery.ts
+
+diff --git a/src/tools/delegate-task/delegated-model-config.ts b/src/tools/delegate-task/delegated-model-config.ts
+new file mode 100644
+index 00000000..dadf8321
+--- /dev/null
++++ b/src/tools/delegate-task/delegated-model-config.ts
+@@ -0,0 +1,20 @@
++import type { CategoryConfig } from "../../config/schema"
++import type { DelegatedModelConfig } from "./types"
++
++export function applyCategoryParams(
++  base: DelegatedModelConfig,
++  config: CategoryConfig | undefined,
++): DelegatedModelConfig {
++  if (!config) {
++    return base
++  }
++
++  return {
++    ...base,
++    ...(config.reasoningEffort !== undefined ? { reasoningEffort: config.reasoningEffort } : {}),
++    ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
++    ...(config.top_p !== undefined ? { top_p: config.top_p } : {}),
++    ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
++    ...(config.thinking !== undefined ? { thinking: config.thinking } : {}),
++  }
++}
+diff --git a/src/tools/delegate-task/fallback-entry-resolution.ts b/src/tools/delegate-task/fallback-entry-resolution.ts
+new file mode 100644
+index 00000000..4603e365
+--- /dev/null
++++ b/src/tools/delegate-task/fallback-entry-resolution.ts
+@@ -0,0 +1,27 @@
++import { findMostSpecificFallbackEntry } from "../../shared/fallback-chain-from-models"
++import type { FallbackEntry } from "../../shared/model-requirements"
++import type { DelegatedModelConfig } from "./types"
++
++export function resolveEffectiveFallbackEntry(input: {
++  categoryModel: DelegatedModelConfig | undefined
++  configuredFallbackChain: FallbackEntry[] | undefined
++  resolution:
++    | { skipped: true }
++    | { fallbackEntry?: FallbackEntry; matchedFallback?: boolean }
++    | undefined
++}): FallbackEntry | undefined {
++  const { categoryModel, configuredFallbackChain, resolution } = input
++
++  const resolutionSkipped = resolution && "skipped" in resolution
++  const resolvedFallbackEntry = resolution && !resolutionSkipped ? resolution.fallbackEntry : undefined
++  const matchedFallback = resolution && !resolutionSkipped ? resolution.matchedFallback === true : false
++
++  if (!matchedFallback || !categoryModel) {
++    return undefined
++  }
++
++  return resolvedFallbackEntry
++    ?? (configuredFallbackChain
++      ? findMostSpecificFallbackEntry(categoryModel.providerID, categoryModel.modelID, configuredFallbackChain)
++      : undefined)
++}
+diff --git a/src/tools/delegate-task/fallback-entry-settings.ts b/src/tools/delegate-task/fallback-entry-settings.ts
+new file mode 100644
+index 00000000..101d9b6e
+--- /dev/null
++++ b/src/tools/delegate-task/fallback-entry-settings.ts
+@@ -0,0 +1,20 @@
++import type { DelegatedModelConfig } from "./types"
++import type { FallbackEntry } from "../../shared/model-requirements"
++
++export function applyFallbackEntrySettings(input: {
++  categoryModel: DelegatedModelConfig
++  effectiveEntry: FallbackEntry
++  variantOverride?: string
++}): DelegatedModelConfig {
++  const { categoryModel, effectiveEntry, variantOverride } = input
++
++  return {
++    ...categoryModel,
++    variant: variantOverride ?? effectiveEntry.variant ?? categoryModel.variant,
++    reasoningEffort: effectiveEntry.reasoningEffort ?? categoryModel.reasoningEffort,
++    temperature: effectiveEntry.temperature ?? categoryModel.temperature,
++    top_p: effectiveEntry.top_p ?? categoryModel.top_p,
++    maxTokens: effectiveEntry.maxTokens ?? categoryModel.maxTokens,
++    thinking: effectiveEntry.thinking ?? categoryModel.thinking,
++  }
++}
+diff --git a/src/tools/delegate-task/subagent-discovery.ts b/src/tools/delegate-task/subagent-discovery.ts
+new file mode 100644
+index 00000000..340ef7c2
+--- /dev/null
++++ b/src/tools/delegate-task/subagent-discovery.ts
+@@ -0,0 +1,85 @@
++import { getAgentConfigKey, getAgentDisplayName, stripAgentListSortPrefix } from "../../shared/agent-display-names"
++import { loadUserAgents, loadProjectAgents } from "../../features/claude-code-agent-loader"
++
++export type AgentMode = "subagent" | "primary" | "all" | undefined
++
++export type AgentInfo = {
++  name: string
++  mode?: "subagent" | "primary" | "all"
++  model?: string | { providerID: string; modelID: string }
++}
++
++export function sanitizeSubagentType(subagentType: string): string {
++  return subagentType.trim().replace(/^[\\\/"']+|[\\\/"']+$/g, "").trim()
++}
++
++export function mergeWithClaudeCodeAgents(
++  serverAgents: AgentInfo[],
++  directory: string | undefined,
++): AgentInfo[] {
++  const userAgentsRecord = loadUserAgents()
++  const projectAgentsRecord = loadProjectAgents(directory)
++
++  const toAgentInfoList = (record: Record<string, { mode?: string; model?: AgentInfo["model"] }>): AgentInfo[] =>
++    Object.entries(record).map(([name, config]) => ({
++      name,
++      mode: config.mode as AgentInfo["mode"],
++      model: config.model,
++    }))
++
++  const mergedAgentMap = new Map<string, AgentInfo>()
++  const addIfAbsent = (agent: AgentInfo): void => {
++    const key = agent.name.toLowerCase()
++    if (!mergedAgentMap.has(key)) {
++      mergedAgentMap.set(key, agent)
++    }
++  }
++
++  for (const agent of serverAgents) addIfAbsent(agent)
++  for (const agent of toAgentInfoList(projectAgentsRecord)) addIfAbsent(agent)
++  for (const agent of toAgentInfoList(userAgentsRecord)) addIfAbsent(agent)
++
++  return Array.from(mergedAgentMap.values())
++}
++
++function buildComparableNames(agentName: string): Set<string> {
++  return new Set([
++    agentName,
++    getAgentDisplayName(agentName),
++    getAgentConfigKey(agentName),
++  ].map(name => stripAgentListSortPrefix(name).trim().toLowerCase()))
++}
++
++function matchesRequestedAgent(agent: AgentInfo, requestedAgentName: string): boolean {
++  const comparableNames = buildComparableNames(requestedAgentName)
++  const listedAgentName = stripAgentListSortPrefix(agent.name).trim().toLowerCase()
++  const listedAgentConfigKey = getAgentConfigKey(agent.name).trim().toLowerCase()
++
++  return comparableNames.has(listedAgentName) || comparableNames.has(listedAgentConfigKey)
++}
++
++export function isTaskCallableAgentMode(mode: AgentMode): boolean {
++  return mode === "all" || mode === "subagent"
++}
++
++export function findPrimaryAgentMatch(
++  agents: AgentInfo[],
++  requestedAgentName: string,
++): AgentInfo | undefined {
++  return agents.find(agent => agent.mode === "primary" && matchesRequestedAgent(agent, requestedAgentName))
++}
++
++export function findCallableAgentMatch(
++  agents: AgentInfo[],
++  requestedAgentName: string,
++): AgentInfo | undefined {
++  return agents.find(agent => isTaskCallableAgentMode(agent.mode) && matchesRequestedAgent(agent, requestedAgentName))
++}
++
++export function listCallableAgentNames(agents: AgentInfo[]): string {
++  return agents
++    .filter(agent => isTaskCallableAgentMode(agent.mode))
++    .map(agent => stripAgentListSortPrefix(agent.name))
++    .sort()
++    .join(", ")
++}
+diff --git a/src/tools/delegate-task/subagent-resolver.ts b/src/tools/delegate-task/subagent-resolver.ts
+index 41eaae1f..1d67f24b 100644
+--- a/src/tools/delegate-task/subagent-resolver.ts
++++ b/src/tools/delegate-task/subagent-resolver.ts
+@@ -3,83 +3,28 @@ import type { ExecutorContext } from "./executor-types"
+ import type { DelegatedModelConfig } from "./types"
+ import { isPlanFamily } from "./constants"
+ import { SISYPHUS_JUNIOR_AGENT } from "./sisyphus-junior-agent"
++import { applyCategoryParams } from "./delegated-model-config"
++import { resolveEffectiveFallbackEntry } from "./fallback-entry-resolution"
++import { applyFallbackEntrySettings } from "./fallback-entry-settings"
++import {
++  type AgentInfo,
++  sanitizeSubagentType,
++  mergeWithClaudeCodeAgents,
++  findPrimaryAgentMatch,
++  findCallableAgentMatch,
++  listCallableAgentNames,
++} from "./subagent-discovery"
+ import { normalizeModelFormat } from "../../shared/model-format-normalizer"
+ import { AGENT_MODEL_REQUIREMENTS } from "../../shared/model-requirements"
+ import { normalizeFallbackModels, flattenToFallbackModelStrings } from "../../shared/model-resolver"
+-import { buildFallbackChainFromModels, findMostSpecificFallbackEntry } from "../../shared/fallback-chain-from-models"
+-import { getAgentDisplayName, getAgentConfigKey, stripAgentListSortPrefix } from "../../shared/agent-display-names"
++import { buildFallbackChainFromModels } from "../../shared/fallback-chain-from-models"
++import { getAgentConfigKey, stripAgentListSortPrefix } from "../../shared/agent-display-names"
+ import { normalizeSDKResponse } from "../../shared"
+ import { log } from "../../shared/logger"
+ import { getAvailableModelsForDelegateTask } from "./available-models"
+ import type { FallbackEntry } from "../../shared/model-requirements"
+ import { resolveModelForDelegateTask } from "./model-selection"
+ import { fuzzyMatchModel } from "../../shared/model-availability"
+-import type { CategoryConfig } from "../../config/schema"
+-import { loadUserAgents, loadProjectAgents } from "../../features/claude-code-agent-loader"
+-
+-type AgentMode = "subagent" | "primary" | "all" | undefined
+-
+-type AgentInfo = {
+-  name: string
+-  mode?: "subagent" | "primary" | "all"
+-  model?: string | { providerID: string; modelID: string }
+-}
+-
+-function applyCategoryParams(
+-  base: DelegatedModelConfig,
+-  config: CategoryConfig | undefined,
+-): DelegatedModelConfig {
+-  if (!config) {
+-    return base
+-  }
+-
+-  return {
+-    ...base,
+-    ...(config.reasoningEffort !== undefined ? { reasoningEffort: config.reasoningEffort } : {}),
+-    ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
+-    ...(config.top_p !== undefined ? { top_p: config.top_p } : {}),
+-    ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
+-    ...(config.thinking !== undefined ? { thinking: config.thinking } : {}),
+-  }
+-}
+-
+-function mergeWithClaudeCodeAgents(
+-  serverAgents: AgentInfo[],
+-  directory: string | undefined,
+-): AgentInfo[] {
+-  const userAgentsRecord = loadUserAgents()
+-  const projectAgentsRecord = loadProjectAgents(directory)
+-
+-  const toAgentInfoList = (record: Record<string, { mode?: string; model?: AgentInfo["model"] }>): AgentInfo[] =>
+-    Object.entries(record).map(([name, config]) => ({
+-      name,
+-      mode: config.mode as AgentInfo["mode"],
+-      model: config.model,
+-    }))
+-
+-  const projectAgentsList = toAgentInfoList(projectAgentsRecord)
+-  const userAgentsList = toAgentInfoList(userAgentsRecord)
+-
+-  const mergedAgentMap = new Map<string, AgentInfo>()
+-  const addIfAbsent = (agent: AgentInfo): void => {
+-    const key = agent.name.toLowerCase()
+-    if (!mergedAgentMap.has(key)) {
+-      mergedAgentMap.set(key, agent)
+-    }
+-  }
+-
+-  for (const agent of serverAgents) {
+-    addIfAbsent(agent)
+-  }
+-  for (const agent of projectAgentsList) {
+-    addIfAbsent(agent)
+-  }
+-  for (const agent of userAgentsList) {
+-    addIfAbsent(agent)
+-  }
+-
+-  return Array.from(mergedAgentMap.values())
+-}
+ 
+ export async function resolveSubagentExecution(
+   args: DelegateTaskArgs,
+@@ -93,9 +38,7 @@ export async function resolveSubagentExecution(
+     return { agentToUse: "", categoryModel: undefined, error: `Agent name cannot be empty.` }
+   }
+ 
+-  // Strip wrapping characters (backslashes, quotes) that LLMs sometimes add around agent names
+-  // e.g. \hephaestus\ -> hephaestus, "oracle" -> oracle, 'explore' -> explore
+-  const agentName = args.subagent_type.trim().replace(/^[\\\/"']+|[\\\/"']+$/g, "").trim()
++  const agentName = sanitizeSubagentType(args.subagent_type)
+ 
+   if (agentName.toLowerCase() === SISYPHUS_JUNIOR_AGENT.toLowerCase()) {
+     return {
+@@ -128,26 +71,22 @@ Create the work plan directly - that's your job as the planning agent.`,
+     })
+ 
+     const mergedAgents = mergeWithClaudeCodeAgents(agents, executorCtx.directory)
+-    const callableAgents = mergedAgents.filter((agent) => isTaskCallableAgentMode(agent.mode))
++    const matchedPrimaryAgent = findPrimaryAgentMatch(mergedAgents, agentToUse)
+ 
+-    const resolvedDisplayName = stripAgentListSortPrefix(getAgentDisplayName(agentToUse))
+-    const normalizedAgentToUse = stripAgentListSortPrefix(agentToUse)
+-    const matchedAgent = callableAgents.find(
+-      (agent) => {
+-        const normalizedListedAgentName = stripAgentListSortPrefix(agent.name)
+-        return normalizedListedAgentName.toLowerCase() === normalizedAgentToUse.toLowerCase()
+-          || normalizedListedAgentName.toLowerCase() === resolvedDisplayName.toLowerCase()
++    if (matchedPrimaryAgent) {
++      return {
++        agentToUse: "",
++        categoryModel: undefined,
++        error: `Cannot delegate to primary agent "${stripAgentListSortPrefix(matchedPrimaryAgent.name)}" via task. Select that agent directly instead.`,
+       }
+-    )
++    }
++
++    const matchedAgent = findCallableAgentMatch(mergedAgents, agentToUse)
+     if (!matchedAgent) {
+-      const availableAgents = callableAgents
+-        .map((a) => stripAgentListSortPrefix(a.name))
+-        .sort()
+-        .join(", ")
+       return {
+         agentToUse: "",
+         categoryModel: undefined,
+-        error: `Unknown agent: "${agentToUse}". Available agents: ${availableAgents}`,
++        error: `Unknown agent: "${agentToUse}". Available agents: ${listCallableAgentNames(mergedAgents)}`,
+       }
+     }
+ 
+@@ -216,29 +155,18 @@ Create the work plan directly - that's your job as the planning agent.`,
+         defaultProviderID,
+       )
+       fallbackChain = configuredFallbackChain ?? (resolutionSkipped ? undefined : agentRequirement?.fallbackChain)
+-
+-      // Only promote fallback-only settings when resolution actually selected a fallback model.
+-      const resolvedFallbackEntry = (resolution && !('skipped' in resolution)) ? resolution.fallbackEntry : undefined
+-      const matchedFallback = (resolution && !('skipped' in resolution)) ? resolution.matchedFallback === true : false
+-      const effectiveEntry = matchedFallback && categoryModel
+-        ? (
+-            resolvedFallbackEntry
+-            ?? (configuredFallbackChain
+-              ? findMostSpecificFallbackEntry(categoryModel.providerID, categoryModel.modelID, configuredFallbackChain)
+-              : undefined)
+-          )
+-        : undefined
++      const effectiveEntry = resolveEffectiveFallbackEntry({
++        categoryModel,
++        configuredFallbackChain,
++        resolution,
++      })
+ 
+       if (categoryModel && effectiveEntry) {
+-        categoryModel = {
+-          ...categoryModel,
+-          variant: agentOverride?.variant ?? effectiveEntry.variant ?? categoryModel.variant,
+-          reasoningEffort: effectiveEntry.reasoningEffort ?? categoryModel.reasoningEffort,
+-          temperature: effectiveEntry.temperature ?? categoryModel.temperature,
+-          top_p: effectiveEntry.top_p ?? categoryModel.top_p,
+-          maxTokens: effectiveEntry.maxTokens ?? categoryModel.maxTokens,
+-          thinking: effectiveEntry.thinking ?? categoryModel.thinking,
+-        }
++        categoryModel = applyFallbackEntrySettings({
++          categoryModel,
++          effectiveEntry,
++          variantOverride: agentOverride?.variant,
++        })
+       }
+     }
+ 
+@@ -273,7 +201,3 @@ Create the work plan directly - that's your job as the planning agent.`,
+ 
+   return { agentToUse, categoryModel, fallbackChain }
+ }
+-
+-function isTaskCallableAgentMode(mode: AgentMode): boolean {
+-  return mode === "all" || mode === "subagent"
+-}
+diff --git a/src/tools/delegate-task/task-schema.test.ts b/src/tools/delegate-task/task-schema.test.ts
+index 958b9f0a..0a6f1c7e 100644
+--- a/src/tools/delegate-task/task-schema.test.ts
++++ b/src/tools/delegate-task/task-schema.test.ts
+@@ -31,4 +31,20 @@ function createDelegateTask(...args: Parameters<typeof import("./tools").createD
+ 		expect(categorySchema.def.type).toBe("optional")
+ 		expect(categorySchema.def.innerType.def.type).toBe("string")
+ 	})
++
++	test("#given task description #when tool is created #then primary agents are not advertised for subagent_type", () => {
++		//#given
++		const toolDefinition = createDelegateTask({ manager: {} as never, client: {} as never, directory: "/tmp/test" })
++
++		//#when
++		const description = toolDefinition.description
++
++		//#then
++		expect(description).toContain("subagent_type: Use specific agent directly")
++		expect(description).not.toContain("sisyphus")
++		expect(description).not.toContain("hephaestus")
++		expect(description).not.toContain("prometheus")
++	})
+ })
++
++export {}
+diff --git a/src/tools/delegate-task/tools.test.ts b/src/tools/delegate-task/tools.test.ts
+index 0508fc5c..650eb767 100644
+--- a/src/tools/delegate-task/tools.test.ts
++++ b/src/tools/delegate-task/tools.test.ts
+@@ -4178,7 +4178,7 @@ describe("sisyphus-task", () => {
+       )
+       
+       //#then
+-      expect(result).toContain('Unknown agent: "prometheus"')
++      expect(result).toContain('Cannot delegate to primary agent "prometheus" via task. Select that agent directly instead.')
+     }, { timeout: 20000 })
+ 
+     test("non-plan subagent should NOT have task permission", async () => {
+diff --git a/src/tools/delegate-task/zauc-mocks-subagent-resolver/subagent-resolver.test.ts b/src/tools/delegate-task/zauc-mocks-subagent-resolver/subagent-resolver.test.ts
+index 08286ba2..fe6ffff9 100644
+--- a/src/tools/delegate-task/zauc-mocks-subagent-resolver/subagent-resolver.test.ts
++++ b/src/tools/delegate-task/zauc-mocks-subagent-resolver/subagent-resolver.test.ts
+@@ -148,7 +148,24 @@ describe("resolveSubagentExecution", () => {
+     //#then
+     expect(result.agentToUse).toBe("")
+     expect(result.categoryModel).toBeUndefined()
+-    expect(result.error).toBe('Unknown agent: "sisyphus". Available agents: metis, oracle')
++    expect(result.error).toBe('Cannot delegate to primary agent "sisyphus" via task. Select that agent directly instead.')
++  })
++
++  test("returns explicit error for primary display-name agents", async () => {
++    //#given
++    const args = createBaseArgs({ subagent_type: "Prometheus - Plan Builder" })
++    const executorCtx = createExecutorContext(async () => ([
++      { name: "Prometheus - Plan Builder", mode: "primary" },
++      { name: "oracle", mode: "subagent" },
++    ]))
++
++    //#when
++    const result = await resolveSubagentExecution(args, executorCtx, "sisyphus", "deep")
++
++    //#then
++    expect(result.agentToUse).toBe("")
++    expect(result.categoryModel).toBeUndefined()
++    expect(result.error).toBe('Cannot delegate to primary agent "Prometheus - Plan Builder" via task. Select that agent directly instead.')
+   })
+ 
+   test("requires explicit all or subagent mode for task-callable agents", async () => {
+@@ -823,7 +840,7 @@ describe("resolveSubagentExecution", () => {
+     const result = await resolveSubagentExecution(args, executorCtx, "sisyphus", "deep")
+ 
+     //#then
+-    expect(result.error).toContain("Unknown agent")
++    expect(result.error).toBe('Cannot delegate to primary agent "my-primary-agent" via task. Select that agent directly instead.')
+     expect(result.agentToUse).toBe("")
+   })
+ })
+-- 
+2.39.2
+

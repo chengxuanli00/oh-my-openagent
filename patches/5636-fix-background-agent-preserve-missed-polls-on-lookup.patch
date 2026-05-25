@@ -1,0 +1,168 @@
+From 0feb12507962d3b8188c9a8c622a32dce352222b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 21 May 2026 13:13:14 +0900
+Subject: [PATCH 5636/5749] fix(background-agent): preserve missed polls on
+ lookup errors
+
+---
+ .../session-existence.test.ts                 | 18 ++++++++++++++-
+ .../background-agent/session-existence.ts     | 19 +++++++++++-----
+ .../background-agent/task-poller.test.ts      |  4 ++--
+ src/features/background-agent/task-poller.ts  | 22 +++++++++++++------
+ 4 files changed, 48 insertions(+), 15 deletions(-)
+
+diff --git a/src/features/background-agent/session-existence.test.ts b/src/features/background-agent/session-existence.test.ts
+index f0cdbed5..44b978b3 100644
+--- a/src/features/background-agent/session-existence.test.ts
++++ b/src/features/background-agent/session-existence.test.ts
+@@ -1,7 +1,7 @@
+ import { describe, expect, mock, test } from "bun:test"
+ 
+ import type { OpencodeClient } from "./opencode-client"
+-import { verifySessionExists } from "./session-existence"
++import { checkSessionExistence, verifySessionExists } from "./session-existence"
+ import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
+ 
+ describe("verifySessionExists", () => {
+@@ -24,4 +24,20 @@ describe("verifySessionExists", () => {
+       query: { directory: "/project/root" },
+     })
+   })
++
++  test("classifies transient lookup errors as unknown", async () => {
++    const get = mock(async () => ({
++      error: { message: "Network timeout", status: 500 },
++      data: undefined,
++    }))
++    const client = unsafeTestValue<OpencodeClient>({
++      session: {
++        get,
++      },
++    })
++
++    const result = await checkSessionExistence(client, "session-123")
++
++    expect(result).toBe("unknown")
++  })
+ })
+diff --git a/src/features/background-agent/session-existence.ts b/src/features/background-agent/session-existence.ts
+index 789b0189..d61544f9 100644
+--- a/src/features/background-agent/session-existence.ts
++++ b/src/features/background-agent/session-existence.ts
+@@ -1,6 +1,7 @@
+ import type { OpencodeClient } from "./opencode-client"
+ 
+ export const MIN_SESSION_GONE_POLLS = 3
++export type SessionExistenceStatus = "exists" | "missing" | "unknown"
+ 
+ function extractErrorMessage(error: unknown): string | undefined {
+   if (typeof error === "string") {
+@@ -35,11 +36,11 @@ function isSessionNotFoundError(error: unknown): boolean {
+   return message.includes("not found") || message.includes("missing")
+ }
+ 
+-export async function verifySessionExists(
++export async function checkSessionExistence(
+   client: OpencodeClient,
+   sessionID: string,
+   directory?: string
+-): Promise<boolean> {
++): Promise<SessionExistenceStatus> {
+   try {
+     const response = await client.session.get({
+       path: { id: sessionID },
+@@ -47,11 +48,19 @@ export async function verifySessionExists(
+     })
+ 
+     if (response.error !== undefined && response.error !== null) {
+-      return !isSessionNotFoundError(response.error)
++      return isSessionNotFoundError(response.error) ? "missing" : "unknown"
+     }
+ 
+-    return response.data != null
++    return response.data != null ? "exists" : "missing"
+   } catch (error) {
+-    return !isSessionNotFoundError(error)
++    return isSessionNotFoundError(error) ? "missing" : "unknown"
+   }
+ }
++
++export async function verifySessionExists(
++  client: OpencodeClient,
++  sessionID: string,
++  directory?: string
++): Promise<boolean> {
++  return await checkSessionExistence(client, sessionID, directory) !== "missing"
++}
+diff --git a/src/features/background-agent/task-poller.test.ts b/src/features/background-agent/task-poller.test.ts
+index b08f78c5..da4d2da1 100644
+--- a/src/features/background-agent/task-poller.test.ts
++++ b/src/features/background-agent/task-poller.test.ts
+@@ -472,7 +472,7 @@ describe("checkAndInterruptStaleTasks", () => {
+     expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: "ses-1" } })
+   })
+ 
+-  it("should NOT cancel task when session.get returns a transient error response", async () => {
++  it("should NOT cancel or reset missed polls when session.get returns a transient error response", async () => {
+     //#given - repeated missing polls but lookup failed with a retryable transport error
+     const task = createRunningTask({
+       startedAt: new Date(Date.now() - 300_000),
+@@ -500,7 +500,7 @@ describe("checkAndInterruptStaleTasks", () => {
+ 
+     //#then
+     expect(task.status).toBe("running")
+-    expect(task.consecutiveMissedPolls).toBe(0)
++    expect(task.consecutiveMissedPolls).toBe(3)
+     expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: "ses-1" } })
+   })
+ 
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index 9f0e0362..d80a16cf 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -16,7 +16,7 @@ import {
+ } from "./constants"
+ import { abortWithTimeout } from "./abort-with-timeout"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
+-import { MIN_SESSION_GONE_POLLS, verifySessionExists } from "./session-existence"
++import { checkSessionExistence, MIN_SESSION_GONE_POLLS } from "./session-existence"
+ 
+ import { isActiveSessionStatus } from "./session-status-classifier"
+ import { getSessionActivityFromClient, type SessionActivityResolver } from "./session-activity"
+@@ -178,9 +178,13 @@ export async function checkAndInterruptStaleTasks(args: {
+         if (activityRefresh.type === "activity" && now - activityRefresh.activityTime <= effectiveTimeout) continue
+       }
+ 
+-      if (sessionGone && await verifySessionExists(client, sessionID, directory)) {
+-        task.consecutiveMissedPolls = 0
+-        continue
++      if (sessionGone) {
++        const existence = await checkSessionExistence(client, sessionID, directory)
++        if (existence === "exists") {
++          task.consecutiveMissedPolls = 0
++          continue
++        }
++        if (existence === "unknown") continue
+       }
+ 
+       const staleMinutes = Math.round(runtime / 60000)
+@@ -228,9 +232,13 @@ export async function checkAndInterruptStaleTasks(args: {
+ 
+     if (task.status !== "running") continue
+ 
+-    if (sessionGone && await verifySessionExists(client, sessionID, directory)) {
+-      task.consecutiveMissedPolls = 0
+-      continue
++    if (sessionGone) {
++      const existence = await checkSessionExistence(client, sessionID, directory)
++      if (existence === "exists") {
++        task.consecutiveMissedPolls = 0
++        continue
++      }
++      if (existence === "unknown") continue
+     }
+ 
+     const staleMinutes = Math.round(timeSinceLastUpdate / 60000)
+-- 
+2.39.2
+

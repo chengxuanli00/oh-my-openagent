@@ -1,0 +1,1108 @@
+From 17994693afc70a5cc43fde58f85e67497d5b1b7b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 17 Feb 2026 02:34:35 +0900
+Subject: [PATCH 2293/5749] fix: add directory parameter and improve CLI run
+ session handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add directory parameter to session API calls (session.get, session.todo,
+  session.status, session.children)
+- Improve agent resolver with display name support via agent-display-names
+- Add tool execution visibility in event handlers with running/completed
+  status output
+- Enhance poll-for-completion with main session status checking and
+  stabilization period handling
+- Add normalizeSDKResponse import for consistent response handling
+- Update types with Todo, ChildSession, and toast-related interfaces
+
+🤖 Generated with OhMyOpenCode assistance
+---
+ src/cli/run/agent-resolver.ts           |  55 ++++--
+ src/cli/run/completion.ts               |  10 +-
+ src/cli/run/event-formatting.ts         |  12 +-
+ src/cli/run/event-handlers.test.ts      | 211 +++++++++++++++++++++++-
+ src/cli/run/event-handlers.ts           | 102 +++++++++++-
+ src/cli/run/event-stream-processor.ts   |   2 +
+ src/cli/run/events.test.ts              |  23 +++
+ src/cli/run/integration.test.ts         |  14 +-
+ src/cli/run/poll-for-completion.test.ts |  46 ++++++
+ src/cli/run/poll-for-completion.ts      |  35 +++-
+ src/cli/run/runner.test.ts              |  21 ++-
+ src/cli/run/runner.ts                   |   1 +
+ src/cli/run/session-resolver.test.ts    |  18 +-
+ src/cli/run/session-resolver.ts         |   9 +-
+ src/cli/run/types.ts                    |  24 ++-
+ 15 files changed, 529 insertions(+), 54 deletions(-)
+
+diff --git a/src/cli/run/agent-resolver.ts b/src/cli/run/agent-resolver.ts
+index 17755712..9bb82041 100644
+--- a/src/cli/run/agent-resolver.ts
++++ b/src/cli/run/agent-resolver.ts
+@@ -1,32 +1,45 @@
+ import pc from "picocolors"
+ import type { RunOptions } from "./types"
+ import type { OhMyOpenCodeConfig } from "../../config"
++import { getAgentConfigKey, getAgentDisplayName } from "../../shared/agent-display-names"
+ 
+ const CORE_AGENT_ORDER = ["sisyphus", "hephaestus", "prometheus", "atlas"] as const
+ const DEFAULT_AGENT = "sisyphus"
+ 
+ type EnvVars = Record<string, string | undefined>
++type CoreAgentKey = (typeof CORE_AGENT_ORDER)[number]
+ 
+-const normalizeAgentName = (agent?: string): string | undefined => {
++interface ResolvedAgent {
++  configKey: string
++  resolvedName: string
++}
++
++const normalizeAgentName = (agent?: string): ResolvedAgent | undefined => {
+   if (!agent) return undefined
+   const trimmed = agent.trim()
+-  if (!trimmed) return undefined
+-  const lowered = trimmed.toLowerCase()
+-  const coreMatch = CORE_AGENT_ORDER.find((name) => name.toLowerCase() === lowered)
+-  return coreMatch ?? trimmed
++  if (trimmed.length === 0) return undefined
++
++  const configKey = getAgentConfigKey(trimmed)
++  const displayName = getAgentDisplayName(configKey)
++  const isKnownAgent = displayName !== configKey
++
++  return {
++    configKey,
++    resolvedName: isKnownAgent ? displayName : trimmed,
++  }
+ }
+ 
+-const isAgentDisabled = (agent: string, config: OhMyOpenCodeConfig): boolean => {
+-  const lowered = agent.toLowerCase()
+-  if (lowered === "sisyphus" && config.sisyphus_agent?.disabled === true) {
++const isAgentDisabled = (agentConfigKey: string, config: OhMyOpenCodeConfig): boolean => {
++  const lowered = agentConfigKey.toLowerCase()
++  if (lowered === DEFAULT_AGENT && config.sisyphus_agent?.disabled === true) {
+     return true
+   }
+   return (config.disabled_agents ?? []).some(
+-    (disabled) => disabled.toLowerCase() === lowered
++    (disabled) => getAgentConfigKey(disabled) === lowered
+   )
+ }
+ 
+-const pickFallbackAgent = (config: OhMyOpenCodeConfig): string => {
++const pickFallbackAgent = (config: OhMyOpenCodeConfig): CoreAgentKey => {
+   for (const agent of CORE_AGENT_ORDER) {
+     if (!isAgentDisabled(agent, config)) {
+       return agent
+@@ -43,27 +56,33 @@ export const resolveRunAgent = (
+   const cliAgent = normalizeAgentName(options.agent)
+   const envAgent = normalizeAgentName(env.OPENCODE_DEFAULT_AGENT)
+   const configAgent = normalizeAgentName(pluginConfig.default_run_agent)
+-  const resolved = cliAgent ?? envAgent ?? configAgent ?? DEFAULT_AGENT
+-  const normalized = normalizeAgentName(resolved) ?? DEFAULT_AGENT
++  const resolved =
++    cliAgent ??
++    envAgent ??
++    configAgent ?? {
++      configKey: DEFAULT_AGENT,
++      resolvedName: getAgentDisplayName(DEFAULT_AGENT),
++    }
+ 
+-  if (isAgentDisabled(normalized, pluginConfig)) {
++  if (isAgentDisabled(resolved.configKey, pluginConfig)) {
+     const fallback = pickFallbackAgent(pluginConfig)
++    const fallbackName = getAgentDisplayName(fallback)
+     const fallbackDisabled = isAgentDisabled(fallback, pluginConfig)
+     if (fallbackDisabled) {
+       console.log(
+         pc.yellow(
+-          `Requested agent "${normalized}" is disabled and no enabled core agent was found. Proceeding with "${fallback}".`
++          `Requested agent "${resolved.resolvedName}" is disabled and no enabled core agent was found. Proceeding with "${fallbackName}".`
+         )
+       )
+-      return fallback
++      return fallbackName
+     }
+     console.log(
+       pc.yellow(
+-        `Requested agent "${normalized}" is disabled. Falling back to "${fallback}".`
++        `Requested agent "${resolved.resolvedName}" is disabled. Falling back to "${fallbackName}".`
+       )
+     )
+-    return fallback
++    return fallbackName
+   }
+ 
+-  return normalized
++  return resolved.resolvedName
+ }
+diff --git a/src/cli/run/completion.ts b/src/cli/run/completion.ts
+index f339e9d2..cb4759d5 100644
+--- a/src/cli/run/completion.ts
++++ b/src/cli/run/completion.ts
+@@ -20,7 +20,10 @@ export async function checkCompletionConditions(ctx: RunContext): Promise<boolea
+ }
+ 
+ async function areAllTodosComplete(ctx: RunContext): Promise<boolean> {
+-  const todosRes = await ctx.client.session.todo({ path: { id: ctx.sessionID } })
++  const todosRes = await ctx.client.session.todo({
++    path: { id: ctx.sessionID },
++    query: { directory: ctx.directory },
++  })
+   const todos = normalizeSDKResponse(todosRes, [] as Todo[])
+ 
+   const incompleteTodos = todos.filter(
+@@ -43,7 +46,9 @@ async function areAllChildrenIdle(ctx: RunContext): Promise<boolean> {
+ async function fetchAllStatuses(
+   ctx: RunContext
+ ): Promise<Record<string, SessionStatus>> {
+-  const statusRes = await ctx.client.session.status()
++  const statusRes = await ctx.client.session.status({
++    query: { directory: ctx.directory },
++  })
+   return normalizeSDKResponse(statusRes, {} as Record<string, SessionStatus>)
+ }
+ 
+@@ -54,6 +59,7 @@ async function areAllDescendantsIdle(
+ ): Promise<boolean> {
+   const childrenRes = await ctx.client.session.children({
+     path: { id: sessionID },
++    query: { directory: ctx.directory },
+   })
+   const children = normalizeSDKResponse(childrenRes, [] as ChildSession[])
+ 
+diff --git a/src/cli/run/event-formatting.ts b/src/cli/run/event-formatting.ts
+index 2e6e2e08..7d996b26 100644
+--- a/src/cli/run/event-formatting.ts
++++ b/src/cli/run/event-formatting.ts
+@@ -57,7 +57,11 @@ export function serializeError(error: unknown): string {
+ function getSessionTag(ctx: RunContext, payload: EventPayload): string {
+   const props = payload.properties as Record<string, unknown> | undefined
+   const info = props?.info as Record<string, unknown> | undefined
+-  const sessionID = props?.sessionID ?? info?.sessionID
++  const part = props?.part as Record<string, unknown> | undefined
++  const sessionID =
++    props?.sessionID ?? props?.sessionId ??
++    info?.sessionID ?? info?.sessionId ??
++    part?.sessionID ?? part?.sessionId
+   const isMainSession = sessionID === ctx.sessionID
+   if (isMainSession) return pc.green("[MAIN]")
+   if (sessionID) return pc.yellow(`[${String(sessionID).slice(0, 8)}]`)
+@@ -79,9 +83,9 @@ export function logEventVerbose(ctx: RunContext, payload: EventPayload): void {
+     case "message.part.updated": {
+       const partProps = props as MessagePartUpdatedProps | undefined
+       const part = partProps?.part
+-      if (part?.type === "tool-invocation") {
+-        const toolPart = part as { toolName?: string; state?: string }
+-        console.error(pc.dim(`${sessionTag} message.part (tool): ${toolPart.toolName} [${toolPart.state}]`))
++      if (part?.type === "tool") {
++        const status = part.state?.status ?? "unknown"
++        console.error(pc.dim(`${sessionTag} message.part (tool): ${part.tool ?? part.name ?? "?"} [${status}]`))
+       } else if (part?.type === "text" && part.text) {
+         const preview = part.text.slice(0, 80).replace(/\n/g, "\\n")
+         console.error(pc.dim(`${sessionTag} message.part (text): "${preview}${part.text.length > 80 ? "..." : ""}"`))
+diff --git a/src/cli/run/event-handlers.test.ts b/src/cli/run/event-handlers.test.ts
+index 7e514831..a30fd27f 100644
+--- a/src/cli/run/event-handlers.test.ts
++++ b/src/cli/run/event-handlers.test.ts
+@@ -1,7 +1,7 @@
+-import { describe, it, expect } from "bun:test"
++import { describe, it, expect, spyOn } from "bun:test"
+ import type { RunContext } from "./types"
+ import { createEventState } from "./events"
+-import { handleSessionStatus } from "./event-handlers"
++import { handleSessionStatus, handleMessagePartUpdated, handleTuiToast } from "./event-handlers"
+ 
+ const createMockContext = (sessionID: string = "test-session"): RunContext => ({
+   sessionID,
+@@ -70,4 +70,211 @@ describe("handleSessionStatus", () => {
+     //#then - state.mainSessionIdle remains unchanged
+     expect(state.mainSessionIdle).toBe(true)
+   })
++
++  it("recognizes idle from camelCase sessionId", () => {
++    //#given - state with mainSessionIdle=false and payload using sessionId
++    const ctx = createMockContext("test-session")
++    const state = createEventState()
++    state.mainSessionIdle = false
++
++    const payload = {
++      type: "session.status",
++      properties: {
++        sessionId: "test-session",
++        status: { type: "idle" as const },
++      },
++    }
++
++    //#when - handleSessionStatus called with camelCase sessionId
++    handleSessionStatus(ctx, payload as any, state)
++
++    //#then - state.mainSessionIdle === true
++    expect(state.mainSessionIdle).toBe(true)
++  })
++})
++
++describe("handleMessagePartUpdated", () => {
++  it("extracts sessionID from part (current OpenCode event structure)", () => {
++    //#given - message.part.updated with sessionID in part, not info
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++
++    const payload = {
++      type: "message.part.updated",
++      properties: {
++        part: {
++          id: "part_1",
++          sessionID: "ses_main",
++          messageID: "msg_1",
++          type: "text",
++          text: "Hello world",
++        },
++      },
++    }
++
++    //#when
++    handleMessagePartUpdated(ctx, payload as any, state)
++
++    //#then
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++    expect(state.lastPartText).toBe("Hello world")
++    expect(stdoutSpy).toHaveBeenCalled()
++    stdoutSpy.mockRestore()
++  })
++
++  it("skips events for different session", () => {
++    //#given - message.part.updated with different session
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++
++    const payload = {
++      type: "message.part.updated",
++      properties: {
++        part: {
++          id: "part_1",
++          sessionID: "ses_other",
++          messageID: "msg_1",
++          type: "text",
++          text: "Hello world",
++        },
++      },
++    }
++
++    //#when
++    handleMessagePartUpdated(ctx, payload as any, state)
++
++    //#then
++    expect(state.hasReceivedMeaningfulWork).toBe(false)
++    expect(state.lastPartText).toBe("")
++  })
++
++  it("handles tool part with running status", () => {
++    //#given - tool part in running state
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++
++    const payload = {
++      type: "message.part.updated",
++      properties: {
++        part: {
++          id: "part_1",
++          sessionID: "ses_main",
++          messageID: "msg_1",
++          type: "tool",
++          tool: "read",
++          state: { status: "running", input: { filePath: "/src/index.ts" } },
++        },
++      },
++    }
++
++    //#when
++    handleMessagePartUpdated(ctx, payload as any, state)
++
++    //#then
++    expect(state.currentTool).toBe("read")
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++    stdoutSpy.mockRestore()
++  })
++
++  it("clears currentTool when tool completes", () => {
++    //#given - tool part in completed state
++    const ctx = createMockContext("ses_main")
++    const state = createEventState()
++    state.currentTool = "read"
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++
++    const payload = {
++      type: "message.part.updated",
++      properties: {
++        part: {
++          id: "part_1",
++          sessionID: "ses_main",
++          messageID: "msg_1",
++          type: "tool",
++          tool: "read",
++          state: { status: "completed", input: {}, output: "file contents here" },
++        },
++      },
++    }
++
++    //#when
++    handleMessagePartUpdated(ctx, payload as any, state)
++
++    //#then
++    expect(state.currentTool).toBeNull()
++    stdoutSpy.mockRestore()
++  })
++
++  it("supports legacy info.sessionID for backward compatibility", () => {
++    //#given - legacy event with sessionID in info
++    const ctx = createMockContext("ses_legacy")
++    const state = createEventState()
++    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
++
++    const payload = {
++      type: "message.part.updated",
++      properties: {
++        info: { sessionID: "ses_legacy", role: "assistant" },
++        part: {
++          type: "text",
++          text: "Legacy text",
++        },
++      },
++    }
++
++    //#when
++    handleMessagePartUpdated(ctx, payload as any, state)
++
++    //#then
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++    expect(state.lastPartText).toBe("Legacy text")
++    stdoutSpy.mockRestore()
++  })
++})
++
++describe("handleTuiToast", () => {
++  it("marks main session as error when toast variant is error", () => {
++    //#given - toast error payload
++    const ctx = createMockContext("test-session")
++    const state = createEventState()
++
++    const payload = {
++      type: "tui.toast.show",
++      properties: {
++        title: "Auth",
++        message: "Invalid API key",
++        variant: "error" as const,
++      },
++    }
++
++    //#when
++    handleTuiToast(ctx, payload as any, state)
++
++    //#then
++    expect(state.mainSessionError).toBe(true)
++    expect(state.lastError).toBe("Auth: Invalid API key")
++  })
++
++  it("does not mark session error for warning toast", () => {
++    //#given - toast warning payload
++    const ctx = createMockContext("test-session")
++    const state = createEventState()
++
++    const payload = {
++      type: "tui.toast.show",
++      properties: {
++        message: "Retrying provider",
++        variant: "warning" as const,
++      },
++    }
++
++    //#when
++    handleTuiToast(ctx, payload as any, state)
++
++    //#then
++    expect(state.mainSessionError).toBe(false)
++    expect(state.lastError).toBe(null)
++  })
+ })
+diff --git a/src/cli/run/event-handlers.ts b/src/cli/run/event-handlers.ts
+index 24b9a30c..13cfdd6d 100644
+--- a/src/cli/run/event-handlers.ts
++++ b/src/cli/run/event-handlers.ts
+@@ -9,15 +9,32 @@ import type {
+   MessagePartUpdatedProps,
+   ToolExecuteProps,
+   ToolResultProps,
++  TuiToastShowProps,
+ } from "./types"
+ import type { EventState } from "./event-state"
+ import { serializeError } from "./event-formatting"
+ 
++function getSessionId(props?: { sessionID?: string; sessionId?: string }): string | undefined {
++  return props?.sessionID ?? props?.sessionId
++}
++
++function getInfoSessionId(props?: {
++  info?: { sessionID?: string; sessionId?: string }
++}): string | undefined {
++  return props?.info?.sessionID ?? props?.info?.sessionId
++}
++
++function getPartSessionId(props?: {
++  part?: { sessionID?: string; sessionId?: string }
++}): string | undefined {
++  return props?.part?.sessionID ?? props?.part?.sessionId
++}
++
+ export function handleSessionIdle(ctx: RunContext, payload: EventPayload, state: EventState): void {
+   if (payload.type !== "session.idle") return
+ 
+   const props = payload.properties as SessionIdleProps | undefined
+-  if (props?.sessionID === ctx.sessionID) {
++  if (getSessionId(props) === ctx.sessionID) {
+     state.mainSessionIdle = true
+   }
+ }
+@@ -26,7 +43,7 @@ export function handleSessionStatus(ctx: RunContext, payload: EventPayload, stat
+   if (payload.type !== "session.status") return
+ 
+   const props = payload.properties as SessionStatusProps | undefined
+-  if (props?.sessionID !== ctx.sessionID) return
++  if (getSessionId(props) !== ctx.sessionID) return
+ 
+   if (props?.status?.type === "busy") {
+     state.mainSessionIdle = false
+@@ -41,7 +58,7 @@ export function handleSessionError(ctx: RunContext, payload: EventPayload, state
+   if (payload.type !== "session.error") return
+ 
+   const props = payload.properties as SessionErrorProps | undefined
+-  if (props?.sessionID === ctx.sessionID) {
++  if (getSessionId(props) === ctx.sessionID) {
+     state.mainSessionError = true
+     state.lastError = serializeError(props?.error)
+     console.error(pc.red(`\n[session.error] ${state.lastError}`))
+@@ -52,10 +69,12 @@ export function handleMessagePartUpdated(ctx: RunContext, payload: EventPayload,
+   if (payload.type !== "message.part.updated") return
+ 
+   const props = payload.properties as MessagePartUpdatedProps | undefined
+-  if (props?.info?.sessionID !== ctx.sessionID) return
+-  if (props?.info?.role !== "assistant") return
++  // Current OpenCode puts sessionID inside part; legacy puts it in info
++  const partSid = getPartSessionId(props)
++  const infoSid = getInfoSessionId(props)
++  if ((partSid ?? infoSid) !== ctx.sessionID) return
+ 
+-  const part = props.part
++  const part = props?.part
+   if (!part) return
+ 
+   if (part.type === "text" && part.text) {
+@@ -66,13 +85,57 @@ export function handleMessagePartUpdated(ctx: RunContext, payload: EventPayload,
+     }
+     state.lastPartText = part.text
+   }
++
++  if (part.type === "tool") {
++    handleToolPart(ctx, part, state)
++  }
++}
++
++function handleToolPart(
++  _ctx: RunContext,
++  part: NonNullable<MessagePartUpdatedProps["part"]>,
++  state: EventState,
++): void {
++  const toolName = part.tool || part.name || "unknown"
++  const status = part.state?.status
++
++  if (status === "running") {
++    state.currentTool = toolName
++    let inputPreview = ""
++    const input = part.state?.input
++    if (input) {
++      if (input.command) {
++        inputPreview = ` ${pc.dim(String(input.command).slice(0, 60))}`
++      } else if (input.pattern) {
++        inputPreview = ` ${pc.dim(String(input.pattern).slice(0, 40))}`
++      } else if (input.filePath) {
++        inputPreview = ` ${pc.dim(String(input.filePath))}`
++      } else if (input.query) {
++        inputPreview = ` ${pc.dim(String(input.query).slice(0, 40))}`
++      }
++    }
++    state.hasReceivedMeaningfulWork = true
++    process.stdout.write(`\n${pc.cyan(">")} ${pc.bold(toolName)}${inputPreview}\n`)
++  }
++
++  if (status === "completed" || status === "error") {
++    const output = part.state?.output || ""
++    const maxLen = 200
++    const preview = output.length > maxLen ? output.slice(0, maxLen) + "..." : output
++    if (preview.trim()) {
++      const lines = preview.split("\n").slice(0, 3)
++      process.stdout.write(pc.dim(`   └─ ${lines.join("\n      ")}\n`))
++    }
++    state.currentTool = null
++    state.lastPartText = ""
++  }
+ }
+ 
+ export function handleMessageUpdated(ctx: RunContext, payload: EventPayload, state: EventState): void {
+   if (payload.type !== "message.updated") return
+ 
+   const props = payload.properties as MessageUpdatedProps | undefined
+-  if (props?.info?.sessionID !== ctx.sessionID) return
++  if (getInfoSessionId(props) !== ctx.sessionID) return
+   if (props?.info?.role !== "assistant") return
+ 
+   state.hasReceivedMeaningfulWork = true
+@@ -84,7 +147,7 @@ export function handleToolExecute(ctx: RunContext, payload: EventPayload, state:
+   if (payload.type !== "tool.execute") return
+ 
+   const props = payload.properties as ToolExecuteProps | undefined
+-  if (props?.sessionID !== ctx.sessionID) return
++  if (getSessionId(props) !== ctx.sessionID) return
+ 
+   const toolName = props?.name || "unknown"
+   state.currentTool = toolName
+@@ -111,7 +174,7 @@ export function handleToolResult(ctx: RunContext, payload: EventPayload, state:
+   if (payload.type !== "tool.result") return
+ 
+   const props = payload.properties as ToolResultProps | undefined
+-  if (props?.sessionID !== ctx.sessionID) return
++  if (getSessionId(props) !== ctx.sessionID) return
+ 
+   const output = props?.output || ""
+   const maxLen = 200
+@@ -125,3 +188,24 @@ export function handleToolResult(ctx: RunContext, payload: EventPayload, state:
+   state.currentTool = null
+   state.lastPartText = ""
+ }
++
++export function handleTuiToast(_ctx: RunContext, payload: EventPayload, state: EventState): void {
++  if (payload.type !== "tui.toast.show") return
++
++  const props = payload.properties as TuiToastShowProps | undefined
++  const title = props?.title ? `${props.title}: ` : ""
++  const message = props?.message?.trim()
++  const variant = props?.variant ?? "info"
++
++  if (!message) return
++
++  if (variant === "error") {
++    state.mainSessionError = true
++    state.lastError = `${title}${message}`
++    console.error(pc.red(`\n[tui.toast.error] ${state.lastError}`))
++    return
++  }
++
++  const colorize = variant === "warning" ? pc.yellow : pc.dim
++  console.log(colorize(`[toast:${variant}] ${title}${message}`))
++}
+diff --git a/src/cli/run/event-stream-processor.ts b/src/cli/run/event-stream-processor.ts
+index 7f629a04..4bc5bbc4 100644
+--- a/src/cli/run/event-stream-processor.ts
++++ b/src/cli/run/event-stream-processor.ts
+@@ -10,6 +10,7 @@ import {
+   handleMessageUpdated,
+   handleToolExecute,
+   handleToolResult,
++  handleTuiToast,
+ } from "./event-handlers"
+ 
+ export async function processEvents(
+@@ -36,6 +37,7 @@ export async function processEvents(
+       handleMessageUpdated(ctx, payload, state)
+       handleToolExecute(ctx, payload, state)
+       handleToolResult(ctx, payload, state)
++      handleTuiToast(ctx, payload, state)
+     } catch (err) {
+       console.error(pc.red(`[event error] ${err}`))
+     }
+diff --git a/src/cli/run/events.test.ts b/src/cli/run/events.test.ts
+index 09d3d0a0..14010e05 100644
+--- a/src/cli/run/events.test.ts
++++ b/src/cli/run/events.test.ts
+@@ -170,6 +170,28 @@ describe("event handling", () => {
+     expect(state.hasReceivedMeaningfulWork).toBe(true)
+   })
+ 
++  it("message.updated with camelCase sessionId sets hasReceivedMeaningfulWork", async () => {
++    //#given - assistant message uses sessionId key
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "message.updated",
++      properties: {
++        info: { sessionId: "my-session", role: "assistant" },
++      },
++    }
++
++    const events = toAsyncIterable([payload])
++    const { processEvents } = await import("./events")
++
++    //#when
++    await processEvents(ctx, events, state)
++
++    //#then
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++  })
++
+   it("message.updated with user role does not set hasReceivedMeaningfulWork", async () => {
+     // given - user message should not count as meaningful work
+     const ctx = createMockContext("my-session")
+@@ -251,6 +273,7 @@ describe("event handling", () => {
+       lastPartText: "",
+       currentTool: null,
+       hasReceivedMeaningfulWork: false,
++      messageCount: 0,
+     }
+ 
+     const payload: EventPayload = {
+diff --git a/src/cli/run/integration.test.ts b/src/cli/run/integration.test.ts
+index 6aa4fc8d..d0fc91cf 100644
+--- a/src/cli/run/integration.test.ts
++++ b/src/cli/run/integration.test.ts
+@@ -127,11 +127,14 @@ describe("integration: --session-id", () => {
+     const mockClient = createMockClient({ data: { id: sessionId } })
+ 
+     // when
+-    const result = await resolveSession({ client: mockClient, sessionId })
++    const result = await resolveSession({ client: mockClient, sessionId, directory: "/test" })
+ 
+     // then
+     expect(result).toBe(sessionId)
+-    expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: sessionId } })
++    expect(mockClient.session.get).toHaveBeenCalledWith({
++      path: { id: sessionId },
++      query: { directory: "/test" },
++    })
+     expect(mockClient.session.create).not.toHaveBeenCalled()
+   })
+ 
+@@ -141,11 +144,14 @@ describe("integration: --session-id", () => {
+     const mockClient = createMockClient({ error: { message: "Session not found" } })
+ 
+     // when
+-    const result = resolveSession({ client: mockClient, sessionId })
++    const result = resolveSession({ client: mockClient, sessionId, directory: "/test" })
+ 
+     // then
+     await expect(result).rejects.toThrow(`Session not found: ${sessionId}`)
+-    expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: sessionId } })
++    expect(mockClient.session.get).toHaveBeenCalledWith({
++      path: { id: sessionId },
++      query: { directory: "/test" },
++    })
+     expect(mockClient.session.create).not.toHaveBeenCalled()
+   })
+ })
+diff --git a/src/cli/run/poll-for-completion.test.ts b/src/cli/run/poll-for-completion.test.ts
+index 4f7194fd..46d8a0f8 100644
+--- a/src/cli/run/poll-for-completion.test.ts
++++ b/src/cli/run/poll-for-completion.test.ts
+@@ -207,6 +207,52 @@ describe("pollForCompletion", () => {
+     expect(todoCallCount).toBe(0)
+   })
+ 
++  it("falls back to session.status API when idle event is missing", async () => {
++    //#given - mainSessionIdle not set by events, but status API says idle
++    spyOn(console, "log").mockImplementation(() => {})
++    spyOn(console, "error").mockImplementation(() => {})
++    const ctx = createMockContext({
++      statuses: {
++        "test-session": { type: "idle" },
++      },
++    })
++    const eventState = createEventState()
++    eventState.mainSessionIdle = false
++    eventState.hasReceivedMeaningfulWork = true
++    const abortController = new AbortController()
++
++    //#when
++    const result = await pollForCompletion(ctx, eventState, abortController, {
++      pollIntervalMs: 10,
++      requiredConsecutive: 2,
++      minStabilizationMs: 0,
++    })
++
++    //#then - completion succeeds without idle event
++    expect(result).toBe(0)
++  })
++
++  it("allows silent completion after stabilization when no meaningful work is received", async () => {
++    //#given - session is idle and stable but no assistant message/tool event arrived
++    spyOn(console, "log").mockImplementation(() => {})
++    spyOn(console, "error").mockImplementation(() => {})
++    const ctx = createMockContext()
++    const eventState = createEventState()
++    eventState.mainSessionIdle = true
++    eventState.hasReceivedMeaningfulWork = false
++    const abortController = new AbortController()
++
++    //#when
++    const result = await pollForCompletion(ctx, eventState, abortController, {
++      pollIntervalMs: 10,
++      requiredConsecutive: 1,
++      minStabilizationMs: 30,
++    })
++
++    //#then - completion succeeds after stabilization window
++    expect(result).toBe(0)
++  })
++
+   it("simulates race condition: brief idle with 0 todos does not cause immediate exit", async () => {
+     //#given - simulate Sisyphus outputting text, session goes idle briefly, then tool fires
+     spyOn(console, "log").mockImplementation(() => {})
+diff --git a/src/cli/run/poll-for-completion.ts b/src/cli/run/poll-for-completion.ts
+index b7d362da..f1ba6cd3 100644
+--- a/src/cli/run/poll-for-completion.ts
++++ b/src/cli/run/poll-for-completion.ts
+@@ -2,6 +2,7 @@ import pc from "picocolors"
+ import type { RunContext } from "./types"
+ import type { EventState } from "./events"
+ import { checkCompletionConditions } from "./completion"
++import { normalizeSDKResponse } from "../../shared"
+ 
+ const DEFAULT_POLL_INTERVAL_MS = 500
+ const DEFAULT_REQUIRED_CONSECUTIVE = 3
+@@ -28,6 +29,7 @@ export async function pollForCompletion(
+   let consecutiveCompleteChecks = 0
+   let errorCycleCount = 0
+   let firstWorkTimestamp: number | null = null
++  const pollStartTimestamp = Date.now()
+ 
+   while (!abortController.signal.aborted) {
+     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+@@ -51,6 +53,13 @@ export async function pollForCompletion(
+       errorCycleCount = 0
+     }
+ 
++    const mainSessionStatus = await getMainSessionStatus(ctx)
++    if (mainSessionStatus === "busy" || mainSessionStatus === "retry") {
++      eventState.mainSessionIdle = false
++    } else if (mainSessionStatus === "idle") {
++      eventState.mainSessionIdle = true
++    }
++
+     if (!eventState.mainSessionIdle) {
+       consecutiveCompleteChecks = 0
+       continue
+@@ -62,8 +71,11 @@ export async function pollForCompletion(
+     }
+ 
+     if (!eventState.hasReceivedMeaningfulWork) {
++      if (Date.now() - pollStartTimestamp < minStabilizationMs) {
++        consecutiveCompleteChecks = 0
++        continue
++      }
+       consecutiveCompleteChecks = 0
+-      continue
+     }
+ 
+     // Track when first meaningful work was received
+@@ -91,3 +103,24 @@ export async function pollForCompletion(
+ 
+   return 130
+ }
++
++async function getMainSessionStatus(
++  ctx: RunContext
++): Promise<"idle" | "busy" | "retry" | null> {
++  try {
++    const statusesRes = await ctx.client.session.status({
++      query: { directory: ctx.directory },
++    })
++    const statuses = normalizeSDKResponse(
++      statusesRes,
++      {} as Record<string, { type?: string }>
++    )
++    const status = statuses[ctx.sessionID]?.type
++    if (status === "idle" || status === "busy" || status === "retry") {
++      return status
++    }
++    return null
++  } catch {
++    return null
++  }
++}
+diff --git a/src/cli/run/runner.test.ts b/src/cli/run/runner.test.ts
+index 09263bb7..e37fc444 100644
+--- a/src/cli/run/runner.test.ts
++++ b/src/cli/run/runner.test.ts
+@@ -22,7 +22,7 @@ describe("resolveRunAgent", () => {
+     )
+ 
+     // then
+-    expect(agent).toBe("hephaestus")
++    expect(agent).toBe("Hephaestus (Deep Agent)")
+   })
+ 
+   it("uses env agent over config", () => {
+@@ -34,7 +34,7 @@ describe("resolveRunAgent", () => {
+     const agent = resolveRunAgent({ message: "test" }, config, env)
+ 
+     // then
+-    expect(agent).toBe("atlas")
++    expect(agent).toBe("Atlas (Plan Executor)")
+   })
+ 
+   it("uses config agent over default", () => {
+@@ -45,7 +45,7 @@ describe("resolveRunAgent", () => {
+     const agent = resolveRunAgent({ message: "test" }, config, {})
+ 
+     // then
+-    expect(agent).toBe("prometheus")
++    expect(agent).toBe("Prometheus (Plan Builder)")
+   })
+ 
+   it("falls back to sisyphus when none set", () => {
+@@ -56,7 +56,7 @@ describe("resolveRunAgent", () => {
+     const agent = resolveRunAgent({ message: "test" }, config, {})
+ 
+     // then
+-    expect(agent).toBe("sisyphus")
++    expect(agent).toBe("Sisyphus (Ultraworker)")
+   })
+ 
+   it("skips disabled sisyphus for next available core agent", () => {
+@@ -67,7 +67,18 @@ describe("resolveRunAgent", () => {
+     const agent = resolveRunAgent({ message: "test" }, config, {})
+ 
+     // then
+-    expect(agent).toBe("hephaestus")
++    expect(agent).toBe("Hephaestus (Deep Agent)")
++  })
++
++  it("maps display-name style default_run_agent values to canonical display names", () => {
++    // given
++    const config = createConfig({ default_run_agent: "Sisyphus (Ultraworker)" })
++
++    // when
++    const agent = resolveRunAgent({ message: "test" }, config, {})
++
++    // then
++    expect(agent).toBe("Sisyphus (Ultraworker)")
+   })
+ })
+ 
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index d7494507..a958932c 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -79,6 +79,7 @@ export async function run(options: RunOptions): Promise<number> {
+       const sessionID = await resolveSession({
+         client,
+         sessionId: options.sessionId,
++        directory,
+       })
+ 
+       console.log(pc.dim(`Session: ${sessionID}`))
+diff --git a/src/cli/run/session-resolver.test.ts b/src/cli/run/session-resolver.test.ts
+index a9775bb4..7b4338f1 100644
+--- a/src/cli/run/session-resolver.test.ts
++++ b/src/cli/run/session-resolver.test.ts
+@@ -26,6 +26,8 @@ const createMockClient = (overrides: {
+ }
+ 
+ describe("resolveSession", () => {
++  const directory = "/test-project"
++
+   beforeEach(() => {
+     spyOn(console, "log").mockImplementation(() => {})
+     spyOn(console, "error").mockImplementation(() => {})
+@@ -39,12 +41,13 @@ describe("resolveSession", () => {
+     })
+ 
+     // when
+-    const result = await resolveSession({ client: mockClient, sessionId })
++    const result = await resolveSession({ client: mockClient, sessionId, directory })
+ 
+     // then
+     expect(result).toBe(sessionId)
+     expect(mockClient.session.get).toHaveBeenCalledWith({
+       path: { id: sessionId },
++      query: { directory },
+     })
+     expect(mockClient.session.create).not.toHaveBeenCalled()
+   })
+@@ -57,7 +60,7 @@ describe("resolveSession", () => {
+     })
+ 
+     // when
+-    const result = resolveSession({ client: mockClient, sessionId })
++    const result = resolveSession({ client: mockClient, sessionId, directory })
+ 
+     // then
+     await Promise.resolve(
+@@ -65,6 +68,7 @@ describe("resolveSession", () => {
+     )
+     expect(mockClient.session.get).toHaveBeenCalledWith({
+       path: { id: sessionId },
++      query: { directory },
+     })
+     expect(mockClient.session.create).not.toHaveBeenCalled()
+   })
+@@ -76,7 +80,7 @@ describe("resolveSession", () => {
+     })
+ 
+     // when
+-    const result = await resolveSession({ client: mockClient })
++    const result = await resolveSession({ client: mockClient, directory })
+ 
+     // then
+     expect(result).toBe("new-session-id")
+@@ -87,6 +91,7 @@ describe("resolveSession", () => {
+           { permission: "question", action: "deny", pattern: "*" },
+         ],
+       },
++      query: { directory },
+     })
+     expect(mockClient.session.get).not.toHaveBeenCalled()
+   })
+@@ -101,7 +106,7 @@ describe("resolveSession", () => {
+     })
+ 
+     // when
+-    const result = await resolveSession({ client: mockClient })
++    const result = await resolveSession({ client: mockClient, directory })
+ 
+     // then
+     expect(result).toBe("retried-session-id")
+@@ -113,6 +118,7 @@ describe("resolveSession", () => {
+           { permission: "question", action: "deny", pattern: "*" },
+         ],
+       },
++      query: { directory },
+     })
+   })
+ 
+@@ -127,7 +133,7 @@ describe("resolveSession", () => {
+     })
+ 
+     // when
+-    const result = resolveSession({ client: mockClient })
++    const result = resolveSession({ client: mockClient, directory })
+ 
+     // then
+     await Promise.resolve(
+@@ -147,7 +153,7 @@ describe("resolveSession", () => {
+     })
+ 
+     // when
+-    const result = resolveSession({ client: mockClient })
++    const result = resolveSession({ client: mockClient, directory })
+ 
+     // then
+     await Promise.resolve(
+diff --git a/src/cli/run/session-resolver.ts b/src/cli/run/session-resolver.ts
+index 1ec07199..51c13525 100644
+--- a/src/cli/run/session-resolver.ts
++++ b/src/cli/run/session-resolver.ts
+@@ -8,11 +8,15 @@ const SESSION_CREATE_RETRY_DELAY_MS = 1000
+ export async function resolveSession(options: {
+   client: OpencodeClient
+   sessionId?: string
++  directory: string
+ }): Promise<string> {
+-  const { client, sessionId } = options
++  const { client, sessionId, directory } = options
+ 
+   if (sessionId) {
+-    const res = await client.session.get({ path: { id: sessionId } })
++    const res = await client.session.get({
++      path: { id: sessionId },
++      query: { directory },
++    })
+     if (res.error || !res.data) {
+       throw new Error(`Session not found: ${sessionId}`)
+     }
+@@ -28,6 +32,7 @@ export async function resolveSession(options: {
+           { permission: "question", action: "deny" as const, pattern: "*" },
+         ],
+       } as any,
++      query: { directory },
+     })
+ 
+     if (res.error) {
+diff --git a/src/cli/run/types.ts b/src/cli/run/types.ts
+index b155642f..ff099de2 100644
+--- a/src/cli/run/types.ts
++++ b/src/cli/run/types.ts
+@@ -55,16 +55,19 @@ export interface EventPayload {
+ 
+ export interface SessionIdleProps {
+   sessionID?: string
++  sessionId?: string
+ }
+ 
+ export interface SessionStatusProps {
+   sessionID?: string
++  sessionId?: string
+   status?: { type?: string }
+ }
+ 
+ export interface MessageUpdatedProps {
+   info?: {
+     sessionID?: string
++    sessionId?: string
+     role?: string
+     modelID?: string
+     providerID?: string
+@@ -73,28 +76,47 @@ export interface MessageUpdatedProps {
+ }
+ 
+ export interface MessagePartUpdatedProps {
+-  info?: { sessionID?: string; role?: string }
++  /** @deprecated Legacy structure — current OpenCode puts sessionID inside part */
++  info?: { sessionID?: string; sessionId?: string; role?: string }
+   part?: {
++    id?: string
++    sessionID?: string
++    sessionId?: string
++    messageID?: string
+     type?: string
+     text?: string
++    /** Tool name (for part.type === "tool") */
++    tool?: string
++    /** Tool state (for part.type === "tool") */
++    state?: { status?: string; input?: Record<string, unknown>; output?: string }
+     name?: string
+     input?: unknown
++    time?: { start?: number; end?: number }
+   }
+ }
+ 
+ export interface ToolExecuteProps {
+   sessionID?: string
++  sessionId?: string
+   name?: string
+   input?: Record<string, unknown>
+ }
+ 
+ export interface ToolResultProps {
+   sessionID?: string
++  sessionId?: string
+   name?: string
+   output?: string
+ }
+ 
+ export interface SessionErrorProps {
+   sessionID?: string
++  sessionId?: string
+   error?: unknown
+ }
++
++export interface TuiToastShowProps {
++  title?: string
++  message?: string
++  variant?: "info" | "success" | "warning" | "error"
++}
+-- 
+2.39.2
+

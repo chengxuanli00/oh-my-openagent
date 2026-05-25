@@ -1,0 +1,617 @@
+From d48ea025f09d0d082bf852b64a149d8613dfb11a Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 18 Mar 2026 14:32:27 +0900
+Subject: [PATCH 3369/5749] refactor(circuit-breaker): replace sliding window
+ with consecutive call detection
+
+Switch background task loop detection from percentage-based sliding window
+(80% of 20-call window) to consecutive same-tool counting. Triggers when
+same tool signature is called 20+ times in a row; a different tool resets
+the counter.
+---
+ .../background-task-circuit-breaker.test.ts   |  15 +--
+ src/config/schema/background-task.ts          |   3 +-
+ src/features/background-agent/constants.ts    |   3 +-
+ .../background-agent/loop-detector.test.ts    | 124 ++++++++----------
+ .../background-agent/loop-detector.ts         |  71 +++-------
+ .../manager-circuit-breaker.test.ts           |  57 ++------
+ src/features/background-agent/manager.ts      |   6 +-
+ src/features/background-agent/types.ts        |   6 +-
+ 8 files changed, 98 insertions(+), 187 deletions(-)
+
+diff --git a/src/config/schema/background-task-circuit-breaker.test.ts b/src/config/schema/background-task-circuit-breaker.test.ts
+index e236d401..32595ca4 100644
+--- a/src/config/schema/background-task-circuit-breaker.test.ts
++++ b/src/config/schema/background-task-circuit-breaker.test.ts
+@@ -8,27 +8,24 @@ describe("BackgroundTaskConfigSchema.circuitBreaker", () => {
+       const result = BackgroundTaskConfigSchema.parse({
+         circuitBreaker: {
+           maxToolCalls: 150,
+-          windowSize: 10,
+-          repetitionThresholdPercent: 70,
++          consecutiveThreshold: 10,
+         },
+       })
+-
+       expect(result.circuitBreaker).toEqual({
+         maxToolCalls: 150,
+-        windowSize: 10,
+-        repetitionThresholdPercent: 70,
++        consecutiveThreshold: 10,
+       })
+     })
+   })
+ 
+-  describe("#given windowSize below minimum", () => {
++  describe("#given consecutiveThreshold below minimum", () => {
+     test("#when parsed #then throws ZodError", () => {
+       let thrownError: unknown
+ 
+       try {
+         BackgroundTaskConfigSchema.parse({
+           circuitBreaker: {
+-            windowSize: 4,
++            consecutiveThreshold: 4,
+           },
+         })
+       } catch (error) {
+@@ -39,14 +36,14 @@ describe("BackgroundTaskConfigSchema.circuitBreaker", () => {
+     })
+   })
+ 
+-  describe("#given repetitionThresholdPercent is zero", () => {
++  describe("#given consecutiveThreshold is zero", () => {
+     test("#when parsed #then throws ZodError", () => {
+       let thrownError: unknown
+ 
+       try {
+         BackgroundTaskConfigSchema.parse({
+           circuitBreaker: {
+-            repetitionThresholdPercent: 0,
++            consecutiveThreshold: 0,
+           },
+         })
+       } catch (error) {
+diff --git a/src/config/schema/background-task.ts b/src/config/schema/background-task.ts
+index 3e694d53..c836e781 100644
+--- a/src/config/schema/background-task.ts
++++ b/src/config/schema/background-task.ts
+@@ -3,8 +3,7 @@ import { z } from "zod"
+ const CircuitBreakerConfigSchema = z.object({
+   enabled: z.boolean().optional(),
+   maxToolCalls: z.number().int().min(10).optional(),
+-  windowSize: z.number().int().min(5).optional(),
+-  repetitionThresholdPercent: z.number().gt(0).max(100).optional(),
++  consecutiveThreshold: z.number().int().min(5).optional(),
+ })
+ 
+ export const BackgroundTaskConfigSchema = z.object({
+diff --git a/src/features/background-agent/constants.ts b/src/features/background-agent/constants.ts
+index c2b3718e..f8f669b8 100644
+--- a/src/features/background-agent/constants.ts
++++ b/src/features/background-agent/constants.ts
+@@ -7,8 +7,7 @@ export const MIN_STABILITY_TIME_MS = 10 * 1000
+ export const DEFAULT_STALE_TIMEOUT_MS = 1_200_000
+ export const DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS = 1_800_000
+ export const DEFAULT_MAX_TOOL_CALLS = 200
+-export const DEFAULT_CIRCUIT_BREAKER_WINDOW_SIZE = 20
+-export const DEFAULT_CIRCUIT_BREAKER_REPETITION_THRESHOLD_PERCENT = 80
++export const DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_THRESHOLD = 20
+ export const DEFAULT_CIRCUIT_BREAKER_ENABLED = true
+ export const MIN_RUNTIME_BEFORE_STALE_MS = 30_000
+ export const MIN_IDLE_TIME_MS = 5000
+diff --git a/src/features/background-agent/loop-detector.test.ts b/src/features/background-agent/loop-detector.test.ts
+index 4d0bad4b..bb500827 100644
+--- a/src/features/background-agent/loop-detector.test.ts
++++ b/src/features/background-agent/loop-detector.test.ts
+@@ -37,16 +37,14 @@ describe("loop-detector", () => {
+           maxToolCalls: 200,
+           circuitBreaker: {
+             maxToolCalls: 120,
+-            windowSize: 10,
+-            repetitionThresholdPercent: 70,
++            consecutiveThreshold: 7,
+           },
+         })
+ 
+         expect(result).toEqual({
+           enabled: true,
+           maxToolCalls: 120,
+-          windowSize: 10,
+-          repetitionThresholdPercent: 70,
++          consecutiveThreshold: 7,
+         })
+       })
+     })
+@@ -56,8 +54,7 @@ describe("loop-detector", () => {
+         const result = resolveCircuitBreakerSettings({
+           circuitBreaker: {
+             maxToolCalls: 100,
+-            windowSize: 5,
+-            repetitionThresholdPercent: 60,
++            consecutiveThreshold: 5,
+           },
+         })
+ 
+@@ -71,8 +68,7 @@ describe("loop-detector", () => {
+           circuitBreaker: {
+             enabled: false,
+             maxToolCalls: 100,
+-            windowSize: 5,
+-            repetitionThresholdPercent: 60,
++            consecutiveThreshold: 5,
+           },
+         })
+ 
+@@ -86,8 +82,7 @@ describe("loop-detector", () => {
+           circuitBreaker: {
+             enabled: true,
+             maxToolCalls: 100,
+-            windowSize: 5,
+-            repetitionThresholdPercent: 60,
++            consecutiveThreshold: 5,
+           },
+         })
+ 
+@@ -151,55 +146,52 @@ describe("loop-detector", () => {
+       })
+     })
+ 
+-    describe("#given the same tool dominates the recent window", () => {
++    describe("#given the same tool is called consecutively", () => {
+       test("#when evaluated #then it triggers", () => {
+-        const window = buildWindow([
+-          "read",
+-          "read",
+-          "read",
+-          "edit",
+-          "read",
+-          "read",
+-          "read",
+-          "read",
+-          "grep",
+-          "read",
+-        ], {
+-          circuitBreaker: {
+-            windowSize: 10,
+-            repetitionThresholdPercent: 80,
+-          },
+-        })
++        const window = buildWindow(Array.from({ length: 20 }, () => "read"))
+ 
+         const result = detectRepetitiveToolUse(window)
+ 
+         expect(result).toEqual({
+           triggered: true,
+           toolName: "read",
+-          repeatedCount: 8,
+-          sampleSize: 10,
+-          thresholdPercent: 80,
++          repeatedCount: 20,
+         })
+       })
+     })
+ 
+-    describe("#given the window is not full yet", () => {
+-      test("#when the current sample crosses the threshold #then it still triggers", () => {
+-        const window = buildWindow(["read", "read", "edit", "read", "read", "read", "read", "read"], {
+-          circuitBreaker: {
+-            windowSize: 10,
+-            repetitionThresholdPercent: 80,
+-          },
+-        })
++    describe("#given consecutive calls are interrupted by different tool", () => {
++      test("#when evaluated #then it does not trigger", () => {
++        const window = buildWindow([
++          ...Array.from({ length: 19 }, () => "read"),
++          "edit",
++          "read",
++        ])
+ 
+         const result = detectRepetitiveToolUse(window)
+ 
++        expect(result).toEqual({ triggered: false })
++      })
++    })
++
++    describe("#given threshold boundary", () => {
++      test("#when below threshold #then it does not trigger", () => {
++        const belowThresholdWindow = buildWindow(Array.from({ length: 19 }, () => "read"))
++
++        const result = detectRepetitiveToolUse(belowThresholdWindow)
++
++        expect(result).toEqual({ triggered: false })
++      })
++
++      test("#when equal to threshold #then it triggers", () => {
++        const atThresholdWindow = buildWindow(Array.from({ length: 20 }, () => "read"))
++
++        const result = detectRepetitiveToolUse(atThresholdWindow)
++
+         expect(result).toEqual({
+           triggered: true,
+           toolName: "read",
+-          repeatedCount: 7,
+-          sampleSize: 8,
+-          thresholdPercent: 80,
++          repeatedCount: 20,
+         })
+       })
+     })
+@@ -210,9 +202,7 @@ describe("loop-detector", () => {
+           tool: "read",
+           input: { filePath: `/src/file-${i}.ts` },
+         }))
+-        const window = buildWindowWithInputs(calls, {
+-          circuitBreaker: { windowSize: 20, repetitionThresholdPercent: 80 },
+-        })
++        const window = buildWindowWithInputs(calls)
+         const result = detectRepetitiveToolUse(window)
+         expect(result.triggered).toBe(false)
+       })
+@@ -220,38 +210,30 @@ describe("loop-detector", () => {
+ 
+     describe("#given same tool with identical file inputs", () => {
+       test("#when evaluated #then it triggers with bare tool name", () => {
+-        const calls = [
+-          ...Array.from({ length: 16 }, () => ({ tool: "read", input: { filePath: "/src/same.ts" } })),
+-          { tool: "grep", input: { pattern: "foo" } },
+-          { tool: "edit", input: { filePath: "/src/other.ts" } },
+-          { tool: "bash", input: { command: "ls" } },
+-          { tool: "glob", input: { pattern: "**/*.ts" } },
+-        ]
+-        const window = buildWindowWithInputs(calls, {
+-          circuitBreaker: { windowSize: 20, repetitionThresholdPercent: 80 },
+-        })
++        const calls = Array.from({ length: 20 }, () => ({
++          tool: "read",
++          input: { filePath: "/src/same.ts" },
++        }))
++        const window = buildWindowWithInputs(calls)
+         const result = detectRepetitiveToolUse(window)
+-        expect(result.triggered).toBe(true)
+-        expect(result.toolName).toBe("read")
+-        expect(result.repeatedCount).toBe(16)
++        expect(result).toEqual({
++          triggered: true,
++          toolName: "read",
++          repeatedCount: 20,
++        })
+       })
+     })
+ 
+     describe("#given tool calls with no input", () => {
+-      test("#when the same tool dominates #then falls back to name-only detection", () => {
+-        const calls = [
+-          ...Array.from({ length: 16 }, () => ({ tool: "read" })),
+-          { tool: "grep" },
+-          { tool: "edit" },
+-          { tool: "bash" },
+-          { tool: "glob" },
+-        ]
+-        const window = buildWindowWithInputs(calls, {
+-          circuitBreaker: { windowSize: 20, repetitionThresholdPercent: 80 },
+-        })
++      test("#when evaluated #then it triggers", () => {
++        const calls = Array.from({ length: 20 }, () => ({ tool: "read" }))
++        const window = buildWindowWithInputs(calls)
+         const result = detectRepetitiveToolUse(window)
+-        expect(result.triggered).toBe(true)
+-        expect(result.toolName).toBe("read")
++        expect(result).toEqual({
++          triggered: true,
++          toolName: "read",
++          repeatedCount: 20,
++        })
+       })
+     })
+   })
+diff --git a/src/features/background-agent/loop-detector.ts b/src/features/background-agent/loop-detector.ts
+index a7ee3a88..4f84079b 100644
+--- a/src/features/background-agent/loop-detector.ts
++++ b/src/features/background-agent/loop-detector.ts
+@@ -1,8 +1,7 @@
+ import type { BackgroundTaskConfig } from "../../config/schema"
+ import {
+   DEFAULT_CIRCUIT_BREAKER_ENABLED,
+-  DEFAULT_CIRCUIT_BREAKER_REPETITION_THRESHOLD_PERCENT,
+-  DEFAULT_CIRCUIT_BREAKER_WINDOW_SIZE,
++  DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_THRESHOLD,
+   DEFAULT_MAX_TOOL_CALLS,
+ } from "./constants"
+ import type { ToolCallWindow } from "./types"
+@@ -10,16 +9,13 @@ import type { ToolCallWindow } from "./types"
+ export interface CircuitBreakerSettings {
+   enabled: boolean
+   maxToolCalls: number
+-  windowSize: number
+-  repetitionThresholdPercent: number
++  consecutiveThreshold: number
+ }
+ 
+ export interface ToolLoopDetectionResult {
+   triggered: boolean
+   toolName?: string
+   repeatedCount?: number
+-  sampleSize?: number
+-  thresholdPercent?: number
+ }
+ 
+ export function resolveCircuitBreakerSettings(
+@@ -29,10 +25,8 @@ export function resolveCircuitBreakerSettings(
+     enabled: config?.circuitBreaker?.enabled ?? DEFAULT_CIRCUIT_BREAKER_ENABLED,
+     maxToolCalls:
+       config?.circuitBreaker?.maxToolCalls ?? config?.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS,
+-    windowSize: config?.circuitBreaker?.windowSize ?? DEFAULT_CIRCUIT_BREAKER_WINDOW_SIZE,
+-    repetitionThresholdPercent:
+-      config?.circuitBreaker?.repetitionThresholdPercent ??
+-      DEFAULT_CIRCUIT_BREAKER_REPETITION_THRESHOLD_PERCENT,
++    consecutiveThreshold:
++      config?.circuitBreaker?.consecutiveThreshold ?? DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_THRESHOLD,
+   }
+ }
+ 
+@@ -42,16 +36,20 @@ export function recordToolCall(
+   settings: CircuitBreakerSettings,
+   toolInput?: Record<string, unknown> | null
+ ): ToolCallWindow {
+-  const previous = window?.toolSignatures ?? []
+   const signature = createToolCallSignature(toolName, toolInput)
+-  const toolSignatures = previous.length >= settings.windowSize
+-    ? [...previous.slice(1), signature]
+-    : [...previous, signature]
++
++  if (window && window.lastSignature === signature) {
++    return {
++      lastSignature: signature,
++      consecutiveCount: window.consecutiveCount + 1,
++      threshold: settings.consecutiveThreshold,
++    }
++  }
+ 
+   return {
+-    toolSignatures,
+-    windowSize: settings.windowSize,
+-    thresholdPercent: settings.repetitionThresholdPercent,
++    lastSignature: signature,
++    consecutiveCount: 1,
++    threshold: settings.consecutiveThreshold,
+   }
+ }
+ 
+@@ -84,46 +82,13 @@ export function createToolCallSignature(
+ export function detectRepetitiveToolUse(
+   window: ToolCallWindow | undefined
+ ): ToolLoopDetectionResult {
+-  if (!window || window.toolSignatures.length === 0) {
+-    return { triggered: false }
+-  }
+-
+-  const counts = new Map<string, number>()
+-  for (const signature of window.toolSignatures) {
+-    counts.set(signature, (counts.get(signature) ?? 0) + 1)
+-  }
+-
+-  let repeatedTool: string | undefined
+-  let repeatedCount = 0
+-
+-  for (const [toolName, count] of counts.entries()) {
+-    if (count > repeatedCount) {
+-      repeatedTool = toolName
+-      repeatedCount = count
+-    }
+-  }
+-
+-  const sampleSize = window.toolSignatures.length
+-  const minimumSampleSize = Math.min(
+-    window.windowSize,
+-    Math.ceil((window.windowSize * window.thresholdPercent) / 100)
+-  )
+-
+-  if (sampleSize < minimumSampleSize) {
+-    return { triggered: false }
+-  }
+-
+-  const thresholdCount = Math.ceil((sampleSize * window.thresholdPercent) / 100)
+-
+-  if (!repeatedTool || repeatedCount < thresholdCount) {
++  if (!window || window.consecutiveCount < window.threshold) {
+     return { triggered: false }
+   }
+ 
+   return {
+     triggered: true,
+-    toolName: repeatedTool.split("::")[0],
+-    repeatedCount,
+-    sampleSize,
+-    thresholdPercent: window.thresholdPercent,
++    toolName: window.lastSignature.split("::")[0],
++    repeatedCount: window.consecutiveCount,
+   }
+ }
+diff --git a/src/features/background-agent/manager-circuit-breaker.test.ts b/src/features/background-agent/manager-circuit-breaker.test.ts
+index 8bb1426e..2836e3f6 100644
+--- a/src/features/background-agent/manager-circuit-breaker.test.ts
++++ b/src/features/background-agent/manager-circuit-breaker.test.ts
+@@ -38,12 +38,11 @@ async function flushAsyncWork() {
+ }
+ 
+ describe("BackgroundManager circuit breaker", () => {
+-  describe("#given the same tool dominates the recent window", () => {
+-    test("#when tool events arrive #then the task is cancelled early", async () => {
++  describe("#given the same tool is called consecutively", () => {
++    test("#when consecutive tool events arrive #then the task is cancelled", async () => {
+       const manager = createManager({
+         circuitBreaker: {
+-          windowSize: 20,
+-          repetitionThresholdPercent: 80,
++          consecutiveThreshold: 20,
+         },
+       })
+       const task: BackgroundTask = {
+@@ -63,38 +62,17 @@ describe("BackgroundManager circuit breaker", () => {
+       }
+       getTaskMap(manager).set(task.id, task)
+ 
+-      for (const toolName of [
+-        "read",
+-        "read",
+-        "grep",
+-        "read",
+-        "edit",
+-        "read",
+-        "read",
+-        "bash",
+-        "read",
+-        "read",
+-        "read",
+-        "glob",
+-        "read",
+-        "read",
+-        "read",
+-        "read",
+-        "read",
+-        "read",
+-        "read",
+-        "read",
+-      ]) {
++      for (let i = 0; i < 20; i++) {
+         manager.handleEvent({
+           type: "message.part.updated",
+-          properties: { sessionID: task.sessionID, type: "tool", tool: toolName },
++          properties: { sessionID: task.sessionID, type: "tool", tool: "read" },
+         })
+       }
+ 
+       await flushAsyncWork()
+ 
+       expect(task.status).toBe("cancelled")
+-      expect(task.error).toContain("repeatedly called read 16/20 times")
++      expect(task.error).toContain("read 20 consecutive times")
+     })
+   })
+ 
+@@ -102,8 +80,7 @@ describe("BackgroundManager circuit breaker", () => {
+     test("#when the window fills #then the task keeps running", async () => {
+       const manager = createManager({
+         circuitBreaker: {
+-          windowSize: 10,
+-          repetitionThresholdPercent: 80,
++          consecutiveThreshold: 10,
+         },
+       })
+       const task: BackgroundTask = {
+@@ -153,8 +130,7 @@ describe("BackgroundManager circuit breaker", () => {
+       const manager = createManager({
+         maxToolCalls: 3,
+         circuitBreaker: {
+-          windowSize: 10,
+-          repetitionThresholdPercent: 95,
++          consecutiveThreshold: 95,
+         },
+       })
+       const task: BackgroundTask = {
+@@ -193,8 +169,7 @@ describe("BackgroundManager circuit breaker", () => {
+       const manager = createManager({
+         maxToolCalls: 2,
+         circuitBreaker: {
+-          windowSize: 5,
+-          repetitionThresholdPercent: 80,
++          consecutiveThreshold: 5,
+         },
+       })
+       const task: BackgroundTask = {
+@@ -241,8 +216,7 @@ describe("BackgroundManager circuit breaker", () => {
+     test("#when tool events arrive with state.input #then task keeps running", async () => {
+       const manager = createManager({
+         circuitBreaker: {
+-          windowSize: 20,
+-          repetitionThresholdPercent: 80,
++          consecutiveThreshold: 20,
+         },
+       })
+       const task: BackgroundTask = {
+@@ -287,8 +261,7 @@ describe("BackgroundManager circuit breaker", () => {
+     test("#when tool events arrive with state.input #then task is cancelled with bare tool name in error", async () => {
+       const manager = createManager({
+         circuitBreaker: {
+-          windowSize: 20,
+-          repetitionThresholdPercent: 80,
++          consecutiveThreshold: 20,
+         },
+       })
+       const task: BackgroundTask = {
+@@ -325,7 +298,7 @@ describe("BackgroundManager circuit breaker", () => {
+       await flushAsyncWork()
+ 
+       expect(task.status).toBe("cancelled")
+-      expect(task.error).toContain("repeatedly called read")
++      expect(task.error).toContain("read 20 consecutive times")
+       expect(task.error).not.toContain("::")
+     })
+   })
+@@ -335,8 +308,7 @@ describe("BackgroundManager circuit breaker", () => {
+       const manager = createManager({
+         circuitBreaker: {
+           enabled: false,
+-          windowSize: 20,
+-          repetitionThresholdPercent: 80,
++          consecutiveThreshold: 20,
+         },
+       })
+       const task: BackgroundTask = {
+@@ -379,8 +351,7 @@ describe("BackgroundManager circuit breaker", () => {
+         maxToolCalls: 3,
+         circuitBreaker: {
+           enabled: false,
+-          windowSize: 10,
+-          repetitionThresholdPercent: 95,
++          consecutiveThreshold: 95,
+         },
+       })
+       const task: BackgroundTask = {
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index b43ba96a..c4ea7528 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -932,18 +932,16 @@ export class BackgroundManager {
+            if (circuitBreaker.enabled) {
+              const loopDetection = detectRepetitiveToolUse(task.progress.toolCallWindow)
+              if (loopDetection.triggered) {
+-               log("[background-agent] Circuit breaker: repetitive tool usage detected", {
++               log("[background-agent] Circuit breaker: consecutive tool usage detected", {
+                  taskId: task.id,
+                  agent: task.agent,
+                  sessionID,
+                  toolName: loopDetection.toolName,
+                  repeatedCount: loopDetection.repeatedCount,
+-                 sampleSize: loopDetection.sampleSize,
+-                 thresholdPercent: loopDetection.thresholdPercent,
+                })
+                void this.cancelTask(task.id, {
+                  source: "circuit-breaker",
+-                 reason: `Subagent repeatedly called ${loopDetection.toolName} ${loopDetection.repeatedCount}/${loopDetection.sampleSize} times in the recent tool-call window (${loopDetection.thresholdPercent}% threshold). This usually indicates an infinite loop. The task was automatically cancelled to prevent excessive token usage.`,
++                 reason: `Subagent called ${loopDetection.toolName} ${loopDetection.repeatedCount} consecutive times (threshold: ${circuitBreaker.consecutiveThreshold}). This usually indicates an infinite loop. The task was automatically cancelled to prevent excessive token usage.`,
+                })
+                return
+              }
+diff --git a/src/features/background-agent/types.ts b/src/features/background-agent/types.ts
+index 3bb7141e..e40f98e2 100644
+--- a/src/features/background-agent/types.ts
++++ b/src/features/background-agent/types.ts
+@@ -10,9 +10,9 @@ export type BackgroundTaskStatus =
+   | "interrupt"
+ 
+ export interface ToolCallWindow {
+-  toolSignatures: string[]
+-  windowSize: number
+-  thresholdPercent: number
++  lastSignature: string
++  consecutiveCount: number
++  threshold: number
+ }
+ 
+ export interface TaskProgress {
+-- 
+2.39.2
+

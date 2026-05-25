@@ -1,0 +1,1275 @@
+From 982fa8136721784246aa2a295a2cf4247294328a Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 16 May 2026 16:21:48 +0900
+Subject: [PATCH 5301/5749] fix(delegate-task): start child prompts reliably
+
+Preserve delegated child prompt/bootstrap metadata for early runtime fallback before OpenCode has persisted the first user turn. Bind prompt gate calls to the SDK session receiver and keep completed background task lookup visible across plugin manager instances.
+---
+ src/features/background-agent/manager.test.ts | 188 +++++++++++++++++-
+ src/features/background-agent/manager.ts      | 159 +++++++++------
+ .../background-agent/task-registry.ts         |  92 +++++++++
+ src/hooks/runtime-fallback/auto-retry.ts      |   4 +-
+ src/hooks/runtime-fallback/index.test.ts      | 115 ++++++++++-
+ .../runtime-fallback/last-user-retry-parts.ts |  20 +-
+ src/hooks/shared/prompt-async-gate.test.ts    |  60 ++++++
+ .../delegated-child-session-bootstrap.ts      |  71 +++++++
+ src/shared/prompt-async-gate.ts               |  14 +-
+ src/tools/delegate-task/sync-task.test.ts     |  60 ++++++
+ src/tools/delegate-task/sync-task.ts          |  39 ++--
+ 11 files changed, 738 insertions(+), 84 deletions(-)
+ create mode 100644 src/features/background-agent/task-registry.ts
+ create mode 100644 src/shared/delegated-child-session-bootstrap.ts
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index 3adbab45..030b3670 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -15,7 +15,15 @@ import { ConcurrencyManager } from "./concurrency"
+ import { promptAsyncAfterSessionIdle } from "../../shared/prompt-async-gate"
+ import { initTaskToastManager, _resetTaskToastManagerForTesting } from "../task-toast-manager/manager"
+ import { _resetForTesting as resetProcessCleanupState } from "./process-cleanup"
+-
++import { clearBackgroundTaskRegistryForTesting } from "./task-registry"
++import {
++  clearAllDelegatedChildSessionBootstrap,
++  getDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
++
++afterEach(() => {
++  clearBackgroundTaskRegistryForTesting()
++})
+ 
+ const TASK_TTL_MS = 30 * 60 * 1000
+ type PendingParentWakeForTest = {
+@@ -458,6 +466,71 @@ describe("BackgroundManager session.error fallback hydration", () => {
+   })
+ })
+ 
++describe("BackgroundManager delegated child-session bootstrap", () => {
++  test("registers launch bootstrap before first prompt and clears it after completion", async () => {
++    //#given
++    clearAllDelegatedChildSessionBootstrap()
++    const observedBootstrapPrompts: string[] = []
++    const client = {
++      session: {
++        get: async () => ({ data: { directory: tmpdir() } }),
++        create: async () => ({ data: { id: "ses_background_bootstrap" } }),
++        promptAsync: async () => {
++          const bootstrap = getDelegatedChildSessionBootstrap("ses_background_bootstrap")
++          observedBootstrapPrompts.push(bootstrap?.retryParts[0]?.text ?? "")
++          return {}
++        },
++        abort: async () => ({}),
++      },
++    }
++    const manager = new BackgroundManager({ pluginContext: createPluginInput(client) })
++    stubNotifyParentSession(manager)
++    const task = createMockTask({
++      id: "bg_bootstrap",
++      parentSessionId: "parent-session",
++      status: "pending",
++      queuedAt: new Date(),
++      prompt: "background bootstrap prompt",
++      agent: "sisyphus-junior",
++      category: "quick",
++      model: { providerID: "anthropic", modelID: "claude-haiku-4-5" },
++      fallbackChain: [{ model: "gpt-5.4", providers: ["openai"], variant: "high" }],
++    })
++    getTaskMap(manager).set(task.id, task)
++    const input = {
++      description: task.description,
++      prompt: task.prompt,
++      agent: task.agent,
++      parentSessionId: task.parentSessionId,
++      parentMessageId: task.parentMessageId,
++      parentModel: task.parentModel,
++      parentAgent: task.parentAgent,
++      parentTools: task.parentTools,
++      model: task.model,
++      fallbackChain: task.fallbackChain,
++      category: task.category,
++    }
++
++    try {
++      //#when
++      await (cast<{ startTask: (item: { task: BackgroundTask; input: typeof input }) => Promise<void> }>(manager))
++        .startTask({ task, input })
++      await flushBackgroundNotifications()
++
++      //#then
++      expect(observedBootstrapPrompts[0]).toContain("background bootstrap prompt")
++      expect(getDelegatedChildSessionBootstrap("ses_background_bootstrap")).toBeDefined()
++
++      const completed = await tryCompleteTaskForTest(manager, task)
++      expect(completed).toBe(true)
++      expect(getDelegatedChildSessionBootstrap("ses_background_bootstrap")).toBeUndefined()
++    } finally {
++      manager.shutdown()
++      clearAllDelegatedChildSessionBootstrap()
++    }
++  })
++})
++
+ describe("BackgroundManager prompt rejection fallback routing", () => {
+   test("routes launch-time prompt rejections into tryFallbackRetry before marking interrupt", async () => {
+     //#given
+@@ -6721,6 +6794,119 @@ describe("BackgroundManager regression fixes - resume and aborted notification",
+     manager.shutdown()
+   })
+ 
++  test("should resolve a completed task registered by an earlier plugin manager instance", () => {
++    //#given
++    const firstManager = createBackgroundManager()
++    const secondManager = createBackgroundManager()
++    const task: BackgroundTask = {
++      id: "task-cross-manager-regression",
++      sessionId: "session-cross-manager-regression",
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-1",
++      description: "cross manager regression",
++      prompt: "test",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(),
++      completedAt: new Date(),
++    }
++
++    //#when
++    ;(cast<{ addTask: (task: BackgroundTask) => void }>(firstManager)).addTask(task)
++
++    //#then
++    const resolvedTask = secondManager.getTask(task.id)
++    expect(resolvedTask?.sessionId).toBe(task.sessionId)
++
++    firstManager.shutdown()
++    secondManager.shutdown()
++  })
++
++  test("should resolve archived completed task from an earlier plugin manager instance", () => {
++    //#given
++    const firstManager = createBackgroundManager()
++    const secondManager = createBackgroundManager()
++    const task: BackgroundTask = {
++      id: "task-cross-manager-archive-regression",
++      sessionId: "session-cross-manager-archive-regression",
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-1",
++      description: "cross manager archive regression",
++      prompt: "sensitive prompt",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(),
++      completedAt: new Date(),
++    }
++    getTaskMap(firstManager).set(task.id, task)
++
++    //#when
++    ;(cast<{ removeTask: (task: BackgroundTask) => void }>(firstManager)).removeTask(task)
++
++    //#then
++    const resolvedTask = secondManager.getTask(task.id)
++    expect(resolvedTask?.sessionId).toBe(task.sessionId)
++    expect(resolvedTask?.prompt).toBe("[redacted]")
++
++    firstManager.shutdown()
++    secondManager.shutdown()
++  })
++
++  test("should archive terminal registry tasks during earlier manager shutdown", async () => {
++    //#given
++    const firstManager = createBackgroundManager()
++    const secondManager = createBackgroundManager()
++    const task: BackgroundTask = {
++      id: "task-shutdown-archive-regression",
++      sessionId: "session-shutdown-archive-regression",
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-1",
++      description: "shutdown archive regression",
++      prompt: "sensitive shutdown prompt",
++      agent: "explore",
++      status: "completed",
++      startedAt: new Date(),
++      completedAt: new Date(),
++    }
++    ;(cast<{ addTask: (task: BackgroundTask) => void }>(firstManager)).addTask(task)
++
++    //#when
++    await firstManager.shutdown()
++
++    //#then
++    const resolvedTask = secondManager.getTask(task.id)
++    expect(resolvedTask?.sessionId).toBe(task.sessionId)
++    expect(resolvedTask?.prompt).toBe("[redacted]")
++
++    await secondManager.shutdown()
++  })
++
++  test("should forget active registry tasks during earlier manager shutdown", async () => {
++    //#given
++    const firstManager = createBackgroundManager()
++    const secondManager = createBackgroundManager()
++    const task: BackgroundTask = {
++      id: "task-shutdown-active-regression",
++      sessionId: "session-shutdown-active-regression",
++      parentSessionId: "parent-session",
++      parentMessageId: "msg-1",
++      description: "shutdown active regression",
++      prompt: "test",
++      agent: "explore",
++      status: "running",
++      startedAt: new Date(),
++    }
++    ;(cast<{ addTask: (task: BackgroundTask) => void }>(firstManager)).addTask(task)
++
++    //#when
++    await firstManager.shutdown()
++
++    //#then
++    expect(secondManager.getTask(task.id)).toBeUndefined()
++
++    await secondManager.shutdown()
++  })
++
+   test("should cap completed task archive size at 100 entries", () => {
+     //#given
+     const manager = createBackgroundManager()
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index fab28ccd..9f96aa4e 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -1,99 +1,107 @@
+-
++import { join } from "node:path"
+ import type { PluginInput } from "@opencode-ai/plugin"
++import type { BackgroundTaskConfig, TmuxConfig } from "../../config/schema"
++import { setContinuationMarkerSource } from "../../features/run-continuation-state"
+ import type { ModelFallbackControllerAccessor } from "../../hooks/model-fallback"
+-import { isAgentNotFoundError, FALLBACK_AGENT, buildFallbackBody } from "./spawner"
+-import type {
+-  BackgroundTask,
+-  BackgroundTaskAttempt,
+-  LaunchInput,
+-  ResumeInput,
+-} from "./types"
+-import { TaskHistory } from "./task-history"
++import { type PromptAsyncGateResult, promptAsyncAfterSessionIdle } from "../../hooks/shared/prompt-async-gate"
++import { isSessionActive as isOpenCodeSessionActive } from "../../hooks/shared/session-idle-settle"
+ import {
+-  log,
++  createInternalAgentTextPart,
+   getAgentToolRestrictions,
++  log,
++  messagesInDirectory,
+   normalizePromptTools,
+   normalizeSDKResponse,
+-  resolveInheritedPromptTools,
+-  createInternalAgentTextPart,
+-  messagesInDirectory,
+   promptWithRetryInDirectory,
++  resolveInheritedPromptTools,
+ } from "../../shared"
++import {
++  clearDelegatedChildSessionBootstrap,
++  registerDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
+ import { resolveMessageEventSessionID, resolveSessionEventID } from "../../shared/event-session-id"
++import {
++  hasMoreFallbacks,
++  shouldRetryError,
++} from "../../shared/model-error-classifier"
++import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+ import { applySessionPromptParams } from "../../shared/session-prompt-params-helpers"
+ import { setSessionTools } from "../../shared/session-tools-store"
+-import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+-import { ConcurrencyManager } from "./concurrency"
+-import type { BackgroundTaskConfig, TmuxConfig } from "../../config/schema"
+ import { isInsideTmux } from "../../shared/tmux"
++import { subagentSessions } from "../claude-code-session-state"
++import { MESSAGE_STORAGE } from "../hook-message-injector"
++import { getTaskToastManager } from "../task-toast-manager"
++import { abortWithTimeout } from "./abort-with-timeout"
+ import {
+-  shouldRetryError,
+-  hasMoreFallbacks,
+-} from "../../shared/model-error-classifier"
++  bindAttemptSession,
++  ensureCurrentAttempt,
++  finalizeAttempt,
++  findAttemptBySession,
++  getCurrentAttempt,
++  startAttempt,
++} from "./attempt-lifecycle"
++import {
++  type BackgroundTaskNotificationTask,
++  buildBackgroundTaskNotificationText,
++} from "./background-task-notification-template"
++import {
++  findNearestMessageExcludingCompaction,
++  resolvePromptContextFromSessionMessages,
++} from "./compaction-aware-message-resolver"
++import { ConcurrencyManager } from "./concurrency"
+ import {
+   POLLING_INTERVAL_MS,
++  type QueueItem,
+   TASK_CLEANUP_DELAY_MS,
+   TASK_TTL_MS,
+-  type QueueItem,
+ } from "./constants"
+-
+-import { subagentSessions } from "../claude-code-session-state"
+-import { getTaskToastManager } from "../task-toast-manager"
+ import { formatDuration } from "./duration-formatter"
+ import {
+-  buildBackgroundTaskNotificationText,
+-  type BackgroundTaskNotificationTask,
+-} from "./background-task-notification-template"
+-import {
+-  isAbortedSessionError,
+-  extractErrorName,
+   extractErrorMessage,
++  extractErrorName,
+   extractErrorStatusCode,
+   getSessionErrorMessage,
++  isAbortedSessionError,
+   isRecord,
+ } from "./error-classifier"
+ import { tryFallbackRetry } from "./fallback-retry-handler"
+ import {
+-  bindAttemptSession,
+-  ensureCurrentAttempt,
+-  findAttemptBySession,
+-  finalizeAttempt,
+-  getCurrentAttempt,
+-  startAttempt,
+-} from "./attempt-lifecycle"
++  type CircuitBreakerSettings,
++  detectRepetitiveToolUse,
++  recordToolCall,
++  resolveCircuitBreakerSettings,
++} from "./loop-detector"
++import { ParentWakeNotifier, type ParentWakePromptContext } from "./parent-wake-notifier"
+ import { registerManagerForCleanup, unregisterManagerForCleanup } from "./process-cleanup"
+-import { setContinuationMarkerSource } from "../../features/run-continuation-state"
+-import { isSessionActive as isOpenCodeSessionActive } from "../../hooks/shared/session-idle-settle"
+-import { promptAsyncAfterSessionIdle, type PromptAsyncGateResult } from "../../hooks/shared/prompt-async-gate"
+-import {
+-  findNearestMessageExcludingCompaction,
+-  resolvePromptContextFromSessionMessages,
+-} from "./compaction-aware-message-resolver"
+-import { handleSessionIdleBackgroundEvent } from "./session-idle-event-handler"
+-import { MESSAGE_STORAGE } from "../hook-message-injector"
+-import { join } from "node:path"
+-import { pruneStaleTasksAndNotifications, type SessionStatusMap } from "./task-poller"
+-import { checkAndInterruptStaleTasks } from "./task-poller"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
+-import { abortWithTimeout } from "./abort-with-timeout"
+ import {
+   MIN_SESSION_GONE_POLLS,
+   verifySessionExists as verifySessionStillExists,
+ } from "./session-existence"
++import { handleSessionIdleBackgroundEvent } from "./session-idle-event-handler"
+ import { isActiveSessionStatus, isTerminalSessionStatus } from "./session-status-classifier"
+-import {
+-  detectRepetitiveToolUse,
+-  recordToolCall,
+-  resolveCircuitBreakerSettings,
+-  type CircuitBreakerSettings,
+-} from "./loop-detector"
++import { buildFallbackBody, FALLBACK_AGENT, isAgentNotFoundError } from "./spawner"
+ import {
+   createSubagentDepthLimitError,
+   getMaxSubagentDepth,
+   resolveSubagentSpawnContext,
+   type SubagentSpawnContext,
+ } from "./subagent-spawn-limits"
+-import { ParentWakeNotifier, type ParentWakePromptContext } from "./parent-wake-notifier"
++import { TaskHistory } from "./task-history"
++import { checkAndInterruptStaleTasks, pruneStaleTasksAndNotifications, type SessionStatusMap } from "./task-poller"
++import {
++  archiveBackgroundTask,
++  forgetBackgroundTask,
++  getRegisteredBackgroundTask,
++  rememberBackgroundTask,
++} from "./task-registry"
++import type {
++  BackgroundTask,
++  BackgroundTaskAttempt,
++  LaunchInput,
++  ResumeInput,
++} from "./types"
++
+ type OpencodeClient = PluginInput["client"]
+ 
+ type ResumeTaskSnapshot = {
+@@ -111,6 +119,13 @@ type ResumeTaskSnapshot = {
+   concurrencyGroup?: string
+ }
+ 
++const TERMINAL_BACKGROUND_TASK_STATUSES = new Set<BackgroundTask["status"]>([
++  "completed",
++  "error",
++  "cancelled",
++  "interrupt",
++])
++
+ const PENDING_PARENT_WAKE_RETRY_MS = 1_000
+ const PENDING_PARENT_WAKE_DEBOUNCE_MS = 100
+ const PARENT_WAKE_ACCEPTED_MESSAGE_SKEW_MS = 5_000
+@@ -376,6 +391,7 @@ export class BackgroundManager {
+   private addTask(task: BackgroundTask): void {
+     this.completedTaskArchive.delete(task.id)
+     this.tasks.set(task.id, task)
++    rememberBackgroundTask(task)
+     if (!task.parentSessionId) {
+       return
+     }
+@@ -387,6 +403,7 @@ export class BackgroundManager {
+ 
+   private removeTask(task: BackgroundTask): void {
+     this.archiveCompletedTask(task)
++    archiveBackgroundTask(task)
+     this.tasks.delete(task.id)
+     this.removeTaskFromParentIndex(task.id, task.parentSessionId)
+   }
+@@ -659,6 +676,7 @@ export class BackgroundManager {
+ 
+           // Abort the orphaned session if one was created before the error
+           if (item.task.sessionId) {
++            clearDelegatedChildSessionBootstrap(item.task.sessionId)
+             await this.abortSessionWithLogging(item.task.sessionId, "startTask error cleanup")
+           }
+ 
+@@ -729,6 +747,7 @@ export class BackgroundManager {
+     const sessionID = createResult.data.id
+ 
+     if (task.status === "cancelled") {
++      clearDelegatedChildSessionBootstrap(sessionID)
+       await this.abortSessionWithLogging(sessionID, "cancelled pre-start cleanup")
+       this.concurrencyManager.release(concurrencyKey)
+       return
+@@ -739,6 +758,7 @@ export class BackgroundManager {
+     subagentSessions.add(sessionID)
+ 
+     if (this.tasks.get(task.id)?.status === "cancelled") {
++      clearDelegatedChildSessionBootstrap(sessionID)
+       await this.abortSessionWithLogging(sessionID, "cancelled during launch setup")
+       subagentSessions.delete(sessionID)
+       if (task.rootSessionId) {
+@@ -750,6 +770,7 @@ export class BackgroundManager {
+ 
+     const boundAttempt = bindAttemptSession(task, attemptID, sessionID, input.model)
+     if (!boundAttempt) {
++      clearDelegatedChildSessionBootstrap(sessionID)
+       await this.abortSessionWithLogging(sessionID, "stale attempt binding cleanup")
+       subagentSessions.delete(sessionID)
+       if (task.rootSessionId) {
+@@ -806,6 +827,13 @@ The fallback retry session is now created and can be inspected directly.
+     this.startPolling()
+ 
+     log("[background-agent] Launching task:", { taskId: task.id, sessionID, agent: input.agent })
++    registerDelegatedChildSessionBootstrap({
++      sessionID,
++      promptText: input.prompt,
++      fallbackChain: input.fallbackChain,
++      category: input.category,
++      modelFallbackControllerAccessor: this.modelFallbackControllerAccessor,
++    })
+ 
+     const toastManager = getTaskToastManager()
+     if (toastManager) {
+@@ -926,6 +954,7 @@ The fallback retry session is now created and can be inspected directly.
+ 
+         // Abort the session to prevent infinite polling hang
+         // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
++        clearDelegatedChildSessionBootstrap(sessionID)
+         await this.abortSessionWithLogging(sessionID, "launch error cleanup")
+ 
+         this.markForNotification(existingTask)
+@@ -960,7 +989,7 @@ The fallback retry session is now created and can be inspected directly.
+   }
+ 
+   getTask(id: string): BackgroundTask | undefined {
+-    return this.tasks.get(id) ?? this.completedTaskArchive.get(id)
++    return this.tasks.get(id) ?? this.completedTaskArchive.get(id) ?? getRegisteredBackgroundTask(id)
+   }
+ 
+   getTasksByParentSession(sessionID: string): BackgroundTask[] {
+@@ -1313,6 +1342,7 @@ The fallback retry session is now created and can be inspected directly.
+       // Abort the session to prevent infinite polling hang
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+       if (existingTask.sessionId) {
++        clearDelegatedChildSessionBootstrap(existingTask.sessionId)
+         await this.abortSessionWithLogging(existingTask.sessionId, "resume error cleanup")
+       }
+ 
+@@ -1650,6 +1680,7 @@ The fallback retry session is now created and can be inspected directly.
+       }
+ 
+       this.rootDescendantCounts.delete(sessionID)
++      clearDelegatedChildSessionBootstrap(sessionID)
+       SessionCategoryRegistry.remove(sessionID)
+     }
+ 
+@@ -1732,6 +1763,7 @@ The fallback retry session is now created and can be inspected directly.
+     this.scheduleTaskRemoval(task.id)
+ 
+     if (task.sessionId) {
++      clearDelegatedChildSessionBootstrap(task.sessionId)
+       SessionCategoryRegistry.remove(task.sessionId)
+       await this.abortSessionWithLogging(task.sessionId, `${reason} cleanup`)
+     }
+@@ -1838,6 +1870,7 @@ The fallback retry session is now created and can be inspected directly.
+     }
+     this.scheduleTaskRemoval(task.id)
+     if (task.sessionId) {
++      clearDelegatedChildSessionBootstrap(task.sessionId)
+       SessionCategoryRegistry.remove(task.sessionId)
+     }
+ 
+@@ -1895,6 +1928,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     if (retried && previousSessionID) {
+       this.clearSessionOutputObserved(previousSessionID)
+       this.clearSessionTodoObservation(previousSessionID)
++      clearDelegatedChildSessionBootstrap(previousSessionID)
+       subagentSessions.delete(previousSessionID)
+     }
+     return retried
+@@ -2059,6 +2093,7 @@ The task was re-queued on a fallback model after a retryable failure.
+       this.clearTaskHistoryWhenParentTasksGone(task.parentSessionId)
+       if (task.sessionId) {
+         subagentSessions.delete(task.sessionId)
++        clearDelegatedChildSessionBootstrap(task.sessionId)
+         SessionCategoryRegistry.remove(task.sessionId)
+       }
+       log("[background-agent] Removed completed task from memory:", taskId)
+@@ -2134,6 +2169,7 @@ The task was re-queued on a fallback model after a retryable failure.
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+       await this.abortSessionWithLogging(task.sessionId, `task cancellation (${source})`)
+ 
++      clearDelegatedChildSessionBootstrap(task.sessionId)
+       SessionCategoryRegistry.remove(task.sessionId)
+     }
+ 
+@@ -2259,6 +2295,7 @@ The task was re-queued on a fallback model after a retryable failure.
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+       await this.abortSessionWithLogging(task.sessionId, `task completion (${source})`)
+ 
++      clearDelegatedChildSessionBootstrap(task.sessionId)
+       SessionCategoryRegistry.remove(task.sessionId)
+     }
+ 
+@@ -2588,6 +2625,7 @@ The task was re-queued on a fallback model after a retryable failure.
+     removeTaskToastTracking(task.id)
+     this.scheduleTaskRemoval(task.id)
+     if (task.sessionId) {
++      clearDelegatedChildSessionBootstrap(task.sessionId)
+       SessionCategoryRegistry.remove(task.sessionId)
+     }
+ 
+@@ -2775,6 +2813,12 @@ The task was re-queued on a fallback model after a retryable failure.
+ 
+     // Release concurrency for all running tasks
+     for (const task of this.tasks.values()) {
++      if (TERMINAL_BACKGROUND_TASK_STATUSES.has(task.status)) {
++        archiveBackgroundTask(task)
++      } else {
++        forgetBackgroundTask(task.id)
++      }
++
+       if (task.concurrencyKey) {
+         this.concurrencyManager.release(task.concurrencyKey)
+         task.concurrencyKey = undefined
+@@ -2795,6 +2839,7 @@ The task was re-queued on a fallback model after a retryable failure.
+ 
+     for (const sessionID of trackedSessionIDs) {
+       subagentSessions.delete(sessionID)
++      clearDelegatedChildSessionBootstrap(sessionID)
+       SessionCategoryRegistry.remove(sessionID)
+     }
+ 
+diff --git a/src/features/background-agent/task-registry.ts b/src/features/background-agent/task-registry.ts
+new file mode 100644
+index 00000000..ae01889a
+--- /dev/null
++++ b/src/features/background-agent/task-registry.ts
+@@ -0,0 +1,92 @@
++import type { BackgroundTask } from "./types"
++
++const MAX_COMPLETED_TASK_REGISTRY_SIZE = 100
++const REGISTRY_KEY = "__omoBackgroundTaskRegistry"
++
++type BackgroundTaskRegistry = {
++  activeTasks: Map<string, BackgroundTask>
++  completedTasks: Map<string, BackgroundTask>
++}
++
++type GlobalWithBackgroundTaskRegistry = typeof globalThis & {
++  [REGISTRY_KEY]?: BackgroundTaskRegistry
++}
++
++const TERMINAL_TASK_STATUSES = new Set<BackgroundTask["status"]>([
++  "completed",
++  "error",
++  "cancelled",
++  "interrupt",
++])
++
++function getRegistry(): BackgroundTaskRegistry {
++  const registryGlobal = globalThis as GlobalWithBackgroundTaskRegistry
++  registryGlobal[REGISTRY_KEY] ??= {
++    activeTasks: new Map<string, BackgroundTask>(),
++    completedTasks: new Map<string, BackgroundTask>(),
++  }
++  return registryGlobal[REGISTRY_KEY]
++}
++
++function cloneCompletedTask(task: BackgroundTask): BackgroundTask {
++  return {
++    id: task.id,
++    parentSessionId: task.parentSessionId,
++    parentMessageId: task.parentMessageId,
++    description: task.description,
++    prompt: "[redacted]",
++    agent: task.agent,
++    sessionId: task.sessionId,
++    status: task.status,
++    queuedAt: task.queuedAt,
++    startedAt: task.startedAt,
++    completedAt: task.completedAt,
++    model: task.model,
++    error: task.error,
++    category: task.category,
++  }
++}
++
++function trimCompletedTasks(registry: BackgroundTaskRegistry): void {
++  while (registry.completedTasks.size > MAX_COMPLETED_TASK_REGISTRY_SIZE) {
++    const oldestTaskID = registry.completedTasks.keys().next().value
++    if (typeof oldestTaskID !== "string") {
++      return
++    }
++    registry.completedTasks.delete(oldestTaskID)
++  }
++}
++
++export function rememberBackgroundTask(task: BackgroundTask): void {
++  const registry = getRegistry()
++  registry.completedTasks.delete(task.id)
++  registry.activeTasks.set(task.id, task)
++}
++
++export function archiveBackgroundTask(task: BackgroundTask): void {
++  const registry = getRegistry()
++  registry.activeTasks.delete(task.id)
++  registry.completedTasks.delete(task.id)
++  if (!task.sessionId || !TERMINAL_TASK_STATUSES.has(task.status)) {
++    return
++  }
++  registry.completedTasks.set(task.id, cloneCompletedTask(task))
++  trimCompletedTasks(registry)
++}
++
++export function getRegisteredBackgroundTask(taskID: string): BackgroundTask | undefined {
++  const registry = getRegistry()
++  return registry.activeTasks.get(taskID) ?? registry.completedTasks.get(taskID)
++}
++
++export function forgetBackgroundTask(taskID: string): void {
++  const registry = getRegistry()
++  registry.activeTasks.delete(taskID)
++  registry.completedTasks.delete(taskID)
++}
++
++export function clearBackgroundTaskRegistryForTesting(): void {
++  const registry = getRegistry()
++  registry.activeTasks.clear()
++  registry.completedTasks.clear()
++}
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index 73b2105d..f6975462 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -6,6 +6,7 @@ import { getSessionAgent } from "../../features/claude-code-session-state"
+ import { getFallbackModelsForSession } from "./fallback-models"
+ import { prepareFallback } from "./fallback-state"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
++import { clearDelegatedChildSessionBootstrap } from "../../shared/delegated-child-session-bootstrap"
+ import { buildRetryModelPayload } from "./retry-model-payload"
+ import { getLastUserRetryParts } from "./last-user-retry-parts"
+ import { extractSessionMessages } from "./session-messages"
+@@ -143,7 +144,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         path: { id: sessionID },
+         query: { directory: ctx.directory },
+       })
+-      const retryParts = getLastUserRetryParts(messagesResp)
++      const retryParts = getLastUserRetryParts(messagesResp, sessionID)
+       if (retryParts.length > 0) {
+         log(`[${HOOK_NAME}] Auto-retrying with fallback model (${source})`, {
+           sessionID,
+@@ -239,6 +240,7 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         sessionRetryInFlight.delete(sessionID)
+         sessionAwaitingFallbackResult.delete(sessionID)
+         clearSessionFallbackTimeout(sessionID)
++        clearDelegatedChildSessionBootstrap(sessionID)
+         SessionCategoryRegistry.remove(sessionID)
+         sessionStatusRetryKeys.delete(sessionID)
+         cleanedCount++
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index dbb4dc22..2d3196cd 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -1,8 +1,13 @@
+-import { describe, expect, test, beforeEach, afterEach, mock } from "bun:test"
+-import type { RuntimeFallbackConfig, OhMyOpenCodeConfig } from "../../config"
++import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
++import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
++import type { OhMyOpenCodeConfig, RuntimeFallbackConfig } from "../../config"
++import {
++  clearAllDelegatedChildSessionBootstrap,
++  getDelegatedChildSessionBootstrap,
++  registerDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
+ import * as loggerModule from "../../shared/logger"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+-import { unsafeTestValue } from "../../../test-support/unsafe-test-value"
+ 
+ type RuntimeFallbackModule = typeof import("./hook")
+ 
+@@ -16,6 +21,7 @@ describe("runtime-fallback", () => {
+     logCalls = []
+     toastCalls = []
+     SessionCategoryRegistry.clear()
++    clearAllDelegatedChildSessionBootstrap()
+ 
+     const cacheBuster = `${Date.now()}-${Math.random()}`
+ 
+@@ -32,6 +38,7 @@ describe("runtime-fallback", () => {
+ 
+   afterEach(() => {
+     SessionCategoryRegistry.clear()
++    clearAllDelegatedChildSessionBootstrap()
+     mock.restore()
+   })
+ 
+@@ -489,6 +496,108 @@ describe("runtime-fallback", () => {
+       })
+     })
+ 
++    test("should retry delegated child session from bootstrap when history has no user prompt", async () => {
++      const promptCalls: Array<Record<string, unknown>> = []
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({ data: [] }),
++            promptAsync: async (args) => {
++              promptCalls.push(args as Record<string, unknown>)
++              return {}
++            },
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: createMockPluginConfigWithCategoryModel(
++            "quick",
++            "anthropic/claude-haiku-4-5",
++            ["openai/gpt-5.4(high)"],
++          ),
++        },
++      )
++      const sessionID = "test-delegated-empty-history-bootstrap"
++      registerDelegatedChildSessionBootstrap({
++        sessionID,
++        promptText: "inspect src/tools/delegate-task and report the issue",
++        category: "quick",
++      })
++
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: {
++            sessionID,
++            error: { statusCode: 429, message: "Rate limit exceeded before history persisted" },
++          },
++        },
++      })
++
++      expect(promptCalls).toHaveLength(1)
++      const promptBody = promptCalls[0]?.body as {
++        model?: { providerID?: string; modelID?: string }
++        parts?: Array<{ type?: string; text?: string }>
++        variant?: string
++      } | undefined
++      expect(promptBody?.model).toEqual({ providerID: "openai", modelID: "gpt-5.4" })
++      expect(promptBody?.variant).toBe("high")
++      expect(promptBody?.parts?.[0]?.text).toContain("inspect src/tools/delegate-task")
++    })
++
++    test("should discard delegated bootstrap once persisted user prompt exists", async () => {
++      const promptCalls: Array<Record<string, unknown>> = []
++      const sessionID = "test-delegated-history-prefers-persisted-user"
++      const hook = createRuntimeFallbackHook(
++        createMockPluginInput({
++          session: {
++            messages: async () => ({
++              data: [
++                {
++                  info: { role: "user" },
++                  parts: [{ type: "text", text: "persisted child task prompt" }],
++                },
++              ],
++            }),
++            promptAsync: async (args) => {
++              promptCalls.push(args as Record<string, unknown>)
++              return {}
++            },
++          },
++        }),
++        {
++          config: createMockConfig({ notify_on_fallback: false }),
++          pluginConfig: createMockPluginConfigWithCategoryModel(
++            "test",
++            "anthropic/claude-haiku-4-5",
++            ["openai/gpt-5.4"],
++          ),
++        },
++      )
++      registerDelegatedChildSessionBootstrap({
++        sessionID,
++        promptText: "bootstrap copy should not be reused",
++      })
++      SessionCategoryRegistry.register(sessionID, "test")
++
++      await hook.event({
++        event: {
++          type: "session.error",
++          properties: {
++            sessionID,
++            error: { statusCode: 429, message: "Rate limit after prompt persisted" },
++          },
++        },
++      })
++
++      expect(promptCalls).toHaveLength(1)
++      const promptBody = promptCalls[0]?.body as {
++        parts?: Array<{ type?: string; text?: string }>
++      } | undefined
++      expect(promptBody?.parts?.[0]?.text).toBe("persisted child task prompt")
++      expect(getDelegatedChildSessionBootstrap(sessionID)).toBeUndefined()
++    })
++
+     test("should trigger fallback on Copilot auto-retry signal in message.updated", async () => {
+       const hook = createRuntimeFallbackHook(createMockPluginInput(), {
+         config: createMockConfig({ notify_on_fallback: false }),
+diff --git a/src/hooks/runtime-fallback/last-user-retry-parts.ts b/src/hooks/runtime-fallback/last-user-retry-parts.ts
+index 899572a7..7705188a 100644
+--- a/src/hooks/runtime-fallback/last-user-retry-parts.ts
++++ b/src/hooks/runtime-fallback/last-user-retry-parts.ts
+@@ -1,7 +1,12 @@
+ import { extractSessionMessages } from "./session-messages"
++import {
++  clearDelegatedChildSessionBootstrap,
++  getDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
+ 
+ export function getLastUserRetryParts(
+   messagesResponse: unknown,
++  sessionID?: string,
+ ): Array<{ type: "text"; text: string }> {
+   const messages = extractSessionMessages(messagesResponse)
+   const lastUserMessage = messages?.filter((message) => message.info?.role === "user").pop()
+@@ -9,7 +14,7 @@ export function getLastUserRetryParts(
+     lastUserMessage?.parts
+     ?? (lastUserMessage?.info?.parts as Array<{ type?: string; text?: string }> | undefined)
+ 
+-  return (lastUserParts ?? [])
++  const retryParts = (lastUserParts ?? [])
+     .filter(
+       (part): part is { type: "text"; text: string } =>
+         part.type === "text"
+@@ -17,4 +22,17 @@ export function getLastUserRetryParts(
+         && part.text.length > 0,
+     )
+     .map((part) => ({ type: "text" as const, text: part.text }))
++
++  if (retryParts.length > 0) {
++    if (sessionID) {
++      clearDelegatedChildSessionBootstrap(sessionID)
++    }
++    return retryParts
++  }
++
++  if (!sessionID) {
++    return retryParts
++  }
++
++  return getDelegatedChildSessionBootstrap(sessionID)?.retryParts ?? []
+ }
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+index b21abd16..450b70de 100644
+--- a/src/hooks/shared/prompt-async-gate.test.ts
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -91,6 +91,36 @@ describe("promptAsyncAfterSessionIdle", () => {
+     expect(promptCalls).toBe(1)
+   })
+ 
++  test("#given SDK promptAsync depends on its session receiver #when the gate dispatches #then method binding is preserved", async () => {
++    // given
++    const session = {
++      _client: { accepted: true },
++      async promptAsync(
++        this: { _client: { accepted: boolean } },
++        input: { path: { id: string }, body: { parts: unknown[] } },
++      ) {
++        return { accepted: this._client.accepted, sessionID: input.path.id }
++      },
++    }
++    const client = { session }
++
++    // when
++    const result = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: "ses_bound_prompt_async",
++      input: { path: { id: "ses_bound_prompt_async" }, body: { parts: [] } },
++      source: "test:bound-prompt-async",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(result).toEqual({
++      status: "dispatched",
++      response: { accepted: true, sessionID: "ses_bound_prompt_async" },
++    })
++  })
++
+   test("#given session.status reports busy #when an internal promptAsync is requested #then no prompt is sent", async () => {
+     // given
+     let promptCalls = 0
+@@ -445,4 +475,34 @@ describe("promptAsyncAfterSessionIdle", () => {
+     expect(second.status).toBe("reserved")
+     expect(promptCalls).toBe(1)
+   })
++
++  test("#given SDK prompt depends on its session receiver #when the gate dispatches #then method binding is preserved", async () => {
++    // given
++    const session = {
++      _client: { accepted: true },
++      async prompt(
++        this: { _client: { accepted: boolean } },
++        input: { path: { id: string }, body: { parts: unknown[] } },
++      ) {
++        return { accepted: this._client.accepted, sessionID: input.path.id }
++      },
++    }
++    const client = { session }
++
++    // when
++    const result = await promptAfterSessionIdle({
++      client,
++      sessionID: "ses_bound_prompt",
++      input: { path: { id: "ses_bound_prompt" }, body: { parts: [] } },
++      source: "test:bound-prompt",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++
++    // then
++    expect(result).toEqual({
++      status: "dispatched",
++      response: { accepted: true, sessionID: "ses_bound_prompt" },
++    })
++  })
+ })
+diff --git a/src/shared/delegated-child-session-bootstrap.ts b/src/shared/delegated-child-session-bootstrap.ts
+new file mode 100644
+index 00000000..c99322d7
+--- /dev/null
++++ b/src/shared/delegated-child-session-bootstrap.ts
+@@ -0,0 +1,71 @@
++import type { ModelFallbackControllerAccessor } from "../hooks/model-fallback"
++import { createInternalAgentTextPart } from "./internal-initiator-marker"
++import type { FallbackEntry } from "./model-requirements"
++import { SessionCategoryRegistry } from "./session-category-registry"
++
++export type DelegatedChildSessionRetryPart = {
++  type: "text"
++  text: string
++}
++
++export type DelegatedChildSessionBootstrap = {
++  retryParts: DelegatedChildSessionRetryPart[]
++  fallbackChain?: FallbackEntry[]
++  category?: string
++}
++
++const delegatedChildSessionBootstraps = new Map<string, DelegatedChildSessionBootstrap>()
++
++function cloneRetryParts(parts: DelegatedChildSessionRetryPart[]): DelegatedChildSessionRetryPart[] {
++  return parts.map((part) => ({ type: part.type, text: part.text }))
++}
++
++function cloneFallbackChain(fallbackChain: FallbackEntry[] | undefined): FallbackEntry[] | undefined {
++  return fallbackChain?.map((entry) => ({
++    ...entry,
++    providers: [...entry.providers],
++  }))
++}
++
++export function registerDelegatedChildSessionBootstrap(_args: {
++  sessionID: string
++  promptText: string
++  fallbackChain?: FallbackEntry[]
++  category?: string
++  modelFallbackControllerAccessor?: ModelFallbackControllerAccessor
++}): void {
++  const retryParts = [createInternalAgentTextPart(_args.promptText)]
++  const fallbackChain = cloneFallbackChain(_args.fallbackChain)
++  delegatedChildSessionBootstraps.set(_args.sessionID, {
++    retryParts,
++    ...(fallbackChain ? { fallbackChain } : {}),
++    ...(_args.category ? { category: _args.category } : {}),
++  })
++
++  _args.modelFallbackControllerAccessor?.setSessionFallbackChain(_args.sessionID, fallbackChain)
++  if (_args.category) {
++    SessionCategoryRegistry.register(_args.sessionID, _args.category)
++  }
++}
++
++export function getDelegatedChildSessionBootstrap(_sessionID: string): DelegatedChildSessionBootstrap | undefined {
++  const bootstrap = delegatedChildSessionBootstraps.get(_sessionID)
++  if (!bootstrap) {
++    return undefined
++  }
++
++  const fallbackChain = cloneFallbackChain(bootstrap.fallbackChain)
++  return {
++    retryParts: cloneRetryParts(bootstrap.retryParts),
++    ...(fallbackChain ? { fallbackChain } : {}),
++    ...(bootstrap.category ? { category: bootstrap.category } : {}),
++  }
++}
++
++export function clearDelegatedChildSessionBootstrap(_sessionID: string): void {
++  delegatedChildSessionBootstraps.delete(_sessionID)
++}
++
++export function clearAllDelegatedChildSessionBootstrap(): void {
++  delegatedChildSessionBootstraps.clear()
++}
+diff --git a/src/shared/prompt-async-gate.ts b/src/shared/prompt-async-gate.ts
+index 6a967c5e..3822ccf1 100644
+--- a/src/shared/prompt-async-gate.ts
++++ b/src/shared/prompt-async-gate.ts
+@@ -217,12 +217,13 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+   } = args
+   const postDispatchHoldMs = args.postDispatchHoldMs ?? DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS
+   const dispatchTimeoutMs = args.dispatchTimeoutMs ?? DEFAULT_PROMPT_DISPATCH_TIMEOUT_MS
+-  const promptAsync = client.session?.promptAsync
++  const session = client.session
+ 
+-  if (typeof promptAsync !== "function") {
++  if (typeof session?.promptAsync !== "function") {
+     log("[prompt-async-gate] promptAsync unavailable", { sessionID, source })
+     return { status: "unavailable" }
+   }
++  const dispatchPromptAsync = session.promptAsync.bind(session)
+ 
+   return dispatchAfterSessionIdle({
+     sessionName: "promptAsync",
+@@ -234,7 +235,7 @@ export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(arg
+     postDispatchHoldMs,
+     dispatchTimeoutMs,
+     checkStatus: args.checkStatus !== false,
+-    dispatch: (dispatchInput) => promptAsync(dispatchInput),
++    dispatch: (dispatchInput) => dispatchPromptAsync(dispatchInput),
+   })
+ }
+ 
+@@ -257,12 +258,13 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+   } = args
+   const postDispatchHoldMs = args.postDispatchHoldMs ?? DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS
+   const dispatchTimeoutMs = args.dispatchTimeoutMs ?? DEFAULT_PROMPT_DISPATCH_TIMEOUT_MS
+-  const prompt = client.session?.prompt
++  const session = client.session
+ 
+-  if (typeof prompt !== "function") {
++  if (typeof session?.prompt !== "function") {
+     log("[prompt-async-gate] prompt unavailable", { sessionID, source })
+     return { status: "unavailable" }
+   }
++  const dispatchPrompt = session.prompt.bind(session)
+ 
+   return dispatchAfterSessionIdle({
+     sessionName: "prompt",
+@@ -274,7 +276,7 @@ export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+     postDispatchHoldMs,
+     dispatchTimeoutMs,
+     checkStatus: args.checkStatus !== false,
+-    dispatch: (dispatchInput) => prompt(dispatchInput),
++    dispatch: (dispatchInput) => dispatchPrompt(dispatchInput),
+   })
+ }
+ 
+diff --git a/src/tools/delegate-task/sync-task.test.ts b/src/tools/delegate-task/sync-task.test.ts
+index e1d792cf..63f03661 100644
+--- a/src/tools/delegate-task/sync-task.test.ts
++++ b/src/tools/delegate-task/sync-task.test.ts
+@@ -27,6 +27,8 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     addTaskCalls = []
+     deleteCalls = []
+     addCalls = []
++    const { clearAllDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
++    clearAllDelegatedChildSessionBootstrap()
+ 
+     clearRequireCache("./sync-task")
+ 
+@@ -62,6 +64,8 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     mock.restore()
+     resetToastManager?.()
+     resetToastManager = null
++    const { clearAllDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
++    clearAllDelegatedChildSessionBootstrap()
+   })
+ 
+   test("cleans up toast and subagentSessions when fetchSyncResult returns ok: false", async () => {
+@@ -664,6 +668,62 @@ describe("executeSyncTask - cleanup on error paths", () => {
+     })
+   })
+ 
++  test("registers child-session bootstrap before sync prompt and clears it after completion", async () => {
++    const mockClient = {
++      session: {
++        create: async () => ({ data: { id: "ignored" } }),
++      },
++    }
++
++    const { executeSyncTask } = require("./sync-task")
++    const { getDelegatedChildSessionBootstrap } = require("../../shared/delegated-child-session-bootstrap")
++    const observedBootstrapPrompts: string[] = []
++
++    const deps = {
++      createSyncSession: async () => ({ ok: true as const, sessionID: "ses_bootstrap_sync" }),
++      sendSyncPrompt: async (_client: unknown, input: { sessionID: string }) => {
++        const bootstrap = getDelegatedChildSessionBootstrap(input.sessionID)
++        observedBootstrapPrompts.push(bootstrap?.retryParts[0]?.text ?? "")
++        return null
++      },
++      pollSyncSession: async () => null,
++      fetchSyncResult: async () => ({ ok: true as const, textContent: "sync result" }),
++    }
++
++    const mockCtx = {
++      sessionID: "parent-session",
++      callID: "call-123",
++      metadata: () => {},
++    }
++
++    const mockExecutorCtx = {
++      client: mockClient,
++      directory: "/tmp",
++      onSyncSessionCreated: null,
++      modelFallbackControllerAccessor: {
++        setSessionFallbackChain: () => {},
++        clearSessionFallbackChain: () => {},
++      },
++    }
++
++    const args = {
++      prompt: "sync bootstrap prompt",
++      description: "sync bootstrap task",
++      category: "quick",
++      load_skills: [],
++      run_in_background: false,
++      command: null,
++    }
++
++    const result = await executeSyncTask(args, mockCtx, mockExecutorCtx, {
++      sessionID: "parent-session",
++    }, "sisyphus-junior", undefined, undefined, undefined, undefined, deps)
++
++    expect(result).toContain("sync result")
++    expect(observedBootstrapPrompts[0]).toContain("sync bootstrap prompt")
++    expect(getDelegatedChildSessionBootstrap("ses_bootstrap_sync")).toBeUndefined()
++  })
++
+   test("replays sync session side effects for retry-created sessions", async () => {
+     const mockClient = {
+       session: {
+diff --git a/src/tools/delegate-task/sync-task.ts b/src/tools/delegate-task/sync-task.ts
+index 44a6f65e..e597634a 100644
+--- a/src/tools/delegate-task/sync-task.ts
++++ b/src/tools/delegate-task/sync-task.ts
+@@ -1,19 +1,24 @@
+-import type { ModelFallbackInfo } from "../../features/task-toast-manager/types"
+-import type { DelegateTaskArgs, ToolContextWithMetadata, DelegatedModelConfig } from "./types"
+-import type { ExecutorContext, ParentContext } from "./executor-types"
++import { setSessionAgent, subagentSessions, syncSubagentSessions } from "../../features/claude-code-session-state"
+ import { getTaskToastManager } from "../../features/task-toast-manager"
++import type { ModelFallbackInfo } from "../../features/task-toast-manager/types"
+ import { publishToolMetadata } from "../../features/tool-metadata-store"
+-import { subagentSessions, syncSubagentSessions, setSessionAgent } from "../../features/claude-code-session-state"
++import { buildTaskMetadataBlock } from "../../features/tool-metadata-store/task-metadata-contract"
++import type { ModelFallbackState } from "../../hooks/model-fallback/hook"
++import {
++  clearDelegatedChildSessionBootstrap,
++  registerDelegatedChildSessionBootstrap,
++} from "../../shared/delegated-child-session-bootstrap"
+ import { log } from "../../shared/logger"
++import { shouldRetryError } from "../../shared/model-error-classifier"
+ import { SessionCategoryRegistry } from "../../shared/session-category-registry"
+-import { formatDuration } from "./time-formatter"
+ import { formatDetailedError } from "./error-formatting"
+-import { syncTaskDeps, type SyncTaskDeps } from "./sync-task-deps"
+-import { getNextSyncFallbackModel, retrySyncPromptWithFallbacks } from "./sync-task-fallback"
+-import { buildTaskMetadataBlock } from "../../features/tool-metadata-store/task-metadata-contract"
++import type { ExecutorContext, ParentContext } from "./executor-types"
++import { buildTaskPrompt } from "./prompt-builder"
+ import { resolveMetadataModel } from "./resolve-metadata-model"
+-import { shouldRetryError } from "../../shared/model-error-classifier"
+-import type { ModelFallbackState } from "../../hooks/model-fallback/hook"
++import { type SyncTaskDeps, syncTaskDeps } from "./sync-task-deps"
++import { getNextSyncFallbackModel, retrySyncPromptWithFallbacks } from "./sync-task-fallback"
++import { formatDuration } from "./time-formatter"
++import type { DelegatedModelConfig, DelegateTaskArgs, ToolContextWithMetadata } from "./types"
+ 
+ function shouldAttemptPollErrorRecovery(pollError: string): boolean {
+   const trimmed = pollError.trim()
+@@ -107,11 +112,13 @@ export async function executeSyncTask(
+       subagentSessions.add(newSessionID)
+       syncSubagentSessions.add(newSessionID)
+       setSessionAgent(newSessionID, agentToUse)
+-      executorCtx.modelFallbackControllerAccessor?.setSessionFallbackChain(newSessionID, fallbackChain)
+-
+-      if (args.category) {
+-        SessionCategoryRegistry.register(newSessionID, args.category)
+-      }
++      registerDelegatedChildSessionBootstrap({
++        sessionID: newSessionID,
++        promptText: buildTaskPrompt(args.prompt, agentToUse, executorCtx.sisyphusAgentConfig?.tdd),
++        fallbackChain,
++        category: args.category,
++        modelFallbackControllerAccessor: executorCtx.modelFallbackControllerAccessor,
++      })
+ 
+       if (onSyncSessionCreated) {
+         log("[task] Invoking onSyncSessionCreated callback", { sessionID: newSessionID, parentID: parentContext.sessionID })
+@@ -199,6 +206,7 @@ export async function executeSyncTask(
+     const cleanupRetrySession = (currentSessionID: string): void => {
+       subagentSessions.delete(currentSessionID)
+       syncSubagentSessions.delete(currentSessionID)
++      clearDelegatedChildSessionBootstrap(currentSessionID)
+       executorCtx.modelFallbackControllerAccessor?.clearSessionFallbackChain(currentSessionID)
+       SessionCategoryRegistry.remove(currentSessionID)
+     }
+@@ -364,6 +372,7 @@ ${buildTaskMetadataBlock({
+     if (syncSessionID) {
+       subagentSessions.delete(syncSessionID)
+       syncSubagentSessions.delete(syncSessionID)
++      clearDelegatedChildSessionBootstrap(syncSessionID)
+       executorCtx.modelFallbackControllerAccessor?.clearSessionFallbackChain(syncSessionID)
+       SessionCategoryRegistry.remove(syncSessionID)
+     }
+-- 
+2.39.2
+

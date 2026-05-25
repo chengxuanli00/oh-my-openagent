@@ -1,0 +1,192 @@
+From 719a58270bce3cf32eb8bcf60f95f2110ad48c88 Mon Sep 17 00:00:00 2001
+From: kilhyeonjun <kboxstar@gmail.com>
+Date: Wed, 18 Mar 2026 12:21:08 +0900
+Subject: [PATCH 3360/5749] fix(shared): respect cached model context limits
+ for Anthropic providers post-GA
+
+After Anthropic's 1M context GA (2026-03-13), the beta header is no
+longer sent. The existing detection relied solely on the beta header
+to set anthropicContext1MEnabled, causing all Anthropic models to
+fall back to the 200K default despite models.dev reporting 1M.
+
+Update resolveActualContextLimit to check per-model cached limits
+from provider config (populated from models.dev data) when the
+explicit 1M flag is not set. Priority order:
+1. Explicit 1M mode (beta header or env var) - all Anthropic models
+2. Per-model cached limit from provider config
+3. Default 200K fallback
+
+This preserves the #2460 fix (explicit 1M flag always wins over
+cached values) while allowing GA models to use their correct limits.
+
+Fixes premature context warnings at 140K and unnecessary compaction
+at 156K for opus-4-6 and sonnet-4-6 users without env var workaround.
+---
+ ...indow-monitor.model-context-limits.test.ts | 54 ++++++++++++++++---
+ src/shared/context-limit-resolver.test.ts     | 39 ++++++++++++--
+ src/shared/context-limit-resolver.ts          |  8 ++-
+ 3 files changed, 89 insertions(+), 12 deletions(-)
+
+diff --git a/src/hooks/context-window-monitor.model-context-limits.test.ts b/src/hooks/context-window-monitor.model-context-limits.test.ts
+index 6dca2df5..f9e2fe43 100644
+--- a/src/hooks/context-window-monitor.model-context-limits.test.ts
++++ b/src/hooks/context-window-monitor.model-context-limits.test.ts
+@@ -136,8 +136,8 @@ describe("context-window-monitor modelContextLimitsCache", () => {
+   })
+ 
+   describe("#given Anthropic provider with cached context limit and 1M mode disabled", () => {
+-    describe("#when cached usage exceeds the Anthropic default limit", () => {
+-      it("#then should ignore the cached limit and append the reminder from the default Anthropic limit", async () => {
++    describe("#when cached usage is below threshold of cached limit", () => {
++      it("#then should respect the cached limit and skip the reminder", async () => {
+         // given
+         const modelContextLimitsCache = new Map<string, number>()
+         modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 500000)
+@@ -146,7 +146,7 @@ describe("context-window-monitor modelContextLimitsCache", () => {
+           anthropicContext1MEnabled: false,
+           modelContextLimitsCache,
+         })
+-        const sessionID = "ses_anthropic_default_overrides_cached_limit"
++        const sessionID = "ses_anthropic_cached_limit_respected"
+ 
+         await hook.event({
+           event: {
+@@ -173,11 +173,51 @@ describe("context-window-monitor modelContextLimitsCache", () => {
+         const output = createOutput()
+         await hook["tool.execute.after"]({ tool: "bash", sessionID, callID: "call_1" }, output)
+ 
+-        // then
++        // then — 160K/500K = 32%, well below 70% threshold
++        expect(output.output).toBe("original")
++      })
++    })
++
++    describe("#when cached usage exceeds threshold of cached limit", () => {
++      it("#then should use the cached limit for the reminder", async () => {
++        // given
++        const modelContextLimitsCache = new Map<string, number>()
++        modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 500000)
++
++        const hook = createContextWindowMonitorHook({} as never, {
++          anthropicContext1MEnabled: false,
++          modelContextLimitsCache,
++        })
++        const sessionID = "ses_anthropic_cached_limit_exceeded"
++
++        await hook.event({
++          event: {
++            type: "message.updated",
++            properties: {
++              info: {
++                role: "assistant",
++                sessionID,
++                providerID: "anthropic",
++                modelID: "claude-sonnet-4-5",
++                finish: true,
++                tokens: {
++                  input: 350000,
++                  output: 0,
++                  reasoning: 0,
++                  cache: { read: 10000, write: 0 },
++                },
++              },
++            },
++          },
++        })
++
++        // when
++        const output = createOutput()
++        await hook["tool.execute.after"]({ tool: "bash", sessionID, callID: "call_1" }, output)
++
++        // then — 360K/500K = 72%, above 70% threshold, uses cached 500K limit
+         expect(output.output).toContain("context remaining")
+-        expect(output.output).toContain("200,000-token context window")
+-        expect(output.output).not.toContain("500,000-token context window")
+-        expect(output.output).not.toContain("1,000,000-token context window")
++        expect(output.output).toContain("500,000-token context window")
+       })
+     })
+   })
+diff --git a/src/shared/context-limit-resolver.test.ts b/src/shared/context-limit-resolver.test.ts
+index 5ce62a8d..f08dd1d1 100644
+--- a/src/shared/context-limit-resolver.test.ts
++++ b/src/shared/context-limit-resolver.test.ts
+@@ -28,21 +28,52 @@ describe("resolveActualContextLimit", () => {
+     resetContextLimitEnv()
+   })
+ 
+-  it("returns the default Anthropic limit when 1M mode is disabled despite a cached limit", () => {
++  it("returns cached limit for Anthropic models when 1M mode is disabled (GA support)", () => {
+     // given
+     delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
+     delete process.env[VERTEX_CONTEXT_ENV_KEY]
+     const modelContextLimitsCache = new Map<string, number>()
+-    modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 123456)
++    modelContextLimitsCache.set("anthropic/claude-opus-4-6", 1_000_000)
+ 
+     // when
+-    const actualLimit = resolveActualContextLimit("anthropic", "claude-sonnet-4-5", {
++    const actualLimit = resolveActualContextLimit("anthropic", "claude-opus-4-6", {
+       anthropicContext1MEnabled: false,
+       modelContextLimitsCache,
+     })
+ 
++    // then — models.dev reports 1M for GA models, resolver should respect it
++    expect(actualLimit).toBe(1_000_000)
++  })
++
++  it("returns default 200K for Anthropic models without cached limit and 1M mode disabled", () => {
++    // given
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++
++    // when
++    const actualLimit = resolveActualContextLimit("anthropic", "claude-sonnet-4-5", {
++      anthropicContext1MEnabled: false,
++    })
++
+     // then
+-    expect(actualLimit).toBe(200000)
++    expect(actualLimit).toBe(200_000)
++  })
++
++  it("explicit 1M mode takes priority over cached limit", () => {
++    // given
++    delete process.env[ANTHROPIC_CONTEXT_ENV_KEY]
++    delete process.env[VERTEX_CONTEXT_ENV_KEY]
++    const modelContextLimitsCache = new Map<string, number>()
++    modelContextLimitsCache.set("anthropic/claude-sonnet-4-5", 200_000)
++
++    // when
++    const actualLimit = resolveActualContextLimit("anthropic", "claude-sonnet-4-5", {
++      anthropicContext1MEnabled: true,
++      modelContextLimitsCache,
++    })
++
++    // then — explicit 1M flag overrides cached 200K
++    expect(actualLimit).toBe(1_000_000)
+   })
+ 
+   it("treats Anthropics aliases as Anthropic providers", () => {
+diff --git a/src/shared/context-limit-resolver.ts b/src/shared/context-limit-resolver.ts
+index 361fa45d..44812712 100644
+--- a/src/shared/context-limit-resolver.ts
++++ b/src/shared/context-limit-resolver.ts
+@@ -26,7 +26,13 @@ export function resolveActualContextLimit(
+   modelCacheState?: ContextLimitModelCacheState,
+ ): number | null {
+   if (isAnthropicProvider(providerID)) {
+-    return getAnthropicActualLimit(modelCacheState)
++    const explicit1M = getAnthropicActualLimit(modelCacheState)
++    if (explicit1M === 1_000_000) return explicit1M
++
++    const cachedLimit = modelCacheState?.modelContextLimitsCache?.get(`${providerID}/${modelID}`)
++    if (cachedLimit) return cachedLimit
++
++    return DEFAULT_ANTHROPIC_ACTUAL_LIMIT
+   }
+ 
+   return modelCacheState?.modelContextLimitsCache?.get(`${providerID}/${modelID}`) ?? null
+-- 
+2.39.2
+

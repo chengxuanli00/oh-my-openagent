@@ -1,0 +1,578 @@
+From 3ae9f5f10414280c2dccfee59727f25a55330ae2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 4 May 2026 16:30:06 +0900
+Subject: [PATCH 4676/5749] fix(background-agent): prevent false task
+ completion on status API outage
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ ...polling.session-status-unavailable.test.ts | 115 +++++++++++++
+ .../background-agent/manager.polling.test.ts  |  98 +++++++++--
+ src/features/background-agent/manager.ts      |  35 +++-
+ src/shared/agent-runtime-name-sort.test.ts    | 152 ------------------
+ 4 files changed, 229 insertions(+), 171 deletions(-)
+ create mode 100644 src/features/background-agent/manager.polling.session-status-unavailable.test.ts
+ delete mode 100644 src/shared/agent-runtime-name-sort.test.ts
+
+diff --git a/src/features/background-agent/manager.polling.session-status-unavailable.test.ts b/src/features/background-agent/manager.polling.session-status-unavailable.test.ts
+new file mode 100644
+index 00000000..ce6cc907
+--- /dev/null
++++ b/src/features/background-agent/manager.polling.session-status-unavailable.test.ts
+@@ -0,0 +1,115 @@
++/// <reference types="bun-types" />
++
++import { describe, expect, test } from "bun:test"
++import { tmpdir } from "node:os"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { BackgroundManager } from "./manager"
++import { MIN_SESSION_GONE_POLLS } from "./session-existence"
++import type { BackgroundTask } from "./types"
++
++type SessionStatus = { type: string }
++type SessionStatusResponse = { data: Record<string, SessionStatus> }
++type SessionOverrides = {
++  status?: (() => Promise<SessionStatusResponse>) | undefined
++  abort?: () => Promise<object>
++}
++
++function createRunningTask(sessionId: string): BackgroundTask {
++  return {
++    id: `bg_test_${sessionId}`,
++    sessionId,
++    parentSessionId: "parent-session",
++    parentMessageId: "parent-message",
++    description: "test task",
++    prompt: "test prompt",
++    agent: "explore",
++    status: "running",
++    startedAt: new Date(),
++    progress: { toolCalls: 0, lastUpdate: new Date() },
++  }
++}
++
++function createManager(overrides: SessionOverrides): BackgroundManager {
++  const session = {
++    ...(overrides.status === undefined ? {} : { status: overrides.status }),
++    get: async () => ({ data: { id: "session" } }),
++    prompt: async () => ({}),
++    promptAsync: async () => ({}),
++    abort: overrides.abort ?? (async () => ({})),
++    todo: async () => ({ data: [] }),
++    messages: async () => ({
++      data: [{
++        info: { role: "assistant", finish: "end_turn", id: "message-2" },
++        parts: [{ type: "text", text: "done" }],
++      }],
++    }),
++  }
++  const client = { session }
++
++  return new BackgroundManager({
++    pluginContext: { client, directory: tmpdir() } as PluginInput,
++    enableParentSessionNotifications: false,
++  })
++}
++
++async function poll(manager: BackgroundManager, cycles: number): Promise<void> {
++  for (let count = 0; count < cycles; count += 1) {
++    await manager["pollRunningTasks"]()
++  }
++}
++
++function injectTask(manager: BackgroundManager, task: BackgroundTask): void {
++  manager["tasks"].set(task.id, task)
++}
++
++describe("BackgroundManager pollRunningTasks when session status registry is unavailable", () => {
++  test("keeps running tasks active and does not increment missed polls when status is unavailable or throws", async () => {
++    const cases: Array<{ name: string; status?: () => Promise<SessionStatusResponse> }> = [
++      { name: "missing status method" },
++      { name: "throwing status method", status: async () => { throw new Error("status unavailable") } },
++    ]
++
++    for (const testCase of cases) {
++      // given
++      let abortCallCount = 0
++      const manager = createManager({
++        status: testCase.status,
++        abort: async () => {
++          abortCallCount += 1
++          return {}
++        },
++      })
++      const task = createRunningTask(`ses-${testCase.name.replaceAll(" ", "-")}`)
++      injectTask(manager, task)
++
++      // when
++      await poll(manager, MIN_SESSION_GONE_POLLS + 1)
++
++      // then
++      expect(task.status).toBe("running")
++      expect(task.completedAt).toBeUndefined()
++      expect(task.error).toBeUndefined()
++      expect(task.consecutiveMissedPolls ?? 0).toBe(0)
++      expect(abortCallCount).toBe(0)
++
++      await manager.shutdown()
++    }
++  })
++
++  test("completes a task when a reliable status response omits the session", async () => {
++    // given
++    const manager = createManager({
++      status: async () => ({ data: {} }),
++    })
++    const task = createRunningTask("ses-gone-after-reliable-status")
++    injectTask(manager, task)
++
++    // when
++    await poll(manager, MIN_SESSION_GONE_POLLS)
++    await manager.shutdown()
++
++    // then
++    expect(task.status).toBe("completed")
++    expect(task.completedAt).toBeDefined()
++  })
++})
+diff --git a/src/features/background-agent/manager.polling.test.ts b/src/features/background-agent/manager.polling.test.ts
+index 3bcceaf1..b436f62b 100644
+--- a/src/features/background-agent/manager.polling.test.ts
++++ b/src/features/background-agent/manager.polling.test.ts
+@@ -4,8 +4,25 @@ import { describe, test, expect, mock } from "bun:test"
+ import { tmpdir } from "node:os"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { BackgroundManager } from "./manager"
++import { MIN_SESSION_GONE_POLLS } from "./session-existence"
+ import type { BackgroundTask } from "./types"
+ 
++function createPluginContext(client: object): PluginInput {
++  const directory = tmpdir()
++  return {
++    project: {
++      id: "test-project",
++      worktree: directory,
++      time: { created: Date.now() },
++    },
++    directory,
++    worktree: directory,
++    serverUrl: new URL("http://localhost:4096"),
++    $: {} as PluginInput["$"],
++    client: client as PluginInput["client"],
++  }
++}
++
+ function createManagerWithStatus(statusImpl: () => Promise<{ data: Record<string, { type: string }> }>): BackgroundManager {
+   const client = {
+     session: {
+@@ -18,7 +35,7 @@ function createManagerWithStatus(statusImpl: () => Promise<{ data: Record<string
+     },
+   }
+ 
+-  return new BackgroundManager({ pluginContext: { client, directory: tmpdir() } as unknown as PluginInput })
++  return new BackgroundManager({ pluginContext: createPluginContext(client) })
+ }
+ 
+ describe("BackgroundManager polling overlap", () => {
+@@ -42,9 +59,9 @@ describe("BackgroundManager polling overlap", () => {
+     })
+ 
+     //#when
+-    const firstPoll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks()
++    const firstPoll = manager["pollRunningTasks"]()
+     await Promise.resolve()
+-    const secondPoll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks()
++    const secondPoll = manager["pollRunningTasks"]()
+     releaseStatus?.()
+     await Promise.all([firstPoll, secondPoll])
+     manager.shutdown()
+@@ -72,8 +89,7 @@ function createRunningTask(sessionId: string): BackgroundTask {
+ }
+ 
+ function injectTask(manager: BackgroundManager, task: BackgroundTask): void {
+-  const tasks = (manager as unknown as { tasks: Map<string, BackgroundTask> }).tasks
+-  tasks.set(task.id, task)
++  manager["tasks"].set(task.id, task)
+ }
+ 
+ function createManagerWithClient(clientOverrides: Record<string, unknown> = {}): BackgroundManager {
+@@ -98,7 +114,7 @@ function createManagerWithClient(clientOverrides: Record<string, unknown> = {}):
+     },
+   }
+   return new BackgroundManager(
+-    { pluginContext: { client, directory: tmpdir() } as unknown as PluginInput, config: undefined, enableParentSessionNotifications: false },
++    { pluginContext: createPluginContext(client), config: undefined, enableParentSessionNotifications: false },
+   )
+ }
+ 
+@@ -151,7 +167,7 @@ describe("BackgroundManager pollRunningTasks", () => {
+       injectTask(manager, task)
+ 
+       //#when
+-      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      const poll = manager["pollRunningTasks"]
+       await poll.call(manager)
+       manager.shutdown()
+ 
+@@ -184,6 +200,62 @@ describe("BackgroundManager pollRunningTasks", () => {
+       expect(task.consecutiveMissedPolls).toBe(1)
+       expect(getSession).not.toHaveBeenCalled()
+     })
++
++    test("#when status polling is unavailable #then it does not complete or increment missed polls", async () => {
++      const cases: Array<{ name: string; status?: (() => Promise<{ data: Record<string, { type: string }> }>) | undefined }> = [
++        { name: "missing status method", status: undefined },
++        { name: "throwing status method", status: async () => { throw new Error("status unavailable") } },
++      ]
++
++      for (const testCase of cases) {
++        //#given
++        let abortCallCount = 0
++        const manager = createManagerWithClient({
++          status: testCase.status,
++          abort: async () => {
++            abortCallCount += 1
++            return {}
++          },
++        })
++        const task = createRunningTask(`ses-${testCase.name.replace(/ /g, "-")}`)
++        injectTask(manager, task)
++
++        //#when
++        const poll = manager["pollRunningTasks"]
++        for (let count = 0; count < MIN_SESSION_GONE_POLLS + 1; count += 1) {
++          await poll.call(manager)
++        }
++
++        //#then
++        expect(task.status).toBe("running")
++        expect(task.completedAt).toBeUndefined()
++        expect(task.error).toBeUndefined()
++        expect(task.consecutiveMissedPolls ?? 0).toBe(0)
++        expect(abortCallCount).toBe(0)
++
++        await manager.shutdown()
++      }
++    })
++
++    test("#when reliable status polling omits the session #then it completes through the session-gone path", async () => {
++      //#given
++      const manager = createManagerWithClient({
++        status: async () => ({ data: {} }),
++      })
++      const task = createRunningTask("ses-reliably-gone")
++      injectTask(manager, task)
++
++      //#when
++      const poll = manager["pollRunningTasks"]
++      for (let count = 0; count < MIN_SESSION_GONE_POLLS; count += 1) {
++        await poll.call(manager)
++      }
++      await manager.shutdown()
++
++      //#then
++      expect(task.status).toBe("completed")
++      expect(task.completedAt).toBeDefined()
++    })
+   })
+ 
+   describe("#given a running task whose session status is idle", () => {
+@@ -196,7 +268,7 @@ describe("BackgroundManager pollRunningTasks", () => {
+       injectTask(manager, task)
+ 
+       //#when
+-      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      const poll = manager["pollRunningTasks"]
+       await poll.call(manager)
+       manager.shutdown()
+ 
+@@ -228,7 +300,7 @@ describe("BackgroundManager pollRunningTasks", () => {
+       })
+ 
+       //#when
+-      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      const poll = manager["pollRunningTasks"]
+       await poll.call(manager)
+       manager.shutdown()
+ 
+@@ -265,7 +337,7 @@ describe("BackgroundManager pollRunningTasks", () => {
+       })
+ 
+       //#when
+-      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      const poll = manager["pollRunningTasks"]
+       await poll.call(manager)
+       manager.shutdown()
+ 
+@@ -285,7 +357,7 @@ describe("BackgroundManager pollRunningTasks", () => {
+       injectTask(manager, task)
+ 
+       //#when
+-      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      const poll = manager["pollRunningTasks"]
+       await poll.call(manager)
+       manager.shutdown()
+ 
+@@ -304,7 +376,7 @@ describe("BackgroundManager pollRunningTasks", () => {
+       injectTask(manager, task)
+ 
+       //#when
+-      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      const poll = manager["pollRunningTasks"]
+       await poll.call(manager)
+       manager.shutdown()
+ 
+@@ -322,7 +394,7 @@ describe("BackgroundManager pollRunningTasks", () => {
+       injectTask(manager, task)
+ 
+       //#when
+-      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      const poll = manager["pollRunningTasks"]
+       await poll.call(manager)
+       manager.shutdown()
+ 
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 9442c23d..8221e7f7 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -66,7 +66,7 @@ import {
+ import { handleSessionIdleBackgroundEvent } from "./session-idle-event-handler"
+ import { MESSAGE_STORAGE } from "../hook-message-injector"
+ import { join } from "node:path"
+-import { pruneStaleTasksAndNotifications } from "./task-poller"
++import { pruneStaleTasksAndNotifications, type SessionStatusMap } from "./task-poller"
+ import { checkAndInterruptStaleTasks } from "./task-poller"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
+ import { abortWithTimeout } from "./abort-with-timeout"
+@@ -214,6 +214,7 @@ export class BackgroundManager {
+   private preStartDescendantReservations: Set<string>
+   private enableParentSessionNotifications: boolean
+   private modelFallbackControllerAccessor?: ModelFallbackControllerAccessor
++  private loggedSessionStatusUnavailable = false
+   readonly taskHistory = new TaskHistory()
+   private cachedCircuitBreakerSettings?: CircuitBreakerSettings
+ 
+@@ -2186,7 +2187,7 @@ The task was re-queued on a fallback model after a retryable failure.
+   }
+ 
+   private async checkAndInterruptStaleTasks(
+-    allStatuses: Record<string, { type: string }> = {},
++    allStatuses: SessionStatusMap | undefined,
+   ): Promise<void> {
+     await checkAndInterruptStaleTasks({
+       tasks: this.tasks.values(),
+@@ -2251,8 +2252,26 @@ The task was re-queued on a fallback model after a retryable failure.
+     try {
+       this.pruneStaleTasksAndNotifications()
+ 
+-      const statusResult = await this.client.session.status()
+-      const allStatuses = normalizeSDKResponse(statusResult, {} as Record<string, { type: string }>)
++      let allStatuses: SessionStatusMap | undefined
++      const sessionStatusMethod = this.client?.session?.status
++      if (typeof sessionStatusMethod !== "function") {
++        if (!this.loggedSessionStatusUnavailable) {
++          log("[background-agent] Unable to poll session statuses:", {
++            reason: "session.status unavailable",
++          })
++          this.loggedSessionStatusUnavailable = true
++        }
++      } else {
++        try {
++          const statusResult = await this.client.session.status()
++          allStatuses = normalizeSDKResponse(statusResult, {})
++        } catch (error) {
++          if (!this.loggedSessionStatusUnavailable) {
++            log("[background-agent] Error polling session statuses:", { error })
++            this.loggedSessionStatusUnavailable = true
++          }
++        }
++      }
+ 
+       await this.checkAndInterruptStaleTasks(allStatuses)
+ 
+@@ -2263,7 +2282,7 @@ The task was re-queued on a fallback model after a retryable failure.
+         if (!sessionID) continue
+ 
+         try {
+-          const sessionStatus = allStatuses[sessionID]
++          const sessionStatus = allStatuses?.[sessionID]
+           // Handle retry before checking running state
+           if (sessionStatus?.type === "retry") {
+             const retryMessage = typeof (sessionStatus as { message?: string }).message === "string"
+@@ -2300,8 +2319,12 @@ The task was re-queued on a fallback model after a retryable failure.
+             })
+           }
+ 
++          if (allStatuses === undefined) {
++            continue
++          }
++
+           // Session is idle or no longer in status response (completed/disappeared)
+-          const sessionGoneFromStatus = !sessionStatus
++          const sessionGoneFromStatus = allStatuses !== undefined && !sessionStatus
+           const sessionGoneThresholdReached = sessionGoneFromStatus
+             && (task.consecutiveMissedPolls ?? 0) >= MIN_SESSION_GONE_POLLS
+           const completionSource = sessionStatus?.type === "idle"
+diff --git a/src/shared/agent-runtime-name-sort.test.ts b/src/shared/agent-runtime-name-sort.test.ts
+deleted file mode 100644
+index c39b4a54..00000000
+--- a/src/shared/agent-runtime-name-sort.test.ts
++++ /dev/null
+@@ -1,152 +0,0 @@
+-/// <reference types="bun-types" />
+-
+-import { describe, expect, it, test } from "bun:test"
+-
+-import {
+-  AGENT_DISPLAY_NAMES,
+-  getAgentRuntimeName,
+-  normalizeAgentForPromptKey,
+-} from "./agent-display-names"
+-
+-// OpenCode Agent.list() sorts via remeda sortBy: default_agent desc, then name asc localeCompare.
+-// Reference: ../opencode/packages/opencode/src/agent/agent.ts:284-293.
+-// Earlier ZWSP prefixes silently failed: Unicode collation treats zero-width chars as ignorable.
+-function simulateOpencodeSort(agentNames: string[], defaultName: string): string[] {
+-  return [...agentNames].sort((a, b) => {
+-    const aIsDefault = a === defaultName ? 1 : 0
+-    const bIsDefault = b === defaultName ? 1 : 0
+-    if (aIsDefault !== bIsDefault) return bIsDefault - aIsDefault
+-    return a.localeCompare(b)
+-  })
+-}
+-
+-describe("OpenCode Agent.list() sort with runtime-name prefixes", () => {
+-  describe("#given the four core agents and a mix of non-core agents", () => {
+-    test("#when sorted using opencode-style sortBy #then core agents come first in canonical order", () => {
+-      const sisyphus = getAgentRuntimeName("sisyphus")
+-      const hephaestus = getAgentRuntimeName("hephaestus")
+-      const prometheus = getAgentRuntimeName("prometheus")
+-      const atlas = getAgentRuntimeName("atlas")
+-
+-      const allAgents = [
+-        sisyphus,
+-        hephaestus,
+-        prometheus,
+-        atlas,
+-        "athena",
+-        "explore",
+-        "metis",
+-        "oracle",
+-      ]
+-
+-      const sorted = simulateOpencodeSort(allAgents, sisyphus)
+-      const orderedConfigKeys = sorted.map((name) => normalizeAgentForPromptKey(name))
+-
+-      expect(orderedConfigKeys).toEqual([
+-        "sisyphus",
+-        "hephaestus",
+-        "prometheus",
+-        "atlas",
+-        "athena",
+-        "explore",
+-        "metis",
+-        "oracle",
+-      ])
+-    })
+-
+-    test("#when default_agent is unset #then canonical core order still holds via prefix alone", () => {
+-      const sisyphus = getAgentRuntimeName("sisyphus")
+-      const hephaestus = getAgentRuntimeName("hephaestus")
+-      const prometheus = getAgentRuntimeName("prometheus")
+-      const atlas = getAgentRuntimeName("atlas")
+-
+-      const allAgents = [hephaestus, prometheus, atlas, sisyphus, "athena", "oracle"]
+-
+-      const sorted = simulateOpencodeSort(allAgents, "no-such-default-agent")
+-      const orderedConfigKeys = sorted.map((name) => normalizeAgentForPromptKey(name))
+-
+-      expect(orderedConfigKeys.slice(0, 4)).toEqual([
+-        "sisyphus",
+-        "hephaestus",
+-        "prometheus",
+-        "atlas",
+-      ])
+-    })
+-  })
+-
+-  describe("#given input array in random order", () => {
+-    test("#when sorted with opencode comparator #then result is always canonical", () => {
+-      const sisyphus = getAgentRuntimeName("sisyphus")
+-      const hephaestus = getAgentRuntimeName("hephaestus")
+-      const prometheus = getAgentRuntimeName("prometheus")
+-      const atlas = getAgentRuntimeName("atlas")
+-      const nonCore = ["athena", "explore", "librarian", "metis", "oracle"]
+-      const allAgents = [...nonCore, atlas, prometheus, hephaestus, sisyphus]
+-
+-      for (let attempt = 0; attempt < 25; attempt += 1) {
+-        const shuffled = [...allAgents]
+-        for (let i = shuffled.length - 1; i > 0; i -= 1) {
+-          const j = Math.floor(Math.random() * (i + 1))
+-          ;[shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]
+-        }
+-        const sorted = simulateOpencodeSort(shuffled, sisyphus)
+-        const orderedConfigKeys = sorted.map((name) => normalizeAgentForPromptKey(name))
+-
+-        expect(orderedConfigKeys).toEqual([
+-          "sisyphus",
+-          "hephaestus",
+-          "prometheus",
+-          "atlas",
+-          "athena",
+-          "explore",
+-          "librarian",
+-          "metis",
+-          "oracle",
+-        ])
+-      }
+-    })
+-  })
+-
+-  describe("#given runtime names containing only core agents", () => {
+-    test("#when sorted #then sisyphus, hephaestus, prometheus, atlas in that order", () => {
+-      const sisyphus = getAgentRuntimeName("sisyphus")
+-      const hephaestus = getAgentRuntimeName("hephaestus")
+-      const prometheus = getAgentRuntimeName("prometheus")
+-      const atlas = getAgentRuntimeName("atlas")
+-
+-      const sorted = simulateOpencodeSort([atlas, prometheus, hephaestus, sisyphus], sisyphus)
+-      const orderedConfigKeys = sorted.map((name) => normalizeAgentForPromptKey(name))
+-
+-      expect(orderedConfigKeys).toEqual([
+-        "sisyphus",
+-        "hephaestus",
+-        "prometheus",
+-        "atlas",
+-      ])
+-    })
+-  })
+-
+-  describe("#given the prefix is meant to render in OpenCode TUI", () => {
+-    it("uses ASCII whitespace so terminals render the prefix without character corruption", () => {
+-      const runtimeNames = Object.keys(AGENT_DISPLAY_NAMES).map(getAgentRuntimeName)
+-      const invisibleCharsRegex = /[\u200B\u200C\u200D\uFEFF]/
+-
+-      for (const name of runtimeNames) {
+-        expect(invisibleCharsRegex.test(name)).toBe(false)
+-      }
+-    })
+-
+-    it("only adds leading whitespace, never trailing or interior whitespace beyond the display name", () => {
+-      const sisyphus = getAgentRuntimeName("sisyphus")
+-      const hephaestus = getAgentRuntimeName("hephaestus")
+-      const prometheus = getAgentRuntimeName("prometheus")
+-      const atlas = getAgentRuntimeName("atlas")
+-
+-      for (const name of [sisyphus, hephaestus, prometheus, atlas]) {
+-        const trimmed = name.trimStart()
+-        expect(name.length).toBeGreaterThanOrEqual(trimmed.length)
+-        expect(trimmed.endsWith(" ")).toBe(false)
+-      }
+-    })
+-  })
+-})
+-- 
+2.39.2
+

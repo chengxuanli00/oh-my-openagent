@@ -1,0 +1,215 @@
+From f72593736da91ca4bacdcfcf2cb7868a7c6822f5 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 28 Apr 2026 10:46:11 +0900
+Subject: [PATCH 4748/5749] feat(team-mode): add team tasklist update with
+ tests
+
+---
+ .../team-mode/team-tasklist/update.test.ts    | 112 ++++++++++++++++++
+ .../team-mode/team-tasklist/update.ts         |  75 ++++++++++++
+ 2 files changed, 187 insertions(+)
+ create mode 100644 src/features/team-mode/team-tasklist/update.test.ts
+ create mode 100644 src/features/team-mode/team-tasklist/update.ts
+
+diff --git a/src/features/team-mode/team-tasklist/update.test.ts b/src/features/team-mode/team-tasklist/update.test.ts
+new file mode 100644
+index 00000000..441a7c32
+--- /dev/null
++++ b/src/features/team-mode/team-tasklist/update.test.ts
+@@ -0,0 +1,112 @@
++/// <reference types="bun-types" />
++
++import { expect, test } from "bun:test"
++
++import { claimTask } from "./claim"
++import { getTask } from "./get"
++import { createTask } from "./store"
++import { createTaskInput, createTasklistFixture } from "./test-support"
++import { CrossOwnerUpdateError, InvalidTaskTransitionError, updateTaskStatus } from "./update"
++
++test("updateTaskStatus supports the one-way claim to complete flow", async () => {
++  // given
++  const fixture = await createTasklistFixture()
++
++  try {
++    const task = await createTask(fixture.teamRunId, createTaskInput(), fixture.config)
++    await claimTask(fixture.teamRunId, task.id, "member-a", fixture.config)
++
++    // when
++    await updateTaskStatus(fixture.teamRunId, task.id, "in_progress", "member-a", fixture.config)
++    const completedTask = await updateTaskStatus(fixture.teamRunId, task.id, "completed", "member-a", fixture.config)
++    const loadedTask = await getTask(fixture.teamRunId, task.id, fixture.config)
++
++    // then
++    expect(completedTask.status).toBe("completed")
++    expect(loadedTask.status).toBe("completed")
++  } finally {
++    await fixture.cleanup()
++  }
++})
++
++test("updateTaskStatus auto-claims when a member starts a pending task directly", async () => {
++  // given
++  const fixture = await createTasklistFixture()
++
++  try {
++    const task = await createTask(fixture.teamRunId, createTaskInput(), fixture.config)
++
++    // when
++    const inProgressTask = await updateTaskStatus(fixture.teamRunId, task.id, "in_progress", "member-a", fixture.config)
++    const loadedTask = await getTask(fixture.teamRunId, task.id, fixture.config)
++
++    // then
++    expect(inProgressTask.status).toBe("in_progress")
++    expect(inProgressTask.owner).toBe("member-a")
++    expect(typeof inProgressTask.claimedAt).toBe("number")
++    expect(loadedTask.status).toBe("in_progress")
++    expect(loadedTask.owner).toBe("member-a")
++    expect(typeof loadedTask.claimedAt).toBe("number")
++  } finally {
++    await fixture.cleanup()
++  }
++})
++
++test("updateTaskStatus rejects reverse transitions", async () => {
++  // given
++  const fixture = await createTasklistFixture()
++
++  try {
++    const task = await createTask(
++      fixture.teamRunId,
++      createTaskInput({ status: "completed", owner: "member-a", claimedAt: Date.now() }),
++      fixture.config,
++    )
++
++    // when
++    let thrownError: unknown = null
++    try {
++      await updateTaskStatus(fixture.teamRunId, task.id, "claimed", "member-a", fixture.config)
++    } catch (error) {
++      thrownError = error
++    }
++
++    // then
++    expect(thrownError).toBeInstanceOf(InvalidTaskTransitionError)
++    expect(thrownError).toHaveProperty("message", "no reverse transitions from completed to claimed")
++  } finally {
++    await fixture.cleanup()
++  }
++})
++
++test("updateTaskStatus rejects non-owner updates except deletion", async () => {
++  // given
++  const fixture = await createTasklistFixture()
++
++  try {
++    const task = await createTask(
++      fixture.teamRunId,
++      createTaskInput({ status: "claimed", owner: "member-a", claimedAt: Date.now() }),
++      fixture.config,
++    )
++
++    // when
++    let crossOwnerError: unknown = null
++    try {
++      await updateTaskStatus(fixture.teamRunId, task.id, "in_progress", "member-b", fixture.config)
++    } catch (error) {
++      crossOwnerError = error
++    }
++
++    // then
++    expect(crossOwnerError).toBeInstanceOf(CrossOwnerUpdateError)
++
++    // when
++    const deletedTask = await updateTaskStatus(fixture.teamRunId, task.id, "deleted", "lead-member", fixture.config)
++
++    // then
++    expect(deletedTask.status).toBe("deleted")
++  } finally {
++    await fixture.cleanup()
++  }
++})
+diff --git a/src/features/team-mode/team-tasklist/update.ts b/src/features/team-mode/team-tasklist/update.ts
+new file mode 100644
+index 00000000..5aa4f7b0
+--- /dev/null
++++ b/src/features/team-mode/team-tasklist/update.ts
+@@ -0,0 +1,75 @@
++import path from "node:path"
++
++import type { TeamModeConfig } from "../../../config/schema/team-mode"
++import { getTasksDir, resolveBaseDir } from "../team-registry"
++import { atomicWrite } from "../team-state-store/locks"
++import { TaskSchema } from "../types"
++import type { Task } from "../types"
++import { claimTask } from "./claim"
++import { getTask } from "./get"
++
++const ALLOWED_TRANSITIONS: Readonly<Record<Task["status"], ReadonlyArray<Task["status"]>>> = {
++  pending: ["claimed", "deleted"],
++  claimed: ["in_progress", "deleted"],
++  in_progress: ["completed", "deleted"],
++  completed: ["deleted"],
++  deleted: [],
++}
++
++function isValidTransition(currentStatus: Task["status"], nextStatus: Task["status"]): boolean {
++  if (currentStatus === nextStatus) return true
++  return ALLOWED_TRANSITIONS[currentStatus].includes(nextStatus)
++}
++
++export class InvalidTaskTransitionError extends Error {
++  constructor(currentStatus: Task["status"], nextStatus: Task["status"]) {
++    super(`no reverse transitions from ${currentStatus} to ${nextStatus}`)
++    this.name = "InvalidTaskTransitionError"
++  }
++}
++
++export class CrossOwnerUpdateError extends Error {
++  constructor(message = "cross-owner updates are not allowed") {
++    super(message)
++    this.name = "CrossOwnerUpdateError"
++  }
++}
++
++export async function updateTaskStatus(
++  teamRunId: string,
++  taskId: string,
++  newStatus: Task["status"],
++  memberName: string,
++  config: TeamModeConfig,
++): Promise<Task> {
++  const task = await getTask(teamRunId, taskId, config)
++
++  if (task.status === newStatus) return task
++
++  if (task.status === "pending" && newStatus === "in_progress") {
++    await claimTask(teamRunId, taskId, memberName, config)
++    return updateTaskStatus(teamRunId, taskId, newStatus, memberName, config)
++  }
++
++  if (!isValidTransition(task.status, newStatus)) {
++    throw new InvalidTaskTransitionError(task.status, newStatus)
++  }
++
++  if (newStatus !== "deleted" && task.owner !== memberName) {
++    throw new CrossOwnerUpdateError()
++  }
++
++  const updatedTask = TaskSchema.parse({
++    ...task,
++    status: newStatus,
++    updatedAt: Date.now(),
++  })
++
++  const tasksDirectory = getTasksDir(resolveBaseDir(config), teamRunId)
++  await atomicWrite(
++    path.join(tasksDirectory, `${taskId}.json`),
++    `${JSON.stringify(updatedTask, null, 2)}\n`,
++  )
++
++  return updatedTask
++}
+-- 
+2.39.2
+

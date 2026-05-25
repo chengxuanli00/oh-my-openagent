@@ -1,0 +1,245 @@
+From d3978ab49173abbc4ba1cb77684a6288d7eb851c Mon Sep 17 00:00:00 2001
+From: Rishi Vhavle <rishivhavle21@gmail.com>
+Date: Thu, 12 Feb 2026 01:33:12 +0530
+Subject: [PATCH 2069/5749] fix: parse config sections independently so one
+ invalid field doesn't discard the entire config
+
+Previously, a single validation error (e.g. wrong type for
+prometheus.permission.edit) caused safeParse to fail and the
+entire oh-my-opencode.json was silently replaced with {}.
+
+Now loadConfigFromPath falls back to parseConfigPartially() which
+validates each top-level key in isolation, keeps the sections that
+pass, and logs which sections were skipped.
+
+Closes #1767
+---
+ src/plugin-config.test.ts | 122 +++++++++++++++++++++++++++++++++++++-
+ src/plugin-config.ts      |  67 +++++++++++++++++----
+ 2 files changed, 176 insertions(+), 13 deletions(-)
+
+diff --git a/src/plugin-config.test.ts b/src/plugin-config.test.ts
+index 65ea1ae0..0431c8a4 100644
+--- a/src/plugin-config.test.ts
++++ b/src/plugin-config.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "bun:test";
+-import { mergeConfigs } from "./plugin-config";
++import { mergeConfigs, parseConfigPartially } from "./plugin-config";
+ import type { OhMyOpenCodeConfig } from "./config";
+ 
+ describe("mergeConfigs", () => {
+@@ -117,3 +117,123 @@ describe("mergeConfigs", () => {
+     });
+   });
+ });
++
++describe("parseConfigPartially", () => {
++  describe("fully valid config", () => {
++    //#given a config where all sections are valid
++    //#when parsing the config
++    //#then should return the full parsed config unchanged
++
++    it("should return the full config when everything is valid", () => {
++      const rawConfig = {
++        agents: {
++          oracle: { model: "openai/gpt-5.2" },
++          momus: { model: "openai/gpt-5.2" },
++        },
++        disabled_hooks: ["comment-checker"],
++      };
++
++      const result = parseConfigPartially(rawConfig);
++
++      expect(result).not.toBeNull();
++      expect(result!.agents?.oracle?.model).toBe("openai/gpt-5.2");
++      expect(result!.agents?.momus?.model).toBe("openai/gpt-5.2");
++      expect(result!.disabled_hooks).toEqual(["comment-checker"]);
++    });
++  });
++
++  describe("partially invalid config", () => {
++    //#given a config where one section is invalid but others are valid
++    //#when parsing the config
++    //#then should return valid sections and skip invalid ones
++
++    it("should preserve valid agent overrides when another section is invalid", () => {
++      const rawConfig = {
++        agents: {
++          oracle: { model: "openai/gpt-5.2" },
++          momus: { model: "openai/gpt-5.2" },
++          prometheus: {
++            permission: {
++              edit: { "*": "ask", ".sisyphus/**": "allow" },
++            },
++          },
++        },
++        disabled_hooks: ["comment-checker"],
++      };
++
++      const result = parseConfigPartially(rawConfig);
++
++      expect(result).not.toBeNull();
++      expect(result!.disabled_hooks).toEqual(["comment-checker"]);
++      expect(result!.agents).toBeUndefined();
++    });
++
++    it("should preserve valid agents when a non-agent section is invalid", () => {
++      const rawConfig = {
++        agents: {
++          oracle: { model: "openai/gpt-5.2" },
++        },
++        disabled_hooks: ["not-a-real-hook"],
++      };
++
++      const result = parseConfigPartially(rawConfig);
++
++      expect(result).not.toBeNull();
++      expect(result!.agents?.oracle?.model).toBe("openai/gpt-5.2");
++      expect(result!.disabled_hooks).toBeUndefined();
++    });
++  });
++
++  describe("completely invalid config", () => {
++    //#given a config where all sections are invalid
++    //#when parsing the config
++    //#then should return an empty object (not null)
++
++    it("should return empty object when all sections are invalid", () => {
++      const rawConfig = {
++        agents: { oracle: { temperature: "not-a-number" } },
++        disabled_hooks: ["not-a-real-hook"],
++      };
++
++      const result = parseConfigPartially(rawConfig);
++
++      expect(result).not.toBeNull();
++      expect(result!.agents).toBeUndefined();
++      expect(result!.disabled_hooks).toBeUndefined();
++    });
++  });
++
++  describe("empty config", () => {
++    //#given an empty config object
++    //#when parsing the config
++    //#then should return an empty object (fast path - full parse succeeds)
++
++    it("should return empty object for empty input", () => {
++      const result = parseConfigPartially({});
++
++      expect(result).not.toBeNull();
++      expect(Object.keys(result!).length).toBe(0);
++    });
++  });
++
++  describe("unknown keys", () => {
++    //#given a config with keys not in the schema
++    //#when parsing the config
++    //#then should silently ignore unknown keys and preserve valid ones
++
++    it("should ignore unknown keys and return valid sections", () => {
++      const rawConfig = {
++        agents: {
++          oracle: { model: "openai/gpt-5.2" },
++        },
++        some_future_key: { foo: "bar" },
++      };
++
++      const result = parseConfigPartially(rawConfig);
++
++      expect(result).not.toBeNull();
++      expect(result!.agents?.oracle?.model).toBe("openai/gpt-5.2");
++      expect((result as Record<string, unknown>)["some_future_key"]).toBeUndefined();
++    });
++  });
++});
+diff --git a/src/plugin-config.ts b/src/plugin-config.ts
+index b95942fd..bc96b281 100644
+--- a/src/plugin-config.ts
++++ b/src/plugin-config.ts
+@@ -11,6 +11,42 @@ import {
+   migrateConfigFile,
+ } from "./shared";
+ 
++export function parseConfigPartially(
++  rawConfig: Record<string, unknown>
++): OhMyOpenCodeConfig | null {
++  const fullResult = OhMyOpenCodeConfigSchema.safeParse(rawConfig);
++  if (fullResult.success) {
++    return fullResult.data;
++  }
++
++  const partialConfig: Record<string, unknown> = {};
++  const invalidSections: string[] = [];
++
++  for (const key of Object.keys(rawConfig)) {
++    const sectionResult = OhMyOpenCodeConfigSchema.safeParse({ [key]: rawConfig[key] });
++    if (sectionResult.success) {
++      const parsed = sectionResult.data as Record<string, unknown>;
++      if (parsed[key] !== undefined) {
++        partialConfig[key] = parsed[key];
++      }
++    } else {
++      const sectionErrors = sectionResult.error.issues
++        .filter((i) => i.path[0] === key)
++        .map((i) => `${i.path.join(".")}: ${i.message}`)
++        .join(", ");
++      if (sectionErrors) {
++        invalidSections.push(`${key}: ${sectionErrors}`);
++      }
++    }
++  }
++
++  if (invalidSections.length > 0) {
++    log("Partial config loaded — invalid sections skipped:", invalidSections);
++  }
++
++  return partialConfig as OhMyOpenCodeConfig;
++}
++
+ export function loadConfigFromPath(
+   configPath: string,
+   ctx: unknown
+@@ -24,20 +60,27 @@ export function loadConfigFromPath(
+ 
+       const result = OhMyOpenCodeConfigSchema.safeParse(rawConfig);
+ 
+-      if (!result.success) {
+-        const errorMsg = result.error.issues
+-          .map((i) => `${i.path.join(".")}: ${i.message}`)
+-          .join(", ");
+-        log(`Config validation error in ${configPath}:`, result.error.issues);
+-        addConfigLoadError({
+-          path: configPath,
+-          error: `Validation error: ${errorMsg}`,
+-        });
+-        return null;
++      if (result.success) {
++        log(`Config loaded from ${configPath}`, { agents: result.data.agents });
++        return result.data;
++      }
++
++      const errorMsg = result.error.issues
++        .map((i) => `${i.path.join(".")}: ${i.message}`)
++        .join(", ");
++      log(`Config validation error in ${configPath}:`, result.error.issues);
++      addConfigLoadError({
++        path: configPath,
++        error: `Partial config loaded — invalid sections skipped: ${errorMsg}`,
++      });
++
++      const partialResult = parseConfigPartially(rawConfig);
++      if (partialResult) {
++        log(`Partial config loaded from ${configPath}`, { agents: partialResult.agents });
++        return partialResult;
+       }
+ 
+-      log(`Config loaded from ${configPath}`, { agents: result.data.agents });
+-      return result.data;
++      return null;
+     }
+   } catch (err) {
+     const errorMsg = err instanceof Error ? err.message : String(err);
+-- 
+2.39.2
+

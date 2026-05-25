@@ -1,0 +1,208 @@
+From 95645effd7e7a8a246846c75794f6a1f7d4a903f Mon Sep 17 00:00:00 2001
+From: Victor Jaepyo Jo <65930387+changeroa@users.noreply.github.com>
+Date: Sat, 3 Jan 2026 14:11:59 +0900
+Subject: [PATCH 0798/5749] fix(ralph-loop): clear orphaned state when original
+ session no longer exists (#446)
+
+* fix(ralph-loop): clear orphaned state when original session no longer exists
+
+When a session with an active ralph-loop terminates abnormally (abort, window close),
+the state file remains with active: true. Previously, when a new session started,
+the hook would skip the orphaned state without cleaning it up.
+
+This fix adds session existence validation:
+- Before skipping a loop owned by a different session, check if that session still exists
+- If the original session no longer exists, clear the orphan state and log
+- If the original session still exists, skip as before (it's another active session's loop)
+
+Changes:
+- Add checkSessionExists option to RalphLoopOptions for dependency injection
+- Wire up sessionExists from session-manager as the default implementation
+- Add tests for orphan state cleanup and active session preservation
+
+* fix(ralph-loop): add error handling around checkSessionExists call
+
+Wraps the async checkSessionExists call in try/catch for consistency
+with other async operations in this file. If the check throws, logs
+the error and falls back to the original behavior (not clearing state).
+
+---------
+
+Co-authored-by: sisyphus-dev-ai <sisyphus-dev-ai@users.noreply.github.com>
+---
+ src/hooks/ralph-loop/index.test.ts | 71 ++++++++++++++++++++++++++++++
+ src/hooks/ralph-loop/index.ts      | 19 ++++++++
+ src/hooks/ralph-loop/types.ts      |  1 +
+ src/index.ts                       |  6 ++-
+ src/tools/index.ts                 |  2 +
+ 5 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/src/hooks/ralph-loop/index.test.ts b/src/hooks/ralph-loop/index.test.ts
+index cbc53e2e..6a0f6727 100644
+--- a/src/hooks/ralph-loop/index.test.ts
++++ b/src/hooks/ralph-loop/index.test.ts
+@@ -302,6 +302,77 @@ describe("ralph-loop", () => {
+       expect(promptCalls.length).toBe(0)
+     })
+ 
++    test("should clear orphaned state when original session no longer exists", async () => {
++      // #given - state file exists from a previous session that no longer exists
++      const state: RalphLoopState = {
++        active: true,
++        iteration: 3,
++        max_iterations: 50,
++        completion_promise: "DONE",
++        started_at: "2025-12-30T01:00:00Z",
++        prompt: "Build something",
++        session_id: "orphaned-session-999", // This session no longer exists
++      }
++      writeState(TEST_DIR, state)
++
++      // Mock sessionExists to return false for the orphaned session
++      const hook = createRalphLoopHook(createMockPluginInput(), {
++        checkSessionExists: async (sessionID: string) => {
++          // Orphaned session doesn't exist, current session does
++          return sessionID !== "orphaned-session-999"
++        },
++      })
++
++      // #when - a new session goes idle (different from the orphaned session in state)
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "new-session-456" },
++        },
++      })
++
++      // #then - orphaned state should be cleared
++      expect(hook.getState()).toBeNull()
++      // #then - no continuation injected (state was cleared, not resumed)
++      expect(promptCalls.length).toBe(0)
++    })
++
++    test("should NOT clear state when original session still exists (different active session)", async () => {
++      // #given - state file exists from a session that still exists
++      const state: RalphLoopState = {
++        active: true,
++        iteration: 2,
++        max_iterations: 50,
++        completion_promise: "DONE",
++        started_at: "2025-12-30T01:00:00Z",
++        prompt: "Build something",
++        session_id: "active-session-123", // This session still exists
++      }
++      writeState(TEST_DIR, state)
++
++      // Mock sessionExists to return true for the active session
++      const hook = createRalphLoopHook(createMockPluginInput(), {
++        checkSessionExists: async (sessionID: string) => {
++          // Original session still exists
++          return sessionID === "active-session-123" || sessionID === "new-session-456"
++        },
++      })
++
++      // #when - a different session goes idle
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "new-session-456" },
++        },
++      })
++
++      // #then - state should NOT be cleared (original session still active)
++      expect(hook.getState()).not.toBeNull()
++      expect(hook.getState()?.session_id).toBe("active-session-123")
++      // #then - no continuation injected (it's a different session's loop)
++      expect(promptCalls.length).toBe(0)
++    })
++
+     test("should use default config values", () => {
+       // #given - hook with config
+       const hook = createRalphLoopHook(createMockPluginInput(), {
+diff --git a/src/hooks/ralph-loop/index.ts b/src/hooks/ralph-loop/index.ts
+index 8804abe0..6115caf2 100644
+--- a/src/hooks/ralph-loop/index.ts
++++ b/src/hooks/ralph-loop/index.ts
+@@ -64,6 +64,7 @@ export function createRalphLoopHook(
+   const stateDir = config?.state_dir
+   const getTranscriptPath = options?.getTranscriptPath ?? getDefaultTranscriptPath
+   const apiTimeout = options?.apiTimeout ?? DEFAULT_API_TIMEOUT
++  const checkSessionExists = options?.checkSessionExists
+ 
+   function getSessionState(sessionID: string): SessionState {
+     let state = sessions.get(sessionID)
+@@ -199,6 +200,24 @@ export function createRalphLoopHook(
+       }
+ 
+       if (state.session_id && state.session_id !== sessionID) {
++        if (checkSessionExists) {
++          try {
++            const originalSessionExists = await checkSessionExists(state.session_id)
++            if (!originalSessionExists) {
++              clearState(ctx.directory, stateDir)
++              log(`[${HOOK_NAME}] Cleared orphaned state from deleted session`, {
++                orphanedSessionId: state.session_id,
++                currentSessionId: sessionID,
++              })
++              return
++            }
++          } catch (err) {
++            log(`[${HOOK_NAME}] Failed to check session existence`, {
++              sessionId: state.session_id,
++              error: String(err),
++            })
++          }
++        }
+         return
+       }
+ 
+diff --git a/src/hooks/ralph-loop/types.ts b/src/hooks/ralph-loop/types.ts
+index 7ec6df70..b8d0c9a4 100644
+--- a/src/hooks/ralph-loop/types.ts
++++ b/src/hooks/ralph-loop/types.ts
+@@ -14,4 +14,5 @@ export interface RalphLoopOptions {
+   config?: RalphLoopConfig
+   getTranscriptPath?: (sessionId: string) => string
+   apiTimeout?: number
++  checkSessionExists?: (sessionId: string) => Promise<boolean>
+ }
+diff --git a/src/index.ts b/src/index.ts
+index 9daf4a5d..0175ac85 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -48,6 +48,7 @@ import {
+   createLookAt,
+   createSkillTool,
+   createSkillMcpTool,
++  sessionExists,
+   interactive_bash,
+   getTmuxPath,
+ } from "./tools";
+@@ -146,7 +147,10 @@ const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+     : null;
+ 
+   const ralphLoop = isHookEnabled("ralph-loop")
+-    ? createRalphLoopHook(ctx, { config: pluginConfig.ralph_loop })
++    ? createRalphLoopHook(ctx, {
++        config: pluginConfig.ralph_loop,
++        checkSessionExists: async (sessionId) => sessionExists(sessionId),
++      })
+     : null;
+ 
+   const autoSlashCommand = isHookEnabled("auto-slash-command")
+diff --git a/src/tools/index.ts b/src/tools/index.ts
+index b9de3547..a45ff06c 100644
+--- a/src/tools/index.ts
++++ b/src/tools/index.ts
+@@ -28,6 +28,8 @@ import {
+   session_info,
+ } from "./session-manager"
+ 
++export { sessionExists } from "./session-manager/storage"
++
+ export { interactive_bash, startBackgroundCheck as startTmuxCheck } from "./interactive-bash"
+ export { createSkillTool } from "./skill"
+ export { getTmuxPath } from "./interactive-bash/utils"
+-- 
+2.39.2
+

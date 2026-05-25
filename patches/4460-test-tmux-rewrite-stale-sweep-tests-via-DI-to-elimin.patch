@@ -1,0 +1,405 @@
+From e35ac38bbfca4fbae8c390f04e9a6554f7ab0de9 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 18 Apr 2026 21:00:34 +0900
+Subject: [PATCH 4460/5749] test(tmux): rewrite stale-sweep tests via DI to
+ eliminate cross-file mock leak
+
+Oracle flagged that the previous test file monkey-patched process.kill
+and relied on mock.module for 5 modules. Running it after manager.test.ts
+in the same Bun process reproduced 2 failures - the test resolution of
+`./session-kill` specifier interacted badly with manager.test.ts's
+`../../shared/tmux` barrel mock.
+
+Solution: refactor stale-session-sweep.ts to expose
+`sweepStaleOmoAgentSessionsWith(deps)` that accepts a SweepDeps record
+(isInsideTmux, getTmuxPath, listCandidateSessions, killSession,
+processAlive, currentPid, log). The public `sweepStaleOmoAgentSessions()`
+still uses runtime-built deps so call sites are unchanged.
+
+The test file now imports the pure function directly and constructs a
+fixture with fake deps. Zero mock.module calls, zero process.kill
+patching, zero cache-bust dynamic imports. 8 tests (up from 6) run
+deterministically in any order with any neighbor.
+
+Before: combined run with manager.test.ts = 2 fail, 50 pass.
+After:  combined run with manager.test.ts = 0 fail, 54 pass.
+---
+ .../tmux-utils/stale-session-sweep.test.ts    | 214 ++++++++----------
+ .../tmux/tmux-utils/stale-session-sweep.ts    |  45 +++-
+ 2 files changed, 126 insertions(+), 133 deletions(-)
+
+diff --git a/src/shared/tmux/tmux-utils/stale-session-sweep.test.ts b/src/shared/tmux/tmux-utils/stale-session-sweep.test.ts
+index 98f6aa1f..1acc171e 100644
+--- a/src/shared/tmux/tmux-utils/stale-session-sweep.test.ts
++++ b/src/shared/tmux/tmux-utils/stale-session-sweep.test.ts
+@@ -1,188 +1,154 @@
+-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+-
+-type SweepStaleOmoAgentSessions = typeof import("./stale-session-sweep").sweepStaleOmoAgentSessions
+-
+-type SpawnCall = { command: string[] }
+-
+-type FakeSubprocess = {
+-	exited: Promise<number>
+-	stdout: ReadableStream<Uint8Array>
+-	stderr: ReadableStream<Uint8Array>
++import { beforeEach, describe, expect, it, mock } from "bun:test"
++import { sweepStaleOmoAgentSessionsWith, type SweepDeps } from "./stale-session-sweep"
++
++type SweepFixture = {
++	deps: SweepDeps
++	candidates: string[]
++	killed: string[]
++	killSessionMock: ReturnType<typeof mock>
++	setCandidates: (sessions: string[]) => void
++	setAlive: (predicate: (pid: number) => boolean) => void
+ }
+ 
+-const spawnCalls: SpawnCall[] = []
+-const queuedProcesses: FakeSubprocess[] = []
+-
+-function createClosedStream(): ReadableStream<Uint8Array> {
+-	return new ReadableStream({ start(controller) { controller.close() } })
+-}
++function createFixture(): SweepFixture {
++	const candidates: string[] = []
++	const killed: string[] = []
++	let aliveCheck: (pid: number) => boolean = () => false
+ 
+-function createTextStream(text: string): ReadableStream<Uint8Array> {
+-	return new ReadableStream({
+-		start(controller) {
+-			controller.enqueue(new TextEncoder().encode(text))
+-			controller.close()
+-		},
++	const killSessionMock = mock(async (sessionName: string): Promise<boolean> => {
++		killed.push(sessionName)
++		return true
+ 	})
+-}
+ 
+-function makeProcess(exitCode: number, stdoutText: string): FakeSubprocess {
+-	return {
+-		exited: Promise.resolve(exitCode),
+-		stdout: createTextStream(stdoutText),
+-		stderr: createClosedStream(),
++	const deps: SweepDeps = {
++		isInsideTmux: () => true,
++		getTmuxPath: async () => "tmux",
++		listCandidateSessions: async () => [...candidates],
++		killSession: killSessionMock,
++		processAlive: (pid) => aliveCheck(pid),
++		currentPid: 12345,
++		log: () => undefined,
+ 	}
+-}
+ 
+-const spawnMock = mock((command: string[]): FakeSubprocess => {
+-	spawnCalls.push({ command })
+-	const process = queuedProcesses.shift()
+-	if (!process) {
+-		throw new Error(`No fake subprocess configured for ${command.join(" ")}`)
++	return {
++		deps,
++		candidates,
++		killed,
++		killSessionMock,
++		setCandidates: (sessions) => {
++			candidates.length = 0
++			candidates.push(...sessions)
++		},
++		setAlive: (predicate) => {
++			aliveCheck = predicate
++		},
+ 	}
+-	return process
+-})
+-
+-const isInsideTmuxMock = mock((): boolean => true)
+-const getTmuxPathMock = mock(async (): Promise<string | undefined> => "tmux")
+-const logMock = mock(() => undefined)
+-const killTmuxSessionMock = mock(async (_name: string): Promise<boolean> => true)
+-const isProcessAliveMock = mock((_pid: number): boolean => false)
+-
+-const sweepSpecifier = import.meta.resolve("./stale-session-sweep")
+-const spawnProcessSpecifier = import.meta.resolve("./spawn-process")
+-const environmentSpecifier = import.meta.resolve("./environment")
+-const loggerSpecifier = import.meta.resolve("../../logger")
+-const tmuxPathResolverSpecifier = import.meta.resolve("../../../tools/interactive-bash/tmux-path-resolver")
+-const sessionKillSpecifier = import.meta.resolve("./session-kill")
+-
+-function registerModuleMocks(): void {
+-	mock.module(spawnProcessSpecifier, () => ({ spawn: spawnMock }))
+-	mock.module(environmentSpecifier, () => ({ isInsideTmux: isInsideTmuxMock }))
+-	mock.module(loggerSpecifier, () => ({ log: logMock }))
+-	mock.module(tmuxPathResolverSpecifier, () => ({ getTmuxPath: getTmuxPathMock }))
+-	mock.module(sessionKillSpecifier, () => ({ killTmuxSessionIfExists: killTmuxSessionMock }))
+ }
+ 
+-const originalProcessKill = process.kill
+-
+-async function loadSweeper(overrideProcessAlive?: (pid: number) => boolean): Promise<SweepStaleOmoAgentSessions> {
+-	const processAlive = overrideProcessAlive ?? isProcessAliveMock
+-	process.kill = ((pid: number, signal?: number | string): true => {
+-		if (signal === 0) {
+-			if (processAlive(pid)) {
+-				return true
+-			}
+-			const err = new Error("ESRCH") as NodeJS.ErrnoException
+-			err.code = "ESRCH"
+-			throw err
+-		}
+-		return originalProcessKill.call(process, pid, signal)
+-	}) as typeof process.kill
+-	const module = await import(`${sweepSpecifier}?test=${crypto.randomUUID()}`)
+-	return module.sweepStaleOmoAgentSessions
+-}
++describe("sweepStaleOmoAgentSessionsWith", () => {
++	let fixture: SweepFixture
+ 
+-describe("sweepStaleOmoAgentSessions", () => {
+ 	beforeEach(() => {
+-		registerModuleMocks()
+-		spawnCalls.length = 0
+-		queuedProcesses.length = 0
+-		spawnMock.mockClear()
+-		isInsideTmuxMock.mockClear()
+-		getTmuxPathMock.mockClear()
+-		logMock.mockClear()
+-		killTmuxSessionMock.mockClear()
+-		isProcessAliveMock.mockClear()
+-
+-		isInsideTmuxMock.mockImplementation((): boolean => true)
+-		getTmuxPathMock.mockImplementation(async (): Promise<string | undefined> => "tmux")
+-		killTmuxSessionMock.mockImplementation(async (_name: string): Promise<boolean> => true)
+-		isProcessAliveMock.mockImplementation((_pid: number): boolean => false)
++		fixture = createFixture()
+ 	})
+ 
+-	afterEach(() => {
+-		process.kill = originalProcessKill
++	it("#given not inside tmux #when sweep called #then returns 0 without listing", async () => {
++		// given
++		const deps: SweepDeps = { ...fixture.deps, isInsideTmux: () => false }
++
++		// when
++		const result = await sweepStaleOmoAgentSessionsWith(deps)
++
++		// then
++		expect(result).toBe(0)
+ 	})
+ 
+-	it("#given not inside tmux #when sweepStaleOmoAgentSessions called #then returns 0 without spawn", async () => {
++	it("#given tmux not found #when sweep called #then returns 0 without listing", async () => {
+ 		// given
+-		isInsideTmuxMock.mockImplementation((): boolean => false)
+-		const sweep = await loadSweeper()
++		const deps: SweepDeps = { ...fixture.deps, getTmuxPath: async () => undefined }
+ 
+ 		// when
+-		const result = await sweep()
++		const result = await sweepStaleOmoAgentSessionsWith(deps)
+ 
+ 		// then
+ 		expect(result).toBe(0)
+-		expect(spawnCalls).toHaveLength(0)
+ 	})
+ 
+-	it("#given no omo-agents sessions exist #when sweepStaleOmoAgentSessions called #then returns 0", async () => {
++	it("#given candidate list is empty #when sweep called #then returns 0 and does not kill anything", async () => {
+ 		// given
+-		queuedProcesses.push(makeProcess(0, "other-session\nmain\n"))
+-		const sweep = await loadSweeper()
++		fixture.setCandidates([])
+ 
+ 		// when
+-		const result = await sweep()
++		const result = await sweepStaleOmoAgentSessionsWith(fixture.deps)
+ 
+ 		// then
+ 		expect(result).toBe(0)
+-		expect(killTmuxSessionMock).toHaveBeenCalledTimes(0)
++		expect(fixture.killed).toEqual([])
+ 	})
+ 
+-	it("#given omo-agents sessions with dead PIDs #when sweepStaleOmoAgentSessions called #then each dead session is killed", async () => {
++	it("#given sessions with dead PIDs #when sweep called #then each dead session is killed once", async () => {
+ 		// given
+-		queuedProcesses.push(makeProcess(0, "omo-agents-99991\nomo-agents-99992\nunrelated\n"))
+-		const sweep = await loadSweeper(() => false)
++		fixture.setCandidates(["omo-agents-99991", "omo-agents-99992"])
++		fixture.setAlive(() => false)
+ 
+ 		// when
+-		const result = await sweep()
++		const result = await sweepStaleOmoAgentSessionsWith(fixture.deps)
+ 
+ 		// then
+ 		expect(result).toBe(2)
+-		expect(killTmuxSessionMock).toHaveBeenCalledTimes(2)
+-		expect(killTmuxSessionMock.mock.calls[0]?.[0]).toBe("omo-agents-99991")
+-		expect(killTmuxSessionMock.mock.calls[1]?.[0]).toBe("omo-agents-99992")
++		expect(fixture.killed).toEqual(["omo-agents-99991", "omo-agents-99992"])
+ 	})
+ 
+-	it("#given session matches current PID #when sweepStaleOmoAgentSessions called #then it is not killed", async () => {
++	it("#given session matches current PID #when sweep called #then it is NOT killed", async () => {
+ 		// given
+-		queuedProcesses.push(makeProcess(0, `omo-agents-${process.pid}\nomo-agents-99999\n`))
+-		const sweep = await loadSweeper(() => false)
++		fixture.setCandidates([`omo-agents-${fixture.deps.currentPid}`, "omo-agents-99999"])
++		fixture.setAlive(() => false)
+ 
+ 		// when
+-		const result = await sweep()
++		const result = await sweepStaleOmoAgentSessionsWith(fixture.deps)
+ 
+ 		// then
+ 		expect(result).toBe(1)
+-		expect(killTmuxSessionMock).toHaveBeenCalledTimes(1)
+-		expect(killTmuxSessionMock.mock.calls[0]?.[0]).toBe("omo-agents-99999")
++		expect(fixture.killed).toEqual(["omo-agents-99999"])
+ 	})
+ 
+-	it("#given session PID is still alive #when sweepStaleOmoAgentSessions called #then it is not killed", async () => {
++	it("#given session PID is still alive #when sweep called #then it is NOT killed", async () => {
+ 		// given
+-		queuedProcesses.push(makeProcess(0, "omo-agents-88888\n"))
+-		const sweep = await loadSweeper((pid) => pid === 88888)
++		fixture.setCandidates(["omo-agents-88888"])
++		fixture.setAlive((pid) => pid === 88888)
+ 
+ 		// when
+-		const result = await sweep()
++		const result = await sweepStaleOmoAgentSessionsWith(fixture.deps)
+ 
+ 		// then
+ 		expect(result).toBe(0)
+-		expect(killTmuxSessionMock).toHaveBeenCalledTimes(0)
++		expect(fixture.killed).toEqual([])
+ 	})
+ 
+-	it("#given list-sessions fails #when sweepStaleOmoAgentSessions called #then returns 0 without killing", async () => {
++	it("#given killSession returns false #when sweep called #then session is not counted toward killedCount", async () => {
+ 		// given
+-		queuedProcesses.push(makeProcess(1, ""))
+-		const sweep = await loadSweeper(() => false)
++		fixture.setCandidates(["omo-agents-55555"])
++		fixture.setAlive(() => false)
++		fixture.killSessionMock.mockImplementation(async () => false)
+ 
+ 		// when
+-		const result = await sweep()
++		const result = await sweepStaleOmoAgentSessionsWith(fixture.deps)
+ 
+ 		// then
+ 		expect(result).toBe(0)
+-		expect(killTmuxSessionMock).toHaveBeenCalledTimes(0)
++		expect(fixture.killSessionMock).toHaveBeenCalledTimes(1)
++	})
++
++	it("#given non-matching sessions mixed in #when sweep called #then only omo-agents-<pid> sessions are considered", async () => {
++		// given
++		fixture.setCandidates(["main", "omo-agents-99999", "other-session", "omo-agents-abc"])
++		fixture.setAlive(() => false)
++
++		// when
++		const result = await sweepStaleOmoAgentSessionsWith(fixture.deps)
++
++		// then
++		expect(result).toBe(1)
++		expect(fixture.killed).toEqual(["omo-agents-99999"])
+ 	})
+ })
+diff --git a/src/shared/tmux/tmux-utils/stale-session-sweep.ts b/src/shared/tmux/tmux-utils/stale-session-sweep.ts
+index f2c79016..c8b27e93 100644
+--- a/src/shared/tmux/tmux-utils/stale-session-sweep.ts
++++ b/src/shared/tmux/tmux-utils/stale-session-sweep.ts
+@@ -10,7 +10,7 @@ function isProcessAlive(pid: number): boolean {
+ 	}
+ }
+ 
+-async function listOmoAgentSessions(tmux: string): Promise<string[]> {
++async function listOmoAgentSessionsViaTmux(tmux: string): Promise<string[]> {
+ 	const { spawn } = await import("./spawn-process")
+ 	const proc = spawn([tmux, "list-sessions", "-F", "#{session_name}"], {
+ 		stdout: "pipe",
+@@ -32,7 +32,17 @@ async function listOmoAgentSessions(tmux: string): Promise<string[]> {
+ 		.filter((name) => STALE_SESSION_PATTERN.test(name))
+ }
+ 
+-export async function sweepStaleOmoAgentSessions(): Promise<number> {
++export type SweepDeps = {
++	isInsideTmux: () => boolean
++	getTmuxPath: () => Promise<string | null | undefined>
++	listCandidateSessions: (tmux: string) => Promise<string[]>
++	killSession: (sessionName: string) => Promise<boolean>
++	processAlive: (pid: number) => boolean
++	currentPid: number
++	log: (message: string, payload?: unknown) => void
++}
++
++async function buildRuntimeDeps(): Promise<SweepDeps> {
+ 	const [{ log }, { isInsideTmux }, { getTmuxPath }, { killTmuxSessionIfExists }] = await Promise.all([
+ 		import("../../logger"),
+ 		import("./environment"),
+@@ -40,16 +50,28 @@ export async function sweepStaleOmoAgentSessions(): Promise<number> {
+ 		import("./session-kill"),
+ 	])
+ 
+-	if (!isInsideTmux()) {
++	return {
++		isInsideTmux,
++		getTmuxPath,
++		listCandidateSessions: listOmoAgentSessionsViaTmux,
++		killSession: killTmuxSessionIfExists,
++		processAlive: isProcessAlive,
++		currentPid: process.pid,
++		log,
++	}
++}
++
++export async function sweepStaleOmoAgentSessionsWith(deps: SweepDeps): Promise<number> {
++	if (!deps.isInsideTmux()) {
+ 		return 0
+ 	}
+ 
+-	const tmux = await getTmuxPath()
++	const tmux = await deps.getTmuxPath()
+ 	if (!tmux) {
+ 		return 0
+ 	}
+ 
+-	const candidateSessions = await listOmoAgentSessions(tmux)
++	const candidateSessions = await deps.listCandidateSessions(tmux)
+ 	let killedCount = 0
+ 
+ 	for (const sessionName of candidateSessions) {
+@@ -58,11 +80,11 @@ export async function sweepStaleOmoAgentSessions(): Promise<number> {
+ 
+ 		const pid = Number.parseInt(pidMatch[1], 10)
+ 		if (!Number.isFinite(pid)) continue
+-		if (pid === process.pid) continue
+-		if (isProcessAlive(pid)) continue
++		if (pid === deps.currentPid) continue
++		if (deps.processAlive(pid)) continue
+ 
+-		log("[sweepStaleOmoAgentSessions] killing stale session", { sessionName, deadPid: pid })
+-		const killed = await killTmuxSessionIfExists(sessionName)
++		deps.log("[sweepStaleOmoAgentSessions] killing stale session", { sessionName, deadPid: pid })
++		const killed = await deps.killSession(sessionName)
+ 		if (killed) {
+ 			killedCount += 1
+ 		}
+@@ -70,3 +92,8 @@ export async function sweepStaleOmoAgentSessions(): Promise<number> {
+ 
+ 	return killedCount
+ }
++
++export async function sweepStaleOmoAgentSessions(): Promise<number> {
++	const deps = await buildRuntimeDeps()
++	return sweepStaleOmoAgentSessionsWith(deps)
++}
+-- 
+2.39.2
+

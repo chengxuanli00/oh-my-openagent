@@ -1,0 +1,318 @@
+From dafdca217bf9630351137cac032ff56875cb00d8 Mon Sep 17 00:00:00 2001
+From: JiHongKim98 <kinjihong9598@gmail.com>
+Date: Sat, 21 Feb 2026 03:01:23 +0900
+Subject: [PATCH 2523/5749] fix(tools): throttle ripgrep CPU usage with thread
+ limits and concurrency control
+
+- Add --threads=4 flag to all rg invocations (grep and glob)
+- Add global semaphore limiting concurrent rg processes to 2
+- Reduce grep timeout from 300s to 60s (matches tool description)
+- Reduce max output from 10MB to 256KB (prevents excessive memory usage)
+- Add output_mode parameter (content/files_with_matches/count)
+- Add head_limit parameter for incremental result fetching
+
+Closes #2008
+
+Ref: #674, #1722
+---
+ src/tools/glob/cli.ts         | 15 ++++++++++++++
+ src/tools/glob/constants.ts   |  2 +-
+ src/tools/glob/types.ts       |  1 +
+ src/tools/grep/cli.ts         | 38 +++++++++++++++++++++++++++++++----
+ src/tools/grep/constants.ts   |  5 +++--
+ src/tools/grep/tools.ts       | 32 +++++++++++++++++++++++++----
+ src/tools/grep/types.ts       |  3 +++
+ src/tools/shared/semaphore.ts | 32 +++++++++++++++++++++++++++++
+ 8 files changed, 117 insertions(+), 11 deletions(-)
+ create mode 100644 src/tools/shared/semaphore.ts
+
+diff --git a/src/tools/glob/cli.ts b/src/tools/glob/cli.ts
+index 468f259a..b621383a 100644
+--- a/src/tools/glob/cli.ts
++++ b/src/tools/glob/cli.ts
+@@ -7,9 +7,11 @@ import {
+   DEFAULT_MAX_DEPTH,
+   DEFAULT_MAX_OUTPUT_BYTES,
+   RG_FILES_FLAGS,
++  DEFAULT_RG_THREADS,
+ } from "./constants"
+ import type { GlobOptions, GlobResult, FileMatch } from "./types"
+ import { stat } from "node:fs/promises"
++import { rgSemaphore } from "../shared/semaphore"
+ 
+ export interface ResolvedCli {
+   path: string
+@@ -19,6 +21,7 @@ export interface ResolvedCli {
+ function buildRgArgs(options: GlobOptions): string[] {
+   const args: string[] = [
+     ...RG_FILES_FLAGS,
++    `--threads=${Math.min(options.threads ?? DEFAULT_RG_THREADS, DEFAULT_RG_THREADS)}`,
+     `--max-depth=${Math.min(options.maxDepth ?? DEFAULT_MAX_DEPTH, DEFAULT_MAX_DEPTH)}`,
+   ]
+ 
+@@ -91,6 +94,18 @@ export { buildRgArgs, buildFindArgs, buildPowerShellCommand }
+ export async function runRgFiles(
+   options: GlobOptions,
+   resolvedCli?: ResolvedCli
++): Promise<GlobResult> {
++  await rgSemaphore.acquire()
++  try {
++    return await runRgFilesInternal(options, resolvedCli)
++  } finally {
++    rgSemaphore.release()
++  }
++}
++
++async function runRgFilesInternal(
++  options: GlobOptions,
++  resolvedCli?: ResolvedCli
+ ): Promise<GlobResult> {
+   const cli = resolvedCli ?? resolveGrepCli()
+   const timeout = Math.min(options.timeout ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
+diff --git a/src/tools/glob/constants.ts b/src/tools/glob/constants.ts
+index bc86efc6..05b5f85f 100644
+--- a/src/tools/glob/constants.ts
++++ b/src/tools/glob/constants.ts
+@@ -1,4 +1,4 @@
+-export { resolveGrepCli, resolveGrepCliWithAutoInstall, type GrepBackend } from "../grep/constants"
++export { resolveGrepCli, resolveGrepCliWithAutoInstall, type GrepBackend, DEFAULT_RG_THREADS } from "../grep/constants"
+ 
+ export const DEFAULT_TIMEOUT_MS = 60_000
+ export const DEFAULT_LIMIT = 100
+diff --git a/src/tools/glob/types.ts b/src/tools/glob/types.ts
+index 0601873b..56d3556b 100644
+--- a/src/tools/glob/types.ts
++++ b/src/tools/glob/types.ts
+@@ -19,4 +19,5 @@ export interface GlobOptions {
+   maxDepth?: number
+   timeout?: number
+   limit?: number
++  threads?: number  // limit rg thread count
+ }
+diff --git a/src/tools/grep/cli.ts b/src/tools/grep/cli.ts
+index bbefd2dd..6109139b 100644
+--- a/src/tools/grep/cli.ts
++++ b/src/tools/grep/cli.ts
+@@ -8,14 +8,17 @@ import {
+   DEFAULT_MAX_COLUMNS,
+   DEFAULT_TIMEOUT_MS,
+   DEFAULT_MAX_OUTPUT_BYTES,
++  DEFAULT_RG_THREADS,
+   RG_SAFETY_FLAGS,
+   GREP_SAFETY_FLAGS,
+ } from "./constants"
+ import type { GrepOptions, GrepMatch, GrepResult, CountResult } from "./types"
++import { rgSemaphore } from "../shared/semaphore"
+ 
+ function buildRgArgs(options: GrepOptions): string[] {
+   const args: string[] = [
+     ...RG_SAFETY_FLAGS,
++    `--threads=${Math.min(options.threads ?? DEFAULT_RG_THREADS, DEFAULT_RG_THREADS)}`,
+     `--max-depth=${Math.min(options.maxDepth ?? DEFAULT_MAX_DEPTH, DEFAULT_MAX_DEPTH)}`,
+     `--max-filesize=${options.maxFilesize ?? DEFAULT_MAX_FILESIZE}`,
+     `--max-count=${Math.min(options.maxCount ?? DEFAULT_MAX_COUNT, DEFAULT_MAX_COUNT)}`,
+@@ -51,6 +54,12 @@ function buildRgArgs(options: GrepOptions): string[] {
+     }
+   }
+ 
++  if (options.outputMode === "files_with_matches") {
++    args.push("--files-with-matches")
++  } else if (options.outputMode === "count") {
++    args.push("--count")
++  }
++
+   return args
+ }
+ 
+@@ -130,6 +139,15 @@ function parseCountOutput(output: string): CountResult[] {
+ }
+ 
+ export async function runRg(options: GrepOptions): Promise<GrepResult> {
++  await rgSemaphore.acquire()
++  try {
++    return await runRgInternal(options)
++  } finally {
++    rgSemaphore.release()
++  }
++}
++
++async function runRgInternal(options: GrepOptions): Promise<GrepResult> {
+   const cli = resolveGrepCli()
+   const args = buildArgs(options, cli.backend)
+   const timeout = Math.min(options.timeout ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
+@@ -174,13 +192,16 @@ export async function runRg(options: GrepOptions): Promise<GrepResult> {
+     }
+ 
+     const matches = parseOutput(outputToProcess)
+-    const filesSearched = new Set(matches.map((m) => m.file)).size
++    const limited = options.headLimit && options.headLimit > 0
++      ? matches.slice(0, options.headLimit)
++      : matches
++    const filesSearched = new Set(limited.map((m) => m.file)).size
+ 
+     return {
+-      matches,
+-      totalMatches: matches.length,
++      matches: limited,
++      totalMatches: limited.length,
+       filesSearched,
+-      truncated,
++      truncated: truncated || (options.headLimit ? matches.length > options.headLimit : false),
+     }
+   } catch (e) {
+     return {
+@@ -194,6 +215,15 @@ export async function runRg(options: GrepOptions): Promise<GrepResult> {
+ }
+ 
+ export async function runRgCount(options: Omit<GrepOptions, "context">): Promise<CountResult[]> {
++  await rgSemaphore.acquire()
++  try {
++    return await runRgCountInternal(options)
++  } finally {
++    rgSemaphore.release()
++  }
++}
++
++async function runRgCountInternal(options: Omit<GrepOptions, "context">): Promise<CountResult[]> {
+   const cli = resolveGrepCli()
+   const args = buildArgs({ ...options, context: 0 }, cli.backend)
+ 
+diff --git a/src/tools/grep/constants.ts b/src/tools/grep/constants.ts
+index df855d20..524fddd4 100644
+--- a/src/tools/grep/constants.ts
++++ b/src/tools/grep/constants.ts
+@@ -113,8 +113,9 @@ export const DEFAULT_MAX_FILESIZE = "10M"
+ export const DEFAULT_MAX_COUNT = 500
+ export const DEFAULT_MAX_COLUMNS = 1000
+ export const DEFAULT_CONTEXT = 2
+-export const DEFAULT_TIMEOUT_MS = 300_000
+-export const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024
++export const DEFAULT_TIMEOUT_MS = 60_000
++export const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024
++export const DEFAULT_RG_THREADS = 4
+ 
+ export const RG_SAFETY_FLAGS = [
+   "--no-follow",
+diff --git a/src/tools/grep/tools.ts b/src/tools/grep/tools.ts
+index 59ff2ec3..356eb53a 100644
+--- a/src/tools/grep/tools.ts
++++ b/src/tools/grep/tools.ts
+@@ -1,16 +1,16 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+-import { runRg } from "./cli"
+-import { formatGrepResult } from "./result-formatter"
++import { runRg, runRgCount } from "./cli"
++import { formatGrepResult, formatCountResult } from "./result-formatter"
+ 
+ export function createGrepTools(ctx: PluginInput): Record<string, ToolDefinition> {
+   const grep: ToolDefinition = tool({
+     description:
+-      "Fast content search tool with safety limits (60s timeout, 10MB output). " +
++      "Fast content search tool with safety limits (60s timeout, 256KB output). " +
+       "Searches file contents using regular expressions. " +
+       "Supports full regex syntax (eg. \"log.*Error\", \"function\\s+\\w+\", etc.). " +
+       "Filter files by pattern with the include parameter (eg. \"*.js\", \"*.{ts,tsx}\"). " +
+-      "Returns file paths with matches sorted by modification time.",
++      "Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only file paths (default), \"count\" shows match counts per file.",
+     args: {
+       pattern: tool.schema.string().describe("The regex pattern to search for in file contents"),
+       include: tool.schema
+@@ -21,18 +21,42 @@ export function createGrepTools(ctx: PluginInput): Record<string, ToolDefinition
+         .string()
+         .optional()
+         .describe("The directory to search in. Defaults to the current working directory."),
++      output_mode: tool.schema
++        .string()
++        .optional()
++        .describe(
++          "Output mode: \"content\" shows matching lines, \"files_with_matches\" shows only file paths (default), \"count\" shows match counts per file."
++        ),
++      head_limit: tool.schema
++        .number()
++        .optional()
++        .describe("Limit output to first N entries. 0 or omitted means no limit."),
+     },
+     execute: async (args) => {
+       try {
+         const globs = args.include ? [args.include] : undefined
+         const searchPath = args.path ?? ctx.directory
+         const paths = [searchPath]
++        const outputMode = (args.output_mode as "content" | "files_with_matches" | "count") ?? "files_with_matches"
++        const headLimit = args.head_limit ?? 0
++
++        if (outputMode === "count") {
++          const results = await runRgCount({
++            pattern: args.pattern,
++            paths,
++            globs,
++          })
++          const limited = headLimit > 0 ? results.slice(0, headLimit) : results
++          return formatCountResult(limited)
++        }
+ 
+         const result = await runRg({
+           pattern: args.pattern,
+           paths,
+           globs,
+           context: 0,
++          outputMode,
++          headLimit,
+         })
+ 
+         return formatGrepResult(result)
+diff --git a/src/tools/grep/types.ts b/src/tools/grep/types.ts
+index c0ef2c7b..1f065025 100644
+--- a/src/tools/grep/types.ts
++++ b/src/tools/grep/types.ts
+@@ -31,6 +31,9 @@ export interface GrepOptions {
+   noIgnore?: boolean
+   fileType?: string[]
+   timeout?: number
++  threads?: number
++  outputMode?: "content" | "files_with_matches" | "count"
++  headLimit?: number
+ }
+ 
+ export interface CountResult {
+diff --git a/src/tools/shared/semaphore.ts b/src/tools/shared/semaphore.ts
+new file mode 100644
+index 00000000..c5e129e6
+--- /dev/null
++++ b/src/tools/shared/semaphore.ts
+@@ -0,0 +1,32 @@
++/**
++ * Simple counting semaphore to limit concurrent process execution.
++ * Used to prevent multiple ripgrep processes from saturating CPU.
++ */
++export class Semaphore {
++  private queue: (() => void)[] = []
++  private running = 0
++
++  constructor(private readonly max: number) {}
++
++  async acquire(): Promise<void> {
++    if (this.running < this.max) {
++      this.running++
++      return
++    }
++    return new Promise<void>((resolve) => {
++      this.queue.push(() => {
++        this.running++
++        resolve()
++      })
++    })
++  }
++
++  release(): void {
++    this.running--
++    const next = this.queue.shift()
++    if (next) next()
++  }
++}
++
++/** Global semaphore limiting concurrent ripgrep processes to 2 */
++export const rgSemaphore = new Semaphore(2)
+-- 
+2.39.2
+

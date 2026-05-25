@@ -1,0 +1,238 @@
+From 9bd2a9d7a92317dcf79548bd5fb7eafa717d15b8 Mon Sep 17 00:00:00 2001
+From: ZeyuFu <fuzeyu09@gmail.com>
+Date: Sat, 16 May 2026 02:29:48 -0400
+Subject: [PATCH 5605/5749] fix(runtime-fallback): fall back to synthetic
+ continuation when session messages are empty  (#3645)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the working directory contains a .git folder the OpenCode server
+normalises the project root to the git root before persisting messages.
+This creates a race: the 429/503/529 error event can fire before the
+user's message is committed to storage, so session.messages returns []
+and getLastUserRetryParts returns an empty array.  The previous code
+treated that as a silent no-op (cleared all retry state, Sisyphus stalled).
+
+Fix: when fetchedParts is empty, emit a structured log explaining the
+.git-directory race and fall back to a synthetic { type:"text", text:"continue" }
+part — matching the pattern already used by autoContinueAfterFallback in
+event.ts.  The fallback dispatch always proceeds regardless of whether
+the messages API can return user parts.
+
+Update four tests that fired two consecutive session.error events relying
+on the old silent-stop behaviour: add top-level model fields to the second
+error so the awaiting-fallback gate recognises it as coming from the
+dispatched fallback model and lets it through normally.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ src/hooks/runtime-fallback/auto-retry.ts | 119 ++++++++++++-----------
+ src/hooks/runtime-fallback/index.test.ts |  23 ++++-
+ 2 files changed, 84 insertions(+), 58 deletions(-)
+
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index 37ae55bf..f3fca8a9 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -155,68 +155,77 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+         query: { directory: ctx.directory },
+       })
+       const retryPayload = getLastUserRetryPayload(messagesResp, sessionID)
+-      const retryParts = retryPayload.retryParts
+-      if (retryParts.length > 0) {
+-        log(`[${HOOK_NAME}] Auto-retrying with fallback model (${source})`, {
+-          sessionID,
+-          model: newModel,
+-        })
++      const fetchedParts = retryPayload.retryParts
++      const retryParts =
++        fetchedParts.length > 0
++          ? fetchedParts
++          : (() => {
++              log(
++                `[${HOOK_NAME}] No user message parts found for auto-retry (${source}); using synthetic continuation`,
++                {
++                  sessionID,
++                  hint: "This can occur when the working directory contains .git and messages are not yet persisted",
++                },
++              )
++              return [{ type: "text" as const, text: "continue" }]
++            })()
++      log(`[${HOOK_NAME}] Auto-retrying with fallback model (${source})`, {
++        sessionID,
++        model: newModel,
++      })
+ 
+-        const retryAgent = resolvedAgent ?? getSessionAgent(sessionID)
+-        const launchAgent = resolveRegisteredAgentName(retryAgent)
+-        if (!hadAwaitingFallbackResult) {
+-          sessionAwaitingFallbackResult.add(sessionID)
+-          scheduleSessionFallbackTimeout(sessionID, retryAgent)
+-        }
++      const retryAgent = resolvedAgent ?? getSessionAgent(sessionID)
++      const launchAgent = resolveRegisteredAgentName(retryAgent)
++      if (!hadAwaitingFallbackResult) {
++        sessionAwaitingFallbackResult.add(sessionID)
++        scheduleSessionFallbackTimeout(sessionID, retryAgent)
++      }
+ 
+-        const promptResult = await dispatchInternalPrompt({
+-          mode: "async",
+-          client: ctx.client,
+-          sessionID,
+-          source: `runtime-fallback:${source}`,
+-          settleMs: 0,
+-          queueBehavior: "defer",
+-          input: {
+-            path: { id: sessionID },
+-            body: {
+-              ...(launchAgent ? { agent: launchAgent } : {}),
+-              ...retryModelPayload,
+-              ...(retryPayload.system ? { system: retryPayload.system } : {}),
+-              ...(retryPayload.tools ? { tools: retryPayload.tools } : {}),
+-              parts: retryParts,
+-            },
+-            query: { directory: ctx.directory },
++      const promptResult = await dispatchInternalPrompt({
++        mode: "async",
++        client: ctx.client,
++        sessionID,
++        source: `runtime-fallback:${source}`,
++        settleMs: 0,
++        queueBehavior: "defer",
++        input: {
++          path: { id: sessionID },
++          body: {
++            ...(launchAgent ? { agent: launchAgent } : {}),
++            ...retryModelPayload,
++            ...(retryPayload.system ? { system: retryPayload.system } : {}),
++            ...(retryPayload.tools ? { tools: retryPayload.tools } : {}),
++            parts: retryParts,
+           },
+-        })
+-        if (promptResult.status === "failed") {
+-          if (isAmbiguousPostDispatchPromptFailure(promptResult)) {
+-            retryMayHaveBeenAccepted = true
+-            log(`[${HOOK_NAME}] Auto-retry prompt failed after dispatch may have been accepted (${source}); preserving fallback state`, {
+-              sessionID,
+-              error: String(promptResult.error),
+-            })
+-          }
+-          throw promptResult.error
+-        }
+-        if (!isInternalPromptDispatchAccepted(promptResult)) {
+-          log(`[${HOOK_NAME}] Auto-retry skipped by promptAsync gate (${source})`, {
++          query: { directory: ctx.directory },
++        },
++      })
++      if (promptResult.status === "failed") {
++        if (isAmbiguousPostDispatchPromptFailure(promptResult)) {
++          retryMayHaveBeenAccepted = true
++          log(`[${HOOK_NAME}] Auto-retry prompt failed after dispatch may have been accepted (${source}); preserving fallback state`, {
+             sessionID,
+-            status: promptResult.status,
++            error: String(promptResult.error),
+           })
+-          return
+         }
+-        sessionAwaitingFallbackResult.add(sessionID)
+-        if (hadAwaitingFallbackResult) {
+-          scheduleSessionFallbackTimeout(sessionID, retryAgent)
+-        }
+-        const state = sessionStates.get(sessionID)
+-        if (state) {
+-          state.pendingFallbackPromptMayHaveBeenAccepted = false
+-        }
+-        retryDispatched = true
+-      } else {
+-        log(`[${HOOK_NAME}] No user message found for auto-retry (${source})`, { sessionID })
++        throw promptResult.error
++      }
++      if (!isInternalPromptDispatchAccepted(promptResult)) {
++        log(`[${HOOK_NAME}] Auto-retry skipped by promptAsync gate (${source})`, {
++          sessionID,
++          status: promptResult.status,
++        })
++        return
++      }
++      sessionAwaitingFallbackResult.add(sessionID)
++      if (hadAwaitingFallbackResult) {
++        scheduleSessionFallbackTimeout(sessionID, retryAgent)
++      }
++      const state = sessionStates.get(sessionID)
++      if (state) {
++        state.pendingFallbackPromptMayHaveBeenAccepted = false
+       }
++      retryDispatched = true
+     } catch (retryError) {
+       log(`[${HOOK_NAME}] Auto-retry failed (${source})`, { sessionID, error: String(retryError) })
+     } finally {
+diff --git a/src/hooks/runtime-fallback/index.test.ts b/src/hooks/runtime-fallback/index.test.ts
+index 967e2251..9a9a1ab8 100644
+--- a/src/hooks/runtime-fallback/index.test.ts
++++ b/src/hooks/runtime-fallback/index.test.ts
+@@ -380,6 +380,9 @@ describe("runtime-fallback", () => {
+           type: "session.error",
+           properties: {
+             sessionID,
++            // model at the top level so the awaiting-fallback gate recognises this
++            // as an error from the fallback model we just dispatched
++            model: "anthropic/claude-opus-4.7",
+             error: { name: "UnknownError", data: { message: "Model not found: anthropic/claude-opus-4.7." } },
+           },
+         },
+@@ -432,6 +435,9 @@ describe("runtime-fallback", () => {
+           type: "session.error",
+           properties: {
+             sessionID,
++            // model at the top level so the awaiting-fallback gate recognises this
++            // as an error from the fallback model we just dispatched
++            model: "anthropic/claude-opus-4.7",
+             error: {
+               name: "ProviderModelNotFoundError",
+               data: {
+@@ -2764,11 +2770,15 @@ describe("runtime-fallback", () => {
+         },
+       })
+ 
++      // Simulate the fallback session completing before the next error arrives
++      await hook.event({ event: { type: "session.idle", properties: { sessionID } } })
++
+       //#when - second error occurs immediately; tries to switch back to original model but should be in cooldown
+       await hook.event({
+         event: {
+           type: "session.error",
+-          properties: { sessionID, error: { statusCode: 429 } },
++          // model matches pendingFallbackModel so the awaiting-fallback gate lets this through
++          properties: { sessionID, model: "openai/gpt-5.4", error: { statusCode: 429 } },
+         },
+       })
+ 
+@@ -3158,14 +3168,21 @@ describe("runtime-fallback", () => {
+         },
+       })
+ 
+-      const autoRetryLog = logCalls.find((call) => call.msg.includes("No user message found for auto-retry"))
++      const autoRetryLog = logCalls.find((call) =>
++        call.msg.includes("No user message parts found for auto-retry") &&
++        call.msg.includes("using synthetic continuation"),
++      )
+       expect(autoRetryLog).toBeDefined()
+ 
++      // Simulate the fallback session completing before the next error arrives
++      await hook.event({ event: { type: "session.idle", properties: { sessionID } } })
++
+       //#when - second error fires after retry completed (retryInFlight cleared)
+       await hook.event({
+         event: {
+           type: "session.error",
+-          properties: { sessionID, error: { statusCode: 429, message: "Rate limit again" } },
++          // model matches pendingFallbackModel so the awaiting-fallback gate lets this through
++          properties: { sessionID, model: "provider-a/model-a", error: { statusCode: 429, message: "Rate limit again" } },
+         },
+       })
+ 
+-- 
+2.39.2
+

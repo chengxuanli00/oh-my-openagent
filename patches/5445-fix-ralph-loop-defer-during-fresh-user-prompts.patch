@@ -1,0 +1,271 @@
+From 9c19bd8c5137fb86427647ac8114642002a4843d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 18 May 2026 16:05:36 +0900
+Subject: [PATCH 5445/5749] fix(ralph-loop): defer during fresh user prompts
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../ralph-loop/ralph-loop-event-handler.ts    |  82 +++++++++++
+ .../ralph-loop/user-message-race.test.ts      | 128 ++++++++++++++++++
+ 2 files changed, 210 insertions(+)
+ create mode 100644 src/hooks/ralph-loop/user-message-race.test.ts
+
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index d4ec9ab9..9e5f73b9 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -1,5 +1,6 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { log } from "../../shared/logger"
++import { isRecord } from "../../shared/record-type-guard"
+ import { resolveMessageEventSessionID, resolveSessionEventID } from "../../shared/event-session-id"
+ import { isSessionActive } from "../shared/session-idle-settle"
+ import type { IterationCommitExpectation, RalphLoopOptions, RalphLoopState } from "./types"
+@@ -14,6 +15,7 @@ import { handlePendingVerification } from "./pending-verification-handler"
+ import { handleDeletedLoopSession, handleErroredLoopSession } from "./session-event-handler"
+ 
+ const RAPID_IDLE_DEDUP_MS = 500
++const USER_MESSAGE_IN_PROGRESS_WINDOW_MS = 2000
+ 
+ type LoopStateController = {
+ 	getState: () => RalphLoopState | null
+@@ -76,6 +78,78 @@ function isAbortError(error: unknown): boolean {
+ 		&& (error as { name?: unknown }).name === "MessageAbortedError"
+ }
+ 
++function getMessagesData(response: unknown): unknown[] {
++	if (Array.isArray(response)) {
++		return response
++	}
++	if (isRecord(response) && Array.isArray(response.data)) {
++		return response.data
++	}
++	return []
++}
++
++function getMessageRole(message: unknown): string | undefined {
++	if (!isRecord(message)) return undefined
++	const info = isRecord(message.info) ? message.info : undefined
++	return typeof info?.role === "string"
++		? info.role
++		: typeof message.role === "string"
++			? message.role
++			: undefined
++}
++
++function parseMessageCreatedAt(value: unknown): number | undefined {
++	if (typeof value === "number" && Number.isFinite(value)) {
++		return value
++	}
++	if (typeof value === "string") {
++		const parsed = Date.parse(value)
++		return Number.isFinite(parsed) ? parsed : undefined
++	}
++	if (value instanceof Date) {
++		return value.getTime()
++	}
++	return undefined
++}
++
++function getMessageCreatedAt(message: unknown): number | undefined {
++	if (!isRecord(message)) return undefined
++	const info = isRecord(message.info) ? message.info : undefined
++	const infoTime = isRecord(info?.time) ? info.time : undefined
++	const messageTime = isRecord(message.time) ? message.time : undefined
++	return parseMessageCreatedAt(infoTime?.created ?? messageTime?.created)
++}
++
++async function latestUserMessageIsInProgress(
++	ctx: PluginInput,
++	options: RalphLoopEventHandlerOptions,
++	sessionID: string,
++	now: number,
++): Promise<boolean> {
++	try {
++		const messagesResponse = await ctx.client.session.messages({
++			path: { id: sessionID },
++			query: { directory: options.directory },
++		})
++		const messages = getMessagesData(messagesResponse)
++		for (let index = messages.length - 1; index >= 0; index--) {
++			const message = messages[index]
++			const role = getMessageRole(message)
++			if (role === "user") {
++				const createdAt = getMessageCreatedAt(message)
++				return createdAt !== undefined && now - createdAt <= USER_MESSAGE_IN_PROGRESS_WINDOW_MS
++			}
++			if (role === "assistant" || role === "tool") {
++				return false
++			}
++		}
++		return false
++	} catch (error) {
++		log(`[${HOOK_NAME}] Failed to inspect recent user activity`, { sessionID, error: String(error) })
++		return false
++	}
++}
++
+ function showToastBestEffort(
+ 	ctx: PluginInput,
+ 	body: { title: string; message: string; variant: "warning" | "info"; duration: number },
+@@ -332,6 +406,10 @@ export function createRalphLoopEventHandler(
+ 					log(`[${HOOK_NAME}] Skipped: session became active during settle window`, { sessionID })
+ 					return
+ 				}
++				if (await latestUserMessageIsInProgress(ctx, options, sessionID, Date.now())) {
++					log(`[${HOOK_NAME}] Skipped: recent user message is still in progress`, { sessionID })
++					return
++				}
+ 				if (stateAfterSettle.verification_pending) {
+ 					log(`[${HOOK_NAME}] Skipped: state entered verification_pending during settle window`, { sessionID })
+ 					return
+@@ -508,6 +586,10 @@ export function createRalphLoopEventHandler(
+ 					log(`[${HOOK_NAME}] Skipped: session became active during settle window`, { sessionID })
+ 					return
+ 				}
++				if (await latestUserMessageIsInProgress(ctx, options, sessionID, Date.now())) {
++					log(`[${HOOK_NAME}] Skipped: recent user message is still in progress after runtime error`, { sessionID })
++					return
++				}
+ 				if (stateAfterSettle.verification_pending) {
+ 					log(`[${HOOK_NAME}] Skipped: state entered verification_pending during settle window`, { sessionID })
+ 					return
+diff --git a/src/hooks/ralph-loop/user-message-race.test.ts b/src/hooks/ralph-loop/user-message-race.test.ts
+new file mode 100644
+index 00000000..611623fa
+--- /dev/null
++++ b/src/hooks/ralph-loop/user-message-race.test.ts
+@@ -0,0 +1,128 @@
++/// <reference types="bun-types" />
++import { afterEach, beforeEach, describe, expect, test } from "bun:test"
++import { existsSync, mkdirSync, rmSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { releaseAllPromptAsyncReservationsForTesting } from "../shared/prompt-async-gate"
++import { createRalphLoopHook } from "./index"
++import { clearState } from "./storage"
++
++type PromptCall = {
++	sessionID: string
++	text: string
++}
++
++type SessionMessage = {
++	info?: {
++		role?: string
++		agent?: string
++		time?: { created?: number }
++	}
++}
++
++describe("ralph-loop user message race guard", () => {
++	const testDirectory = join(tmpdir(), `ralph-loop-user-message-race-${Date.now()}`)
++	let promptCalls: PromptCall[]
++	let messagesBySession: Record<string, SessionMessage[]>
++
++	beforeEach(() => {
++		promptCalls = []
++		messagesBySession = {}
++		mkdirSync(testDirectory, { recursive: true })
++		clearState(testDirectory)
++		releaseAllPromptAsyncReservationsForTesting()
++	})
++
++	afterEach(() => {
++		clearState(testDirectory)
++		releaseAllPromptAsyncReservationsForTesting()
++		if (existsSync(testDirectory)) {
++			rmSync(testDirectory, { recursive: true, force: true })
++		}
++	})
++
++	function createHook() {
++		return createRalphLoopHook({
++			directory: testDirectory,
++			project: testDirectory,
++			worktree: testDirectory,
++			serverUrl: "http://localhost:4096",
++			$: async () => ({}),
++			client: {
++				session: {
++					messages: async (options: { path: { id: string } }) => ({
++						data: messagesBySession[options.path.id] ?? [],
++					}),
++					promptAsync: async (options: {
++						path: { id: string }
++						body: { parts: Array<{ type: string; text: string }> }
++					}) => {
++						promptCalls.push({
++							sessionID: options.path.id,
++							text: options.body.parts[0]?.text ?? "",
++						})
++						return {}
++					},
++				},
++				tui: {
++					showToast: async () => ({}),
++				},
++			},
++		} as never, { idleSettleMs: 0 })
++	}
++
++	test("#given latest main-session message is a fresh user prompt #when loop idle fires #then continuation is deferred", async () => {
++		// given
++		const originalDateNow = Date.now
++		Date.now = () => 60_000
++		const hook = createHook()
++		hook.startLoop("session-123", "Keep working", {
++			messageCountAtStart: 0,
++			maxIterations: 5,
++		})
++		messagesBySession["session-123"] = [
++			{ info: { role: "user", time: { created: Date.now() - 1_000 } } },
++		]
++
++		try {
++			// when
++			await hook.event({
++				event: { type: "session.idle", properties: { sessionID: "session-123" } },
++			})
++
++			// then
++			expect(promptCalls).toHaveLength(0)
++			expect(hook.getState()?.iteration).toBe(1)
++		} finally {
++			Date.now = originalDateNow
++		}
++	})
++
++	test("#given assistant output is newer than a fresh user prompt #when loop idle fires #then continuation may dispatch", async () => {
++		// given
++		const originalDateNow = Date.now
++		Date.now = () => 60_000
++		const hook = createHook()
++		hook.startLoop("session-123", "Keep working", {
++			messageCountAtStart: 0,
++			maxIterations: 5,
++		})
++		messagesBySession["session-123"] = [
++			{ info: { role: "user", time: { created: Date.now() - 1_000 } } },
++			{ info: { role: "assistant", agent: "sisyphus", time: { created: Date.now() - 500 } } },
++		]
++
++		try {
++			// when
++			await hook.event({
++				event: { type: "session.idle", properties: { sessionID: "session-123" } },
++			})
++
++			// then
++			expect(promptCalls).toHaveLength(1)
++			expect(hook.getState()?.iteration).toBe(2)
++		} finally {
++			Date.now = originalDateNow
++		}
++	})
++})
+-- 
+2.39.2
+

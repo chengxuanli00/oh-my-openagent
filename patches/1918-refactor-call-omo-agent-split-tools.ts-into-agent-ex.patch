@@ -1,0 +1,932 @@
+From 6e0f6d53a76e305a12fcca92a41c4251444bab23 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 8 Feb 2026 16:24:13 +0900
+Subject: [PATCH 1918/5749] refactor(call-omo-agent): split tools.ts into agent
+ execution modules
+
+Extract agent call pipeline:
+- agent-type-normalizer.ts, tool-context-with-metadata.ts
+- subagent-session-creator.ts, subagent-session-prompter.ts
+- sync-agent-executor.ts, background-agent-executor.ts
+- session-completion-poller.ts, session-message-output-extractor.ts
+- message-storage-directory.ts
+---
+ .../call-omo-agent/agent-type-normalizer.ts   |  12 +
+ .../background-agent-executor.ts              |  81 +++++
+ .../message-storage-directory.ts              |  18 +
+ .../session-completion-poller.ts              |  76 ++++
+ .../session-message-output-extractor.ts       |  93 +++++
+ .../subagent-session-creator.ts               |  67 ++++
+ .../subagent-session-prompter.ts              |  26 ++
+ .../call-omo-agent/sync-agent-executor.ts     |  89 +++++
+ .../tool-context-with-metadata.ts             |  10 +
+ src/tools/call-omo-agent/tools.ts             | 340 +-----------------
+ 10 files changed, 482 insertions(+), 330 deletions(-)
+ create mode 100644 src/tools/call-omo-agent/agent-type-normalizer.ts
+ create mode 100644 src/tools/call-omo-agent/background-agent-executor.ts
+ create mode 100644 src/tools/call-omo-agent/message-storage-directory.ts
+ create mode 100644 src/tools/call-omo-agent/session-completion-poller.ts
+ create mode 100644 src/tools/call-omo-agent/session-message-output-extractor.ts
+ create mode 100644 src/tools/call-omo-agent/subagent-session-creator.ts
+ create mode 100644 src/tools/call-omo-agent/subagent-session-prompter.ts
+ create mode 100644 src/tools/call-omo-agent/sync-agent-executor.ts
+ create mode 100644 src/tools/call-omo-agent/tool-context-with-metadata.ts
+
+diff --git a/src/tools/call-omo-agent/agent-type-normalizer.ts b/src/tools/call-omo-agent/agent-type-normalizer.ts
+new file mode 100644
+index 00000000..ac40d536
+--- /dev/null
++++ b/src/tools/call-omo-agent/agent-type-normalizer.ts
+@@ -0,0 +1,12 @@
++import { ALLOWED_AGENTS } from "./constants"
++import type { AllowedAgentType } from "./types"
++
++export function normalizeAgentType(input: string): AllowedAgentType | null {
++	const lowered = input.toLowerCase()
++	for (const allowed of ALLOWED_AGENTS) {
++		if (allowed.toLowerCase() === lowered) {
++			return allowed
++		}
++	}
++	return null
++}
+diff --git a/src/tools/call-omo-agent/background-agent-executor.ts b/src/tools/call-omo-agent/background-agent-executor.ts
+new file mode 100644
+index 00000000..0993c7fe
+--- /dev/null
++++ b/src/tools/call-omo-agent/background-agent-executor.ts
+@@ -0,0 +1,81 @@
++import type { BackgroundManager } from "../../features/background-agent"
++import { findFirstMessageWithAgent, findNearestMessageWithFields } from "../../features/hook-message-injector"
++import { getSessionAgent } from "../../features/claude-code-session-state"
++import { log } from "../../shared"
++import type { CallOmoAgentArgs } from "./types"
++import type { ToolContextWithMetadata } from "./tool-context-with-metadata"
++import { getMessageDir } from "./message-storage-directory"
++
++export async function executeBackgroundAgent(
++	args: CallOmoAgentArgs,
++	toolContext: ToolContextWithMetadata,
++	manager: BackgroundManager,
++): Promise<string> {
++	try {
++		const messageDir = getMessageDir(toolContext.sessionID)
++		const prevMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
++		const firstMessageAgent = messageDir ? findFirstMessageWithAgent(messageDir) : null
++		const sessionAgent = getSessionAgent(toolContext.sessionID)
++		const parentAgent =
++			toolContext.agent ?? sessionAgent ?? firstMessageAgent ?? prevMessage?.agent
++
++		log("[call_omo_agent] parentAgent resolution", {
++			sessionID: toolContext.sessionID,
++			messageDir,
++			ctxAgent: toolContext.agent,
++			sessionAgent,
++			firstMessageAgent,
++			prevMessageAgent: prevMessage?.agent,
++			resolvedParentAgent: parentAgent,
++		})
++
++		const task = await manager.launch({
++			description: args.description,
++			prompt: args.prompt,
++			agent: args.subagent_type,
++			parentSessionID: toolContext.sessionID,
++			parentMessageID: toolContext.messageID,
++			parentAgent,
++		})
++
++		const waitStart = Date.now()
++		const waitTimeoutMs = 30_000
++		const waitIntervalMs = 50
++
++		let sessionId = task.sessionID
++		while (!sessionId && Date.now() - waitStart < waitTimeoutMs) {
++			if (toolContext.abort?.aborted) {
++				return `Task aborted while waiting for session to start.\n\nTask ID: ${task.id}`
++			}
++			const updated = manager.getTask(task.id)
++			if (updated?.status === "error" || updated?.status === "cancelled") {
++				return `Task failed to start (status: ${updated.status}).\n\nTask ID: ${task.id}`
++			}
++			await new Promise<void>((resolve) => {
++				setTimeout(resolve, waitIntervalMs)
++			})
++			sessionId = manager.getTask(task.id)?.sessionID
++		}
++
++		await toolContext.metadata?.({
++			title: args.description,
++			metadata: { sessionId: sessionId ?? "pending" },
++		})
++
++		return `Background agent task launched successfully.
++
++Task ID: ${task.id}
++Session ID: ${sessionId ?? "pending"}
++Description: ${task.description}
++Agent: ${task.agent} (subagent)
++Status: ${task.status}
++
++The system will notify you when the task completes.
++Use \`background_output\` tool with task_id="${task.id}" to check progress:
++- block=false (default): Check status immediately - returns full status info
++- block=true: Wait for completion (rarely needed since system notifies)`
++	} catch (error) {
++		const message = error instanceof Error ? error.message : String(error)
++		return `Failed to launch background agent task: ${message}`
++	}
++}
+diff --git a/src/tools/call-omo-agent/message-storage-directory.ts b/src/tools/call-omo-agent/message-storage-directory.ts
+new file mode 100644
+index 00000000..30fecd6e
+--- /dev/null
++++ b/src/tools/call-omo-agent/message-storage-directory.ts
+@@ -0,0 +1,18 @@
++import { existsSync, readdirSync } from "node:fs"
++import { join } from "node:path"
++import { MESSAGE_STORAGE } from "../../features/hook-message-injector"
++
++export function getMessageDir(sessionID: string): string | null {
++	if (!sessionID.startsWith("ses_")) return null
++	if (!existsSync(MESSAGE_STORAGE)) return null
++
++	const directPath = join(MESSAGE_STORAGE, sessionID)
++	if (existsSync(directPath)) return directPath
++
++	for (const dir of readdirSync(MESSAGE_STORAGE)) {
++		const sessionPath = join(MESSAGE_STORAGE, dir, sessionID)
++		if (existsSync(sessionPath)) return sessionPath
++	}
++
++	return null
++}
+diff --git a/src/tools/call-omo-agent/session-completion-poller.ts b/src/tools/call-omo-agent/session-completion-poller.ts
+new file mode 100644
+index 00000000..7b40c265
+--- /dev/null
++++ b/src/tools/call-omo-agent/session-completion-poller.ts
+@@ -0,0 +1,76 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared"
++
++function getSessionStatusType(statusResult: unknown, sessionID: string): string | null {
++	if (typeof statusResult !== "object" || statusResult === null) return null
++	if (!("data" in statusResult)) return null
++	const data = (statusResult as { data?: unknown }).data
++	if (typeof data !== "object" || data === null) return null
++	const record = data as Record<string, unknown>
++	const entry = record[sessionID]
++	if (typeof entry !== "object" || entry === null) return null
++	const typeValue = (entry as Record<string, unknown>)["type"]
++	return typeof typeValue === "string" ? typeValue : null
++}
++
++function getMessagesArray(result: unknown): unknown[] {
++	if (Array.isArray(result)) return result
++	if (typeof result !== "object" || result === null) return []
++	if (!("data" in result)) return []
++	const data = (result as { data?: unknown }).data
++	return Array.isArray(data) ? data : []
++}
++
++export async function waitForSessionCompletion(
++	ctx: PluginInput,
++	options: {
++		sessionID: string
++		abortSignal?: AbortSignal
++		maxPollTimeMs: number
++		pollIntervalMs: number
++		stabilityRequired: number
++	},
++): Promise<{ ok: true } | { ok: false; reason: "aborted" | "timeout" }> {
++	const pollStart = Date.now()
++	let lastMsgCount = 0
++	let stablePolls = 0
++
++	while (Date.now() - pollStart < options.maxPollTimeMs) {
++		if (options.abortSignal?.aborted) {
++			log("[call_omo_agent] Aborted by user")
++			return { ok: false, reason: "aborted" }
++		}
++
++		await new Promise<void>((resolve) => {
++			setTimeout(resolve, options.pollIntervalMs)
++		})
++
++		const statusResult = await ctx.client.session.status()
++		const sessionStatusType = getSessionStatusType(statusResult, options.sessionID)
++
++		if (sessionStatusType && sessionStatusType !== "idle") {
++			stablePolls = 0
++			lastMsgCount = 0
++			continue
++		}
++
++		const messagesCheck = await ctx.client.session.messages({
++			path: { id: options.sessionID },
++		})
++		const currentMsgCount = getMessagesArray(messagesCheck).length
++
++		if (currentMsgCount > 0 && currentMsgCount === lastMsgCount) {
++			stablePolls++
++			if (stablePolls >= options.stabilityRequired) {
++				log("[call_omo_agent] Session complete", { messageCount: currentMsgCount })
++				return { ok: true }
++			}
++		} else {
++			stablePolls = 0
++			lastMsgCount = currentMsgCount
++		}
++	}
++
++	log("[call_omo_agent] Timeout reached")
++	return { ok: false, reason: "timeout" }
++}
+diff --git a/src/tools/call-omo-agent/session-message-output-extractor.ts b/src/tools/call-omo-agent/session-message-output-extractor.ts
+new file mode 100644
+index 00000000..3cc2347a
+--- /dev/null
++++ b/src/tools/call-omo-agent/session-message-output-extractor.ts
+@@ -0,0 +1,93 @@
++import { consumeNewMessages, type CursorMessage } from "../../shared/session-cursor"
++
++type SessionMessagePart = {
++	type: string
++	text?: string
++	content?: unknown
++}
++
++export type SessionMessage = CursorMessage & {
++	info?: CursorMessage["info"] & { role?: string }
++	parts?: SessionMessagePart[]
++}
++
++function getRole(message: SessionMessage): string | null {
++	const role = message.info?.role
++	return typeof role === "string" ? role : null
++}
++
++function getCreatedTime(message: SessionMessage): number {
++	const time = message.info?.time
++	if (typeof time === "number") return time
++	if (typeof time === "string") return Number(time) || 0
++	const created = time?.created
++	if (typeof created === "number") return created
++	if (typeof created === "string") return Number(created) || 0
++	return 0
++}
++
++function isRelevantRole(role: string | null): boolean {
++	return role === "assistant" || role === "tool"
++}
++
++function extractTextFromParts(parts: SessionMessagePart[] | undefined): string[] {
++	if (!parts) return []
++	const extracted: string[] = []
++
++	for (const part of parts) {
++		if ((part.type === "text" || part.type === "reasoning") && part.text) {
++			extracted.push(part.text)
++			continue
++		}
++		if (part.type !== "tool_result") continue
++		const content = part.content
++		if (typeof content === "string" && content) {
++			extracted.push(content)
++			continue
++		}
++		if (!Array.isArray(content)) continue
++		for (const block of content) {
++			if (typeof block !== "object" || block === null) continue
++			const record = block as Record<string, unknown>
++			const typeValue = record["type"]
++			const textValue = record["text"]
++			if (
++				(typeValue === "text" || typeValue === "reasoning") &&
++				typeof textValue === "string" &&
++				textValue
++			) {
++				extracted.push(textValue)
++			}
++		}
++	}
++
++	return extracted
++}
++
++export function extractNewSessionOutput(
++	sessionID: string,
++	messages: SessionMessage[],
++): { output: string; hasNewOutput: boolean } {
++	const relevantMessages = messages.filter((message) =>
++		isRelevantRole(getRole(message)),
++	)
++	if (relevantMessages.length === 0) {
++		return { output: "", hasNewOutput: false }
++	}
++
++	const sortedMessages = [...relevantMessages].sort(
++		(a, b) => getCreatedTime(a) - getCreatedTime(b),
++	)
++	const newMessages = consumeNewMessages(sessionID, sortedMessages)
++	if (newMessages.length === 0) {
++		return { output: "", hasNewOutput: false }
++	}
++
++	const chunks: string[] = []
++	for (const message of newMessages) {
++		chunks.push(...extractTextFromParts(message.parts))
++	}
++
++	const output = chunks.filter((text) => text.length > 0).join("\n\n")
++	return { output, hasNewOutput: output.length > 0 }
++}
+diff --git a/src/tools/call-omo-agent/subagent-session-creator.ts b/src/tools/call-omo-agent/subagent-session-creator.ts
+new file mode 100644
+index 00000000..908060da
+--- /dev/null
++++ b/src/tools/call-omo-agent/subagent-session-creator.ts
+@@ -0,0 +1,67 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared"
++import type { CallOmoAgentArgs } from "./types"
++import type { ToolContextWithMetadata } from "./tool-context-with-metadata"
++
++export async function resolveOrCreateSessionId(
++	ctx: PluginInput,
++	args: CallOmoAgentArgs,
++	toolContext: ToolContextWithMetadata,
++): Promise<{ ok: true; sessionID: string } | { ok: false; error: string }> {
++	if (args.session_id) {
++		log(`[call_omo_agent] Using existing session: ${args.session_id}`)
++		const sessionResult = await ctx.client.session.get({
++			path: { id: args.session_id },
++		})
++		if (sessionResult.error) {
++			log("[call_omo_agent] Session get error", { error: sessionResult.error })
++			return {
++				ok: false,
++				error: `Error: Failed to get existing session: ${sessionResult.error}`,
++			}
++		}
++		return { ok: true, sessionID: args.session_id }
++	}
++
++	log(`[call_omo_agent] Creating new session with parent: ${toolContext.sessionID}`)
++	const parentSession = await ctx.client.session
++		.get({ path: { id: toolContext.sessionID } })
++		.catch((err) => {
++			log("[call_omo_agent] Failed to get parent session", { error: String(err) })
++			return null
++		})
++	const parentDirectory = parentSession?.data?.directory ?? ctx.directory
++
++	const body = {
++		parentID: toolContext.sessionID,
++		title: `${args.description} (@${args.subagent_type} subagent)`,
++	}
++
++	const createResult = await ctx.client.session.create({
++		body,
++		query: { directory: parentDirectory },
++	})
++
++	if (createResult.error) {
++		log("[call_omo_agent] Session create error", { error: createResult.error })
++		const errorStr = String(createResult.error)
++		if (errorStr.toLowerCase().includes("unauthorized")) {
++			return {
++				ok: false,
++				error: `Error: Failed to create session (Unauthorized). This may be due to:
++1. OAuth token restrictions (e.g., Claude Code credentials are restricted to Claude Code only)
++2. Provider authentication issues
++3. Session permission inheritance problems
++
++Try using a different provider or API key authentication.
++
++Original error: ${createResult.error}`,
++			}
++		}
++		return { ok: false, error: `Error: Failed to create session: ${createResult.error}` }
++	}
++
++	const sessionID = createResult.data.id
++	log(`[call_omo_agent] Created session: ${sessionID}`)
++	return { ok: true, sessionID }
++}
+diff --git a/src/tools/call-omo-agent/subagent-session-prompter.ts b/src/tools/call-omo-agent/subagent-session-prompter.ts
+new file mode 100644
+index 00000000..ce8e3796
+--- /dev/null
++++ b/src/tools/call-omo-agent/subagent-session-prompter.ts
+@@ -0,0 +1,26 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log, getAgentToolRestrictions } from "../../shared"
++
++export async function promptSubagentSession(
++	ctx: PluginInput,
++	options: { sessionID: string; agent: string; prompt: string },
++): Promise<{ ok: true } | { ok: false; error: string }> {
++	try {
++		await ctx.client.session.promptAsync({
++			path: { id: options.sessionID },
++			body: {
++				agent: options.agent,
++				tools: {
++					...getAgentToolRestrictions(options.agent),
++					task: false,
++				},
++				parts: [{ type: "text", text: options.prompt }],
++			},
++		})
++		return { ok: true }
++	} catch (error) {
++		const errorMessage = error instanceof Error ? error.message : String(error)
++		log("[call_omo_agent] Prompt error", { error: errorMessage })
++		return { ok: false, error: errorMessage }
++	}
++}
+diff --git a/src/tools/call-omo-agent/sync-agent-executor.ts b/src/tools/call-omo-agent/sync-agent-executor.ts
+new file mode 100644
+index 00000000..9b1a1bd6
+--- /dev/null
++++ b/src/tools/call-omo-agent/sync-agent-executor.ts
+@@ -0,0 +1,89 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared"
++import { extractNewSessionOutput, type SessionMessage } from "./session-message-output-extractor"
++import { waitForSessionCompletion } from "./session-completion-poller"
++import { resolveOrCreateSessionId } from "./subagent-session-creator"
++import { promptSubagentSession } from "./subagent-session-prompter"
++import type { CallOmoAgentArgs } from "./types"
++import type { ToolContextWithMetadata } from "./tool-context-with-metadata"
++
++function buildTaskMetadata(sessionID: string): string {
++	return ["<task_metadata>", `session_id: ${sessionID}`, "</task_metadata>"].join(
++		"\n",
++	)
++}
++
++function getMessagesArray(result: unknown): SessionMessage[] {
++	if (Array.isArray(result)) return result as SessionMessage[]
++	if (typeof result !== "object" || result === null) return []
++	if (!("data" in result)) return []
++	const data = (result as { data?: unknown }).data
++	return Array.isArray(data) ? (data as SessionMessage[]) : []
++}
++
++export async function executeSyncAgent(
++	args: CallOmoAgentArgs,
++	toolContext: ToolContextWithMetadata,
++	ctx: PluginInput,
++): Promise<string> {
++	const sessionResult = await resolveOrCreateSessionId(ctx, args, toolContext)
++	if (!sessionResult.ok) {
++		return sessionResult.error
++	}
++	const sessionID = sessionResult.sessionID
++
++	await toolContext.metadata?.({
++		title: args.description,
++		metadata: { sessionId: sessionID },
++	})
++
++	log(`[call_omo_agent] Sending prompt to session ${sessionID}`)
++	log("[call_omo_agent] Prompt preview", { preview: args.prompt.substring(0, 100) })
++
++	const promptResult = await promptSubagentSession(ctx, {
++		sessionID,
++		agent: args.subagent_type,
++		prompt: args.prompt,
++	})
++	if (!promptResult.ok) {
++		const errorMessage = promptResult.error
++		if (errorMessage.includes("agent.name") || errorMessage.includes("undefined")) {
++			return `Error: Agent "${args.subagent_type}" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.\n\n${buildTaskMetadata(sessionID)}`
++		}
++		return `Error: Failed to send prompt: ${errorMessage}\n\n${buildTaskMetadata(sessionID)}`
++	}
++
++	log("[call_omo_agent] Prompt sent, polling for completion...")
++	const completion = await waitForSessionCompletion(ctx, {
++		sessionID,
++		abortSignal: toolContext.abort,
++		maxPollTimeMs: 5 * 60 * 1000,
++		pollIntervalMs: 500,
++		stabilityRequired: 3,
++	})
++	if (!completion.ok) {
++		if (completion.reason === "aborted") {
++			return `Task aborted.\n\n${buildTaskMetadata(sessionID)}`
++		}
++		return `Error: Agent task timed out after 5 minutes.\n\n${buildTaskMetadata(sessionID)}`
++	}
++
++	const messagesResult = await ctx.client.session.messages({
++		path: { id: sessionID },
++	})
++	if (messagesResult.error) {
++		log("[call_omo_agent] Messages error", { error: messagesResult.error })
++		return `Error: Failed to get messages: ${messagesResult.error}`
++	}
++
++	const messages = getMessagesArray(messagesResult)
++	log("[call_omo_agent] Got messages", { count: messages.length })
++
++	const extracted = extractNewSessionOutput(sessionID, messages)
++	if (!extracted.hasNewOutput) {
++		return `No new output since last check.\n\n${buildTaskMetadata(sessionID)}`
++	}
++
++	log("[call_omo_agent] Got response", { length: extracted.output.length })
++	return `${extracted.output}\n\n${buildTaskMetadata(sessionID)}`
++}
+diff --git a/src/tools/call-omo-agent/tool-context-with-metadata.ts b/src/tools/call-omo-agent/tool-context-with-metadata.ts
+new file mode 100644
+index 00000000..e3f771b2
+--- /dev/null
++++ b/src/tools/call-omo-agent/tool-context-with-metadata.ts
+@@ -0,0 +1,10 @@
++export type ToolContextWithMetadata = {
++	sessionID: string
++	messageID: string
++	agent: string
++	abort: AbortSignal
++	metadata?: (input: {
++		title?: string
++		metadata?: Record<string, unknown>
++	}) => void
++}
+diff --git a/src/tools/call-omo-agent/tools.ts b/src/tools/call-omo-agent/tools.ts
+index 64fa74a4..242b4d5c 100644
+--- a/src/tools/call-omo-agent/tools.ts
++++ b/src/tools/call-omo-agent/tools.ts
+@@ -1,36 +1,12 @@
+ import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin"
+-import { existsSync, readdirSync } from "node:fs"
+-import { join } from "node:path"
+ import { ALLOWED_AGENTS, CALL_OMO_AGENT_DESCRIPTION } from "./constants"
+ import type { CallOmoAgentArgs } from "./types"
+ import type { BackgroundManager } from "../../features/background-agent"
+-import { log, getAgentToolRestrictions } from "../../shared"
+-import { consumeNewMessages } from "../../shared/session-cursor"
+-import { findFirstMessageWithAgent, findNearestMessageWithFields, MESSAGE_STORAGE } from "../../features/hook-message-injector"
+-import { getSessionAgent } from "../../features/claude-code-session-state"
+-
+-function getMessageDir(sessionID: string): string | null {
+-  if (!sessionID.startsWith("ses_")) return null
+-  if (!existsSync(MESSAGE_STORAGE)) return null
+-
+-  const directPath = join(MESSAGE_STORAGE, sessionID)
+-  if (existsSync(directPath)) return directPath
+-
+-  for (const dir of readdirSync(MESSAGE_STORAGE)) {
+-    const sessionPath = join(MESSAGE_STORAGE, dir, sessionID)
+-    if (existsSync(sessionPath)) return sessionPath
+-  }
+-
+-  return null
+-}
+-
+-type ToolContextWithMetadata = {
+-  sessionID: string
+-  messageID: string
+-  agent: string
+-  abort: AbortSignal
+-  metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void
+-}
++import { log } from "../../shared"
++import { normalizeAgentType } from "./agent-type-normalizer"
++import { executeBackgroundAgent } from "./background-agent-executor"
++import { executeSyncAgent } from "./sync-agent-executor"
++import type { ToolContextWithMetadata } from "./tool-context-with-metadata"
+ 
+ export function createCallOmoAgent(
+   ctx: PluginInput,
+@@ -58,317 +34,21 @@ export function createCallOmoAgent(
+       const toolCtx = toolContext as ToolContextWithMetadata
+       log(`[call_omo_agent] Starting with agent: ${args.subagent_type}, background: ${args.run_in_background}`)
+ 
+-      // Case-insensitive agent validation - allows "Explore", "EXPLORE", "explore" etc.
+-      if (![...ALLOWED_AGENTS].some(
+-        (name) => name.toLowerCase() === args.subagent_type.toLowerCase()
+-      )) {
++      const normalizedAgent = normalizeAgentType(args.subagent_type)
++      if (!normalizedAgent) {
+         return `Error: Invalid agent type "${args.subagent_type}". Only ${ALLOWED_AGENTS.join(", ")} are allowed.`
+       }
+-      
+-      const normalizedAgent = args.subagent_type.toLowerCase() as typeof ALLOWED_AGENTS[number]
++
+       args = { ...args, subagent_type: normalizedAgent }
+ 
+       if (args.run_in_background) {
+         if (args.session_id) {
+           return `Error: session_id is not supported in background mode. Use run_in_background=false to continue an existing session.`
+         }
+-        return await executeBackground(args, toolCtx, backgroundManager)
++        return await executeBackgroundAgent(args, toolCtx, backgroundManager)
+       }
+ 
+-      return await executeSync(args, toolCtx, ctx)
++      return await executeSyncAgent(args, toolCtx, ctx)
+     },
+   })
+ }
+-
+-async function executeBackground(
+-  args: CallOmoAgentArgs,
+-  toolContext: ToolContextWithMetadata,
+-  manager: BackgroundManager
+-): Promise<string> {
+-  try {
+-    const messageDir = getMessageDir(toolContext.sessionID)
+-    const prevMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
+-    const firstMessageAgent = messageDir ? findFirstMessageWithAgent(messageDir) : null
+-    const sessionAgent = getSessionAgent(toolContext.sessionID)
+-    const parentAgent = toolContext.agent ?? sessionAgent ?? firstMessageAgent ?? prevMessage?.agent
+-    
+-    log("[call_omo_agent] parentAgent resolution", {
+-      sessionID: toolContext.sessionID,
+-      messageDir,
+-      ctxAgent: toolContext.agent,
+-      sessionAgent,
+-      firstMessageAgent,
+-      prevMessageAgent: prevMessage?.agent,
+-      resolvedParentAgent: parentAgent,
+-    })
+-
+-    const task = await manager.launch({
+-      description: args.description,
+-      prompt: args.prompt,
+-      agent: args.subagent_type,
+-      parentSessionID: toolContext.sessionID,
+-      parentMessageID: toolContext.messageID,
+-      parentAgent,
+-    })
+-
+-    const WAIT_FOR_SESSION_INTERVAL_MS = 50
+-    const WAIT_FOR_SESSION_TIMEOUT_MS = 30000
+-    const waitStart = Date.now()
+-    let sessionId = task.sessionID
+-    while (!sessionId && Date.now() - waitStart < WAIT_FOR_SESSION_TIMEOUT_MS) {
+-      if (toolContext.abort?.aborted) {
+-        return `Task aborted while waiting for session to start.\n\nTask ID: ${task.id}`
+-      }
+-      const updated = manager.getTask(task.id)
+-      if (updated?.status === "error" || updated?.status === "cancelled") {
+-        return `Task failed to start (status: ${updated.status}).\n\nTask ID: ${task.id}`
+-      }
+-      await new Promise(resolve => setTimeout(resolve, WAIT_FOR_SESSION_INTERVAL_MS))
+-      sessionId = manager.getTask(task.id)?.sessionID
+-    }
+-
+-    await toolContext.metadata?.({
+-      title: args.description,
+-      metadata: { sessionId: sessionId ?? "pending" },
+-    })
+-
+-    return `Background agent task launched successfully.
+-
+-Task ID: ${task.id}
+-Session ID: ${sessionId ?? "pending"}
+-Description: ${task.description}
+-Agent: ${task.agent} (subagent)
+-Status: ${task.status}
+-
+-The system will notify you when the task completes.
+-Use \`background_output\` tool with task_id="${task.id}" to check progress:
+-- block=false (default): Check status immediately - returns full status info
+-- block=true: Wait for completion (rarely needed since system notifies)`
+-  } catch (error) {
+-    const message = error instanceof Error ? error.message : String(error)
+-    return `Failed to launch background agent task: ${message}`
+-  }
+-}
+-
+-async function executeSync(
+-  args: CallOmoAgentArgs,
+-  toolContext: ToolContextWithMetadata,
+-  ctx: PluginInput
+-): Promise<string> {
+-  let sessionID: string
+-
+-  if (args.session_id) {
+-    log(`[call_omo_agent] Using existing session: ${args.session_id}`)
+-    const sessionResult = await ctx.client.session.get({
+-      path: { id: args.session_id },
+-    })
+-    if (sessionResult.error) {
+-      log(`[call_omo_agent] Session get error:`, sessionResult.error)
+-      return `Error: Failed to get existing session: ${sessionResult.error}`
+-    }
+-    sessionID = args.session_id
+-  } else {
+-    log(`[call_omo_agent] Creating new session with parent: ${toolContext.sessionID}`)
+-    const parentSession = await ctx.client.session.get({
+-      path: { id: toolContext.sessionID },
+-    }).catch((err) => {
+-      log(`[call_omo_agent] Failed to get parent session:`, err)
+-      return null
+-    })
+-    log(`[call_omo_agent] Parent session dir: ${parentSession?.data?.directory}, fallback: ${ctx.directory}`)
+-    const parentDirectory = parentSession?.data?.directory ?? ctx.directory
+-
+-    const createResult = await ctx.client.session.create({
+-      body: {
+-        parentID: toolContext.sessionID,
+-        title: `${args.description} (@${args.subagent_type} subagent)`,
+-        permission: [
+-          { permission: "question", action: "deny" as const, pattern: "*" },
+-        ],
+-      } as any,
+-      query: {
+-        directory: parentDirectory,
+-      },
+-    })
+-
+-    if (createResult.error) {
+-      log(`[call_omo_agent] Session create error:`, createResult.error)
+-      const errorStr = String(createResult.error)
+-      if (errorStr.toLowerCase().includes("unauthorized")) {
+-        return `Error: Failed to create session (Unauthorized). This may be due to:
+-1. OAuth token restrictions (e.g., Claude Code credentials are restricted to Claude Code only)
+-2. Provider authentication issues
+-3. Session permission inheritance problems
+-
+-Try using a different provider or API key authentication.
+-
+-Original error: ${createResult.error}`
+-      }
+-      return `Error: Failed to create session: ${createResult.error}`
+-    }
+-
+-    sessionID = createResult.data.id
+-    log(`[call_omo_agent] Created session: ${sessionID}`)
+-  }
+-
+-  await toolContext.metadata?.({
+-    title: args.description,
+-    metadata: { sessionId: sessionID },
+-  })
+-
+-  log(`[call_omo_agent] Sending prompt to session ${sessionID}`)
+-  log(`[call_omo_agent] Prompt text:`, args.prompt.substring(0, 100))
+-
+-   try {
+-     await (ctx.client.session as any).promptAsync({
+-       path: { id: sessionID },
+-       body: {
+-         agent: args.subagent_type,
+-         tools: {
+-           ...getAgentToolRestrictions(args.subagent_type),
+-           task: false,
+-         },
+-         parts: [{ type: "text", text: args.prompt }],
+-       },
+-     })
+-  } catch (error) {
+-    const errorMessage = error instanceof Error ? error.message : String(error)
+-    log(`[call_omo_agent] Prompt error:`, errorMessage)
+-    if (errorMessage.includes("agent.name") || errorMessage.includes("undefined")) {
+-      return `Error: Agent "${args.subagent_type}" not found. Make sure the agent is registered in your opencode.json or provided by a plugin.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+-    }
+-    return `Error: Failed to send prompt: ${errorMessage}\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+-  }
+-
+-  log(`[call_omo_agent] Prompt sent, polling for completion...`)
+-
+-  // Poll for session completion
+-  const POLL_INTERVAL_MS = 500
+-  const MAX_POLL_TIME_MS = 5 * 60 * 1000 // 5 minutes max
+-  const pollStart = Date.now()
+-  let lastMsgCount = 0
+-  let stablePolls = 0
+-  const STABILITY_REQUIRED = 3
+-
+-  while (Date.now() - pollStart < MAX_POLL_TIME_MS) {
+-    // Check if aborted
+-    if (toolContext.abort?.aborted) {
+-      log(`[call_omo_agent] Aborted by user`)
+-      return `Task aborted.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+-    }
+-
+-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
+-
+-    // Check session status
+-    const statusResult = await ctx.client.session.status()
+-    const allStatuses = (statusResult.data ?? {}) as Record<string, { type: string }>
+-    const sessionStatus = allStatuses[sessionID]
+-
+-    // If session is actively running, reset stability counter
+-    if (sessionStatus && sessionStatus.type !== "idle") {
+-      stablePolls = 0
+-      lastMsgCount = 0
+-      continue
+-    }
+-
+-    // Session is idle - check message stability
+-    const messagesCheck = await ctx.client.session.messages({ path: { id: sessionID } })
+-    const msgs = ((messagesCheck as { data?: unknown }).data ?? messagesCheck) as Array<unknown>
+-    const currentMsgCount = msgs.length
+-
+-    if (currentMsgCount > 0 && currentMsgCount === lastMsgCount) {
+-      stablePolls++
+-      if (stablePolls >= STABILITY_REQUIRED) {
+-        log(`[call_omo_agent] Session complete, ${currentMsgCount} messages`)
+-        break
+-      }
+-    } else {
+-      stablePolls = 0
+-      lastMsgCount = currentMsgCount
+-    }
+-  }
+-
+-  if (Date.now() - pollStart >= MAX_POLL_TIME_MS) {
+-    log(`[call_omo_agent] Timeout reached`)
+-    return `Error: Agent task timed out after 5 minutes.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+-  }
+-
+-  const messagesResult = await ctx.client.session.messages({
+-    path: { id: sessionID },
+-  })
+-
+-  if (messagesResult.error) {
+-    log(`[call_omo_agent] Messages error:`, messagesResult.error)
+-    return `Error: Failed to get messages: ${messagesResult.error}`
+-  }
+-
+-  const messages = messagesResult.data
+-  log(`[call_omo_agent] Got ${messages.length} messages`)
+-
+-  // Include both assistant messages AND tool messages
+-  // Tool results (grep, glob, bash output) come from role "tool"
+-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+-  const relevantMessages = messages.filter(
+-    (m: any) => m.info?.role === "assistant" || m.info?.role === "tool"
+-  )
+-
+-  if (relevantMessages.length === 0) {
+-    log(`[call_omo_agent] No assistant or tool messages found`)
+-    log(`[call_omo_agent] All messages:`, JSON.stringify(messages, null, 2))
+-    return `Error: No assistant or tool response found\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+-  }
+-
+-  log(`[call_omo_agent] Found ${relevantMessages.length} relevant messages`)
+-
+-  // Sort by time ascending (oldest first) to process messages in order
+-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+-  const sortedMessages = [...relevantMessages].sort((a: any, b: any) => {
+-    const timeA = a.info?.time?.created ?? 0
+-    const timeB = b.info?.time?.created ?? 0
+-    return timeA - timeB
+-  })
+-
+-  const newMessages = consumeNewMessages(sessionID, sortedMessages)
+-
+-  if (newMessages.length === 0) {
+-    return `No new output since last check.\n\n<task_metadata>\nsession_id: ${sessionID}\n</task_metadata>`
+-  }
+-
+-  // Extract content from ALL messages, not just the last one
+-  // Tool results may be in earlier messages while the final message is empty
+-  const extractedContent: string[] = []
+-
+-  for (const message of newMessages) {
+-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+-    for (const part of (message as any).parts ?? []) {
+-      // Handle both "text" and "reasoning" parts (thinking models use "reasoning")
+-      if ((part.type === "text" || part.type === "reasoning") && part.text) {
+-        extractedContent.push(part.text)
+-      } else if (part.type === "tool_result") {
+-        // Tool results contain the actual output from tool calls
+-        const toolResult = part as { content?: string | Array<{ type: string; text?: string }> }
+-        if (typeof toolResult.content === "string" && toolResult.content) {
+-          extractedContent.push(toolResult.content)
+-        } else if (Array.isArray(toolResult.content)) {
+-          // Handle array of content blocks
+-          for (const block of toolResult.content) {
+-            if ((block.type === "text" || block.type === "reasoning") && block.text) {
+-              extractedContent.push(block.text)
+-            }
+-          }
+-        }
+-      }
+-    }
+-  }
+-
+-  const responseText = extractedContent
+-    .filter((text) => text.length > 0)
+-    .join("\n\n")
+-
+-  log(`[call_omo_agent] Got response, length: ${responseText.length}`)
+-
+-  const output =
+-    responseText + "\n\n" + ["<task_metadata>", `session_id: ${sessionID}`, "</task_metadata>"].join("\n")
+-
+-  return output
+-}
+-- 
+2.39.2
+

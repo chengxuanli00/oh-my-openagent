@@ -1,0 +1,328 @@
+From c63108d55b6fea3b076768946d8e1689993ecd56 Mon Sep 17 00:00:00 2001
+From: Disaster-Terminator <2557058999@qq.com>
+Date: Sat, 18 Apr 2026 16:39:43 +0800
+Subject: [PATCH 5255/5749] fix(tmux): track placeholder panes before attach
+ readiness
+
+---
+ .../tmux-subagent/polling-manager.test.ts     | 121 ++++++++++++++++++
+ src/features/tmux-subagent/polling-manager.ts |  26 +++-
+ .../tmux-subagent/tracked-session-state.ts    |   1 +
+ src/features/tmux-subagent/types.ts           |   1 +
+ src/shared/tmux/tmux-utils/session-spawn.ts   |  11 +-
+ src/shared/tmux/tmux-utils/window-spawn.ts    |   9 +-
+ 6 files changed, 153 insertions(+), 16 deletions(-)
+
+diff --git a/src/features/tmux-subagent/polling-manager.test.ts b/src/features/tmux-subagent/polling-manager.test.ts
+index e3ed4e76..69526610 100644
+--- a/src/features/tmux-subagent/polling-manager.test.ts
++++ b/src/features/tmux-subagent/polling-manager.test.ts
+@@ -336,4 +336,125 @@ describe("TmuxPollingManager overlap", () => {
+     expect(closedSessionIds).toEqual([])
+     expect(sessions.has("ses-1")).toBe(true)
+   })
++
++  test("does not close immediately when first status is delayed after focused activation", async () => {
++    //#given
++    const originalDateNow = Date.now
++    let now = 0
++    Date.now = () => now
++
++    try {
++      const sessions = new Map<string, TrackedSession>()
++      const tracked: TrackedSession = {
++        sessionId: "ses-1",
++        paneId: "%1",
++        description: "test",
++        attachActivated: false,
++        createdAt: new Date(0),
++        lastSeenAt: new Date(0),
++        closePending: false,
++        closeRetryCount: 0,
++      }
++      sessions.set("ses-1", tracked)
++
++      let activationCount = 0
++      let statusCalls = 0
++      const closedSessionIds: string[] = []
++      const getWindowState = async (): Promise<WindowState> => ({
++        windowWidth: 220,
++        windowHeight: 44,
++        mainPane: { paneId: "%0", width: 110, height: 44, left: 0, top: 0, title: "main", isActive: false },
++        agentPanes: [{ paneId: "%1", width: 110, height: 44, left: 110, top: 0, title: "agent", isActive: true }],
++      })
++
++      const client = {
++        session: {
++          status: async () => {
++            statusCalls += 1
++            now += 3_000
++            if (statusCalls <= 3) {
++              return { data: {} }
++            }
++            return { data: { "ses-1": { type: "running" } } }
++          },
++          messages: async () => ({ data: [] }),
++        },
++      }
++
++      const manager = new TmuxPollingManager(
++        client as unknown as import("../../tools/delegate-task/types").OpencodeClient,
++        sessions,
++        async (sessionId) => {
++          closedSessionIds.push(sessionId)
++        },
++        getWindowState,
++        async () => {
++          activationCount += 1
++          return true
++        },
++      )
++
++      //#when
++      const pollSessions = (manager as unknown as { pollSessions: () => Promise<void> }).pollSessions
++      await pollSessions.call(manager)
++      await pollSessions.call(manager)
++      await pollSessions.call(manager)
++      await pollSessions.call(manager)
++
++      //#then
++      expect(activationCount).toBe(1)
++      expect(tracked.attachActivated).toBe(true)
++      expect(closedSessionIds).toEqual([])
++      expect(sessions.has("ses-1")).toBe(true)
++    } finally {
++      Date.now = originalDateNow
++    }
++  })
++
++  test("can still close non-activated sessions once status is idle and stable", async () => {
++    //#given
++    const sessions = new Map<string, TrackedSession>()
++    sessions.set("ses-1", {
++      sessionId: "ses-1",
++      paneId: "%1",
++      description: "test",
++      attachActivated: false,
++      createdAt: new Date(Date.now() - 15_000),
++      lastSeenAt: new Date(),
++      closePending: false,
++      closeRetryCount: 0,
++      activityVersion: 0,
++    })
++
++    const closedSessionIds: string[] = []
++    const client = {
++      session: {
++        status: async () => ({ data: { "ses-1": { type: "idle" } } }),
++        messages: async () => ({ data: [] }),
++      },
++    }
++
++    const manager = new TmuxPollingManager(
++      client as unknown as import("../../tools/delegate-task/types").OpencodeClient,
++      sessions,
++      async (sessionId) => {
++        closedSessionIds.push(sessionId)
++      },
++    )
++
++    manager.handleEvent({
++      type: "message.part.delta",
++      properties: { sessionID: "ses-1", field: "text", delta: "done" },
++    })
++
++    //#when
++    const pollSessions = (manager as unknown as { pollSessions: () => Promise<void> }).pollSessions
++    await pollSessions.call(manager)
++    await pollSessions.call(manager)
++    await pollSessions.call(manager)
++    await pollSessions.call(manager)
++
++    //#then
++    expect(closedSessionIds).toEqual(["ses-1"])
++  })
+ })
+diff --git a/src/features/tmux-subagent/polling-manager.ts b/src/features/tmux-subagent/polling-manager.ts
+index 384ef7c2..9c457a20 100644
+--- a/src/features/tmux-subagent/polling-manager.ts
++++ b/src/features/tmux-subagent/polling-manager.ts
+@@ -2,6 +2,7 @@ import type { OpencodeClient } from "../../tools/delegate-task/types"
+ import {
+   POLL_INTERVAL_BACKGROUND_MS,
+   SESSION_MISSING_GRACE_MS,
++  SESSION_READY_TIMEOUT_MS,
+   SESSION_TIMEOUT_MS,
+ } from "../../shared/tmux"
+ import type { TrackedSession, WindowState } from "./types"
+@@ -76,15 +77,30 @@ export class TmuxPollingManager {
+       const sessionsToClose: string[] = []
+ 
+       for (const [sessionId, tracked] of this.sessions.entries()) {
+-        if (!tracked.attachActivated) {
+-          log("[tmux-session-manager] skipping close checks for non-activated pane", {
++        const status = allStatuses[sessionId]
++        const elapsedMs = now - tracked.createdAt.getTime()
++        if (!tracked.attachActivated && !status) {
++          log("[tmux-session-manager] placeholder pane has not been activated yet; skipping close checks", {
+             sessionId,
+             paneId: tracked.paneId,
++            elapsedMs,
++          })
++          continue
++        }
++
++        const attachElapsedMs = tracked.attachActivatedAt
++          ? now - tracked.attachActivatedAt.getTime()
++          : undefined
++        if (tracked.attachActivated && !status && attachElapsedMs !== undefined && attachElapsedMs < SESSION_READY_TIMEOUT_MS) {
++          log("[tmux-session-manager] waiting for first post-activation session status", {
++            sessionId,
++            paneId: tracked.paneId,
++            attachElapsedMs,
++            graceMs: SESSION_READY_TIMEOUT_MS,
+           })
+           continue
+         }
+ 
+-        const status = allStatuses[sessionId]
+         const isIdle = status?.type === "idle"
+ 
+         if (status) {
+@@ -93,8 +109,7 @@ export class TmuxPollingManager {
+ 
+         const missingSince = !status ? now - tracked.lastSeenAt.getTime() : 0
+         const missingTooLong = missingSince >= SESSION_MISSING_GRACE_MS
+-        const isTimedOut = now - tracked.createdAt.getTime() > SESSION_TIMEOUT_MS
+-        const elapsedMs = now - tracked.createdAt.getTime()
++        const isTimedOut = elapsedMs > SESSION_TIMEOUT_MS
+ 
+         let shouldCloseViaStability = false
+ 
+@@ -217,6 +232,7 @@ export class TmuxPollingManager {
+       const activated = await this.activateSessionPane(tracked)
+       if (activated) {
+         tracked.attachActivated = true
++        tracked.attachActivatedAt = new Date()
+         tracked.lastSeenAt = new Date()
+         tracked.stableIdlePolls = 0
+         tracked.observedIdleActivityVersion = tracked.activityVersion
+diff --git a/src/features/tmux-subagent/tracked-session-state.ts b/src/features/tmux-subagent/tracked-session-state.ts
+index 9def399e..383a6eba 100644
+--- a/src/features/tmux-subagent/tracked-session-state.ts
++++ b/src/features/tmux-subagent/tracked-session-state.ts
+@@ -13,6 +13,7 @@ export function createTrackedSession(params: {
+     paneId: params.paneId,
+     description: params.description,
+     attachActivated: false,
++    attachActivatedAt: undefined,
+     createdAt: now,
+     lastSeenAt: now,
+     closePending: false,
+diff --git a/src/features/tmux-subagent/types.ts b/src/features/tmux-subagent/types.ts
+index 36cc4939..27567afa 100644
+--- a/src/features/tmux-subagent/types.ts
++++ b/src/features/tmux-subagent/types.ts
+@@ -3,6 +3,7 @@ export interface TrackedSession {
+   paneId: string
+   description: string
+   attachActivated: boolean
++  attachActivatedAt?: Date
+   createdAt: Date
+   lastSeenAt: Date
+   closePending: boolean
+diff --git a/src/shared/tmux/tmux-utils/session-spawn.ts b/src/shared/tmux/tmux-utils/session-spawn.ts
+index 333330bc..27f68cc0 100644
+--- a/src/shared/tmux/tmux-utils/session-spawn.ts
++++ b/src/shared/tmux/tmux-utils/session-spawn.ts
+@@ -4,7 +4,7 @@ import type { SpawnPaneResult } from "../types"
+ import type { runTmuxCommand as RunTmuxCommand } from "../runner"
+ import { isInsideTmux } from "./environment"
+ import { isServerRunning } from "./server-health"
+-import { shellSingleQuote } from "../../shell-env"
++import { buildTmuxPlaceholderCommand } from "./pane-command"
+ 
+ const ISOLATED_SESSION_NAME_PREFIX = "omo-agents"
+ 
+@@ -61,7 +61,7 @@ export async function spawnTmuxSession(
+ 	description: string,
+ 	config: TmuxConfig,
+ 	serverUrl: string,
+-	directory: string,
++	_directory: string,
+ 	sourcePaneId?: string,
+ 	depsInput?: Partial<SpawnTmuxSessionDeps>,
+ ): Promise<SpawnPaneResult> {
+@@ -98,8 +98,7 @@ export async function spawnTmuxSession(
+ 
+ 	log("[spawnTmuxSession] all checks passed, creating isolated session...")
+ 
+-	const effectiveDirectory = directory || process.cwd()
+-	const opencodeCmd = `opencode attach ${shellSingleQuote(serverUrl)} --session ${shellSingleQuote(sessionId)} --dir ${shellSingleQuote(effectiveDirectory)}`
++	const placeholderCmd = buildTmuxPlaceholderCommand(description)
+ 
+ 	const sizeArgs: string[] = []
+ 	if (sourcePaneId) {
+@@ -118,7 +117,7 @@ export async function spawnTmuxSession(
+ 			"-t", isolatedSessionName,
+ 			"-P",
+ 			"-F", "#{pane_id}",
+-			opencodeCmd,
++			placeholderCmd,
+ 		]
+ 		: [
+ 			"new-session",
+@@ -127,7 +126,7 @@ export async function spawnTmuxSession(
+ 			...sizeArgs,
+ 			"-P",
+ 			"-F", "#{pane_id}",
+-			opencodeCmd,
++			placeholderCmd,
+ 		]
+ 
+ 	log("[spawnTmuxSession] spawning", {
+diff --git a/src/shared/tmux/tmux-utils/window-spawn.ts b/src/shared/tmux/tmux-utils/window-spawn.ts
+index 8c07faef..b2eecd88 100644
+--- a/src/shared/tmux/tmux-utils/window-spawn.ts
++++ b/src/shared/tmux/tmux-utils/window-spawn.ts
+@@ -3,8 +3,8 @@ import { getTmuxPath } from "../../../tools/interactive-bash/tmux-path-resolver"
+ import type { SpawnPaneResult } from "../types"
+ import { isInsideTmux } from "./environment"
+ import { isServerRunning } from "./server-health"
+-import { shellSingleQuote } from "../../shell-env"
+ import type { runTmuxCommand as RunTmuxCommand } from "../runner"
++import { buildTmuxPlaceholderCommand } from "./pane-command"
+ 
+ const ISOLATED_WINDOW_NAME = "omo-agents"
+ 
+@@ -37,7 +37,7 @@ export async function spawnTmuxWindow(
+ 	description: string,
+ 	config: TmuxConfig,
+ 	serverUrl: string,
+-	directory: string,
++	_directory: string,
+ 	depsInput?: Partial<SpawnTmuxWindowDeps>,
+ ): Promise<SpawnPaneResult> {
+ 	const deps = await resolveSpawnTmuxWindowDeps(depsInput)
+@@ -73,8 +73,7 @@ export async function spawnTmuxWindow(
+ 
+ 	log("[spawnTmuxWindow] all checks passed, creating isolated window...")
+ 
+-	const effectiveDirectory = directory || process.cwd()
+-	const opencodeCmd = `opencode attach ${shellSingleQuote(serverUrl)} --session ${shellSingleQuote(sessionId)} --dir ${shellSingleQuote(effectiveDirectory)}`
++	const placeholderCmd = buildTmuxPlaceholderCommand(description)
+ 
+ 	const args = [
+ 		"new-window",
+@@ -82,7 +81,7 @@ export async function spawnTmuxWindow(
+ 		"-n", ISOLATED_WINDOW_NAME,
+ 		"-P",
+ 		"-F", "#{pane_id}",
+-		opencodeCmd,
++		placeholderCmd,
+ 	]
+ 
+ 	const result = await runTmuxCommand(tmux, args)
+-- 
+2.39.2
+

@@ -1,0 +1,466 @@
+From 829c58ccb0be1f96b412bd46a9544e89e515276c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 26 Mar 2026 12:04:50 +0900
+Subject: [PATCH 3513/5749] refactor(aliases): migrate to pattern-based model
+ alias resolution
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Move from hardcoded exact aliases to pattern-based canonicalization:
+
+- Populate PATTERN_ALIAS_RULES with regex patterns for:
+  - Claude thinking variants (claude-opus-4-6-thinking → claude-opus-4-6)
+  - Gemini tier suffixes (gemini-3.1-pro-{high,low} → gemini-3.1-pro)
+- Add stripProviderPrefixForAliasLookup() for provider-prefixed models
+  (anthropic/claude-sonnet-4-6 → claude-sonnet-4-6 for capability lookup)
+- Preserve requestedModelID (with prefix) for API transport
+- Reduce EXACT_ALIAS_RULES to exceptional cases only
+  (gemini-3-pro-{high,low} → gemini-3-pro-preview)
+- Comprehensive test coverage for patterns, prefix stripping, negatives
+
+Addresses Discussion #2835 (pattern matching architecture)
+Related to PR #2834 (alias guardrails)
+
+41 targeted tests pass, 4467 full suite tests pass, tsc clean.
+---
+ .../doctor/checks/model-resolution.test.ts    | 42 +++++++++++
+ src/shared/model-capabilities.test.ts         | 59 ++++++++++++++-
+ src/shared/model-capability-aliases.test.ts   | 73 +++++++++++++++++--
+ src/shared/model-capability-aliases.ts        | 59 ++++++++-------
+ .../model-capability-guardrails.test.ts       | 40 ++++++++--
+ 5 files changed, 231 insertions(+), 42 deletions(-)
+
+diff --git a/src/cli/doctor/checks/model-resolution.test.ts b/src/cli/doctor/checks/model-resolution.test.ts
+index 696e8c4d..b64b1fa1 100644
+--- a/src/cli/doctor/checks/model-resolution.test.ts
++++ b/src/cli/doctor/checks/model-resolution.test.ts
+@@ -142,6 +142,48 @@ describe("model-resolution check", () => {
+         snapshot: { source: "bundled-snapshot" },
+       })
+     })
++
++    it("keeps provider-prefixed overrides for transport while capability diagnostics use pattern aliases", async () => {
++      const { getModelResolutionInfoWithOverrides } = await import("./model-resolution")
++
++      const info = getModelResolutionInfoWithOverrides({
++        categories: {
++          "visual-engineering": { model: "google/gemini-3.1-pro-high" },
++        },
++      })
++
++      const visual = info.categories.find((category) => category.name === "visual-engineering")
++      expect(visual).toBeDefined()
++      expect(visual!.effectiveModel).toBe("google/gemini-3.1-pro-high")
++      expect(visual!.capabilityDiagnostics).toMatchObject({
++        resolutionMode: "alias-backed",
++        canonicalization: {
++          source: "pattern-alias",
++          ruleID: "gemini-3.1-pro-tier-alias",
++        },
++      })
++    })
++
++    it("keeps provider-prefixed Claude overrides for transport while capability diagnostics canonicalize to bare IDs", async () => {
++      const { getModelResolutionInfoWithOverrides } = await import("./model-resolution")
++
++      const info = getModelResolutionInfoWithOverrides({
++        agents: {
++          oracle: { model: "anthropic/claude-opus-4-6-thinking" },
++        },
++      })
++
++      const oracle = info.agents.find((agent) => agent.name === "oracle")
++      expect(oracle).toBeDefined()
++      expect(oracle!.effectiveModel).toBe("anthropic/claude-opus-4-6-thinking")
++      expect(oracle!.capabilityDiagnostics).toMatchObject({
++        resolutionMode: "alias-backed",
++        canonicalization: {
++          source: "pattern-alias",
++          ruleID: "claude-thinking-legacy-alias",
++        },
++      })
++    })
+   })
+ 
+   describe("checkModelResolution", () => {
+diff --git a/src/shared/model-capabilities.test.ts b/src/shared/model-capabilities.test.ts
+index 35dc40f8..196b1349 100644
+--- a/src/shared/model-capabilities.test.ts
++++ b/src/shared/model-capabilities.test.ts
+@@ -178,8 +178,8 @@ describe("getModelCapabilities", () => {
+     expect(result.diagnostics).toMatchObject({
+       resolutionMode: "alias-backed",
+       canonicalization: {
+-        source: "exact-alias",
+-        ruleID: "claude-opus-4-6-thinking-legacy-alias",
++        source: "pattern-alias",
++        ruleID: "claude-thinking-legacy-alias",
+       },
+       snapshot: { source: "bundled-snapshot" },
+     })
+@@ -202,13 +202,63 @@ describe("getModelCapabilities", () => {
+     expect(result.diagnostics).toMatchObject({
+       resolutionMode: "alias-backed",
+       canonicalization: {
+-        source: "exact-alias",
++        source: "pattern-alias",
+         ruleID: "gemini-3.1-pro-tier-alias",
+       },
+       snapshot: { source: "bundled-snapshot" },
+     })
+   })
+ 
++  test("canonicalizes provider-prefixed gemini aliases without changing the transport-facing request", () => {
++    const result = getModelCapabilities({
++      providerID: "google",
++      modelID: "google/gemini-3.1-pro-high",
++      bundledSnapshot,
++    })
++
++    expect(result).toMatchObject({
++      requestedModelID: "google/gemini-3.1-pro-high",
++      canonicalModelID: "gemini-3.1-pro",
++      family: "gemini",
++      supportsThinking: true,
++      supportsTemperature: true,
++      maxOutputTokens: 65_000,
++    })
++    expect(result.diagnostics).toMatchObject({
++      resolutionMode: "alias-backed",
++      canonicalization: {
++        source: "pattern-alias",
++        ruleID: "gemini-3.1-pro-tier-alias",
++      },
++      snapshot: { source: "bundled-snapshot" },
++    })
++  })
++
++  test("canonicalizes provider-prefixed Claude thinking aliases to bare snapshot IDs", () => {
++    const result = getModelCapabilities({
++      providerID: "anthropic",
++      modelID: "anthropic/claude-opus-4-6-thinking",
++      bundledSnapshot,
++    })
++
++    expect(result).toMatchObject({
++      requestedModelID: "anthropic/claude-opus-4-6-thinking",
++      canonicalModelID: "claude-opus-4-6",
++      family: "claude-opus",
++      supportsThinking: true,
++      supportsTemperature: true,
++      maxOutputTokens: 128_000,
++    })
++    expect(result.diagnostics).toMatchObject({
++      resolutionMode: "alias-backed",
++      canonicalization: {
++        source: "pattern-alias",
++        ruleID: "claude-thinking-legacy-alias",
++      },
++      snapshot: { source: "bundled-snapshot" },
++    })
++  })
++
+   test("prefers runtime models.dev cache over bundled snapshot", () => {
+     const runtimeSnapshot: ModelCapabilitiesSnapshot = {
+       ...bundledSnapshot,
+@@ -272,7 +322,8 @@ describe("getModelCapabilities", () => {
+     })
+ 
+     expect(result).toMatchObject({
+-      canonicalModelID: "openai/o3-mini",
++      requestedModelID: "openai/o3-mini",
++      canonicalModelID: "o3-mini",
+       family: "openai-reasoning",
+       variants: ["low", "medium", "high"],
+       reasoningEfforts: ["none", "minimal", "low", "medium", "high"],
+diff --git a/src/shared/model-capability-aliases.test.ts b/src/shared/model-capability-aliases.test.ts
+index 9e563fc0..6d05c3ab 100644
+--- a/src/shared/model-capability-aliases.test.ts
++++ b/src/shared/model-capability-aliases.test.ts
+@@ -13,17 +13,49 @@ describe("model-capability-aliases", () => {
+     })
+   })
+ 
+-  test("normalizes exact local tier aliases to canonical models.dev IDs", () => {
++  test("strips provider prefixes when the input is already canonical", () => {
++    const result = resolveModelIDAlias("anthropic/claude-sonnet-4-6")
++
++    expect(result).toEqual({
++      requestedModelID: "anthropic/claude-sonnet-4-6",
++      canonicalModelID: "claude-sonnet-4-6",
++      source: "canonical",
++    })
++  })
++
++  test("normalizes gemini tier aliases through a pattern rule", () => {
+     const result = resolveModelIDAlias("gemini-3.1-pro-high")
+ 
+     expect(result).toEqual({
+       requestedModelID: "gemini-3.1-pro-high",
+       canonicalModelID: "gemini-3.1-pro",
+-      source: "exact-alias",
++      source: "pattern-alias",
++      ruleID: "gemini-3.1-pro-tier-alias",
++    })
++  })
++
++  test("normalizes provider-prefixed gemini tier aliases to bare canonical IDs", () => {
++    const result = resolveModelIDAlias("google/gemini-3.1-pro-high")
++
++    expect(result).toEqual({
++      requestedModelID: "google/gemini-3.1-pro-high",
++      canonicalModelID: "gemini-3.1-pro",
++      source: "pattern-alias",
+       ruleID: "gemini-3.1-pro-tier-alias",
+     })
+   })
+ 
++  test("keeps exceptional gemini preview aliases as exact rules", () => {
++    const result = resolveModelIDAlias("gemini-3-pro-high")
++
++    expect(result).toEqual({
++      requestedModelID: "gemini-3-pro-high",
++      canonicalModelID: "gemini-3-pro-preview",
++      source: "exact-alias",
++      ruleID: "gemini-3-pro-tier-alias",
++    })
++  })
++
+   test("does not resolve prototype keys as aliases", () => {
+     const result = resolveModelIDAlias("constructor")
+ 
+@@ -34,14 +66,45 @@ describe("model-capability-aliases", () => {
+     })
+   })
+ 
+-  test("normalizes legacy Claude thinking aliases through a named exact rule", () => {
++  test("normalizes provider-prefixed Claude thinking aliases through a pattern rule", () => {
++    const result = resolveModelIDAlias("anthropic/claude-opus-4-6-thinking")
++
++    expect(result).toEqual({
++      requestedModelID: "anthropic/claude-opus-4-6-thinking",
++      canonicalModelID: "claude-opus-4-6",
++      source: "pattern-alias",
++      ruleID: "claude-thinking-legacy-alias",
++    })
++  })
++
++  test("does not pattern-match nearby canonical Claude IDs incorrectly", () => {
++    const result = resolveModelIDAlias("claude-opus-4-6-think")
++
++    expect(result).toEqual({
++      requestedModelID: "claude-opus-4-6-think",
++      canonicalModelID: "claude-opus-4-6-think",
++      source: "canonical",
++    })
++  })
++
++  test("does not pattern-match canonical gemini preview IDs incorrectly", () => {
++    const result = resolveModelIDAlias("gemini-3.1-pro-preview")
++
++    expect(result).toEqual({
++      requestedModelID: "gemini-3.1-pro-preview",
++      canonicalModelID: "gemini-3.1-pro-preview",
++      source: "canonical",
++    })
++  })
++
++  test("normalizes legacy Claude thinking aliases through a pattern rule", () => {
+     const result = resolveModelIDAlias("claude-opus-4-6-thinking")
+ 
+     expect(result).toEqual({
+       requestedModelID: "claude-opus-4-6-thinking",
+       canonicalModelID: "claude-opus-4-6",
+-      source: "exact-alias",
+-      ruleID: "claude-opus-4-6-thinking-legacy-alias",
++      source: "pattern-alias",
++      ruleID: "claude-thinking-legacy-alias",
+     })
+   })
+ })
+diff --git a/src/shared/model-capability-aliases.ts b/src/shared/model-capability-aliases.ts
+index 953b5a30..4f9f1c75 100644
+--- a/src/shared/model-capability-aliases.ts
++++ b/src/shared/model-capability-aliases.ts
+@@ -20,18 +20,6 @@ export type ModelIDAliasResolution = {
+ }
+ 
+ const EXACT_ALIAS_RULES: ReadonlyArray<ExactAliasRule> = [
+-  {
+-    aliasModelID: "gemini-3.1-pro-high",
+-    ruleID: "gemini-3.1-pro-tier-alias",
+-    canonicalModelID: "gemini-3.1-pro",
+-    rationale: "OmO historically encoded Gemini tier selection in the model name instead of variant metadata.",
+-  },
+-  {
+-    aliasModelID: "gemini-3.1-pro-low",
+-    ruleID: "gemini-3.1-pro-tier-alias",
+-    canonicalModelID: "gemini-3.1-pro",
+-    rationale: "OmO historically encoded Gemini tier selection in the model name instead of variant metadata.",
+-  },
+   {
+     aliasModelID: "gemini-3-pro-high",
+     ruleID: "gemini-3-pro-tier-alias",
+@@ -44,30 +32,47 @@ const EXACT_ALIAS_RULES: ReadonlyArray<ExactAliasRule> = [
+     canonicalModelID: "gemini-3-pro-preview",
+     rationale: "Legacy Gemini 3 tier suffixes still need to land on the canonical preview model.",
+   },
+-  {
+-    aliasModelID: "claude-opus-4-6-thinking",
+-    ruleID: "claude-opus-4-6-thinking-legacy-alias",
+-    canonicalModelID: "claude-opus-4-6",
+-    rationale: "OmO historically used a legacy compatibility suffix before models.dev shipped canonical thinking variants for newer Claude families.",
+-  },
+ ]
+ 
+ const EXACT_ALIAS_RULES_BY_MODEL: ReadonlyMap<string, ExactAliasRule> = new Map(
+   EXACT_ALIAS_RULES.map((rule) => [rule.aliasModelID, rule]),
+ )
+ 
+-const PATTERN_ALIAS_RULES: ReadonlyArray<PatternAliasRule> = []
++const PATTERN_ALIAS_RULES: ReadonlyArray<PatternAliasRule> = [
++  {
++    ruleID: "claude-thinking-legacy-alias",
++    description: "Normalizes the legacy Claude Opus 4.6 thinking suffix to the canonical snapshot ID.",
++    match: (normalizedModelID) => /^claude-opus-4-6-thinking$/.test(normalizedModelID),
++    canonicalize: () => "claude-opus-4-6",
++  },
++  {
++    ruleID: "gemini-3.1-pro-tier-alias",
++    description: "Normalizes Gemini 3.1 Pro tier suffixes to the canonical snapshot ID.",
++    match: (normalizedModelID) => /^gemini-3\.1-pro-(?:high|low)$/.test(normalizedModelID),
++    canonicalize: () => "gemini-3.1-pro",
++  },
++]
+ 
+ function normalizeLookupModelID(modelID: string): string {
+   return modelID.trim().toLowerCase()
+ }
+ 
++function stripProviderPrefixForAliasLookup(normalizedModelID: string): string {
++  const slashIndex = normalizedModelID.indexOf("/")
++  if (slashIndex <= 0 || slashIndex === normalizedModelID.length - 1) {
++    return normalizedModelID
++  }
++
++  return normalizedModelID.slice(slashIndex + 1)
++}
++
+ export function resolveModelIDAlias(modelID: string): ModelIDAliasResolution {
+-  const normalizedModelID = normalizeLookupModelID(modelID)
+-  const exactRule = EXACT_ALIAS_RULES_BY_MODEL.get(normalizedModelID)
++  const requestedModelID = normalizeLookupModelID(modelID)
++  const aliasLookupModelID = stripProviderPrefixForAliasLookup(requestedModelID)
++  const exactRule = EXACT_ALIAS_RULES_BY_MODEL.get(aliasLookupModelID)
+   if (exactRule) {
+     return {
+-      requestedModelID: normalizedModelID,
++      requestedModelID,
+       canonicalModelID: exactRule.canonicalModelID,
+       source: "exact-alias",
+       ruleID: exactRule.ruleID,
+@@ -75,21 +80,21 @@ export function resolveModelIDAlias(modelID: string): ModelIDAliasResolution {
+   }
+ 
+   for (const rule of PATTERN_ALIAS_RULES) {
+-    if (!rule.match(normalizedModelID)) {
++    if (!rule.match(aliasLookupModelID)) {
+       continue
+     }
+ 
+     return {
+-      requestedModelID: normalizedModelID,
+-      canonicalModelID: rule.canonicalize(normalizedModelID),
++      requestedModelID,
++      canonicalModelID: rule.canonicalize(aliasLookupModelID),
+       source: "pattern-alias",
+       ruleID: rule.ruleID,
+     }
+   }
+ 
+   return {
+-    requestedModelID: normalizedModelID,
+-    canonicalModelID: normalizedModelID,
++    requestedModelID,
++    canonicalModelID: aliasLookupModelID,
+     source: "canonical",
+   }
+ }
+diff --git a/src/shared/model-capability-guardrails.test.ts b/src/shared/model-capability-guardrails.test.ts
+index 06a9c07e..a37534d9 100644
+--- a/src/shared/model-capability-guardrails.test.ts
++++ b/src/shared/model-capability-guardrails.test.ts
+@@ -29,7 +29,7 @@ describe("model-capability-guardrails", () => {
+     const brokenSnapshot: ModelCapabilitiesSnapshot = {
+       ...bundledSnapshot,
+       models: Object.fromEntries(
+-        Object.entries(bundledSnapshot.models).filter(([modelID]) => modelID !== "gemini-3.1-pro"),
++        Object.entries(bundledSnapshot.models).filter(([modelID]) => modelID !== "gemini-3-pro-preview"),
+       ),
+     }
+ 
+@@ -41,13 +41,13 @@ describe("model-capability-guardrails", () => {
+     expect(issues).toContainEqual(
+       expect.objectContaining({
+         kind: "alias-target-missing-from-snapshot",
+-        aliasModelID: "gemini-3.1-pro-high",
+-        canonicalModelID: "gemini-3.1-pro",
++        aliasModelID: "gemini-3-pro-high",
++        canonicalModelID: "gemini-3-pro-preview",
+       }),
+     )
+   })
+ 
+-  test("flags exact aliases when models.dev gains a canonical entry for the alias itself", () => {
++  test("flags pattern aliases when models.dev gains a canonical entry for the alias itself", () => {
+     const bundledSnapshot = getBundledModelCapabilitiesSnapshot()
+     const aliasCollisionSnapshot: ModelCapabilitiesSnapshot = {
+       ...bundledSnapshot,
+@@ -68,13 +68,41 @@ describe("model-capability-guardrails", () => {
+ 
+     expect(issues).toContainEqual(
+       expect.objectContaining({
+-        kind: "exact-alias-collides-with-snapshot",
+-        aliasModelID: "gemini-3.1-pro-high",
++        kind: "pattern-alias-collides-with-snapshot",
++        modelID: "gemini-3.1-pro-high",
+         canonicalModelID: "gemini-3.1-pro",
+       }),
+     )
+   })
+ 
++  test("flags exact aliases when models.dev gains a canonical entry for the alias itself", () => {
++    const bundledSnapshot = getBundledModelCapabilitiesSnapshot()
++    const aliasCollisionSnapshot: ModelCapabilitiesSnapshot = {
++      ...bundledSnapshot,
++      models: {
++        ...bundledSnapshot.models,
++        "gemini-3-pro-high": {
++          id: "gemini-3-pro-high",
++          family: "gemini",
++          reasoning: true,
++        },
++      },
++    }
++
++    const issues = collectModelCapabilityGuardrailIssues({
++      snapshot: aliasCollisionSnapshot,
++      requirementModelIDs: [],
++    })
++
++    expect(issues).toContainEqual(
++      expect.objectContaining({
++        kind: "exact-alias-collides-with-snapshot",
++        aliasModelID: "gemini-3-pro-high",
++        canonicalModelID: "gemini-3-pro-preview",
++      }),
++    )
++  })
++
+   test("flags built-in requirement models that rely on aliases instead of canonical IDs", () => {
+     const issues = collectModelCapabilityGuardrailIssues({
+       requirementModelIDs: ["gemini-3.1-pro-high"],
+-- 
+2.39.2
+

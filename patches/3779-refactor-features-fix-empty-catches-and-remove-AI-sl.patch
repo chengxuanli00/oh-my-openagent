@@ -1,0 +1,251 @@
+From c7afc795beb271330c4595c209198af3c088ce14 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 3 Apr 2026 21:42:10 +0900
+Subject: [PATCH 3779/5749] refactor(features): fix empty catches and remove AI
+ slop from manager modules
+
+---
+ src/features/background-agent/manager.ts | 69 ++++++++++++------------
+ src/features/tmux-subagent/manager.ts    | 40 +++++++-------
+ 2 files changed, 57 insertions(+), 52 deletions(-)
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 62170003..dc4d23d6 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -191,6 +191,19 @@ export class BackgroundManager {
+     this.registerProcessCleanup()
+   }
+ 
++  private async abortSessionWithLogging(sessionID: string, reason: string): Promise<void> {
++    try {
++      await this.client.session.abort({
++        path: { id: sessionID },
++      })
++    } catch (error) {
++      log(`[background-agent] Failed to abort session during ${reason}:`, {
++        sessionID,
++        error,
++      })
++    }
++  }
++
+   async assertCanSpawn(parentSessionID: string): Promise<SubagentSpawnContext> {
+     const spawnContext = await resolveSubagentSpawnContext(this.client, parentSessionID)
+     const maxDepth = getMaxSubagentDepth(this.config)
+@@ -448,11 +461,7 @@ export class BackgroundManager {
+     const sessionID = createResult.data.id
+ 
+     if (task.status === "cancelled") {
+-      await this.client.session.abort({
+-        path: { id: sessionID },
+-      }).catch((error) => {
+-        log("[background-agent] Failed to abort cancelled pre-start session:", error)
+-      })
++      await this.abortSessionWithLogging(sessionID, "cancelled pre-start cleanup")
+       this.concurrencyManager.release(concurrencyKey)
+       return
+     }
+@@ -570,9 +579,7 @@ export class BackgroundManager {
+ 
+         // Abort the session to prevent infinite polling hang
+         // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+-        await this.client.session.abort({
+-          path: { id: sessionID },
+-        }).catch(() => {})
++        await this.abortSessionWithLogging(sessionID, "launch error cleanup")
+ 
+         this.markForNotification(existingTask)
+         this.enqueueNotificationForParent(existingTask.parentSessionID, () => this.notifyParentSession(existingTask)).catch(err => {
+@@ -853,9 +860,7 @@ export class BackgroundManager {
+       // Abort the session to prevent infinite polling hang
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+       if (existingTask.sessionID) {
+-        await this.client.session.abort({
+-          path: { id: existingTask.sessionID },
+-        }).catch(() => {})
++        await this.abortSessionWithLogging(existingTask.sessionID, "resume error cleanup")
+       }
+ 
+       this.markForNotification(existingTask)
+@@ -879,7 +884,11 @@ export class BackgroundManager {
+         (t) => t.status !== "completed" && t.status !== "cancelled"
+       )
+       return incomplete.length > 0
+-    } catch {
++    } catch (error) {
++      log("[background-agent] Failed to check session todos:", {
++        sessionID,
++        error,
++      })
+       return false
+     }
+   }
+@@ -1269,7 +1278,6 @@ export class BackgroundManager {
+         return false
+       }
+ 
+-      // Additionally check that at least one message has content (not just empty)
+       // OpenCode API uses different part types than Anthropic's API:
+       // - "reasoning" with .text property (thinking/reasoning content)
+       // - "tool" with .state.output property (tool call results)
+@@ -1438,9 +1446,7 @@ export class BackgroundManager {
+ 
+     if (abortSession && task.sessionID) {
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+-      await this.client.session.abort({
+-        path: { id: task.sessionID },
+-      }).catch(() => {})
++      await this.abortSessionWithLogging(task.sessionID, `task cancellation (${source})`)
+ 
+       SessionCategoryRegistry.remove(task.sessionID)
+     }
+@@ -1557,9 +1563,7 @@ export class BackgroundManager {
+ 
+     if (task.sessionID) {
+       // Awaited to prevent dangling promise during subagent teardown (Bun/WebKit SIGABRT)
+-      await this.client.session.abort({
+-        path: { id: task.sessionID },
+-      }).catch(() => {})
++      await this.abortSessionWithLogging(task.sessionID, `task completion (${source})`)
+ 
+       SessionCategoryRegistry.remove(task.sessionID)
+     }
+@@ -1576,9 +1580,6 @@ export class BackgroundManager {
+   }
+ 
+   private async notifyParentSession(task: BackgroundTask): Promise<void> {
+-    // Note: Callers must release concurrency before calling this method
+-    // to ensure slots are freed even if notification fails
+-
+     const duration = formatDuration(task.startedAt ?? new Date(), task.completedAt)
+ 
+     log("[background-agent] notifyParentSession called for task:", task.id)
+@@ -1903,16 +1904,11 @@ export class BackgroundManager {
+           continue
+         }
+ 
+-        // Explicit terminal non-idle status (e.g., "interrupted") — complete immediately,
+-        // skipping output validation (session will never produce more output).
+-        // Unknown statuses fall through to the idle/gone path with output validation.
+         if (sessionStatus && isTerminalSessionStatus(sessionStatus.type)) {
+           await this.tryCompleteTask(task, `polling (terminal session status: ${sessionStatus.type})`)
+           continue
+         }
+ 
+-        // Unknown non-idle status — not active, not terminal, not idle.
+-        // Fall through to idle/gone completion path with output validation.
+         if (sessionStatus && sessionStatus.type !== "idle") {
+           log("[background-agent] Unknown session status, treating as potentially idle:", {
+             taskId: task.id,
+@@ -2065,17 +2061,24 @@ export class BackgroundManager {
+     }
+ 
+     const previous = this.notificationQueueByParent.get(parentSessionID) ?? Promise.resolve()
++    const cleanupQueueEntry = (): void => {
++      if (this.notificationQueueByParent.get(parentSessionID) === current) {
++        this.notificationQueueByParent.delete(parentSessionID)
++      }
++    }
++
+     const current = previous
+-      .catch(() => {})
++      .catch((error) => {
++        log("[background-agent] Continuing notification queue after previous failure:", {
++          parentSessionID,
++          error,
++        })
++      })
+       .then(operation)
+ 
+     this.notificationQueueByParent.set(parentSessionID, current)
+ 
+-    void current.finally(() => {
+-      if (this.notificationQueueByParent.get(parentSessionID) === current) {
+-        this.notificationQueueByParent.delete(parentSessionID)
+-      }
+-    }).catch(() => {})
++    void current.then(cleanupQueueEntry, cleanupQueueEntry)
+ 
+     return current
+   }
+diff --git a/src/features/tmux-subagent/manager.ts b/src/features/tmux-subagent/manager.ts
+index 403efb7c..31bb7457 100644
+--- a/src/features/tmux-subagent/manager.ts
++++ b/src/features/tmux-subagent/manager.ts
+@@ -43,18 +43,6 @@ const DEFERRED_SESSION_TTL_MS = 5 * 60 * 1000
+ const MAX_DEFERRED_QUEUE_SIZE = 20
+ const MAX_CLOSE_RETRY_COUNT = 3
+ 
+-/**
+- * State-first Tmux Session Manager
+- * 
+- * Architecture:
+- * 1. QUERY: Get actual tmux pane state (source of truth)
+- * 2. DECIDE: Pure function determines actions based on state
+- * 3. EXECUTE: Execute actions with verification
+- * 4. UPDATE: Update internal cache only after tmux confirms success
+- * 
+- * The internal `sessions` Map is just a cache for sessionId<->paneId mapping.
+- * The REAL source of truth is always queried from tmux.
+- */
+ export class TmuxSessionManager {
+   private client: OpencodeClient
+   private tmuxConfig: TmuxConfig
+@@ -78,16 +66,20 @@ export class TmuxSessionManager {
+     this.deps = deps
+     const defaultPort = process.env.OPENCODE_PORT ?? "4096"
+     const fallbackUrl = `http://localhost:${defaultPort}`
++    const rawServerUrl = ctx.serverUrl?.toString()
+     try {
+-      const raw = ctx.serverUrl?.toString()
+-      if (raw) {
+-        const parsed = new URL(raw)
++      if (rawServerUrl) {
++        const parsed = new URL(rawServerUrl)
+         const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80')
+-        this.serverUrl = port === '0' ? fallbackUrl : raw
++        this.serverUrl = port === '0' ? fallbackUrl : rawServerUrl
+       } else {
+         this.serverUrl = fallbackUrl
+       }
+-    } catch {
++    } catch (error) {
++      log("[tmux-session-manager] failed to parse server URL, using fallback", {
++        serverUrl: rawServerUrl,
++        error: String(error),
++      })
+       this.serverUrl = fallbackUrl
+     }
+     this.sourcePaneId = deps.getCurrentPaneId()
+@@ -124,7 +116,13 @@ export class TmuxSessionManager {
+   ): Promise<string | null> {
+     if (!this.isIsolated()) return null
+     if (this.isolatedWindowPaneId) {
+-      const state = await queryWindowState(this.isolatedWindowPaneId).catch(() => null)
++      const state = await queryWindowState(this.isolatedWindowPaneId).catch((error) => {
++        log("[tmux-session-manager] failed to query isolated window state", {
++          paneId: this.isolatedWindowPaneId,
++          error: String(error),
++        })
++        return null
++      })
+       if (state) return null
+       this.isolatedContainerPaneId = undefined
+       this.isolatedWindowPaneId = undefined
+@@ -736,7 +734,11 @@ export class TmuxSessionManager {
+ 
+   private async enqueueSpawn(run: () => Promise<void>): Promise<void> {
+     this.spawnQueue = this.spawnQueue
+-      .catch(() => undefined)
++      .catch((error) => {
++        log("[tmux-session-manager] recovering spawn queue after previous failure", {
++          error: String(error),
++        })
++      })
+       .then(run)
+       .catch((err) => {
+         log("[tmux-session-manager] spawn queue task failed", {
+-- 
+2.39.2
+

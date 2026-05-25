@@ -1,0 +1,323 @@
+From 7e68690c700bb23951b518a61f7a564e15686b97 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 22 Feb 2026 03:54:31 +0900
+Subject: [PATCH 2619/5749] fix(hashline-edit): address Cubic review issues -
+ boundary echo, chunking dedup, empty stream alignment
+
+- Fix single-line anchor-echo stripping to trigger empty-insert validation
+
+- Fix trailing boundary-echo stripping for boundary-only payloads
+
+- Extract shared chunking logic to hashline-chunk-formatter
+
+- Align empty stream/iterable handling with formatHashLines
+
+- Add regression tests for all fixes
+---
+ .../hashline-edit/edit-operations.test.ts     | 25 +++++
+ .../hashline-edit/edit-text-normalization.ts  |  6 +-
+ .../hashline-edit/hash-computation.test.ts    | 22 +++++
+ src/tools/hashline-edit/hash-computation.ts   | 91 ++-----------------
+ .../hashline-edit/hashline-chunk-formatter.ts | 52 +++++++++++
+ 5 files changed, 112 insertions(+), 84 deletions(-)
+ create mode 100644 src/tools/hashline-edit/hashline-chunk-formatter.ts
+
+diff --git a/src/tools/hashline-edit/edit-operations.test.ts b/src/tools/hashline-edit/edit-operations.test.ts
+index 5c948af3..8437373d 100644
+--- a/src/tools/hashline-edit/edit-operations.test.ts
++++ b/src/tools/hashline-edit/edit-operations.test.ts
+@@ -186,6 +186,14 @@ describe("hashline edit operations", () => {
+     expect(result).toEqual(["line 1", "inserted", "line 2"])
+   })
+ 
++  it("throws when insert_after payload only repeats anchor line", () => {
++    //#given
++    const lines = ["line 1", "line 2"]
++
++    //#when / #then
++    expect(() => applyInsertAfter(lines, anchorFor(lines, 1), ["line 1"])).toThrow(/non-empty/i)
++  })
++
+   it("restores indentation for paired single-line replacement", () => {
+     //#given
+     const lines = ["if (x) {", "  return 1", "}"]
+@@ -213,6 +221,23 @@ describe("hashline edit operations", () => {
+     expect(result).toEqual(["before", "new 1", "new 2", "after"])
+   })
+ 
++  it("throws when insert_between payload contains only boundary echoes", () => {
++    //#given
++    const lines = ["line 1", "line 2", "line 3"]
++
++    //#when / #then
++    expect(() =>
++      applyHashlineEdits(lines.join("\n"), [
++        {
++          type: "insert_between",
++          after_line: anchorFor(lines, 1),
++          before_line: anchorFor(lines, 2),
++          text: ["line 1", "line 2"],
++        },
++      ])
++    ).toThrow(/non-empty/i)
++  })
++
+   it("restores indentation for first replace_lines entry", () => {
+     //#given
+     const lines = ["if (x) {", "  return 1", "  return 2", "}"]
+diff --git a/src/tools/hashline-edit/edit-text-normalization.ts b/src/tools/hashline-edit/edit-text-normalization.ts
+index 8d259e45..b508bf57 100644
+--- a/src/tools/hashline-edit/edit-text-normalization.ts
++++ b/src/tools/hashline-edit/edit-text-normalization.ts
+@@ -57,7 +57,7 @@ export function restoreLeadingIndent(templateLine: string, line: string): string
+ }
+ 
+ export function stripInsertAnchorEcho(anchorLine: string, newLines: string[]): string[] {
+-  if (newLines.length <= 1) return newLines
++  if (newLines.length === 0) return newLines
+   if (equalsIgnoringWhitespace(newLines[0], anchorLine)) {
+     return newLines.slice(1)
+   }
+@@ -74,10 +74,10 @@ export function stripInsertBeforeEcho(anchorLine: string, newLines: string[]): s
+ 
+ export function stripInsertBoundaryEcho(afterLine: string, beforeLine: string, newLines: string[]): string[] {
+   let out = newLines
+-  if (out.length > 1 && equalsIgnoringWhitespace(out[0], afterLine)) {
++  if (out.length > 0 && equalsIgnoringWhitespace(out[0], afterLine)) {
+     out = out.slice(1)
+   }
+-  if (out.length > 1 && equalsIgnoringWhitespace(out[out.length - 1], beforeLine)) {
++  if (out.length > 0 && equalsIgnoringWhitespace(out[out.length - 1], beforeLine)) {
+     out = out.slice(0, -1)
+   }
+   return out
+diff --git a/src/tools/hashline-edit/hash-computation.test.ts b/src/tools/hashline-edit/hash-computation.test.ts
+index feb617c6..bbca1baa 100644
+--- a/src/tools/hashline-edit/hash-computation.test.ts
++++ b/src/tools/hashline-edit/hash-computation.test.ts
+@@ -116,4 +116,26 @@ describe("streamHashLinesFrom*", () => {
+     //#then
+     expect(result).toBe(formatHashLines(content))
+   })
++
++  it("matches formatHashLines for empty utf8 stream input", async () => {
++    //#given
++    const content = ""
++
++    //#when
++    const result = await collectStream(streamHashLinesFromUtf8(utf8Chunks(content, 1), { maxChunkLines: 1 }))
++
++    //#then
++    expect(result).toBe(formatHashLines(content))
++  })
++
++  it("matches formatHashLines for empty line iterable input", async () => {
++    //#given
++    const content = ""
++
++    //#when
++    const result = await collectStream(streamHashLinesFromLines([], { maxChunkLines: 1 }))
++
++    //#then
++    expect(result).toBe(formatHashLines(content))
++  })
+ })
+diff --git a/src/tools/hashline-edit/hash-computation.ts b/src/tools/hashline-edit/hash-computation.ts
+index efed53bb..374bd56d 100644
+--- a/src/tools/hashline-edit/hash-computation.ts
++++ b/src/tools/hashline-edit/hash-computation.ts
+@@ -1,4 +1,5 @@
+ import { HASHLINE_DICT } from "./constants"
++import { createHashlineChunkFormatter } from "./hashline-chunk-formatter"
+ 
+ export function computeLineHash(lineNumber: number, content: string): string {
+   const stripped = content.replace(/\s+/g, "")
+@@ -61,42 +62,12 @@ export async function* streamHashLinesFromUtf8(
+   let pending = ""
+   let sawAnyText = false
+   let endedWithNewline = false
+-  let outputLines: string[] = []
+-  let outputBytes = 0
+-
+-  const flush = (): string | undefined => {
+-    if (outputLines.length === 0) return undefined
+-    const chunk = outputLines.join("\n")
+-    outputLines = []
+-    outputBytes = 0
+-    return chunk
+-  }
++  const chunkFormatter = createHashlineChunkFormatter({ maxChunkLines, maxChunkBytes })
+ 
+   const pushLine = (line: string): string[] => {
+-    const formatted = `${lineNumber}#${computeLineHash(lineNumber, line)}:${line}`
++    const formatted = formatHashLine(lineNumber, line)
+     lineNumber += 1
+-
+-    const chunksToYield: string[] = []
+-    const separatorBytes = outputLines.length === 0 ? 0 : 1
+-    const lineBytes = Buffer.byteLength(formatted, "utf-8")
+-
+-    if (
+-      outputLines.length > 0 &&
+-      (outputLines.length >= maxChunkLines || outputBytes + separatorBytes + lineBytes > maxChunkBytes)
+-    ) {
+-      const flushed = flush()
+-      if (flushed) chunksToYield.push(flushed)
+-    }
+-
+-    outputLines.push(formatted)
+-    outputBytes += (outputLines.length === 1 ? 0 : 1) + lineBytes
+-
+-    if (outputLines.length >= maxChunkLines || outputBytes >= maxChunkBytes) {
+-      const flushed = flush()
+-      if (flushed) chunksToYield.push(flushed)
+-    }
+-
+-    return chunksToYield
++    return chunkFormatter.push(formatted)
+   }
+ 
+   const consumeText = (text: string): string[] => {
+@@ -128,17 +99,13 @@ export async function* streamHashLinesFromUtf8(
+     yield out
+   }
+ 
+-  if (!sawAnyText) {
+-    for (const out of pushLine("")) {
+-      yield out
+-    }
+-  } else if (pending.length > 0 || endedWithNewline) {
++  if (sawAnyText && (pending.length > 0 || endedWithNewline)) {
+     for (const out of pushLine(pending)) {
+       yield out
+     }
+   }
+ 
+-  const finalChunk = flush()
++  const finalChunk = chunkFormatter.flush()
+   if (finalChunk) yield finalChunk
+ }
+ 
+@@ -151,44 +118,12 @@ export async function* streamHashLinesFromLines(
+   const maxChunkBytes = options.maxChunkBytes ?? 64 * 1024
+ 
+   let lineNumber = startLine
+-  let outputLines: string[] = []
+-  let outputBytes = 0
+-  let sawAnyLine = false
+-
+-  const flush = (): string | undefined => {
+-    if (outputLines.length === 0) return undefined
+-    const chunk = outputLines.join("\n")
+-    outputLines = []
+-    outputBytes = 0
+-    return chunk
+-  }
++  const chunkFormatter = createHashlineChunkFormatter({ maxChunkLines, maxChunkBytes })
+ 
+   const pushLine = (line: string): string[] => {
+-    sawAnyLine = true
+-    const formatted = `${lineNumber}#${computeLineHash(lineNumber, line)}:${line}`
++    const formatted = formatHashLine(lineNumber, line)
+     lineNumber += 1
+-
+-    const chunksToYield: string[] = []
+-    const separatorBytes = outputLines.length === 0 ? 0 : 1
+-    const lineBytes = Buffer.byteLength(formatted, "utf-8")
+-
+-    if (
+-      outputLines.length > 0 &&
+-      (outputLines.length >= maxChunkLines || outputBytes + separatorBytes + lineBytes > maxChunkBytes)
+-    ) {
+-      const flushed = flush()
+-      if (flushed) chunksToYield.push(flushed)
+-    }
+-
+-    outputLines.push(formatted)
+-    outputBytes += (outputLines.length === 1 ? 0 : 1) + lineBytes
+-
+-    if (outputLines.length >= maxChunkLines || outputBytes >= maxChunkBytes) {
+-      const flushed = flush()
+-      if (flushed) chunksToYield.push(flushed)
+-    }
+-
+-    return chunksToYield
++    return chunkFormatter.push(formatted)
+   }
+ 
+   const asyncIterator = (lines as AsyncIterable<string>)[Symbol.asyncIterator]
+@@ -202,12 +137,6 @@ export async function* streamHashLinesFromLines(
+     }
+   }
+ 
+-  if (!sawAnyLine) {
+-    for (const out of pushLine("")) {
+-      yield out
+-    }
+-  }
+-
+-  const finalChunk = flush()
++  const finalChunk = chunkFormatter.flush()
+   if (finalChunk) yield finalChunk
+ }
+diff --git a/src/tools/hashline-edit/hashline-chunk-formatter.ts b/src/tools/hashline-edit/hashline-chunk-formatter.ts
+new file mode 100644
+index 00000000..f92563ec
+--- /dev/null
++++ b/src/tools/hashline-edit/hashline-chunk-formatter.ts
+@@ -0,0 +1,52 @@
++export interface HashlineChunkFormatter {
++  push(formattedLine: string): string[]
++  flush(): string | undefined
++}
++
++interface HashlineChunkFormatterOptions {
++  maxChunkLines: number
++  maxChunkBytes: number
++}
++
++export function createHashlineChunkFormatter(options: HashlineChunkFormatterOptions): HashlineChunkFormatter {
++  const { maxChunkLines, maxChunkBytes } = options
++  let outputLines: string[] = []
++  let outputBytes = 0
++
++  const flush = (): string | undefined => {
++    if (outputLines.length === 0) return undefined
++    const chunk = outputLines.join("\n")
++    outputLines = []
++    outputBytes = 0
++    return chunk
++  }
++
++  const push = (formattedLine: string): string[] => {
++    const chunksToYield: string[] = []
++    const separatorBytes = outputLines.length === 0 ? 0 : 1
++    const lineBytes = Buffer.byteLength(formattedLine, "utf-8")
++
++    if (
++      outputLines.length > 0 &&
++      (outputLines.length >= maxChunkLines || outputBytes + separatorBytes + lineBytes > maxChunkBytes)
++    ) {
++      const flushed = flush()
++      if (flushed) chunksToYield.push(flushed)
++    }
++
++    outputLines.push(formattedLine)
++    outputBytes += (outputLines.length === 1 ? 0 : 1) + lineBytes
++
++    if (outputLines.length >= maxChunkLines || outputBytes >= maxChunkBytes) {
++      const flushed = flush()
++      if (flushed) chunksToYield.push(flushed)
++    }
++
++    return chunksToYield
++  }
++
++  return {
++    push,
++    flush,
++  }
++}
+-- 
+2.39.2
+

@@ -1,0 +1,236 @@
+From c2f7d059d21e5c76a1f9e494106e1912c6ecca54 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 18 Mar 2026 14:19:00 +0900
+Subject: [PATCH 3366/5749] perf(shared): optimize hot-path utilities across
+ plugin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- task-list: replace O(n³) blocker resolution with Map lookup (C4)
+- logger: buffer log entries and flush periodically to reduce sync I/O (C5)
+- plugin-interface: create chatParamsHandler once at init (H3)
+- pattern-matcher: cache compiled RegExp for wildcard matchers (H6)
+- file-reference-resolver: use replaceAll instead of split/join (M9)
+- connected-providers-cache: add in-memory cache for read operations (L4)
+---
+ src/plugin-interface.ts                 |  5 +---
+ src/shared/connected-providers-cache.ts | 13 ++++++++++
+ src/shared/file-reference-resolver.ts   |  2 +-
+ src/shared/logger.ts                    | 32 ++++++++++++++++++++++---
+ src/shared/pattern-matcher.ts           | 10 ++++++--
+ src/tools/task/task-list.ts             |  4 +++-
+ 6 files changed, 55 insertions(+), 11 deletions(-)
+
+diff --git a/src/plugin-interface.ts b/src/plugin-interface.ts
+index b37c9d41..403ae1df 100644
+--- a/src/plugin-interface.ts
++++ b/src/plugin-interface.ts
+@@ -32,10 +32,7 @@ export function createPluginInterface(args: {
+   return {
+     tool: tools,
+ 
+-    "chat.params": async (input: unknown, output: unknown) => {
+-      const handler = createChatParamsHandler({ anthropicEffort: hooks.anthropicEffort })
+-      await handler(input, output)
+-    },
++    "chat.params": createChatParamsHandler({ anthropicEffort: hooks.anthropicEffort }),
+ 
+     "chat.headers": createChatHeadersHandler({ ctx }),
+ 
+diff --git a/src/shared/connected-providers-cache.ts b/src/shared/connected-providers-cache.ts
+index b86926a1..692d35dd 100644
+--- a/src/shared/connected-providers-cache.ts
++++ b/src/shared/connected-providers-cache.ts
+@@ -32,6 +32,9 @@ export function createConnectedProvidersCacheStore(
+ 		return join(getCacheDir(), filename)
+ 	}
+ 
++	let memConnected: string[] | null | undefined
++	let memProviderModels: ProviderModelsCache | null | undefined
++
+ 	function ensureCacheDir(): void {
+ 		const cacheDir = getCacheDir()
+ 		if (!existsSync(cacheDir)) {
+@@ -40,10 +43,12 @@ export function createConnectedProvidersCacheStore(
+ 	}
+ 
+ 	function readConnectedProvidersCache(): string[] | null {
++		if (memConnected !== undefined) return memConnected
+ 		const cacheFile = getCacheFilePath(CONNECTED_PROVIDERS_CACHE_FILE)
+ 
+ 		if (!existsSync(cacheFile)) {
+ 			log("[connected-providers-cache] Cache file not found", { cacheFile })
++			memConnected = null
+ 			return null
+ 		}
+ 
+@@ -51,9 +56,11 @@ export function createConnectedProvidersCacheStore(
+ 			const content = readFileSync(cacheFile, "utf-8")
+ 			const data = JSON.parse(content) as ConnectedProvidersCache
+ 			log("[connected-providers-cache] Read cache", { count: data.connected.length, updatedAt: data.updatedAt })
++			memConnected = data.connected
+ 			return data.connected
+ 		} catch (err) {
+ 			log("[connected-providers-cache] Error reading cache", { error: String(err) })
++			memConnected = null
+ 			return null
+ 		}
+ 	}
+@@ -74,6 +81,7 @@ export function createConnectedProvidersCacheStore(
+ 
+ 		try {
+ 			writeFileSync(cacheFile, JSON.stringify(data, null, 2))
++			memConnected = connected
+ 			log("[connected-providers-cache] Cache written", { count: connected.length })
+ 		} catch (err) {
+ 			log("[connected-providers-cache] Error writing cache", { error: String(err) })
+@@ -81,10 +89,12 @@ export function createConnectedProvidersCacheStore(
+ 	}
+ 
+ 	function readProviderModelsCache(): ProviderModelsCache | null {
++		if (memProviderModels !== undefined) return memProviderModels
+ 		const cacheFile = getCacheFilePath(PROVIDER_MODELS_CACHE_FILE)
+ 
+ 		if (!existsSync(cacheFile)) {
+ 			log("[connected-providers-cache] Provider-models cache file not found", { cacheFile })
++			memProviderModels = null
+ 			return null
+ 		}
+ 
+@@ -95,9 +105,11 @@ export function createConnectedProvidersCacheStore(
+ 				providerCount: Object.keys(data.models).length,
+ 				updatedAt: data.updatedAt,
+ 			})
++			memProviderModels = data
+ 			return data
+ 		} catch (err) {
+ 			log("[connected-providers-cache] Error reading provider-models cache", { error: String(err) })
++			memProviderModels = null
+ 			return null
+ 		}
+ 	}
+@@ -118,6 +130,7 @@ export function createConnectedProvidersCacheStore(
+ 
+ 		try {
+ 			writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2))
++			memProviderModels = cacheData
+ 			log("[connected-providers-cache] Provider-models cache written", {
+ 				providerCount: Object.keys(data.models).length,
+ 			})
+diff --git a/src/shared/file-reference-resolver.ts b/src/shared/file-reference-resolver.ts
+index 20b2ed9f..b1dbae07 100644
+--- a/src/shared/file-reference-resolver.ts
++++ b/src/shared/file-reference-resolver.ts
+@@ -74,7 +74,7 @@ export async function resolveFileReferencesInText(
+ 
+   let resolved = text
+   for (const [pattern, replacement] of replacements.entries()) {
+-    resolved = resolved.split(pattern).join(replacement)
++    resolved = resolved.replaceAll(pattern, replacement)
+   }
+ 
+   if (findFileReferences(resolved).length > 0 && depth + 1 < maxDepth) {
+diff --git a/src/shared/logger.ts b/src/shared/logger.ts
+index 23f48be7..21effaf6 100644
+--- a/src/shared/logger.ts
++++ b/src/shared/logger.ts
+@@ -1,16 +1,42 @@
+-// Shared logging utility for the plugin
+-
+ import * as fs from "fs"
+ import * as os from "os"
+ import * as path from "path"
+ 
+ const logFile = path.join(os.tmpdir(), "oh-my-opencode.log")
+ 
++let buffer: string[] = []
++let flushTimer: ReturnType<typeof setTimeout> | null = null
++const FLUSH_INTERVAL_MS = 500
++const BUFFER_SIZE_LIMIT = 50
++
++function flush(): void {
++  if (buffer.length === 0) return
++  const data = buffer.join("")
++  buffer = []
++  try {
++    fs.appendFileSync(logFile, data)
++  } catch {
++  }
++}
++
++function scheduleFlush(): void {
++  if (flushTimer) return
++  flushTimer = setTimeout(() => {
++    flushTimer = null
++    flush()
++  }, FLUSH_INTERVAL_MS)
++}
++
+ export function log(message: string, data?: unknown): void {
+   try {
+     const timestamp = new Date().toISOString()
+     const logEntry = `[${timestamp}] ${message} ${data ? JSON.stringify(data) : ""}\n`
+-    fs.appendFileSync(logFile, logEntry)
++    buffer.push(logEntry)
++    if (buffer.length >= BUFFER_SIZE_LIMIT) {
++      flush()
++    } else {
++      scheduleFlush()
++    }
+   } catch {
+   }
+ }
+diff --git a/src/shared/pattern-matcher.ts b/src/shared/pattern-matcher.ts
+index f28568a6..c01896ec 100644
+--- a/src/shared/pattern-matcher.ts
++++ b/src/shared/pattern-matcher.ts
+@@ -9,6 +9,8 @@ function escapeRegexExceptAsterisk(str: string): string {
+   return str.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+ }
+ 
++const regexCache = new Map<string, RegExp>()
++
+ export function matchesToolMatcher(toolName: string, matcher: string): boolean {
+   if (!matcher) {
+     return true
+@@ -17,8 +19,12 @@ export function matchesToolMatcher(toolName: string, matcher: string): boolean {
+   return patterns.some((p) => {
+     if (p.includes("*")) {
+       // First escape regex special chars (except *), then convert * to .*
+-      const escaped = escapeRegexExceptAsterisk(p)
+-      const regex = new RegExp(`^${escaped.replace(/\*/g, ".*")}$`, "i")
++      let regex = regexCache.get(p)
++      if (!regex) {
++        const escaped = escapeRegexExceptAsterisk(p)
++        regex = new RegExp(`^${escaped.replace(/\*/g, ".*")}$`, "i")
++        regexCache.set(p, regex)
++      }
+       return regex.test(toolName)
+     }
+     return p.toLowerCase() === toolName.toLowerCase()
+diff --git a/src/tools/task/task-list.ts b/src/tools/task/task-list.ts
+index 6582d472..83ee425e 100644
+--- a/src/tools/task/task-list.ts
++++ b/src/tools/task/task-list.ts
+@@ -45,6 +45,8 @@ Returns summary format: id, subject, status, owner, blockedBy (not full descript
+         }
+       }
+ 
++      const taskMap = new Map(allTasks.map((t) => [t.id, t]))
++
+       // Filter out completed and deleted tasks
+       const activeTasks = allTasks.filter(
+         (task) => task.status !== "completed" && task.status !== "deleted"
+@@ -54,7 +56,7 @@ Returns summary format: id, subject, status, owner, blockedBy (not full descript
+       const summaries: TaskSummary[] = activeTasks.map((task) => {
+         // Filter blockedBy to only include unresolved (non-completed) blockers
+         const unresolvedBlockers = task.blockedBy.filter((blockerId) => {
+-          const blockerTask = allTasks.find((t) => t.id === blockerId)
++          const blockerTask = taskMap.get(blockerId)
+           // Include if blocker doesn't exist (missing) or if it's not completed
+           return !blockerTask || blockerTask.status !== "completed"
+         })
+-- 
+2.39.2
+

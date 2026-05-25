@@ -1,0 +1,920 @@
+From b28567251d5d6a365e79068d156f22af84394ded Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 8 Apr 2026 15:28:17 +0900
+Subject: [PATCH 4073/5749] fix(plugin-loader): filter project-scoped plugins
+ by cwd
+
+discoverInstalledPlugins read scope from installed_plugins.json but
+never filtered by it, so project/local scoped Claude Code plugins
+leaked into every session regardless of process.cwd().
+
+Add projectPath to PluginInstallation and InstalledPluginEntryV3,
+propagate it through v3EntryToInstallation, and introduce
+shouldLoadPluginForCwd which reuses shared/contains-path for safe
+symlink- and ancestor-aware matching and expands a leading tilde.
+user and managed scopes still always load; project and local without
+a projectPath are skipped as a safe default.
+
+Covered by 13 new shouldLoadPluginForCwd unit tests (including tilde
+expansion against a mocked homedir) and 13 new discoverInstalledPlugins
+integration tests spanning v1, v2, and v3 database formats plus the
+existing enabledPluginsOverride path.
+
+Fixes #3216
+---
+ .../discovery.test.ts                         | 497 ++++++++++++++++++
+ .../claude-code-plugin-loader/discovery.ts    |  11 +
+ .../scope-filter.test.ts                      | 244 +++++++++
+ .../claude-code-plugin-loader/scope-filter.ts |  29 +
+ .../claude-code-plugin-loader/types.ts        |  11 +
+ 5 files changed, 792 insertions(+)
+ create mode 100644 src/features/claude-code-plugin-loader/scope-filter.test.ts
+ create mode 100644 src/features/claude-code-plugin-loader/scope-filter.ts
+
+diff --git a/src/features/claude-code-plugin-loader/discovery.test.ts b/src/features/claude-code-plugin-loader/discovery.test.ts
+index 6e3e1cd3..2d4930ac 100644
+--- a/src/features/claude-code-plugin-loader/discovery.test.ts
++++ b/src/features/claude-code-plugin-loader/discovery.test.ts
+@@ -10,6 +10,7 @@ import { join } from "node:path"
+ 
+ const originalClaudePluginsHome = process.env.CLAUDE_PLUGINS_HOME
+ const temporaryDirectories: string[] = []
++const originalCwd = process.cwd()
+ 
+ function createTemporaryDirectory(prefix: string): string {
+   const directory = mkdtempSync(join(tmpdir(), prefix))
+@@ -17,6 +18,14 @@ function createTemporaryDirectory(prefix: string): string {
+   return directory
+ }
+ 
++function writeDatabase(pluginsHome: string, database: unknown): void {
++  writeFileSync(join(pluginsHome, "installed_plugins.json"), JSON.stringify(database), "utf-8")
++}
++
++function createInstallPath(prefix: string): string {
++  return createTemporaryDirectory(prefix)
++}
++
+ describe("discoverInstalledPlugins", () => {
+   beforeEach(() => {
+     mock.module("../../shared/logger", () => ({
+@@ -36,6 +45,10 @@ describe("discoverInstalledPlugins", () => {
+       process.env.CLAUDE_PLUGINS_HOME = originalClaudePluginsHome
+     }
+ 
++    if (process.cwd() !== originalCwd) {
++      process.chdir(originalCwd)
++    }
++
+     for (const directory of temporaryDirectories.splice(0)) {
+       rmSync(directory, { recursive: true, force: true })
+     }
+@@ -156,4 +169,488 @@ describe("discoverInstalledPlugins", () => {
+     expect(discovered.plugins).toHaveLength(1)
+     expect(discovered.plugins[0]?.name).toBe("oh-my-openagent")
+   })
++
++  describe("#given project-scoped entries in v1 format", () => {
++    it("#when cwd matches projectPath #then the plugin loads", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v1-project-match-")
++      const installPath = createInstallPath("omo-v1-install-")
++      writeDatabase(pluginsHome, {
++        version: 1,
++        plugins: {
++          "project-plugin@market": {
++            scope: "project",
++            projectPath: projectDirectory,
++            installPath,
++            version: "1.0.0",
++            installedAt: "2026-03-25T00:00:00Z",
++            lastUpdated: "2026-03-25T00:00:00Z",
++          },
++        },
++      })
++      process.chdir(projectDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v1-match`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(1)
++      expect(discovered.plugins[0]?.name).toBe("project-plugin")
++    })
++
++    it("#when cwd is a subdirectory of projectPath #then the plugin loads", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v1-project-sub-")
++      const subdirectory = join(projectDirectory, "packages", "app")
++      mkdirSync(subdirectory, { recursive: true })
++      const installPath = createInstallPath("omo-v1-install-")
++      writeDatabase(pluginsHome, {
++        version: 1,
++        plugins: {
++          "sub-plugin@market": {
++            scope: "project",
++            projectPath: projectDirectory,
++            installPath,
++            version: "1.0.0",
++            installedAt: "2026-03-25T00:00:00Z",
++            lastUpdated: "2026-03-25T00:00:00Z",
++          },
++        },
++      })
++      process.chdir(subdirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v1-sub`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(1)
++      expect(discovered.plugins[0]?.name).toBe("sub-plugin")
++    })
++
++    it("#when cwd does not match projectPath #then the plugin is skipped", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v1-project-miss-")
++      const otherDirectory = createTemporaryDirectory("omo-v1-other-")
++      const installPath = createInstallPath("omo-v1-install-")
++      writeDatabase(pluginsHome, {
++        version: 1,
++        plugins: {
++          "outside-plugin@market": {
++            scope: "project",
++            projectPath: projectDirectory,
++            installPath,
++            version: "1.0.0",
++            installedAt: "2026-03-25T00:00:00Z",
++            lastUpdated: "2026-03-25T00:00:00Z",
++          },
++        },
++      })
++      process.chdir(otherDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v1-miss`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(0)
++    })
++
++    it("#when projectPath is missing #then the plugin is skipped", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const installPath = createInstallPath("omo-v1-install-")
++      writeDatabase(pluginsHome, {
++        version: 1,
++        plugins: {
++          "no-path-plugin@market": {
++            scope: "project",
++            installPath,
++            version: "1.0.0",
++            installedAt: "2026-03-25T00:00:00Z",
++            lastUpdated: "2026-03-25T00:00:00Z",
++          },
++        },
++      })
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v1-noproj`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(0)
++    })
++
++    it("#when scope is user #then it always loads regardless of cwd", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const unrelatedDirectory = createTemporaryDirectory("omo-v1-unrelated-")
++      const installPath = createInstallPath("omo-v1-install-")
++      writeDatabase(pluginsHome, {
++        version: 1,
++        plugins: {
++          "user-plugin@market": {
++            scope: "user",
++            installPath,
++            version: "1.0.0",
++            installedAt: "2026-03-25T00:00:00Z",
++            lastUpdated: "2026-03-25T00:00:00Z",
++          },
++        },
++      })
++      process.chdir(unrelatedDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v1-user`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(1)
++      expect(discovered.plugins[0]?.name).toBe("user-plugin")
++    })
++  })
++
++  describe("#given project and local scoped entries in v2 format", () => {
++    it("#when cwd matches project-scoped projectPath #then it loads while non-matching entries are dropped", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v2-project-")
++      const otherDirectory = createTemporaryDirectory("omo-v2-other-")
++      const matchingInstall = createInstallPath("omo-v2-match-install-")
++      const missingInstall = createInstallPath("omo-v2-miss-install-")
++      const userInstall = createInstallPath("omo-v2-user-install-")
++      writeDatabase(pluginsHome, {
++        version: 2,
++        plugins: {
++          "matching-project@market": [
++            {
++              scope: "project",
++              projectPath: projectDirectory,
++              installPath: matchingInstall,
++              version: "1.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++          "other-project@market": [
++            {
++              scope: "project",
++              projectPath: otherDirectory,
++              installPath: missingInstall,
++              version: "1.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++          "global-user@market": [
++            {
++              scope: "user",
++              installPath: userInstall,
++              version: "2.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++        },
++      })
++      process.chdir(projectDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v2-mix`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      const names = discovered.plugins.map((plugin) => plugin.name).sort()
++      expect(names).toEqual(["global-user", "matching-project"])
++    })
++
++    it("#when scope is local and cwd matches projectPath #then it loads", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v2-local-match-")
++      const installPath = createInstallPath("omo-v2-local-install-")
++      writeDatabase(pluginsHome, {
++        version: 2,
++        plugins: {
++          "local-plugin@market": [
++            {
++              scope: "local",
++              projectPath: projectDirectory,
++              installPath,
++              version: "1.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++        },
++      })
++      process.chdir(projectDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v2-local-match`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(1)
++      expect(discovered.plugins[0]?.name).toBe("local-plugin")
++    })
++
++    it("#when scope is local and cwd does not match projectPath #then it is skipped", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v2-local-miss-")
++      const otherDirectory = createTemporaryDirectory("omo-v2-local-other-")
++      const installPath = createInstallPath("omo-v2-local-install-")
++      writeDatabase(pluginsHome, {
++        version: 2,
++        plugins: {
++          "local-plugin@market": [
++            {
++              scope: "local",
++              projectPath: projectDirectory,
++              installPath,
++              version: "1.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++        },
++      })
++      process.chdir(otherDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v2-local-miss`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(0)
++    })
++
++    it("#when multiple installations are present #then only the first is considered and scope filtering still applies", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v2-multi-")
++      const otherDirectory = createTemporaryDirectory("omo-v2-multi-other-")
++      const primaryInstall = createInstallPath("omo-v2-multi-primary-")
++      const secondaryInstall = createInstallPath("omo-v2-multi-secondary-")
++      writeDatabase(pluginsHome, {
++        version: 2,
++        plugins: {
++          "multi-plugin@market": [
++            {
++              scope: "project",
++              projectPath: otherDirectory,
++              installPath: primaryInstall,
++              version: "1.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++            {
++              scope: "project",
++              projectPath: projectDirectory,
++              installPath: secondaryInstall,
++              version: "2.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++        },
++      })
++      process.chdir(projectDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v2-multi`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then — existing behavior keeps only the first entry; with scope filter it is
++      // (correctly) skipped because the first entry points at a different project.
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(0)
++    })
++  })
++
++  describe("#given project and local scoped entries in v3 flat-array format", () => {
++    it("#when cwd matches projectPath #then projectPath flows through and the plugin loads", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v3-match-")
++      const installPath = createInstallPath("omo-v3-install-")
++      writeDatabase(pluginsHome, [
++        {
++          name: "v3-project-plugin",
++          marketplace: "market",
++          scope: "project",
++          projectPath: projectDirectory,
++          installPath,
++          version: "1.0.0",
++          lastUpdated: "2026-03-25T00:00:00Z",
++        },
++      ])
++      process.chdir(projectDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v3-match`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(1)
++      expect(discovered.plugins[0]?.name).toBe("v3-project-plugin")
++    })
++
++    it("#when cwd does not match projectPath #then the plugin is skipped", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-v3-miss-")
++      const otherDirectory = createTemporaryDirectory("omo-v3-miss-other-")
++      const installPath = createInstallPath("omo-v3-install-")
++      writeDatabase(pluginsHome, [
++        {
++          name: "v3-skipped-plugin",
++          marketplace: "market",
++          scope: "project",
++          projectPath: projectDirectory,
++          installPath,
++          version: "1.0.0",
++          lastUpdated: "2026-03-25T00:00:00Z",
++        },
++        {
++          name: "v3-user-plugin",
++          marketplace: "market",
++          scope: "user",
++          installPath: createInstallPath("omo-v3-user-install-"),
++          version: "2.0.0",
++          lastUpdated: "2026-03-25T00:00:00Z",
++        },
++      ])
++      process.chdir(otherDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-v3-miss`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(1)
++      expect(discovered.plugins[0]?.name).toBe("v3-user-plugin")
++    })
++  })
++
++  describe("#given enabledPluginsOverride combined with scope filtering", () => {
++    it("#when a project-scoped plugin is disabled via override #then it is still skipped even if cwd would match", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-enabled-proj-")
++      const installPath = createInstallPath("omo-enabled-install-")
++      writeDatabase(pluginsHome, {
++        version: 2,
++        plugins: {
++          "gated-plugin@market": [
++            {
++              scope: "project",
++              projectPath: projectDirectory,
++              installPath,
++              version: "1.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++        },
++      })
++      process.chdir(projectDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-enabled-off`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++        enabledPluginsOverride: { "gated-plugin@market": false },
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(0)
++    })
++
++    it("#when a project-scoped plugin is enabled and cwd matches #then it loads", async () => {
++      //#given
++      const pluginsHome = process.env.CLAUDE_PLUGINS_HOME as string
++      const projectDirectory = createTemporaryDirectory("omo-enabled-match-")
++      const installPath = createInstallPath("omo-enabled-match-install-")
++      writeDatabase(pluginsHome, {
++        version: 2,
++        plugins: {
++          "enabled-plugin@market": [
++            {
++              scope: "project",
++              projectPath: projectDirectory,
++              installPath,
++              version: "1.0.0",
++              installedAt: "2026-03-25T00:00:00Z",
++              lastUpdated: "2026-03-25T00:00:00Z",
++            },
++          ],
++        },
++      })
++      process.chdir(projectDirectory)
++
++      //#when
++      const { discoverInstalledPlugins } = await import(`./discovery?t=${Date.now()}-enabled-on`)
++      const discovered = discoverInstalledPlugins({
++        pluginsHomeOverride: pluginsHome,
++        loadPluginManifestOverride: () => null,
++        enabledPluginsOverride: { "enabled-plugin@market": true },
++      })
++
++      //#then
++      expect(discovered.errors).toHaveLength(0)
++      expect(discovered.plugins).toHaveLength(1)
++      expect(discovered.plugins[0]?.name).toBe("enabled-plugin")
++    })
++  })
+ })
+diff --git a/src/features/claude-code-plugin-loader/discovery.ts b/src/features/claude-code-plugin-loader/discovery.ts
+index f4781fef..4a633782 100644
+--- a/src/features/claude-code-plugin-loader/discovery.ts
++++ b/src/features/claude-code-plugin-loader/discovery.ts
+@@ -3,6 +3,7 @@ import { homedir } from "os"
+ import { basename, join } from "path"
+ import { fileURLToPath } from "url"
+ import { log } from "../../shared/logger"
++import { shouldLoadPluginForCwd } from "./scope-filter"
+ import type {
+   InstalledPluginsDatabase,
+   InstalledPluginEntryV3,
+@@ -132,6 +133,7 @@ function v3EntryToInstallation(entry: InstalledPluginEntryV3): PluginInstallatio
+     installedAt: entry.lastUpdated,
+     lastUpdated: entry.lastUpdated,
+     gitCommitSha: entry.gitCommitSha,
++    projectPath: entry.projectPath,
+   }
+ }
+ 
+@@ -177,6 +179,7 @@ export function discoverInstalledPlugins(options?: PluginLoaderOptions): PluginL
+   const settingsEnabledPlugins = settings?.enabledPlugins
+   const overrideEnabledPlugins = options?.enabledPluginsOverride
+   const pluginManifestLoader = options?.loadPluginManifestOverride ?? loadPluginManifest
++  const cwd = process.cwd()
+ 
+   for (const [pluginKey, installation] of extractPluginEntries(db)) {
+     if (!installation) continue
+@@ -186,6 +189,14 @@ export function discoverInstalledPlugins(options?: PluginLoaderOptions): PluginL
+       continue
+     }
+ 
++    if (!shouldLoadPluginForCwd(installation, cwd)) {
++      log(`Skipping ${installation.scope}-scoped plugin outside current cwd: ${pluginKey}`, {
++        projectPath: installation.projectPath,
++        cwd,
++      })
++      continue
++    }
++
+     const { installPath, scope, version } = installation
+ 
+     if (!existsSync(installPath)) {
+diff --git a/src/features/claude-code-plugin-loader/scope-filter.test.ts b/src/features/claude-code-plugin-loader/scope-filter.test.ts
+new file mode 100644
+index 00000000..3ac585e3
+--- /dev/null
++++ b/src/features/claude-code-plugin-loader/scope-filter.test.ts
+@@ -0,0 +1,244 @@
++import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
++import { mkdtempSync, rmSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { shouldLoadPluginForCwd } from "./scope-filter"
++
++const temporaryDirectories: string[] = []
++
++function createTemporaryDirectory(prefix: string): string {
++  const directory = mkdtempSync(join(tmpdir(), prefix))
++  temporaryDirectories.push(directory)
++  return directory
++}
++
++describe("shouldLoadPluginForCwd", () => {
++  afterEach(() => {
++    mock.restore()
++
++    for (const directory of temporaryDirectories.splice(0)) {
++      rmSync(directory, { recursive: true, force: true })
++    }
++  })
++
++  describe("#given a user-scoped plugin", () => {
++    it("#when called with any cwd #then it loads", () => {
++      //#given
++      const installation = { scope: "user" as const }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, "/tmp/anywhere")
++
++      //#then
++      expect(result).toBe(true)
++    })
++  })
++
++  describe("#given a managed-scoped plugin", () => {
++    it("#when called with any cwd #then it loads", () => {
++      //#given
++      const installation = { scope: "managed" as const }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, "/tmp/anywhere")
++
++      //#then
++      expect(result).toBe(true)
++    })
++  })
++
++  describe("#given a project-scoped plugin without projectPath", () => {
++    it("#when called with any cwd #then it is skipped", () => {
++      //#given
++      const installation = { scope: "project" as const }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, "/tmp/anywhere")
++
++      //#then
++      expect(result).toBe(false)
++    })
++  })
++
++  describe("#given a local-scoped plugin without projectPath", () => {
++    it("#when called with any cwd #then it is skipped", () => {
++      //#given
++      const installation = { scope: "local" as const }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, "/tmp/anywhere")
++
++      //#then
++      expect(result).toBe(false)
++    })
++  })
++
++  describe("#given a project-scoped plugin with matching projectPath", () => {
++    it("#when cwd exactly matches projectPath #then it loads", () => {
++      //#given
++      const projectDirectory = createTemporaryDirectory("omo-scope-")
++      const installation = {
++        scope: "project" as const,
++        projectPath: projectDirectory,
++      }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, projectDirectory)
++
++      //#then
++      expect(result).toBe(true)
++    })
++
++    it("#when cwd is a subdirectory of projectPath #then it loads", () => {
++      //#given
++      const projectDirectory = createTemporaryDirectory("omo-scope-")
++      const installation = {
++        scope: "project" as const,
++        projectPath: projectDirectory,
++      }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, join(projectDirectory, "packages", "app"))
++
++      //#then
++      expect(result).toBe(true)
++    })
++  })
++
++  describe("#given a project-scoped plugin with non-matching projectPath", () => {
++    it("#when cwd is unrelated #then it is skipped", () => {
++      //#given
++      const projectDirectory = createTemporaryDirectory("omo-scope-")
++      const otherDirectory = createTemporaryDirectory("omo-other-")
++      const installation = {
++        scope: "project" as const,
++        projectPath: projectDirectory,
++      }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, otherDirectory)
++
++      //#then
++      expect(result).toBe(false)
++    })
++
++    it("#when cwd is the parent of projectPath #then it is skipped", () => {
++      //#given
++      const projectDirectory = createTemporaryDirectory("omo-scope-")
++      const installation = {
++        scope: "project" as const,
++        projectPath: join(projectDirectory, "nested"),
++      }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, projectDirectory)
++
++      //#then
++      expect(result).toBe(false)
++    })
++  })
++
++  describe("#given a local-scoped plugin with matching projectPath", () => {
++    it("#when cwd matches projectPath #then it loads", () => {
++      //#given
++      const projectDirectory = createTemporaryDirectory("omo-scope-")
++      const installation = {
++        scope: "local" as const,
++        projectPath: projectDirectory,
++      }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, projectDirectory)
++
++      //#then
++      expect(result).toBe(true)
++    })
++  })
++
++  describe("#given a local-scoped plugin with non-matching projectPath", () => {
++    it("#when cwd is unrelated #then it is skipped", () => {
++      //#given
++      const projectDirectory = createTemporaryDirectory("omo-scope-")
++      const otherDirectory = createTemporaryDirectory("omo-other-")
++      const installation = {
++        scope: "local" as const,
++        projectPath: projectDirectory,
++      }
++
++      //#when
++      const result = shouldLoadPluginForCwd(installation, otherDirectory)
++
++      //#then
++      expect(result).toBe(false)
++    })
++  })
++
++  describe("#given a project-scoped plugin with a tilde-prefixed projectPath", () => {
++    let fakeHome: string
++
++    beforeEach(() => {
++      fakeHome = createTemporaryDirectory("omo-home-")
++      mock.module("node:os", () => ({
++        homedir: () => fakeHome,
++        tmpdir,
++      }))
++      mock.module("os", () => ({
++        homedir: () => fakeHome,
++        tmpdir,
++      }))
++    })
++
++    it("#when the expanded home matches cwd #then it loads", async () => {
++      //#given
++      const { shouldLoadPluginForCwd: freshShouldLoad } = await import(
++        `./scope-filter?t=${Date.now()}-tilde-match`
++      )
++      const installation = {
++        scope: "project" as const,
++        projectPath: "~/workspace/proj-a",
++      }
++      const cwd = join(fakeHome, "workspace", "proj-a")
++
++      //#when
++      const result = freshShouldLoad(installation, cwd)
++
++      //#then
++      expect(result).toBe(true)
++    })
++
++    it("#when the expanded home does not match cwd #then it is skipped", async () => {
++      //#given
++      const { shouldLoadPluginForCwd: freshShouldLoad } = await import(
++        `./scope-filter?t=${Date.now()}-tilde-mismatch`
++      )
++      const installation = {
++        scope: "project" as const,
++        projectPath: "~/workspace/proj-a",
++      }
++      const cwd = join(fakeHome, "workspace", "proj-b")
++
++      //#when
++      const result = freshShouldLoad(installation, cwd)
++
++      //#then
++      expect(result).toBe(false)
++    })
++
++    it("#when projectPath is exactly ~ and cwd equals fake home #then it loads", async () => {
++      //#given
++      const { shouldLoadPluginForCwd: freshShouldLoad } = await import(
++        `./scope-filter?t=${Date.now()}-tilde-root`
++      )
++      const installation = {
++        scope: "project" as const,
++        projectPath: "~",
++      }
++
++      //#when
++      const result = freshShouldLoad(installation, fakeHome)
++
++      //#then
++      expect(result).toBe(true)
++    })
++  })
++})
+diff --git a/src/features/claude-code-plugin-loader/scope-filter.ts b/src/features/claude-code-plugin-loader/scope-filter.ts
+new file mode 100644
+index 00000000..b3651b5c
+--- /dev/null
++++ b/src/features/claude-code-plugin-loader/scope-filter.ts
+@@ -0,0 +1,29 @@
++import { homedir } from "os"
++import { join } from "path"
++import { containsPath } from "../../shared/contains-path"
++import type { PluginInstallation } from "./types"
++
++function expandTilde(inputPath: string): string {
++  if (inputPath === "~") {
++    return homedir()
++  }
++  if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
++    return join(homedir(), inputPath.slice(2))
++  }
++  return inputPath
++}
++
++export function shouldLoadPluginForCwd(
++  installation: Pick<PluginInstallation, "scope" | "projectPath">,
++  cwd: string = process.cwd(),
++): boolean {
++  if (installation.scope !== "project" && installation.scope !== "local") {
++    return true
++  }
++
++  if (!installation.projectPath) {
++    return false
++  }
++
++  return containsPath(expandTilde(installation.projectPath), cwd)
++}
+diff --git a/src/features/claude-code-plugin-loader/types.ts b/src/features/claude-code-plugin-loader/types.ts
+index d93d6979..1db4dd16 100644
+--- a/src/features/claude-code-plugin-loader/types.ts
++++ b/src/features/claude-code-plugin-loader/types.ts
+@@ -18,6 +18,12 @@ export interface PluginInstallation {
+   lastUpdated: string
+   gitCommitSha?: string
+   isLocal?: boolean
++  /**
++   * Claude Code records this on project/local-scoped installations.
++   * Absolute path (or `~`-prefixed) of the project the plugin was installed for.
++   * Used to filter project/local plugins that do not belong to the current cwd.
++   */
++  projectPath?: string
+ }
+ 
+ /**
+@@ -51,6 +57,11 @@ export interface InstalledPluginEntryV3 {
+   installPath: string
+   lastUpdated: string
+   gitCommitSha?: string
++  /**
++   * Claude Code records this on project/local-scoped installations.
++   * Absolute path (or `~`-prefixed) of the project the plugin was installed for.
++   */
++  projectPath?: string
+ }
+ 
+ /**
+-- 
+2.39.2
+

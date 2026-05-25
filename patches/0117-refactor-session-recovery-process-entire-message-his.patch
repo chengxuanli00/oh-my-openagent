@@ -1,0 +1,275 @@
+From 16806da615a6ca415f58ac786ab6e2ff4637b65d Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 8 Dec 2025 15:00:09 +0900
+Subject: [PATCH 0117/5749] refactor(session-recovery): process entire message
+ history for empty/thinking block recovery
+
+- Scan all non-final assistant messages for empty content, orphan thinking blocks, and disabled thinking
+- Add storage utility functions: findMessagesWithThinkingBlocks, findMessagesWithOrphanThinking, stripThinkingParts, prependThinkingPart
+- Fix: Previously only processed single failed message, now handles multiple broken messages in history
+- Improve: Use filesystem-based recovery instead of unreliable SDK APIs
+---
+ src/hooks/session-recovery/index.ts   | 105 ++++++++++++--------------
+ src/hooks/session-recovery/storage.ts |  99 +++++++++++++++++++++++-
+ 2 files changed, 145 insertions(+), 59 deletions(-)
+
+diff --git a/src/hooks/session-recovery/index.ts b/src/hooks/session-recovery/index.ts
+index 7979988c..bf68ed62 100644
+--- a/src/hooks/session-recovery/index.ts
++++ b/src/hooks/session-recovery/index.ts
+@@ -1,6 +1,13 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { createOpencodeClient } from "@opencode-ai/sdk"
+-import { findFirstEmptyMessage, injectTextPart } from "./storage"
++import {
++  findEmptyMessages,
++  findMessagesWithOrphanThinking,
++  findMessagesWithThinkingBlocks,
++  injectTextPart,
++  prependThinkingPart,
++  stripThinkingParts,
++} from "./storage"
+ import type { MessageData } from "./types"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+@@ -109,76 +116,46 @@ async function recoverToolResultMissing(
+ }
+ 
+ async function recoverThinkingBlockOrder(
+-  client: Client,
++  _client: Client,
+   sessionID: string,
+-  failedAssistantMsg: MessageData,
+-  directory: string
++  _failedAssistantMsg: MessageData,
++  _directory: string
+ ): Promise<boolean> {
+-  const messageID = failedAssistantMsg.info?.id
+-  if (!messageID) {
++  const orphanMessages = findMessagesWithOrphanThinking(sessionID)
++
++  if (orphanMessages.length === 0) {
+     return false
+   }
+ 
+-  const existingParts = failedAssistantMsg.parts || []
+-  const patchedParts: MessagePart[] = [{ type: "thinking", thinking: "" } as ThinkingPart, ...existingParts]
+-
+-  try {
+-    // @ts-expect-error - Experimental API
+-    await client.message?.update?.({
+-      path: { id: messageID },
+-      body: { parts: patchedParts },
+-    })
+-    return true
+-  } catch {}
+-
+-  try {
+-    // @ts-expect-error - Experimental API
+-    await client.session.patch?.({
+-      path: { id: sessionID },
+-      body: { messageID, parts: patchedParts },
+-    })
+-    return true
+-  } catch {}
++  let anySuccess = false
++  for (const messageID of orphanMessages) {
++    if (prependThinkingPart(sessionID, messageID)) {
++      anySuccess = true
++    }
++  }
+ 
+-  return await fallbackRevertStrategy(client, sessionID, failedAssistantMsg, directory)
++  return anySuccess
+ }
+ 
+ async function recoverThinkingDisabledViolation(
+-  client: Client,
++  _client: Client,
+   sessionID: string,
+-  failedAssistantMsg: MessageData
++  _failedAssistantMsg: MessageData
+ ): Promise<boolean> {
+-  const messageID = failedAssistantMsg.info?.id
+-  if (!messageID) {
+-    return false
+-  }
++  const messagesWithThinking = findMessagesWithThinkingBlocks(sessionID)
+ 
+-  const existingParts = failedAssistantMsg.parts || []
+-  const strippedParts = existingParts.filter((p) => p.type !== "thinking" && p.type !== "redacted_thinking")
+-
+-  if (strippedParts.length === 0) {
++  if (messagesWithThinking.length === 0) {
+     return false
+   }
+ 
+-  try {
+-    // @ts-expect-error - Experimental API
+-    await client.message?.update?.({
+-      path: { id: messageID },
+-      body: { parts: strippedParts },
+-    })
+-    return true
+-  } catch {}
+-
+-  try {
+-    // @ts-expect-error - Experimental API
+-    await client.session.patch?.({
+-      path: { id: sessionID },
+-      body: { messageID, parts: strippedParts },
+-    })
+-    return true
+-  } catch {}
++  let anySuccess = false
++  for (const messageID of messagesWithThinking) {
++    if (stripThinkingParts(messageID)) {
++      anySuccess = true
++    }
++  }
+ 
+-  return false
++  return anySuccess
+ }
+ 
+ async function recoverEmptyContentMessage(
+@@ -187,10 +164,22 @@ async function recoverEmptyContentMessage(
+   failedAssistantMsg: MessageData,
+   _directory: string
+ ): Promise<boolean> {
+-  const emptyMessageID = findFirstEmptyMessage(sessionID) || failedAssistantMsg.info?.id
+-  if (!emptyMessageID) return false
++  const emptyMessageIDs = findEmptyMessages(sessionID)
++
++  if (emptyMessageIDs.length === 0) {
++    const fallbackID = failedAssistantMsg.info?.id
++    if (!fallbackID) return false
++    return injectTextPart(sessionID, fallbackID, "(interrupted)")
++  }
++
++  let anySuccess = false
++  for (const messageID of emptyMessageIDs) {
++    if (injectTextPart(sessionID, messageID, "(interrupted)")) {
++      anySuccess = true
++    }
++  }
+ 
+-  return injectTextPart(sessionID, emptyMessageID, "(interrupted)")
++  return anySuccess
+ }
+ 
+ async function fallbackRevertStrategy(
+diff --git a/src/hooks/session-recovery/storage.ts b/src/hooks/session-recovery/storage.ts
+index 75b42ee1..b6e14f2b 100644
+--- a/src/hooks/session-recovery/storage.ts
++++ b/src/hooks/session-recovery/storage.ts
+@@ -1,4 +1,4 @@
+-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
++import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+ import { join } from "node:path"
+ import { MESSAGE_STORAGE, PART_STORAGE, THINKING_TYPES, META_TYPES } from "./constants"
+ import type { StoredMessageMeta, StoredPart, StoredTextPart } from "./types"
+@@ -136,3 +136,100 @@ export function findFirstEmptyMessage(sessionID: string): string | null {
+   const emptyIds = findEmptyMessages(sessionID)
+   return emptyIds.length > 0 ? emptyIds[0] : null
+ }
++
++export function findMessagesWithThinkingBlocks(sessionID: string): string[] {
++  const messages = readMessages(sessionID)
++  const result: string[] = []
++
++  for (let i = 0; i < messages.length; i++) {
++    const msg = messages[i]
++    if (msg.role !== "assistant") continue
++
++    const isLastMessage = i === messages.length - 1
++    if (isLastMessage) continue
++
++    const parts = readParts(msg.id)
++    const hasThinking = parts.some((p) => THINKING_TYPES.has(p.type))
++    if (hasThinking) {
++      result.push(msg.id)
++    }
++  }
++
++  return result
++}
++
++export function findMessagesWithOrphanThinking(sessionID: string): string[] {
++  const messages = readMessages(sessionID)
++  const result: string[] = []
++
++  for (let i = 0; i < messages.length; i++) {
++    const msg = messages[i]
++    if (msg.role !== "assistant") continue
++
++    const isLastMessage = i === messages.length - 1
++    if (isLastMessage) continue
++
++    const parts = readParts(msg.id)
++    if (parts.length === 0) continue
++
++    const sortedParts = [...parts].sort((a, b) => a.id.localeCompare(b.id))
++    const firstPart = sortedParts[0]
++
++    const hasThinking = parts.some((p) => THINKING_TYPES.has(p.type))
++    const firstIsThinking = THINKING_TYPES.has(firstPart.type)
++
++    if (hasThinking && !firstIsThinking) {
++      result.push(msg.id)
++    }
++  }
++
++  return result
++}
++
++export function prependThinkingPart(sessionID: string, messageID: string): boolean {
++  const partDir = join(PART_STORAGE, messageID)
++
++  if (!existsSync(partDir)) {
++    mkdirSync(partDir, { recursive: true })
++  }
++
++  const partId = `prt_0000000000_thinking`
++  const part = {
++    id: partId,
++    sessionID,
++    messageID,
++    type: "thinking",
++    thinking: "",
++    synthetic: true,
++  }
++
++  try {
++    writeFileSync(join(partDir, `${partId}.json`), JSON.stringify(part, null, 2))
++    return true
++  } catch {
++    return false
++  }
++}
++
++export function stripThinkingParts(messageID: string): boolean {
++  const partDir = join(PART_STORAGE, messageID)
++  if (!existsSync(partDir)) return false
++
++  let anyRemoved = false
++  for (const file of readdirSync(partDir)) {
++    if (!file.endsWith(".json")) continue
++    try {
++      const filePath = join(partDir, file)
++      const content = readFileSync(filePath, "utf-8")
++      const part = JSON.parse(content) as StoredPart
++      if (THINKING_TYPES.has(part.type)) {
++        unlinkSync(filePath)
++        anyRemoved = true
++      }
++    } catch {
++      continue
++    }
++  }
++
++  return anyRemoved
++}
+-- 
+2.39.2
+

@@ -1,0 +1,140 @@
+From 980b685393d7e6282fcebe36e310d351aa603cee Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 7 Jan 2026 02:24:07 +0900
+Subject: [PATCH 0897/5749] fix(background-agent): release concurrency before
+ prompt to unblock queued tasks
+
+Previously, concurrency was released in finally block AFTER prompt completion.
+This caused queued tasks to remain blocked while prompt hangs.
+
+Now release happens BEFORE prompt, allowing next queued task to start immediately
+when current task completes, regardless of prompt success/failure.
+
+Also added early release on session creation error for proper cleanup.
+---
+ src/features/background-agent/manager.test.ts | 68 +++++++++++++++++++
+ src/features/background-agent/manager.ts      | 12 ++--
+ 2 files changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/src/features/background-agent/manager.test.ts b/src/features/background-agent/manager.test.ts
+index fd6ff75d..6bd818c9 100644
+--- a/src/features/background-agent/manager.test.ts
++++ b/src/features/background-agent/manager.test.ts
+@@ -302,6 +302,74 @@ describe("BackgroundManager.getAllDescendantTasks", () => {
+   })
+ })
+ 
++describe("BackgroundManager.notifyParentSession - release ordering", () => {
++  test("should unblock queued task even when prompt hangs", async () => {
++    // #given - concurrency limit 1, task1 running, task2 waiting
++    const { ConcurrencyManager } = await import("./concurrency")
++    const concurrencyManager = new ConcurrencyManager({ defaultConcurrency: 1 })
++
++    await concurrencyManager.acquire("explore")
++
++    let task2Resolved = false
++    const task2Promise = concurrencyManager.acquire("explore").then(() => {
++      task2Resolved = true
++    })
++
++    await Promise.resolve()
++    expect(task2Resolved).toBe(false)
++
++    // #when - simulate notifyParentSession: release BEFORE prompt (fixed behavior)
++    let promptStarted = false
++    const simulateNotifyParentSession = async () => {
++      concurrencyManager.release("explore")
++
++      promptStarted = true
++      await new Promise(() => {})
++    }
++
++    simulateNotifyParentSession()
++
++    await Promise.resolve()
++    await Promise.resolve()
++
++    // #then - task2 should be unblocked even though prompt never completes
++    expect(promptStarted).toBe(true)
++    await task2Promise
++    expect(task2Resolved).toBe(true)
++  })
++
++  test("should keep queue blocked if release is after prompt (demonstrates the bug)", async () => {
++    // #given - same setup
++    const { ConcurrencyManager } = await import("./concurrency")
++    const concurrencyManager = new ConcurrencyManager({ defaultConcurrency: 1 })
++
++    await concurrencyManager.acquire("explore")
++
++    let task2Resolved = false
++    concurrencyManager.acquire("explore").then(() => {
++      task2Resolved = true
++    })
++
++    await Promise.resolve()
++    expect(task2Resolved).toBe(false)
++
++    // #when - simulate BUGGY behavior: release AFTER prompt (in finally)
++    const simulateBuggyNotifyParentSession = async () => {
++      try {
++        await new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 50))
++      } finally {
++        concurrencyManager.release("explore")
++      }
++    }
++
++    await simulateBuggyNotifyParentSession().catch(() => {})
++
++    // #then - task2 resolves only after prompt completes (blocked during hang)
++    await Promise.resolve()
++    expect(task2Resolved).toBe(true)
++  })
++})
++
+ describe("BackgroundManager.pruneStaleTasksAndNotifications", () => {
+   let manager: MockBackgroundManager
+ 
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 3b33b47f..87083aad 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -86,9 +86,13 @@ export class BackgroundManager {
+         parentID: input.parentSessionID,
+         title: `Background: ${input.description}`,
+       },
++    }).catch((error) => {
++      this.concurrencyManager.release(model)
++      throw error
+     })
+ 
+     if (createResult.error) {
++      this.concurrencyManager.release(model)
+       throw new Error(`Failed to create background session: ${createResult.error}`)
+     }
+ 
+@@ -345,6 +349,10 @@ export class BackgroundManager {
+ 
+     const taskId = task.id
+     setTimeout(async () => {
++      if (task.model) {
++        this.concurrencyManager.release(task.model)
++      }
++
+       try {
+         const messageDir = getMessageDir(task.parentSessionID)
+         const prevMessage = messageDir ? findNearestMessageWithFields(messageDir) : null
+@@ -367,10 +375,6 @@ export class BackgroundManager {
+       } catch (error) {
+         log("[background-agent] prompt failed:", String(error))
+       } finally {
+-        if (task.model) {
+-          this.concurrencyManager.release(task.model)
+-        }
+-        // Always clean up both maps to prevent memory leaks
+         this.clearNotificationsForTask(taskId)
+         this.tasks.delete(taskId)
+         log("[background-agent] Removed completed task from memory:", taskId)
+-- 
+2.39.2
+

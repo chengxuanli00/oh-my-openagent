@@ -1,0 +1,267 @@
+From e22e13cd298f82d6e18a3c68a2d65c0a9c592718 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 27 Mar 2026 15:43:01 +0900
+Subject: [PATCH 3571/5749] fix(#2732): detect crashed subagent sessions with
+ shorter timeout
+
+When a subagent session disappears from the status registry (process
+crashed), the main agent was waiting the full stale timeout before
+acting. Fix:
+
+- Add sessionGoneTimeoutMs config option (default 60s, vs 30min normal)
+- task-poller: use shorter timeout when session is gone from status
+- manager: verify session existence when gone, fail crashed tasks
+  immediately with descriptive error
+- Add legacy-plugin-toast hook for #2823 migration warnings
+- Update schema with new config option
+---
+ assets/oh-my-opencode.schema.json            |  4 ++
+ src/config/schema/background-task.ts         |  2 +
+ src/features/background-agent/constants.ts   |  1 +
+ src/features/background-agent/manager.ts     | 56 ++++++++++++++++++++
+ src/features/background-agent/task-poller.ts | 15 ++++--
+ src/hooks/index.ts                           |  1 +
+ src/plugin/event.ts                          |  1 +
+ src/plugin/hooks/create-session-hooks.ts     |  8 +++
+ 8 files changed, 84 insertions(+), 4 deletions(-)
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index c579a790..a1b30720 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -4661,6 +4661,10 @@
+           "type": "number",
+           "minimum": 60000
+         },
++        "sessionGoneTimeoutMs": {
++          "type": "number",
++          "minimum": 10000
++        },
+         "syncPollTimeoutMs": {
+           "type": "number",
+           "minimum": 60000
+diff --git a/src/config/schema/background-task.ts b/src/config/schema/background-task.ts
+index c836e781..dbf53a7d 100644
+--- a/src/config/schema/background-task.ts
++++ b/src/config/schema/background-task.ts
+@@ -16,6 +16,8 @@ export const BackgroundTaskConfigSchema = z.object({
+   staleTimeoutMs: z.number().min(60000).optional(),
+   /** Timeout for tasks that never received any progress update, falling back to startedAt (default: 1800000 = 30 minutes, minimum: 60000 = 1 minute) */
+   messageStalenessTimeoutMs: z.number().min(60000).optional(),
++  /** Timeout for tasks whose session has completely disappeared from the status registry (default: 60000 = 1 minute, minimum: 10000 = 10 seconds). When a session is gone (likely crashed), this shorter timeout is used instead of the normal stale timeout. */
++  sessionGoneTimeoutMs: z.number().min(10000).optional(),
+   syncPollTimeoutMs: z.number().min(60000).optional(),
+   /** Maximum tool calls per subagent task before circuit breaker triggers (default: 200, minimum: 10). Prevents runaway loops from burning unlimited tokens. */
+   maxToolCalls: z.number().int().min(10).optional(),
+diff --git a/src/features/background-agent/constants.ts b/src/features/background-agent/constants.ts
+index 9c20c0f6..4129a251 100644
+--- a/src/features/background-agent/constants.ts
++++ b/src/features/background-agent/constants.ts
+@@ -10,6 +10,7 @@ export const DEFAULT_MAX_TOOL_CALLS = 4000
+ export const DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_THRESHOLD = 20
+ export const DEFAULT_CIRCUIT_BREAKER_ENABLED = true
+ export const MIN_RUNTIME_BEFORE_STALE_MS = 30_000
++export const DEFAULT_SESSION_GONE_TIMEOUT_MS = 60_000
+ export const MIN_IDLE_TIME_MS = 5000
+ export const POLLING_INTERVAL_MS = 3000
+ export const TASK_CLEANUP_DELAY_MS = 10 * 60 * 1000
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index aef37f95..980061bb 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -1787,6 +1787,53 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+     })
+   }
+ 
++  private async verifySessionExists(sessionID: string): Promise<boolean> {
++    try {
++      const result = await this.client.session.get({ path: { id: sessionID } })
++      return !!result.data
++    } catch {
++      return false
++    }
++  }
++
++  private async failCrashedTask(task: BackgroundTask, errorMessage: string): Promise<void> {
++    task.status = "error"
++    task.error = errorMessage
++    task.completedAt = new Date()
++    if (task.rootSessionID) {
++      this.unregisterRootDescendant(task.rootSessionID)
++    }
++    this.taskHistory.record(task.parentSessionID, { id: task.id, sessionID: task.sessionID, agent: task.agent, description: task.description, status: "error", category: task.category, startedAt: task.startedAt, completedAt: task.completedAt })
++    if (task.concurrencyKey) {
++      this.concurrencyManager.release(task.concurrencyKey)
++      task.concurrencyKey = undefined
++    }
++
++    const completionTimer = this.completionTimers.get(task.id)
++    if (completionTimer) {
++      clearTimeout(completionTimer)
++      this.completionTimers.delete(task.id)
++    }
++    const idleTimer = this.idleDeferralTimers.get(task.id)
++    if (idleTimer) {
++      clearTimeout(idleTimer)
++      this.idleDeferralTimers.delete(task.id)
++    }
++
++    this.cleanupPendingByParent(task)
++    this.clearNotificationsForTask(task.id)
++    removeTaskToastTracking(task.id)
++    this.scheduleTaskRemoval(task.id)
++    if (task.sessionID) {
++      SessionCategoryRegistry.remove(task.sessionID)
++    }
++
++    this.markForNotification(task)
++    this.enqueueNotificationForParent(task.parentSessionID, () => this.notifyParentSession(task)).catch(err => {
++      log("[background-agent] Error in notifyParentSession for crashed task:", { taskId: task.id, error: err })
++    })
++  }
++
+   private async pollRunningTasks(): Promise<void> {
+     if (this.pollingInFlight) return
+     this.pollingInFlight = true
+@@ -1848,11 +1895,20 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+         }
+ 
+         // Session is idle or no longer in status response (completed/disappeared)
++        const sessionGoneFromStatus = !sessionStatus
+         const completionSource = sessionStatus?.type === "idle"
+           ? "polling (idle status)"
+           : "polling (session gone from status)"
+         const hasValidOutput = await this.validateSessionHasOutput(sessionID)
+         if (!hasValidOutput) {
++          if (sessionGoneFromStatus) {
++            const sessionExists = await this.verifySessionExists(sessionID)
++            if (!sessionExists) {
++              log("[background-agent] Session no longer exists (crashed), marking task as error:", task.id)
++              await this.failCrashedTask(task, "Subagent session no longer exists (process likely crashed). The session disappeared without producing any output.")
++              continue
++            }
++          }
+           log("[background-agent] Polling idle/gone but no valid output yet, waiting:", task.id)
+           continue
+         }
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index 84ba4c56..6e97e025 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -7,6 +7,7 @@ import type { OpencodeClient } from "./opencode-client"
+ 
+ import {
+   DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS,
++  DEFAULT_SESSION_GONE_TIMEOUT_MS,
+   DEFAULT_STALE_TIMEOUT_MS,
+   MIN_RUNTIME_BEFORE_STALE_MS,
+   TERMINAL_TASK_TTL_MS,
+@@ -109,6 +110,7 @@ export async function checkAndInterruptStaleTasks(args: {
+     onTaskInterrupted = (task) => removeTaskToastTracking(task.id),
+   } = args
+   const staleTimeoutMs = config?.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS
++  const sessionGoneTimeoutMs = config?.sessionGoneTimeoutMs ?? DEFAULT_SESSION_GONE_TIMEOUT_MS
+   const now = Date.now()
+ 
+   const messageStalenessMs = config?.messageStalenessTimeoutMs ?? DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS
+@@ -122,15 +124,18 @@ export async function checkAndInterruptStaleTasks(args: {
+ 
+     const sessionStatus = sessionStatuses?.[sessionID]?.type
+     const sessionIsRunning = sessionStatus !== undefined && isActiveSessionStatus(sessionStatus)
++    const sessionGone = sessionStatuses !== undefined && sessionStatus === undefined
+     const runtime = now - startedAt.getTime()
+ 
+     if (!task.progress?.lastUpdate) {
+       if (sessionIsRunning) continue
+-      if (runtime <= messageStalenessMs) continue
++      const effectiveTimeout = sessionGone ? sessionGoneTimeoutMs : messageStalenessMs
++      if (runtime <= effectiveTimeout) continue
+ 
+       const staleMinutes = Math.round(runtime / 60000)
++      const reason = sessionGone ? "session gone from status registry" : "no activity"
+       task.status = "cancelled"
+-      task.error = `Stale timeout (no activity for ${staleMinutes}min since start). This is a FINAL cancellation - do NOT create a replacement task. If the timeout is too short, increase 'background_task.staleTimeoutMs' in .opencode/oh-my-opencode.json.`
++      task.error = `Stale timeout (${reason} for ${staleMinutes}min since start). This is a FINAL cancellation - do NOT create a replacement task. If the timeout is too short, increase 'background_task.${sessionGone ? "sessionGoneTimeoutMs" : "staleTimeoutMs"}' in .opencode/oh-my-opencode.json.`
+       task.completedAt = new Date()
+ 
+       if (task.concurrencyKey) {
+@@ -156,12 +161,14 @@ export async function checkAndInterruptStaleTasks(args: {
+     if (runtime < MIN_RUNTIME_BEFORE_STALE_MS) continue
+ 
+     const timeSinceLastUpdate = now - task.progress.lastUpdate.getTime()
+-    if (timeSinceLastUpdate <= staleTimeoutMs) continue
++    const effectiveStaleTimeout = sessionGone ? sessionGoneTimeoutMs : staleTimeoutMs
++    if (timeSinceLastUpdate <= effectiveStaleTimeout) continue
+     if (task.status !== "running") continue
+ 
+      const staleMinutes = Math.round(timeSinceLastUpdate / 60000)
++     const reason = sessionGone ? "session gone from status registry" : "no activity"
+      task.status = "cancelled"
+-     task.error = `Stale timeout (no activity for ${staleMinutes}min). This is a FINAL cancellation - do NOT create a replacement task. If the timeout is too short, increase 'background_task.staleTimeoutMs' in .opencode/oh-my-opencode.json.`
++     task.error = `Stale timeout (${reason} for ${staleMinutes}min). This is a FINAL cancellation - do NOT create a replacement task. If the timeout is too short, increase 'background_task.${sessionGone ? "sessionGoneTimeoutMs" : "staleTimeoutMs"}' in .opencode/oh-my-opencode.json.`
+      task.completedAt = new Date()
+ 
+     if (task.concurrencyKey) {
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 8121f509..4ce5fadb 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -53,3 +53,4 @@ export { createJsonErrorRecoveryHook, JSON_ERROR_TOOL_EXCLUDE_LIST, JSON_ERROR_P
+ export { createReadImageResizerHook } from "./read-image-resizer"
+ export { createTodoDescriptionOverrideHook } from "./todo-description-override"
+ export { createWebFetchRedirectGuardHook } from "./webfetch-redirect-guard"
++export { createLegacyPluginToastHook } from "./legacy-plugin-toast"
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 126d6e81..e6dbf1c4 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -195,6 +195,7 @@ export function createEventHandler(args: {
+ 
+   const dispatchToHooks = async (input: EventInput): Promise<void> => {
+     await Promise.resolve(hooks.autoUpdateChecker?.event?.(input));
++    await Promise.resolve(hooks.legacyPluginToast?.event?.(input));
+     await Promise.resolve(hooks.claudeCodeHooks?.event?.(input));
+     await Promise.resolve(hooks.backgroundNotificationHook?.event?.(input));
+     await Promise.resolve(hooks.sessionNotification?.(input));
+diff --git a/src/plugin/hooks/create-session-hooks.ts b/src/plugin/hooks/create-session-hooks.ts
+index 60ea8241..ccbc8bf0 100644
+--- a/src/plugin/hooks/create-session-hooks.ts
++++ b/src/plugin/hooks/create-session-hooks.ts
+@@ -25,6 +25,7 @@ import {
+   createQuestionLabelTruncatorHook,
+   createPreemptiveCompactionHook,
+   createRuntimeFallbackHook,
++  createLegacyPluginToastHook,
+ } from "../../hooks"
+ import { createAnthropicEffortHook } from "../../hooks/anthropic-effort"
+ import {
+@@ -60,6 +61,7 @@ export type SessionHooks = {
+   taskResumeInfo: ReturnType<typeof createTaskResumeInfoHook> | null
+   anthropicEffort: ReturnType<typeof createAnthropicEffortHook> | null
+   runtimeFallback: ReturnType<typeof createRuntimeFallbackHook> | null
++  legacyPluginToast: ReturnType<typeof createLegacyPluginToastHook> | null
+ }
+ 
+ export function createSessionHooks(args: {
+@@ -262,6 +264,11 @@ export function createSessionHooks(args: {
+           pluginConfig,
+         }))
+     : null
++
++  const legacyPluginToast = isHookEnabled("legacy-plugin-toast")
++    ? safeHook("legacy-plugin-toast", () => createLegacyPluginToastHook(ctx))
++    : null
++
+   return {
+     contextWindowMonitor,
+     preemptiveCompaction,
+@@ -286,5 +293,6 @@ export function createSessionHooks(args: {
+     taskResumeInfo,
+     anthropicEffort,
+     runtimeFallback,
++    legacyPluginToast,
+   }
+ }
+-- 
+2.39.2
+

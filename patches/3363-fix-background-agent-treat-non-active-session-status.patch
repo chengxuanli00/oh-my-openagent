@@ -1,0 +1,340 @@
+From 952bd5338d5deaf1edfb4915398f94a663f9857b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 18 Mar 2026 13:56:11 +0900
+Subject: [PATCH 3363/5749] fix(background-agent): treat non-active session
+ statuses as terminal to prevent parent session hang
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously, pollRunningTasks() and checkAndInterruptStaleTasks() treated
+any non-"idle" session status as "still running", which caused tasks with
+terminal statuses like "interrupted" to be skipped indefinitely — both
+for completion detection AND stale timeout. This made the parent session
+hang forever waiting for an ALL COMPLETE notification that never came.
+
+Extract isActiveSessionStatus() and isTerminalSessionStatus() that
+classify session statuses explicitly. Only known active statuses
+("busy", "retry", "running") protect tasks from completion/stale checks.
+Known terminal statuses ("interrupted") trigger immediate completion.
+Unknown statuses fall through to the standard idle/gone path with output
+validation as a conservative default.
+
+Introduced by: a0c93816 (2026-02-14), dc370f7f (2026-03-08)
+---
+ .../background-agent/manager.polling.test.ts  | 38 +++++++++++
+ src/features/background-agent/manager.ts      | 34 +++++++---
+ .../session-status-classifier.test.ts         | 66 +++++++++++++++++++
+ .../session-status-classifier.ts              | 20 ++++++
+ .../background-agent/task-poller.test.ts      | 50 ++++++++++++++
+ src/features/background-agent/task-poller.ts  |  3 +-
+ 6 files changed, 202 insertions(+), 9 deletions(-)
+ create mode 100644 src/features/background-agent/session-status-classifier.test.ts
+ create mode 100644 src/features/background-agent/session-status-classifier.ts
+
+diff --git a/src/features/background-agent/manager.polling.test.ts b/src/features/background-agent/manager.polling.test.ts
+index 3b06ae98..964d2603 100644
+--- a/src/features/background-agent/manager.polling.test.ts
++++ b/src/features/background-agent/manager.polling.test.ts
+@@ -153,4 +153,42 @@ describe("BackgroundManager pollRunningTasks", () => {
+       expect(task.status).toBe("running")
+     })
+   })
++
++  describe("#given a running task whose session has terminal non-idle status", () => {
++    test('#when session status is "interrupted" #then completes the task', async () => {
++      //#given
++      const manager = createManagerWithClient({
++        status: async () => ({ data: { "ses-interrupted": { type: "interrupted" } } }),
++      })
++      const task = createRunningTask("ses-interrupted")
++      injectTask(manager, task)
++
++      //#when
++      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      await poll.call(manager)
++      manager.shutdown()
++
++      //#then
++      expect(task.status).toBe("completed")
++      expect(task.completedAt).toBeDefined()
++    })
++
++    test('#when session status is an unknown type #then completes the task', async () => {
++      //#given
++      const manager = createManagerWithClient({
++        status: async () => ({ data: { "ses-unknown": { type: "some-weird-status" } } }),
++      })
++      const task = createRunningTask("ses-unknown")
++      injectTask(manager, task)
++
++      //#when
++      const poll = (manager as unknown as { pollRunningTasks: () => Promise<void> }).pollRunningTasks
++      await poll.call(manager)
++      manager.shutdown()
++
++      //#then
++      expect(task.status).toBe("completed")
++      expect(task.completedAt).toBeDefined()
++    })
++  })
+ })
+\ No newline at end of file
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index d4d98206..5a0e3c67 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -52,6 +52,7 @@ import { join } from "node:path"
+ import { pruneStaleTasksAndNotifications } from "./task-poller"
+ import { checkAndInterruptStaleTasks } from "./task-poller"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
++import { isActiveSessionStatus, isTerminalSessionStatus } from "./session-status-classifier"
+ import {
+   detectRepetitiveToolUse,
+   recordToolCall,
+@@ -900,18 +901,19 @@ export class BackgroundManager {
+       task.progress.lastUpdate = new Date()
+ 
+       if (partInfo?.type === "tool" || partInfo?.tool) {
+-        const countedToolPartIDs = task.progress.countedToolPartIDs ?? []
++        const countedToolPartIDs = task.progress.countedToolPartIDs ?? new Set<string>()
+         const shouldCountToolCall =
+           !partInfo.id ||
+           partInfo.state?.status !== "running" ||
+-          !countedToolPartIDs.includes(partInfo.id)
++          !countedToolPartIDs.has(partInfo.id)
+ 
+         if (!shouldCountToolCall) {
+           return
+         }
+ 
+         if (partInfo.id && partInfo.state?.status === "running") {
+-          task.progress.countedToolPartIDs = [...countedToolPartIDs, partInfo.id]
++          countedToolPartIDs.add(partInfo.id)
++          task.progress.countedToolPartIDs = countedToolPartIDs
+         }
+ 
+         task.progress.toolCalls += 1
+@@ -1782,11 +1784,9 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+           }
+         }
+ 
+-        // Match sync-session-poller pattern: only skip completion check when
+-        // status EXISTS and is not idle (i.e., session is actively running).
+-        // When sessionStatus is undefined, the session has completed and dropped
+-        // from the status response — fall through to completion detection.
+-        if (sessionStatus && sessionStatus.type !== "idle") {
++        // Only skip completion when session status is actively running.
++        // Unknown or terminal statuses (like "interrupted") fall through to completion.
++        if (sessionStatus && isActiveSessionStatus(sessionStatus.type)) {
+           log("[background-agent] Session still running, relying on event-based progress:", {
+             taskId: task.id,
+             sessionID,
+@@ -1796,6 +1796,24 @@ Use \`background_output(task_id="${task.id}")\` to retrieve this result when rea
+           continue
+         }
+ 
++        // Explicit terminal non-idle status (e.g., "interrupted") — complete immediately,
++        // skipping output validation (session will never produce more output).
++        // Unknown statuses fall through to the idle/gone path with output validation.
++        if (sessionStatus && isTerminalSessionStatus(sessionStatus.type)) {
++          await this.tryCompleteTask(task, `polling (terminal session status: ${sessionStatus.type})`)
++          continue
++        }
++
++        // Unknown non-idle status — not active, not terminal, not idle.
++        // Fall through to idle/gone completion path with output validation.
++        if (sessionStatus && sessionStatus.type !== "idle") {
++          log("[background-agent] Unknown session status, treating as potentially idle:", {
++            taskId: task.id,
++            sessionID,
++            sessionStatus: sessionStatus.type,
++          })
++        }
++
+         // Session is idle or no longer in status response (completed/disappeared)
+         const completionSource = sessionStatus?.type === "idle"
+           ? "polling (idle status)"
+diff --git a/src/features/background-agent/session-status-classifier.test.ts b/src/features/background-agent/session-status-classifier.test.ts
+new file mode 100644
+index 00000000..5a024474
+--- /dev/null
++++ b/src/features/background-agent/session-status-classifier.test.ts
+@@ -0,0 +1,66 @@
++import { describe, test, expect, mock } from "bun:test"
++import { isActiveSessionStatus, isTerminalSessionStatus } from "./session-status-classifier"
++
++const mockLog = mock()
++mock.module("../../shared", () => ({ log: mockLog }))
++
++describe("isActiveSessionStatus", () => {
++  describe("#given a known active session status", () => {
++    test('#when type is "busy" #then returns true', () => {
++      expect(isActiveSessionStatus("busy")).toBe(true)
++    })
++
++    test('#when type is "retry" #then returns true', () => {
++      expect(isActiveSessionStatus("retry")).toBe(true)
++    })
++
++    test('#when type is "running" #then returns true', () => {
++      expect(isActiveSessionStatus("running")).toBe(true)
++    })
++  })
++
++  describe("#given a known terminal session status", () => {
++    test('#when type is "idle" #then returns false', () => {
++      expect(isActiveSessionStatus("idle")).toBe(false)
++    })
++
++    test('#when type is "interrupted" #then returns false and does not log', () => {
++      mockLog.mockClear()
++      expect(isActiveSessionStatus("interrupted")).toBe(false)
++      expect(mockLog).not.toHaveBeenCalled()
++    })
++  })
++
++  describe("#given an unknown session status", () => {
++    test('#when type is an arbitrary unknown string #then returns false and logs warning', () => {
++      mockLog.mockClear()
++      expect(isActiveSessionStatus("some-unknown-status")).toBe(false)
++      expect(mockLog).toHaveBeenCalledWith(
++        "[background-agent] Unknown session status type encountered:",
++        "some-unknown-status",
++      )
++    })
++
++    test('#when type is empty string #then returns false', () => {
++      expect(isActiveSessionStatus("")).toBe(false)
++    })
++  })
++})
++
++describe("isTerminalSessionStatus", () => {
++  test('#when type is "interrupted" #then returns true', () => {
++    expect(isTerminalSessionStatus("interrupted")).toBe(true)
++  })
++
++  test('#when type is "idle" #then returns false (idle is handled separately)', () => {
++    expect(isTerminalSessionStatus("idle")).toBe(false)
++  })
++
++  test('#when type is "busy" #then returns false', () => {
++    expect(isTerminalSessionStatus("busy")).toBe(false)
++  })
++
++  test('#when type is an unknown string #then returns false', () => {
++    expect(isTerminalSessionStatus("some-unknown")).toBe(false)
++  })
++})
+diff --git a/src/features/background-agent/session-status-classifier.ts b/src/features/background-agent/session-status-classifier.ts
+new file mode 100644
+index 00000000..91236288
+--- /dev/null
++++ b/src/features/background-agent/session-status-classifier.ts
+@@ -0,0 +1,20 @@
++import { log } from "../../shared"
++
++const ACTIVE_SESSION_STATUSES = new Set(["busy", "retry", "running"])
++const KNOWN_TERMINAL_STATUSES = new Set(["idle", "interrupted"])
++
++export function isActiveSessionStatus(type: string): boolean {
++  if (ACTIVE_SESSION_STATUSES.has(type)) {
++    return true
++  }
++
++  if (!KNOWN_TERMINAL_STATUSES.has(type)) {
++    log("[background-agent] Unknown session status type encountered:", type)
++  }
++
++  return false
++}
++
++export function isTerminalSessionStatus(type: string): boolean {
++  return KNOWN_TERMINAL_STATUSES.has(type) && type !== "idle"
++}
+diff --git a/src/features/background-agent/task-poller.test.ts b/src/features/background-agent/task-poller.test.ts
+index b71e27d8..7895dfe0 100644
+--- a/src/features/background-agent/task-poller.test.ts
++++ b/src/features/background-agent/task-poller.test.ts
+@@ -417,6 +417,56 @@ describe("checkAndInterruptStaleTasks", () => {
+     expect(task.status).toBe("cancelled")
+     expect(onTaskInterrupted).toHaveBeenCalledWith(task)
+   })
++
++  it('should NOT protect task when session has terminal non-idle status like "interrupted"', async () => {
++    //#given — lastUpdate is 5min old, session is "interrupted" (terminal, not active)
++    const task = createRunningTask({
++      startedAt: new Date(Date.now() - 300_000),
++      progress: {
++        toolCalls: 2,
++        lastUpdate: new Date(Date.now() - 300_000),
++      },
++    })
++
++    //#when — session status is "interrupted" (terminal)
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient as never,
++      config: { staleTimeoutMs: 180_000 },
++      concurrencyManager: mockConcurrencyManager as never,
++      notifyParentSession: mockNotify,
++      sessionStatuses: { "ses-1": { type: "interrupted" } },
++    })
++
++    //#then — terminal statuses should not protect from stale timeout
++    expect(task.status).toBe("cancelled")
++    expect(task.error).toContain("Stale timeout")
++  })
++
++  it('should NOT protect task when session has unknown status type', async () => {
++    //#given — lastUpdate is 5min old, session has an unknown status
++    const task = createRunningTask({
++      startedAt: new Date(Date.now() - 300_000),
++      progress: {
++        toolCalls: 2,
++        lastUpdate: new Date(Date.now() - 300_000),
++      },
++    })
++
++    //#when — session has unknown status type
++    await checkAndInterruptStaleTasks({
++      tasks: [task],
++      client: mockClient as never,
++      config: { staleTimeoutMs: 180_000 },
++      concurrencyManager: mockConcurrencyManager as never,
++      notifyParentSession: mockNotify,
++      sessionStatuses: { "ses-1": { type: "some-weird-status" } },
++    })
++
++    //#then — unknown statuses should not protect from stale timeout
++    expect(task.status).toBe("cancelled")
++    expect(task.error).toContain("Stale timeout")
++  })
+ })
+ 
+ describe("pruneStaleTasksAndNotifications", () => {
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index 9b17e626..d23a241a 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -14,6 +14,7 @@ import {
+ } from "./constants"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
+ 
++import { isActiveSessionStatus } from "./session-status-classifier"
+ const TERMINAL_TASK_STATUSES = new Set<BackgroundTask["status"]>([
+   "completed",
+   "error",
+@@ -120,7 +121,7 @@ export async function checkAndInterruptStaleTasks(args: {
+     if (!startedAt || !sessionID) continue
+ 
+     const sessionStatus = sessionStatuses?.[sessionID]?.type
+-    const sessionIsRunning = sessionStatus !== undefined && sessionStatus !== "idle"
++    const sessionIsRunning = sessionStatus !== undefined && isActiveSessionStatus(sessionStatus)
+     const runtime = now - startedAt.getTime()
+ 
+     if (!task.progress?.lastUpdate) {
+-- 
+2.39.2
+

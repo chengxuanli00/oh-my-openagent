@@ -1,0 +1,158 @@
+From 1e05f4770e311ec8663b67c999b30bce6f33dc9b Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 18 Feb 2026 13:45:41 +0900
+Subject: [PATCH 2360/5749] fix(cli-run): retry server start on port binding
+ race condition
+
+When port appears available but binding fails (race with another opencode
+instance), retry on next available port (auto mode) or attach to existing
+server (explicit port mode) instead of crashing with exit code 1.
+---
+ src/cli/run/server-connection.test.ts | 44 +++++++++++++++++++++
+ src/cli/run/server-connection.ts      | 56 ++++++++++++++++++++++-----
+ 2 files changed, 90 insertions(+), 10 deletions(-)
+
+diff --git a/src/cli/run/server-connection.test.ts b/src/cli/run/server-connection.test.ts
+index ad5e1aa9..a9e22412 100644
+--- a/src/cli/run/server-connection.test.ts
++++ b/src/cli/run/server-connection.test.ts
+@@ -95,6 +95,24 @@ describe("createServerConnection", () => {
+     expect(mockServerClose).toHaveBeenCalled()
+   })
+ 
++  it("explicit port attaches when start fails because port became occupied", async () => {
++    // given
++    const signal = new AbortController().signal
++    const port = 8080
++    mockIsPortAvailable.mockResolvedValueOnce(true).mockResolvedValueOnce(false)
++    mockCreateOpencode.mockRejectedValueOnce(new Error("Failed to start server on port 8080"))
++
++    // when
++    const result = await createServerConnection({ port, signal })
++
++    // then
++    expect(mockIsPortAvailable).toHaveBeenNthCalledWith(1, 8080, "127.0.0.1")
++    expect(mockIsPortAvailable).toHaveBeenNthCalledWith(2, 8080, "127.0.0.1")
++    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({ baseUrl: "http://127.0.0.1:8080" })
++    result.cleanup()
++    expect(mockServerClose).not.toHaveBeenCalled()
++  })
++
+   it("explicit port attaches when port is occupied", async () => {
+     // given
+     const signal = new AbortController().signal
+@@ -133,6 +151,32 @@ describe("createServerConnection", () => {
+     expect(mockServerClose).toHaveBeenCalled()
+   })
+ 
++  it("auto mode retries on next port when initial start fails", async () => {
++    // given
++    const signal = new AbortController().signal
++    mockGetAvailableServerPort
++      .mockResolvedValueOnce({ port: 4096, wasAutoSelected: false })
++      .mockResolvedValueOnce({ port: 4097, wasAutoSelected: true })
++
++    mockCreateOpencode
++      .mockRejectedValueOnce(new Error("Failed to start server on port 4096"))
++      .mockResolvedValueOnce({
++        client: { session: {} },
++        server: { url: "http://127.0.0.1:4097", close: mockServerClose },
++      })
++
++    // when
++    const result = await createServerConnection({ signal })
++
++    // then
++    expect(mockGetAvailableServerPort).toHaveBeenNthCalledWith(1, 4096, "127.0.0.1")
++    expect(mockGetAvailableServerPort).toHaveBeenNthCalledWith(2, 4097, "127.0.0.1")
++    expect(mockCreateOpencode).toHaveBeenNthCalledWith(1, { signal, port: 4096, hostname: "127.0.0.1" })
++    expect(mockCreateOpencode).toHaveBeenNthCalledWith(2, { signal, port: 4097, hostname: "127.0.0.1" })
++    result.cleanup()
++    expect(mockServerClose).toHaveBeenCalledTimes(1)
++  })
++
+   it("invalid port throws error", async () => {
+     // given
+     const signal = new AbortController().signal
+diff --git a/src/cli/run/server-connection.ts b/src/cli/run/server-connection.ts
+index 934d469d..3472e7a2 100644
+--- a/src/cli/run/server-connection.ts
++++ b/src/cli/run/server-connection.ts
+@@ -5,6 +5,24 @@ import { getAvailableServerPort, isPortAvailable, DEFAULT_SERVER_PORT } from "..
+ import { withWorkingOpencodePath } from "./opencode-binary-resolver"
+ import { prependResolvedOpencodeBinToPath } from "./opencode-bin-path"
+ 
++function isPortStartFailure(error: unknown, port: number): boolean {
++  if (!(error instanceof Error)) {
++    return false
++  }
++
++  return error.message.includes(`Failed to start server on port ${port}`)
++}
++
++async function startServer(options: { signal: AbortSignal, port: number }): Promise<ServerConnection> {
++  const { signal, port } = options
++  const { client, server } = await withWorkingOpencodePath(() =>
++    createOpencode({ signal, port, hostname: "127.0.0.1" }),
++  )
++
++  console.log(pc.dim("Server listening at"), pc.cyan(server.url))
++  return { client, cleanup: () => server.close() }
++}
++
+ export async function createServerConnection(options: {
+   port?: number
+   attach?: string
+@@ -29,11 +47,22 @@ export async function createServerConnection(options: {
+ 
+     if (available) {
+       console.log(pc.dim("Starting server on port"), pc.cyan(port.toString()))
+-      const { client, server } = await withWorkingOpencodePath(() =>
+-        createOpencode({ signal, port, hostname: "127.0.0.1" }),
+-      )
+-      console.log(pc.dim("Server listening at"), pc.cyan(server.url))
+-      return { client, cleanup: () => server.close() }
++      try {
++        return await startServer({ signal, port })
++      } catch (error) {
++        if (!isPortStartFailure(error, port)) {
++          throw error
++        }
++
++        const stillAvailable = await isPortAvailable(port, "127.0.0.1")
++        if (stillAvailable) {
++          throw error
++        }
++
++        console.log(pc.dim("Port"), pc.cyan(port.toString()), pc.dim("became occupied, attaching to existing server"))
++        const client = createOpencodeClient({ baseUrl: `http://127.0.0.1:${port}` })
++        return { client, cleanup: () => {} }
++      }
+     }
+ 
+     console.log(pc.dim("Port"), pc.cyan(port.toString()), pc.dim("is occupied, attaching to existing server"))
+@@ -47,9 +76,16 @@ export async function createServerConnection(options: {
+   } else {
+     console.log(pc.dim("Starting server on port"), pc.cyan(selectedPort.toString()))
+   }
+-  const { client, server } = await withWorkingOpencodePath(() =>
+-    createOpencode({ signal, port: selectedPort, hostname: "127.0.0.1" }),
+-  )
+-  console.log(pc.dim("Server listening at"), pc.cyan(server.url))
+-  return { client, cleanup: () => server.close() }
++
++  try {
++    return await startServer({ signal, port: selectedPort })
++  } catch (error) {
++    if (!isPortStartFailure(error, selectedPort)) {
++      throw error
++    }
++
++    const { port: retryPort } = await getAvailableServerPort(selectedPort + 1, "127.0.0.1")
++    console.log(pc.dim("Retrying server start on port"), pc.cyan(retryPort.toString()))
++    return await startServer({ signal, port: retryPort })
++  }
+ }
+-- 
+2.39.2
+

@@ -1,0 +1,264 @@
+From 3bbe0cbb1d13309636461b5ef2a55d60d59f1b73 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 15 Feb 2026 19:06:57 +0900
+Subject: [PATCH 2212/5749] feat: implement SDK/HTTP pruning for deduplication
+ and tool-output truncation on SQLite
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- executeDeduplication: now async, reads messages from SDK on SQLite via
+  client.session.messages() instead of JSON file reads
+- truncateToolOutputsByCallId: now async, uses truncateToolResultAsync()
+  HTTP PATCH on SQLite instead of file-based truncateToolResult()
+- deduplication-recovery: passes client through to both functions
+- recovery-hook: passes ctx.client to attemptDeduplicationRecovery
+
+Removes the last intentional feature gap on SQLite backend — dynamic
+context pruning (dedup + tool-output truncation) now works on both
+JSON and SQLite storage backends.
+---
+ .../deduplication-recovery.ts                 | 10 ++-
+ .../pruning-deduplication.ts                  | 31 +++++---
+ .../pruning-tool-output-truncation.ts         | 72 ++++++++++++++++---
+ .../recovery-hook.ts                          |  2 +-
+ 4 files changed, 93 insertions(+), 22 deletions(-)
+
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/deduplication-recovery.ts b/src/hooks/anthropic-context-window-limit-recovery/deduplication-recovery.ts
+index d7cb0314..5a76be36 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/deduplication-recovery.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/deduplication-recovery.ts
+@@ -1,3 +1,4 @@
++import type { PluginInput } from "@opencode-ai/plugin"
+ import type { ParsedTokenLimitError } from "./types"
+ import type { ExperimentalConfig } from "../../config"
+ import type { DeduplicationConfig } from "./pruning-deduplication"
+@@ -6,6 +7,8 @@ import { executeDeduplication } from "./pruning-deduplication"
+ import { truncateToolOutputsByCallId } from "./pruning-tool-output-truncation"
+ import { log } from "../../shared/logger"
+ 
++type OpencodeClient = PluginInput["client"]
++
+ function createPruningState(): PruningState {
+   return {
+     toolIdsToPrune: new Set<string>(),
+@@ -43,6 +46,7 @@ export async function attemptDeduplicationRecovery(
+   sessionID: string,
+   parsed: ParsedTokenLimitError,
+   experimental: ExperimentalConfig | undefined,
++  client?: OpencodeClient,
+ ): Promise<void> {
+   if (!isPromptTooLongError(parsed)) return
+ 
+@@ -50,15 +54,17 @@ export async function attemptDeduplicationRecovery(
+   if (!plan) return
+ 
+   const pruningState = createPruningState()
+-  const prunedCount = executeDeduplication(
++  const prunedCount = await executeDeduplication(
+     sessionID,
+     pruningState,
+     plan.config,
+     plan.protectedTools,
++    client,
+   )
+-  const { truncatedCount } = truncateToolOutputsByCallId(
++  const { truncatedCount } = await truncateToolOutputsByCallId(
+     sessionID,
+     pruningState.toolIdsToPrune,
++    client,
+   )
+ 
+   if (prunedCount > 0 || truncatedCount > 0) {
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/pruning-deduplication.ts b/src/hooks/anthropic-context-window-limit-recovery/pruning-deduplication.ts
+index 45e69bda..be141699 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/pruning-deduplication.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/pruning-deduplication.ts
+@@ -1,11 +1,14 @@
+ import { readdirSync, readFileSync } from "node:fs"
+ import { join } from "node:path"
++import type { PluginInput } from "@opencode-ai/plugin"
+ import type { PruningState, ToolCallSignature } from "./pruning-types"
+ import { estimateTokens } from "./pruning-types"
+ import { log } from "../../shared/logger"
+ import { getMessageDir } from "../../shared/opencode-message-dir"
+ import { isSqliteBackend } from "../../shared/opencode-storage-detection"
+ 
++type OpencodeClient = PluginInput["client"]
++
+ export interface DeduplicationConfig {
+   enabled: boolean
+   protectedTools?: string[]
+@@ -45,7 +48,6 @@ function sortObject(obj: unknown): unknown {
+ }
+ 
+ function readMessages(sessionID: string): MessagePart[] {
+-  if (isSqliteBackend()) return []
+   const messageDir = getMessageDir(sessionID)
+   if (!messageDir) return []
+ 
+@@ -67,20 +69,29 @@ function readMessages(sessionID: string): MessagePart[] {
+   return messages
+ }
+ 
+-export function executeDeduplication(
++async function readMessagesFromSDK(client: OpencodeClient, sessionID: string): Promise<MessagePart[]> {
++  try {
++    const response = await client.session.messages({ path: { id: sessionID } })
++    const rawMessages = (response.data ?? []) as Array<{ parts?: ToolPart[] }>
++    return rawMessages.filter((m) => m.parts) as MessagePart[]
++  } catch {
++    return []
++  }
++}
++
++export async function executeDeduplication(
+   sessionID: string,
+   state: PruningState,
+   config: DeduplicationConfig,
+-  protectedTools: Set<string>
+-): number {
+-  if (isSqliteBackend()) {
+-    log("[pruning-deduplication] Skipping deduplication on SQLite backend")
+-    return 0
+-  }
+-
++  protectedTools: Set<string>,
++  client?: OpencodeClient,
++): Promise<number> {
+   if (!config.enabled) return 0
+ 
+-  const messages = readMessages(sessionID)
++  const messages = (client && isSqliteBackend())
++    ? await readMessagesFromSDK(client, sessionID)
++    : readMessages(sessionID)
++
+   const signatures = new Map<string, ToolCallSignature[]>()
+   
+   let currentTurn = 0
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/pruning-tool-output-truncation.ts b/src/hooks/anthropic-context-window-limit-recovery/pruning-tool-output-truncation.ts
+index b1fe9b33..3db4ec8b 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/pruning-tool-output-truncation.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/pruning-tool-output-truncation.ts
+@@ -1,11 +1,15 @@
+ import { existsSync, readdirSync, readFileSync } from "node:fs"
+ import { join } from "node:path"
++import type { PluginInput } from "@opencode-ai/plugin"
+ import { getOpenCodeStorageDir } from "../../shared/data-path"
+ import { truncateToolResult } from "./storage"
++import { truncateToolResultAsync } from "./tool-result-storage-sdk"
+ import { log } from "../../shared/logger"
+ import { getMessageDir } from "../../shared/opencode-message-dir"
+ import { isSqliteBackend } from "../../shared/opencode-storage-detection"
+ 
++type OpencodeClient = PluginInput["client"]
++
+ interface StoredToolPart {
+   type?: string
+   callID?: string
+@@ -15,8 +19,19 @@ interface StoredToolPart {
+   }
+ }
+ 
+-function getMessageStorage(): string {
+-  return join(getOpenCodeStorageDir(), "message")
++interface SDKToolPart {
++  id: string
++  type: string
++  callID?: string
++  tool?: string
++  state?: { output?: string }
++  truncated?: boolean
++  originalSize?: number
++}
++
++interface SDKMessage {
++  info?: { id?: string }
++  parts?: SDKToolPart[]
+ }
+ 
+ function getPartStorage(): string {
+@@ -36,17 +51,17 @@ function getMessageIds(sessionID: string): string[] {
+   return messageIds
+ }
+ 
+-export function truncateToolOutputsByCallId(
++export async function truncateToolOutputsByCallId(
+   sessionID: string,
+   callIds: Set<string>,
+-): { truncatedCount: number } {
+-  if (isSqliteBackend()) {
+-    log("[auto-compact] Skipping pruning tool outputs on SQLite backend")
+-    return { truncatedCount: 0 }
+-  }
+-
++  client?: OpencodeClient,
++): Promise<{ truncatedCount: number }> {
+   if (callIds.size === 0) return { truncatedCount: 0 }
+ 
++  if (client && isSqliteBackend()) {
++    return truncateToolOutputsByCallIdFromSDK(client, sessionID, callIds)
++  }
++
+   const messageIds = getMessageIds(sessionID)
+   if (messageIds.length === 0) return { truncatedCount: 0 }
+ 
+@@ -87,3 +102,42 @@ export function truncateToolOutputsByCallId(
+ 
+   return { truncatedCount }
+ }
++
++async function truncateToolOutputsByCallIdFromSDK(
++  client: OpencodeClient,
++  sessionID: string,
++  callIds: Set<string>,
++): Promise<{ truncatedCount: number }> {
++  try {
++    const response = await client.session.messages({ path: { id: sessionID } })
++    const messages = (response.data ?? []) as SDKMessage[]
++    let truncatedCount = 0
++
++    for (const msg of messages) {
++      const messageID = msg.info?.id
++      if (!messageID || !msg.parts) continue
++
++      for (const part of msg.parts) {
++        if (part.type !== "tool" || !part.callID) continue
++        if (!callIds.has(part.callID)) continue
++        if (!part.state?.output || part.truncated) continue
++
++        const result = await truncateToolResultAsync(client, sessionID, messageID, part.id, part)
++        if (result.success) {
++          truncatedCount++
++        }
++      }
++    }
++
++    if (truncatedCount > 0) {
++      log("[auto-compact] pruned duplicate tool outputs (SDK)", {
++        sessionID,
++        truncatedCount,
++      })
++    }
++
++    return { truncatedCount }
++  } catch {
++    return { truncatedCount: 0 }
++  }
++}
+diff --git a/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts b/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts
+index 556f9b45..e7064b4f 100644
+--- a/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts
++++ b/src/hooks/anthropic-context-window-limit-recovery/recovery-hook.ts
+@@ -64,7 +64,7 @@ export function createAnthropicContextWindowLimitRecoveryHook(
+         autoCompactState.errorDataBySession.set(sessionID, parsed)
+ 
+         if (autoCompactState.compactionInProgress.has(sessionID)) {
+-          await attemptDeduplicationRecovery(sessionID, parsed, experimental)
++          await attemptDeduplicationRecovery(sessionID, parsed, experimental, ctx.client)
+           return
+         }
+ 
+-- 
+2.39.2
+

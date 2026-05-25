@@ -1,0 +1,297 @@
+From 5f1fb0c52a5b9f08daa6b515bdbda8f11d040bdd Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sun, 24 May 2026 15:21:24 +0900
+Subject: [PATCH 5698/5749] fix(team-mode): make lead close teams on its own
+ initiative
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The lead currently leaves teams alive after the task list drains because
+none of the prompt surfaces tell it WHEN to close or HOW. omx-style
+'self-closing' behavior was missing for four reasons (diagnosed via
+prompt-engineering A/B/C: wrong / misframed / missing):
+
+1. builtin team-mode skill 'Lifecycle' (B+C): 'phase ends / shape
+   outgrown' is qualitative, so the model maps it to 'wait for user'.
+   Step 6 jumped to team_delete without the request/approve pair the
+   tool contract requires. Replaced with a 'Closure Contract' (a
+   computable predicate over team_task_list + team_status) and an
+   explicit 'Closure Sequence' (request -> approve -> delete, with
+   force=true reserved for unrecoverable paths only).
+
+2. TEAM_MESSAGE keyword injection (C): spent 100%% of its one-shot
+   budget on routing ('do not substitute delegate_task'), 0%% on
+   closure. Added the same closure rule in compressed form. Kept the
+   'NEVER substitute with delegate_task' literal that
+   keyword-detector/index.test.ts depends on.
+
+3. team-mode-status-injector body (C): the only per-session injection
+   for team mode had no closure obligation. Replaced the optional
+   'load the team-mode skill ... otherwise use the team_* tools'
+   sentence with a 'Closure invariant' clause that ties the check to
+   every team_task_update.
+
+4. member-guidance Wrap-up (A+B): step 3 said 'so the lead can decide
+   whether to request shutdown', but team_shutdown_request is
+   lead-only - members cannot initiate it. Step ordering also placed
+   the completion message before team_task_update, so the lead's
+   closable check would see stale data. Reordered to
+   task_update -> check task_list for new work -> if nothing left,
+   send a single 'closure-ready' message and idle. Test assertion
+   updated to match the new accurate contract.
+
+Also: stripped Korean alternation from TEAM_PATTERN per directive
+('절대로 코드 내에 한국어 적지 마라'). Pattern is now
+/\\bteam[\\s_-]?mode\\b/i. Removed 4 Korean test cases
+(2 positive triggers + 2 false-positive guards) that the pattern no
+longer needs to defend, and updated the keyword-detector AGENTS.md
+row.
+
+Net: -71 lines across prompt surfaces. The Closure Contract is the
+only addition; everything else tightened.
+
+Tests: 428/428 pass across src/features/team-mode/,
+src/features/builtin-skills/, src/hooks/keyword-detector/,
+src/hooks/team-mode-status-injector/, src/hooks/team-mailbox-injector/,
+src/hooks/team-tool-gating/, src/hooks/team-session-events/.
+LSP: no errors introduced (one pre-existing error in
+keyword-detector/index.test.ts confirmed pre-existing on dev).
+---
+ .../builtin-skills/skills/team-mode.ts        | 26 +++++-
+ src/features/team-mode/member-guidance.ts     |  8 +-
+ .../team-mode/team-runtime/create.test.ts     |  2 +-
+ src/hooks/keyword-detector/AGENTS.md          |  2 +-
+ src/hooks/keyword-detector/index.test.ts      | 84 -------------------
+ src/hooks/keyword-detector/team/default.ts    | 12 +--
+ src/hooks/team-mode-status-injector/hook.ts   |  7 +-
+ 7 files changed, 35 insertions(+), 106 deletions(-)
+
+diff --git a/src/features/builtin-skills/skills/team-mode.ts b/src/features/builtin-skills/skills/team-mode.ts
+index 44f1a6c5..f28735d9 100644
+--- a/src/features/builtin-skills/skills/team-mode.ts
++++ b/src/features/builtin-skills/skills/team-mode.ts
+@@ -91,7 +91,7 @@ Do not use \`oracle\`, \`prometheus\`, or other non-eligible agents here. For th
+ 
+ ## Lifecycle
+ 
+-Teams are **ephemeral**: one team per phase of work. The moment a phase ends, or the team's shape no longer fits the next problem, **call \`team_delete\` immediately and spawn a fresh team for the next phase**. There is no in-place reshape; restructuring is delete-then-create. Lingering teams burn sessions, mailbox quota, and member-turn budget.
++Teams are **ephemeral**. There is no in-place reshape — restructuring is delete-then-create. Lingering teams burn sessions, mailbox quota, and member-turn budget every idle minute.
+ 
+ One cycle:
+ 
+@@ -99,8 +99,28 @@ One cycle:
+ 2. Lead assigns work with \`team_send_message\` or \`team_task_create\`.
+ 3. Members report progress with \`team_send_message\` plus \`team_task_update\`.
+ 4. Lead and members track progress with \`team_task_list\`, \`team_task_get\`, and \`team_status\`.
+-5. A member that finishes early asks to leave with \`team_shutdown_request\`; the lead handles \`team_approve_shutdown\` or \`team_reject_shutdown\`.
+-6. **Phase done or shape outgrown? Call \`team_delete\` now; no idle members "just in case." Loop to step 1 for the next phase.**
++5. When the **Closure Contract** below holds, the lead runs the **Closure Sequence** in the same turn. Loop to step 1 for the next phase.
++
++### Closure Contract
++
++A team is **closable** when ALL of the following hold, as observed by \`team_task_list({ teamRunId })\` and \`team_status({ teamRunId })\`:
++
++- Every task is in a terminal state: \`completed\` or \`failed\`. (No \`pending\`, no \`claimed\`, no \`in_progress\`.)
++- No outstanding \`team_shutdown_request\` is still awaiting approval.
++- The user has not asked you to keep the team open for follow-up.
++
++Closure is **the lead's responsibility**, not the user's. Do not wait to be told. The check runs after every \`team_task_update\` that completes or fails a task — if the contract holds, close in the same turn. Closure now is cheaper than closure after the next user message, because by then the model has paged out the context.
++
++### Closure Sequence
++
++Run in order:
++
++1. For each active member \`M\` returned by \`team_status\`:
++   - \`team_shutdown_request({ teamRunId, memberName: M })\`
++   - \`team_approve_shutdown({ teamRunId, memberName: M })\`
++2. \`team_delete({ teamRunId })\`
++
++If step 2 errors because a member is still active, re-run \`team_status\`. Use \`team_delete({ teamRunId, force: true })\` **only** after confirming the remaining member is not mid-write — for example, after an unrecoverable error path where graceful shutdown is impossible. Do not use \`force: true\` to skip step 1.
+ 
+ ## Task ownership
+ 
+diff --git a/src/features/team-mode/member-guidance.ts b/src/features/team-mode/member-guidance.ts
+index e771c857..4563bc72 100644
+--- a/src/features/team-mode/member-guidance.ts
++++ b/src/features/team-mode/member-guidance.ts
+@@ -38,9 +38,9 @@ Going idle after sending a message is the expected flow — it does NOT mean you
+ 
+ ## Wrap-up
+ 
+-When you finish your assigned work, ALWAYS:
+-1. Send your results to the lead via \`team_send_message\`.
+-2. Mark your task as completed via \`team_task_update\`.
+-3. Send a completion message to the lead so the lead can decide whether to request shutdown.
++When you finish your assigned work, ALWAYS, in this order:
++1. Mark your task \`status: "completed"\` (or \`"failed"\` with a reason) via \`team_task_update\` — the lead's closure check reads \`team_task_list\`, so the task update must land before any completion message.
++2. Re-check \`team_task_list\` for newly unblocked work. If there is any, claim it and continue — do not idle.
++3. If \`team_task_list\` shows nothing left for you, send the lead a single short \`team_send_message\` with your results and the phrase \`closure-ready\` so the lead knows you have no more work in flight. Then go idle.
+ `
+ }
+diff --git a/src/features/team-mode/team-runtime/create.test.ts b/src/features/team-mode/team-runtime/create.test.ts
+index b14ad4f3..99db1c41 100644
+--- a/src/features/team-mode/team-runtime/create.test.ts
++++ b/src/features/team-mode/team-runtime/create.test.ts
+@@ -224,7 +224,7 @@ describe("createTeamRun", () => {
+     expect(firstPrompt).toContain("Include `summary` and `references`")
+     expect(firstPrompt).toContain("Move to `status: \"in_progress\"` when you start working")
+     expect(firstPrompt).toContain("Do NOT call this from inside team members")
+-    expect(firstPrompt).toContain("lead can decide whether to request shutdown")
++    expect(firstPrompt).toContain("closure-ready")
+     expect(firstPrompt).toContain("user interacts primarily with the team lead")
+     expect(firstPrompt).toContain("Idle is normal")
+     expect(firstPrompt).toContain("structured JSON status messages")
+diff --git a/src/hooks/keyword-detector/AGENTS.md b/src/hooks/keyword-detector/AGENTS.md
+index 2da3a487..ed2fee80 100644
+--- a/src/hooks/keyword-detector/AGENTS.md
++++ b/src/hooks/keyword-detector/AGENTS.md
+@@ -13,7 +13,7 @@ Transform Tier hook on `messages.transform`. Scans first user message for mode k
+ | `ultrawork` / `ulw` | `/\b(ultrawork|ulw)\b/i` | Full orchestration mode — parallel agents, deep exploration, relentless execution |
+ | Search mode | `SEARCH_PATTERN` (from `search/`) | Web/doc search focus prompt injection |
+ | Analyze mode | `ANALYZE_PATTERN` (from `analyze/`) | Deep analysis mode prompt injection |
+-| Team mode | `TEAM_PATTERN` (from `team/`) | Forces orchestration via `team_*` tools when user invokes `team mode` / `팀 모드` / `팀으로`; instructs user to enable `team_mode.enabled` if tools are absent |
++| Team mode | `TEAM_PATTERN` (from `team/`) | Forces orchestration via `team_*` tools when user invokes `team mode` / `team-mode` / `team_mode` / `teammode`; instructs user to enable `team_mode.enabled` if tools are absent and reminds lead to run the closure sequence once every task is terminal |
+ 
+ ## STRUCTURE
+ 
+diff --git a/src/hooks/keyword-detector/index.test.ts b/src/hooks/keyword-detector/index.test.ts
+index 14567299..8b60e369 100644
+--- a/src/hooks/keyword-detector/index.test.ts
++++ b/src/hooks/keyword-detector/index.test.ts
+@@ -1062,90 +1062,6 @@ describe("keyword-detector team mode", () => {
+     expect(textPart!.text).toContain("for this task")
+   })
+ 
+-  test("should inject team-mode message when user types '팀 모드' (Korean with space)", async () => {
+-    // given - main session typing Korean '팀 모드'
+-    const collector = new ContextCollector()
+-    const sessionID = "team-ko-spaced-session"
+-    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
+-    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
+-    const output = {
+-      message: {} as Record<string, unknown>,
+-      parts: [{ type: "text", text: "이거 팀 모드로 해줘" }],
+-    }
+-
+-    // when - keyword detection runs
+-    await hook["chat.message"]({ sessionID }, output)
+-
+-    // then - team-mode message should be prepended
+-    const textPart = output.parts.find(p => p.type === "text")
+-    expect(textPart).toBeDefined()
+-    expect(textPart!.text).toContain("[team-mode]")
+-    expect(textPart!.text).toContain("팀 모드로 해줘")
+-  })
+-
+-  test("should inject team-mode message when user types '팀으로'", async () => {
+-    // given - main session typing Korean '팀으로'
+-    const collector = new ContextCollector()
+-    const sessionID = "team-ko-eulo-session"
+-    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
+-    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
+-    const output = {
+-      message: {} as Record<string, unknown>,
+-      parts: [{ type: "text", text: "팀으로 일하자" }],
+-    }
+-
+-    // when - keyword detection runs
+-    await hook["chat.message"]({ sessionID }, output)
+-
+-    // then - team-mode message should be prepended
+-    const textPart = output.parts.find(p => p.type === "text")
+-    expect(textPart).toBeDefined()
+-    expect(textPart!.text).toContain("[team-mode]")
+-    expect(textPart!.text).toContain("팀으로 일하자")
+-  })
+-
+-  test("should NOT trigger team-mode on '스팀으로' (false-positive guard)", async () => {
+-    // given - text contains '팀으로' as substring of another Korean word ('스팀으로')
+-    const collector = new ContextCollector()
+-    const sessionID = "false-positive-eulo-session"
+-    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
+-    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
+-    const output = {
+-      message: {} as Record<string, unknown>,
+-      parts: [{ type: "text", text: "스팀으로 게임 켜줘" }],
+-    }
+-
+-    // when - keyword detection runs
+-    await hook["chat.message"]({ sessionID }, output)
+-
+-    // then - team-mode should NOT be triggered, text unchanged
+-    const textPart = output.parts.find(p => p.type === "text")
+-    expect(textPart).toBeDefined()
+-    expect(textPart!.text).toBe("스팀으로 게임 켜줘")
+-    expect(textPart!.text).not.toContain("[team-mode]")
+-  })
+-
+-  test("should NOT trigger team-mode on '스팀모드' (Hangul-prefix false-positive guard)", async () => {
+-    // given - text contains '팀모드' as substring of another Korean word ('스팀모드')
+-    const collector = new ContextCollector()
+-    const sessionID = "false-positive-mode-session"
+-    getMainSessionSpy = spyOn(sessionState, "getMainSessionID").mockReturnValue(sessionID)
+-    const hook = createKeywordDetectorHook(createMockPluginInput(), collector)
+-    const output = {
+-      message: {} as Record<string, unknown>,
+-      parts: [{ type: "text", text: "스팀모드 활성화" }],
+-    }
+-
+-    // when - keyword detection runs
+-    await hook["chat.message"]({ sessionID }, output)
+-
+-    // then - team-mode should NOT be triggered
+-    const textPart = output.parts.find(p => p.type === "text")
+-    expect(textPart).toBeDefined()
+-    expect(textPart!.text).toBe("스팀모드 활성화")
+-    expect(textPart!.text).not.toContain("[team-mode]")
+-  })
+-
+   test("should NOT trigger team-mode on bare 'team' without 'mode'", async () => {
+     // given - text contains 'team' but not 'team mode'
+     const collector = new ContextCollector()
+diff --git a/src/hooks/keyword-detector/team/default.ts b/src/hooks/keyword-detector/team/default.ts
+index 59db8d46..43e0ce70 100644
+--- a/src/hooks/keyword-detector/team/default.ts
++++ b/src/hooks/keyword-detector/team/default.ts
+@@ -2,16 +2,10 @@
+  * Team mode keyword detector.
+  *
+  * Triggers when the user explicitly invokes team-mode work:
+- * - English: team mode, team-mode, team_mode, teammode (case-insensitive)
+- * - Korean: 팀 모드, 팀모드, 팀으로
+- *
+- * The Korean variants use a negative lookbehind on Hangul syllables (가-힣)
+- * to prevent false positives like "스팀으로" matching "팀으로", or
+- * "스팀모드" matching "팀모드".
++ *   team mode, team-mode, team_mode, teammode (case-insensitive)
+  */
+ 
+-export const TEAM_PATTERN =
+-  /\bteam[\s_-]?mode\b|(?<![가-힣])(?:팀\s*모드|팀으로)/i
++export const TEAM_PATTERN = /\bteam[\s_-]?mode\b/i
+ 
+ export const TEAM_MESSAGE = `[team-mode]
+-Team mode reference detected. If user wants team-mode work, MUST orchestrate via team_* tools (team_create -> team_task_create + team_send_message). NEVER substitute with delegate_task - it is not equivalent. If team_* tools are unavailable (team_mode disabled in config), instruct user to set team_mode.enabled=true and restart opencode.`
++Team-mode reference detected. Orchestrate via team_* tools (team_create -> team_task_create + team_send_message); NEVER substitute with delegate_task — it is not equivalent. After every team_task_update that completes or fails a task, re-check team_task_list: if every task is terminal, run the closure sequence (team_shutdown_request + team_approve_shutdown per active member, then team_delete) in the same turn. Closing the team is the lead's responsibility, not the user's. If the team_* tools are absent, team_mode is disabled — tell the user to set team_mode.enabled=true and restart opencode.`
+diff --git a/src/hooks/team-mode-status-injector/hook.ts b/src/hooks/team-mode-status-injector/hook.ts
+index d7c9ad3f..42552f7c 100644
+--- a/src/hooks/team-mode-status-injector/hook.ts
++++ b/src/hooks/team-mode-status-injector/hook.ts
+@@ -100,10 +100,9 @@ function latestUserMessageRequestsTeamMode(
+ 
+ function buildTeamModeStatusContent(): string {
+   return `${TEAM_MODE_STATUS_MARKER}
+-Team mode is ENABLED for this session.
+-If the team_* tools are present, that is authoritative proof that team mode is active.
+-Do not inspect ~/.config/opencode or project config files to verify team mode.
+-If you need usage guidance, load the team-mode skill. Otherwise use the team_* tools directly.
++Team mode is ENABLED for this session. Presence of the team_* tools is authoritative proof; do not inspect config files to verify.
++Closure invariant: every team you open is yours to close. After each team_task_update that completes or fails a task, call team_task_list({ teamRunId }); if every task is terminal, run team_shutdown_request + team_approve_shutdown per active member, then team_delete — in the same turn, without waiting for the user to ask. Lingering teams are a defect.
++Load the team-mode skill for the full Closure Contract and Closure Sequence.
+ </team_mode_status>`
+ }
+ 
+-- 
+2.39.2
+

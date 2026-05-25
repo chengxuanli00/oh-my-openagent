@@ -1,0 +1,269 @@
+From b3ef86c574526733299a4325ab0eb93d12d1abbc Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 7 Mar 2026 15:39:25 +0900
+Subject: [PATCH 2965/5749] fix(atlas): skip compaction in last-agent recovery
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ .../atlas/compaction-agent-filter.test.ts     | 108 ++++++++++++++++++
+ .../atlas/session-last-agent.sqlite.test.ts   |  46 ++++++++
+ src/hooks/atlas/session-last-agent.ts         |  69 ++++++++---
+ 3 files changed, 209 insertions(+), 14 deletions(-)
+ create mode 100644 src/hooks/atlas/compaction-agent-filter.test.ts
+ create mode 100644 src/hooks/atlas/session-last-agent.sqlite.test.ts
+
+diff --git a/src/hooks/atlas/compaction-agent-filter.test.ts b/src/hooks/atlas/compaction-agent-filter.test.ts
+new file mode 100644
+index 00000000..7e821bd8
+--- /dev/null
++++ b/src/hooks/atlas/compaction-agent-filter.test.ts
+@@ -0,0 +1,108 @@
++declare const require: (name: string) => any
++const { afterEach, beforeEach, describe, expect, mock, test } = require("bun:test")
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++import { randomUUID } from "node:crypto"
++
++import { clearBoulderState, writeBoulderState } from "../../features/boulder-state"
++import { _resetForTesting } from "../../features/claude-code-session-state"
++import type { BoulderState } from "../../features/boulder-state"
++
++const TEST_STORAGE_ROOT = join(tmpdir(), `atlas-compaction-storage-${randomUUID()}`)
++const TEST_MESSAGE_STORAGE = join(TEST_STORAGE_ROOT, "message")
++const TEST_PART_STORAGE = join(TEST_STORAGE_ROOT, "part")
++
++mock.module("../../features/hook-message-injector/constants", () => ({
++  OPENCODE_STORAGE: TEST_STORAGE_ROOT,
++  MESSAGE_STORAGE: TEST_MESSAGE_STORAGE,
++  PART_STORAGE: TEST_PART_STORAGE,
++}))
++
++mock.module("../../shared/opencode-message-dir", () => ({
++  getMessageDir: (sessionID: string) => {
++    const directory = join(TEST_MESSAGE_STORAGE, sessionID)
++    return existsSync(directory) ? directory : null
++  },
++}))
++
++mock.module("../../shared/opencode-storage-detection", () => ({
++  isSqliteBackend: () => false,
++}))
++
++const { createAtlasHook } = await import("./index")
++
++describe("atlas hook compaction agent filtering", () => {
++  let testDirectory: string
++
++  function createMockPluginInput() {
++    const promptMock = mock(() => Promise.resolve())
++    return {
++      directory: testDirectory,
++      client: {
++        session: {
++          prompt: promptMock,
++          promptAsync: promptMock,
++        },
++      },
++      _promptMock: promptMock,
++    } as Parameters<typeof createAtlasHook>[0] & { _promptMock: ReturnType<typeof mock> }
++  }
++
++  function writeMessage(sessionID: string, fileName: string, agent: string): void {
++    const messageDir = join(TEST_MESSAGE_STORAGE, sessionID)
++    mkdirSync(messageDir, { recursive: true })
++    writeFileSync(
++      join(messageDir, fileName),
++      JSON.stringify({
++        agent,
++        model: { providerID: "anthropic", modelID: "claude-opus-4-6" },
++      }),
++    )
++  }
++
++  beforeEach(() => {
++    testDirectory = join(tmpdir(), `atlas-compaction-test-${randomUUID()}`)
++    mkdirSync(testDirectory, { recursive: true })
++    clearBoulderState(testDirectory)
++    _resetForTesting()
++  })
++
++  afterEach(() => {
++    clearBoulderState(testDirectory)
++    rmSync(testDirectory, { recursive: true, force: true })
++    _resetForTesting()
++  })
++
++  test("should inject continuation when the latest message is compaction but the previous agent matches atlas", async () => {
++    // given
++    const sessionID = "main-session-after-compaction"
++    const planPath = join(testDirectory, "test-plan.md")
++    writeFileSync(planPath, "# Plan\n- [ ] Task 1\n- [ ] Task 2")
++
++    const state: BoulderState = {
++      active_plan: planPath,
++      started_at: "2026-01-02T10:00:00Z",
++      session_ids: [sessionID],
++      plan_name: "test-plan",
++      agent: "atlas",
++    }
++    writeBoulderState(testDirectory, state)
++    writeMessage(sessionID, "msg_001.json", "atlas")
++    writeMessage(sessionID, "msg_002.json", "compaction")
++
++    const mockInput = createMockPluginInput()
++    const hook = createAtlasHook(mockInput)
++
++    // when
++    await hook.handler({
++      event: {
++        type: "session.idle",
++        properties: { sessionID },
++      },
++    })
++
++    // then
++    expect(mockInput._promptMock).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/src/hooks/atlas/session-last-agent.sqlite.test.ts b/src/hooks/atlas/session-last-agent.sqlite.test.ts
+new file mode 100644
+index 00000000..8501223b
+--- /dev/null
++++ b/src/hooks/atlas/session-last-agent.sqlite.test.ts
+@@ -0,0 +1,46 @@
++const { describe, expect, mock, test } = require("bun:test")
++
++mock.module("../../shared", () => ({
++  getMessageDir: () => null,
++  isSqliteBackend: () => true,
++  normalizeSDKResponse: <TData>(response: { data?: TData }, fallback: TData): TData => response.data ?? fallback,
++}))
++
++const { getLastAgentFromSession } = await import("./session-last-agent")
++
++function createMockClient(messages: Array<{ info?: { agent?: string } }>) {
++  return {
++    session: {
++      messages: async () => ({ data: messages }),
++    },
++  }
++}
++
++describe("getLastAgentFromSession sqlite branch", () => {
++  test("should skip compaction and return the previous real agent from sqlite messages", async () => {
++    // given
++    const client = createMockClient([
++      { info: { agent: "atlas" } },
++      { info: { agent: "compaction" } },
++    ])
++
++    // when
++    const result = await getLastAgentFromSession("ses_sqlite_compaction", client)
++
++    // then
++    expect(result).toBe("atlas")
++  })
++
++  test("should return null when sqlite history contains only compaction", async () => {
++    // given
++    const client = createMockClient([{ info: { agent: "compaction" } }])
++
++    // when
++    const result = await getLastAgentFromSession("ses_sqlite_only_compaction", client)
++
++    // then
++    expect(result).toBeNull()
++  })
++})
++
++export {}
+diff --git a/src/hooks/atlas/session-last-agent.ts b/src/hooks/atlas/session-last-agent.ts
+index 6ddbbacb..5b8de656 100644
+--- a/src/hooks/atlas/session-last-agent.ts
++++ b/src/hooks/atlas/session-last-agent.ts
+@@ -1,24 +1,65 @@
+-import type { PluginInput } from "@opencode-ai/plugin"
++import { readFileSync, readdirSync } from "node:fs"
++import { join } from "node:path"
+ 
+-import { findNearestMessageWithFields } from "../../features/hook-message-injector"
+-import { findNearestMessageWithFieldsFromSDK } from "../../features/hook-message-injector"
+-import { getMessageDir, isSqliteBackend } from "../../shared"
++import { getMessageDir, isSqliteBackend, normalizeSDKResponse } from "../../shared"
+ 
+-type OpencodeClient = PluginInput["client"]
++type SessionMessagesClient = {
++  session: {
++    messages: (input: { path: { id: string } }) => Promise<unknown>
++  }
++}
++
++function isCompactionAgent(agent: unknown): boolean {
++  return typeof agent === "string" && agent.toLowerCase() === "compaction"
++}
++
++function getLastAgentFromMessageDir(messageDir: string): string | null {
++  try {
++    const files = readdirSync(messageDir)
++      .filter((fileName) => fileName.endsWith(".json"))
++      .sort()
++      .reverse()
++
++    for (const fileName of files) {
++      try {
++        const content = readFileSync(join(messageDir, fileName), "utf-8")
++        const parsed = JSON.parse(content) as { agent?: unknown }
++        if (typeof parsed.agent === "string" && !isCompactionAgent(parsed.agent)) {
++          return parsed.agent.toLowerCase()
++        }
++      } catch {
++        continue
++      }
++    }
++  } catch {
++    return null
++  }
++
++  return null
++}
+ 
+ export async function getLastAgentFromSession(
+   sessionID: string,
+-  client?: OpencodeClient
++  client?: SessionMessagesClient
+ ): Promise<string | null> {
+-  let nearest = null
+-
+   if (isSqliteBackend() && client) {
+-    nearest = await findNearestMessageWithFieldsFromSDK(client, sessionID)
+-  } else {
+-    const messageDir = getMessageDir(sessionID)
+-    if (!messageDir) return null
+-    nearest = findNearestMessageWithFields(messageDir)
++    const response = await client.session.messages({ path: { id: sessionID } })
++    const messages = normalizeSDKResponse(response, [] as Array<{ info?: { agent?: string } }>, {
++      preferResponseOnMissingData: true,
++    })
++
++    for (let i = messages.length - 1; i >= 0; i--) {
++      const agent = messages[i].info?.agent
++      if (typeof agent === "string" && !isCompactionAgent(agent)) {
++        return agent.toLowerCase()
++      }
++    }
++
++    return null
+   }
+ 
+-  return nearest?.agent?.toLowerCase() ?? null
++  const messageDir = getMessageDir(sessionID)
++  if (!messageDir) return null
++
++  return getLastAgentFromMessageDir(messageDir)
+ }
+-- 
+2.39.2
+

@@ -1,0 +1,1719 @@
+From e343e625c7437bbe8423b049ea391e733ff001bb Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 7 Feb 2026 17:26:33 +0900
+Subject: [PATCH 1820/5749] feat(cli): extend run command with port, attach,
+ session-id, on-complete, and json options
+
+Implement all 5 CLI extension options for external orchestration:
+
+- --port <port>: Start server on port, or attach if port occupied
+- --attach <url>: Connect to existing opencode server
+- --session-id <id>: Resume existing session instead of creating new
+- --on-complete <command>: Execute shell command with env vars on completion
+- --json: Output structured RunResult JSON to stdout
+
+Refactor runner.ts into focused modules:
+- agent-resolver.ts: Agent resolution logic
+- server-connection.ts: Server connection management
+- session-resolver.ts: Session create/resume with retry
+- json-output.ts: Stdout redirect + JSON emission
+- on-complete-hook.ts: Shell command execution with env vars
+
+Fixes #1586
+---
+ src/cli/index.ts                      |  19 ++
+ src/cli/run/agent-resolver.ts         |  69 +++++++
+ src/cli/run/events.ts                 |   4 +
+ src/cli/run/index.ts                  |   7 +-
+ src/cli/run/integration.test.ts       | 264 ++++++++++++++++++++++++++
+ src/cli/run/json-output.test.ts       | 170 +++++++++++++++++
+ src/cli/run/json-output.ts            |  42 ++++
+ src/cli/run/on-complete-hook.test.ts  | 177 +++++++++++++++++
+ src/cli/run/on-complete-hook.ts       |  42 ++++
+ src/cli/run/runner.ts                 | 247 +++++++-----------------
+ src/cli/run/server-connection.test.ts | 146 ++++++++++++++
+ src/cli/run/server-connection.ts      |  47 +++++
+ src/cli/run/session-resolver.test.ts  | 140 ++++++++++++++
+ src/cli/run/session-resolver.ts       |  64 +++++++
+ src/cli/run/types.ts                  |  19 ++
+ 15 files changed, 1281 insertions(+), 176 deletions(-)
+ create mode 100644 src/cli/run/agent-resolver.ts
+ create mode 100644 src/cli/run/integration.test.ts
+ create mode 100644 src/cli/run/json-output.test.ts
+ create mode 100644 src/cli/run/json-output.ts
+ create mode 100644 src/cli/run/on-complete-hook.test.ts
+ create mode 100644 src/cli/run/on-complete-hook.ts
+ create mode 100644 src/cli/run/server-connection.test.ts
+ create mode 100644 src/cli/run/server-connection.ts
+ create mode 100644 src/cli/run/session-resolver.test.ts
+ create mode 100644 src/cli/run/session-resolver.ts
+
+diff --git a/src/cli/index.ts b/src/cli/index.ts
+index a66a45fc..4c9eac70 100644
+--- a/src/cli/index.ts
++++ b/src/cli/index.ts
+@@ -69,11 +69,21 @@ program
+   .option("-a, --agent <name>", "Agent to use (default: from CLI/env/config, fallback: Sisyphus)")
+   .option("-d, --directory <path>", "Working directory")
+   .option("-t, --timeout <ms>", "Timeout in milliseconds (default: 30 minutes)", parseInt)
++  .option("-p, --port <port>", "Server port (attaches if port already in use)", parseInt)
++  .option("--attach <url>", "Attach to existing opencode server URL")
++  .option("--on-complete <command>", "Shell command to run after completion")
++  .option("--json", "Output structured JSON result to stdout")
++  .option("--session-id <id>", "Resume existing session instead of creating new one")
+   .addHelpText("after", `
+ Examples:
+   $ bunx oh-my-opencode run "Fix the bug in index.ts"
+   $ bunx oh-my-opencode run --agent Sisyphus "Implement feature X"
+   $ bunx oh-my-opencode run --timeout 3600000 "Large refactoring task"
++  $ bunx oh-my-opencode run --port 4321 "Fix the bug"
++  $ bunx oh-my-opencode run --attach http://127.0.0.1:4321 "Fix the bug"
++  $ bunx oh-my-opencode run --json "Fix the bug" | jq .sessionId
++  $ bunx oh-my-opencode run --on-complete "notify-send Done" "Fix the bug"
++  $ bunx oh-my-opencode run --session-id ses_abc123 "Continue the work"
+ 
+ Agent resolution order:
+   1) --agent flag
+@@ -89,11 +99,20 @@ Unlike 'opencode run', this command waits until:
+   - All child sessions (background tasks) are idle
+ `)
+   .action(async (message: string, options) => {
++    if (options.port && options.attach) {
++      console.error("Error: --port and --attach are mutually exclusive")
++      process.exit(1)
++    }
+     const runOptions: RunOptions = {
+       message,
+       agent: options.agent,
+       directory: options.directory,
+       timeout: options.timeout,
++      port: options.port,
++      attach: options.attach,
++      onComplete: options.onComplete,
++      json: options.json ?? false,
++      sessionId: options.sessionId,
+     }
+     const exitCode = await run(runOptions)
+     process.exit(exitCode)
+diff --git a/src/cli/run/agent-resolver.ts b/src/cli/run/agent-resolver.ts
+new file mode 100644
+index 00000000..17755712
+--- /dev/null
++++ b/src/cli/run/agent-resolver.ts
+@@ -0,0 +1,69 @@
++import pc from "picocolors"
++import type { RunOptions } from "./types"
++import type { OhMyOpenCodeConfig } from "../../config"
++
++const CORE_AGENT_ORDER = ["sisyphus", "hephaestus", "prometheus", "atlas"] as const
++const DEFAULT_AGENT = "sisyphus"
++
++type EnvVars = Record<string, string | undefined>
++
++const normalizeAgentName = (agent?: string): string | undefined => {
++  if (!agent) return undefined
++  const trimmed = agent.trim()
++  if (!trimmed) return undefined
++  const lowered = trimmed.toLowerCase()
++  const coreMatch = CORE_AGENT_ORDER.find((name) => name.toLowerCase() === lowered)
++  return coreMatch ?? trimmed
++}
++
++const isAgentDisabled = (agent: string, config: OhMyOpenCodeConfig): boolean => {
++  const lowered = agent.toLowerCase()
++  if (lowered === "sisyphus" && config.sisyphus_agent?.disabled === true) {
++    return true
++  }
++  return (config.disabled_agents ?? []).some(
++    (disabled) => disabled.toLowerCase() === lowered
++  )
++}
++
++const pickFallbackAgent = (config: OhMyOpenCodeConfig): string => {
++  for (const agent of CORE_AGENT_ORDER) {
++    if (!isAgentDisabled(agent, config)) {
++      return agent
++    }
++  }
++  return DEFAULT_AGENT
++}
++
++export const resolveRunAgent = (
++  options: RunOptions,
++  pluginConfig: OhMyOpenCodeConfig,
++  env: EnvVars = process.env
++): string => {
++  const cliAgent = normalizeAgentName(options.agent)
++  const envAgent = normalizeAgentName(env.OPENCODE_DEFAULT_AGENT)
++  const configAgent = normalizeAgentName(pluginConfig.default_run_agent)
++  const resolved = cliAgent ?? envAgent ?? configAgent ?? DEFAULT_AGENT
++  const normalized = normalizeAgentName(resolved) ?? DEFAULT_AGENT
++
++  if (isAgentDisabled(normalized, pluginConfig)) {
++    const fallback = pickFallbackAgent(pluginConfig)
++    const fallbackDisabled = isAgentDisabled(fallback, pluginConfig)
++    if (fallbackDisabled) {
++      console.log(
++        pc.yellow(
++          `Requested agent "${normalized}" is disabled and no enabled core agent was found. Proceeding with "${fallback}".`
++        )
++      )
++      return fallback
++    }
++    console.log(
++      pc.yellow(
++        `Requested agent "${normalized}" is disabled. Falling back to "${fallback}".`
++      )
++    )
++    return fallback
++  }
++
++  return normalized
++}
+diff --git a/src/cli/run/events.ts b/src/cli/run/events.ts
+index af0fabbd..ff3af1f7 100644
+--- a/src/cli/run/events.ts
++++ b/src/cli/run/events.ts
+@@ -65,6 +65,8 @@ export interface EventState {
+   currentTool: string | null
+   /** Set to true when the main session has produced meaningful work (text, tool call, or tool result) */
+   hasReceivedMeaningfulWork: boolean
++  /** Count of assistant messages for the main session */
++  messageCount: number
+ }
+ 
+ export function createEventState(): EventState {
+@@ -76,6 +78,7 @@ export function createEventState(): EventState {
+     lastPartText: "",
+     currentTool: null,
+     hasReceivedMeaningfulWork: false,
++    messageCount: 0,
+   }
+ }
+ 
+@@ -266,6 +269,7 @@ function handleMessageUpdated(
+   if (props?.info?.role !== "assistant") return
+ 
+   state.hasReceivedMeaningfulWork = true
++  state.messageCount++
+ }
+ 
+ function handleToolExecute(
+diff --git a/src/cli/run/index.ts b/src/cli/run/index.ts
+index 0b0d7c9f..33d9ff9b 100644
+--- a/src/cli/run/index.ts
++++ b/src/cli/run/index.ts
+@@ -1,2 +1,7 @@
+ export { run } from "./runner"
+-export type { RunOptions, RunContext } from "./types"
++export { resolveRunAgent } from "./agent-resolver"
++export { createServerConnection } from "./server-connection"
++export { resolveSession } from "./session-resolver"
++export { createJsonOutputManager } from "./json-output"
++export { executeOnCompleteHook } from "./on-complete-hook"
++export type { RunOptions, RunContext, RunResult, ServerConnection } from "./types"
+diff --git a/src/cli/run/integration.test.ts b/src/cli/run/integration.test.ts
+new file mode 100644
+index 00000000..afa6c049
+--- /dev/null
++++ b/src/cli/run/integration.test.ts
+@@ -0,0 +1,264 @@
++import { describe, it, expect, mock, spyOn, beforeEach, afterEach } from "bun:test"
++import type { RunResult } from "./types"
++import { createJsonOutputManager } from "./json-output"
++import { resolveSession } from "./session-resolver"
++import { executeOnCompleteHook } from "./on-complete-hook"
++import { createServerConnection } from "./server-connection"
++import type { OpencodeClient } from "./types"
++
++interface MockWriteStream {
++  write: (chunk: string) => boolean
++  writes: string[]
++}
++
++function createMockWriteStream(): MockWriteStream {
++  const writes: string[] = []
++  return {
++    writes,
++    write: function (this: MockWriteStream, chunk: string): boolean {
++      this.writes.push(chunk)
++      return true
++    },
++  }
++}
++
++const createMockClient = (
++  getResult?: { error?: unknown; data?: { id: string } }
++): OpencodeClient => ({
++  session: {
++    get: mock((opts: { path: { id: string } }) =>
++      Promise.resolve(getResult ?? { data: { id: opts.path.id } })
++    ),
++    create: mock(() => Promise.resolve({ data: { id: "new-session-id" } })),
++  },
++} as unknown as OpencodeClient)
++
++describe("integration: --json mode", () => {
++  it("emits valid RunResult JSON to stdout", () => {
++    // given
++    const mockStdout = createMockWriteStream()
++    const mockStderr = createMockWriteStream()
++    const result: RunResult = {
++      sessionId: "test-session",
++      success: true,
++      durationMs: 1234,
++      messageCount: 42,
++      summary: "Test summary",
++    }
++    const manager = createJsonOutputManager({
++      stdout: mockStdout as unknown as NodeJS.WriteStream,
++      stderr: mockStderr as unknown as NodeJS.WriteStream,
++    })
++
++    // when
++    manager.emitResult(result)
++
++    // then
++    expect(mockStdout.writes).toHaveLength(1)
++    const emitted = mockStdout.writes[0]!
++    expect(() => JSON.parse(emitted)).not.toThrow()
++    const parsed = JSON.parse(emitted) as RunResult
++    expect(parsed.sessionId).toBe("test-session")
++    expect(parsed.success).toBe(true)
++    expect(parsed.durationMs).toBe(1234)
++    expect(parsed.messageCount).toBe(42)
++    expect(parsed.summary).toBe("Test summary")
++  })
++
++  it("redirects stdout to stderr when active", () => {
++    // given
++    spyOn(console, "log").mockImplementation(() => {})
++    const mockStdout = createMockWriteStream()
++    const mockStderr = createMockWriteStream()
++    const manager = createJsonOutputManager({
++      stdout: mockStdout as unknown as NodeJS.WriteStream,
++      stderr: mockStderr as unknown as NodeJS.WriteStream,
++    })
++    manager.redirectToStderr()
++
++    // when
++    mockStdout.write("should go to stderr")
++
++    // then
++    expect(mockStdout.writes).toHaveLength(0)
++    expect(mockStderr.writes).toEqual(["should go to stderr"])
++  })
++})
++
++describe("integration: --session-id", () => {
++  beforeEach(() => {
++    spyOn(console, "log").mockImplementation(() => {})
++    spyOn(console, "error").mockImplementation(() => {})
++  })
++
++  it("resolves provided session ID without creating new session", async () => {
++    // given
++    const sessionId = "existing-session-id"
++    const mockClient = createMockClient({ data: { id: sessionId } })
++
++    // when
++    const result = await resolveSession({ client: mockClient, sessionId })
++
++    // then
++    expect(result).toBe(sessionId)
++    expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: sessionId } })
++    expect(mockClient.session.create).not.toHaveBeenCalled()
++  })
++
++  it("throws when session does not exist", async () => {
++    // given
++    const sessionId = "non-existent-session-id"
++    const mockClient = createMockClient({ error: { message: "Session not found" } })
++
++    // when
++    const result = resolveSession({ client: mockClient, sessionId })
++
++    // then
++    await expect(result).rejects.toThrow(`Session not found: ${sessionId}`)
++    expect(mockClient.session.get).toHaveBeenCalledWith({ path: { id: sessionId } })
++    expect(mockClient.session.create).not.toHaveBeenCalled()
++  })
++})
++
++describe("integration: --on-complete", () => {
++  let spawnSpy: ReturnType<typeof spyOn>
++
++  beforeEach(() => {
++    spyOn(console, "error").mockImplementation(() => {})
++    spawnSpy = spyOn(Bun, "spawn").mockReturnValue({
++      exited: Promise.resolve(0),
++      exitCode: 0,
++    } as unknown as ReturnType<typeof Bun.spawn>)
++  })
++
++  afterEach(() => {
++    spawnSpy.mockRestore()
++  })
++
++  it("passes all 4 env vars as strings to spawned process", async () => {
++    // given
++    spawnSpy.mockClear()
++
++    // when
++    await executeOnCompleteHook({
++      command: "echo test",
++      sessionId: "session-123",
++      exitCode: 0,
++      durationMs: 5000,
++      messageCount: 10,
++    })
++
++    // then
++    expect(spawnSpy).toHaveBeenCalledTimes(1)
++    const [_, options] = spawnSpy.mock.calls[0] as Parameters<typeof Bun.spawn>
++    expect(options?.env?.SESSION_ID).toBe("session-123")
++    expect(options?.env?.EXIT_CODE).toBe("0")
++    expect(options?.env?.DURATION_MS).toBe("5000")
++    expect(options?.env?.MESSAGE_COUNT).toBe("10")
++    expect(options?.env?.SESSION_ID).toBeTypeOf("string")
++    expect(options?.env?.EXIT_CODE).toBeTypeOf("string")
++    expect(options?.env?.DURATION_MS).toBeTypeOf("string")
++    expect(options?.env?.MESSAGE_COUNT).toBeTypeOf("string")
++  })
++})
++
++describe("integration: option combinations", () => {
++  let mockStdout: MockWriteStream
++  let mockStderr: MockWriteStream
++  let spawnSpy: ReturnType<typeof spyOn>
++
++  beforeEach(() => {
++    spyOn(console, "log").mockImplementation(() => {})
++    spyOn(console, "error").mockImplementation(() => {})
++    mockStdout = createMockWriteStream()
++    mockStderr = createMockWriteStream()
++    spawnSpy = spyOn(Bun, "spawn").mockReturnValue({
++      exited: Promise.resolve(0),
++      exitCode: 0,
++    } as unknown as ReturnType<typeof Bun.spawn>)
++  })
++
++  afterEach(() => {
++    spawnSpy?.mockRestore?.()
++  })
++
++  it("json output and on-complete hook can both execute", async () => {
++    // given - json manager active + on-complete hook ready
++    const result: RunResult = {
++      sessionId: "session-123",
++      success: true,
++      durationMs: 5000,
++      messageCount: 10,
++      summary: "Test completed",
++    }
++    const jsonManager = createJsonOutputManager({
++      stdout: mockStdout as unknown as NodeJS.WriteStream,
++      stderr: mockStderr as unknown as NodeJS.WriteStream,
++    })
++    jsonManager.redirectToStderr()
++    spawnSpy.mockClear()
++
++    // when - both are invoked sequentially (as runner would)
++    jsonManager.emitResult(result)
++    await executeOnCompleteHook({
++      command: "echo done",
++      sessionId: result.sessionId,
++      exitCode: result.success ? 0 : 1,
++      durationMs: result.durationMs,
++      messageCount: result.messageCount,
++    })
++
++    // then - json emits result AND on-complete hook runs
++    expect(mockStdout.writes).toHaveLength(1)
++    const emitted = mockStdout.writes[0]!
++    expect(() => JSON.parse(emitted)).not.toThrow()
++    expect(spawnSpy).toHaveBeenCalledTimes(1)
++    const [args] = spawnSpy.mock.calls[0] as Parameters<typeof Bun.spawn>
++    expect(args).toEqual(["sh", "-c", "echo done"])
++    const [_, options] = spawnSpy.mock.calls[0] as Parameters<typeof Bun.spawn>
++    expect(options?.env?.SESSION_ID).toBe("session-123")
++    expect(options?.env?.EXIT_CODE).toBe("0")
++    expect(options?.env?.DURATION_MS).toBe("5000")
++    expect(options?.env?.MESSAGE_COUNT).toBe("10")
++  })
++})
++
++describe("integration: server connection", () => {
++  let consoleSpy: ReturnType<typeof spyOn>
++
++  beforeEach(() => {
++    consoleSpy = spyOn(console, "log").mockImplementation(() => {})
++  })
++
++  afterEach(() => {
++    consoleSpy.mockRestore()
++  })
++
++  it("attach mode creates client with no-op cleanup", async () => {
++    // given
++    const signal = new AbortController().signal
++    const attachUrl = "http://localhost:8080"
++
++    // when
++    const result = await createServerConnection({ attach: attachUrl, signal })
++
++    // then
++    expect(result.client).toBeDefined()
++    expect(result.cleanup).toBeDefined()
++    result.cleanup()
++  })
++
++  it("port with available port starts server", async () => {
++    // given - assuming port is available
++    const signal = new AbortController().signal
++    const port = 9999
++
++    // when
++    const result = await createServerConnection({ port, signal })
++
++    // then
++    expect(result.client).toBeDefined()
++    expect(result.cleanup).toBeDefined()
++    result.cleanup()
++  })
++})
+diff --git a/src/cli/run/json-output.test.ts b/src/cli/run/json-output.test.ts
+new file mode 100644
+index 00000000..d932af3c
+--- /dev/null
++++ b/src/cli/run/json-output.test.ts
+@@ -0,0 +1,170 @@
++import { describe, it, expect, beforeEach } from "bun:test"
++import type { RunResult } from "./types"
++import { createJsonOutputManager } from "./json-output"
++
++interface MockWriteStream {
++  write: (chunk: string) => boolean
++  writes: string[]
++}
++
++function createMockWriteStream(): MockWriteStream {
++  const stream: MockWriteStream = {
++    writes: [],
++    write: function (this: MockWriteStream, chunk: string): boolean {
++      this.writes.push(chunk)
++      return true
++    },
++  }
++  return stream
++}
++
++describe("createJsonOutputManager", () => {
++  let mockStdout: MockWriteStream
++  let mockStderr: MockWriteStream
++
++  beforeEach(() => {
++    mockStdout = createMockWriteStream()
++    mockStderr = createMockWriteStream()
++  })
++
++  describe("redirectToStderr", () => {
++    it("causes stdout writes to go to stderr", () => {
++      // given
++      const manager = createJsonOutputManager({
++        stdout: mockStdout as unknown as NodeJS.WriteStream,
++        stderr: mockStderr as unknown as NodeJS.WriteStream,
++      })
++      manager.redirectToStderr()
++
++      // when
++      mockStdout.write("test message")
++
++      // then
++      expect(mockStdout.writes).toHaveLength(0)
++      expect(mockStderr.writes).toEqual(["test message"])
++    })
++  })
++
++  describe("restore", () => {
++    it("reverses the redirect", () => {
++      // given
++      const manager = createJsonOutputManager({
++        stdout: mockStdout as unknown as NodeJS.WriteStream,
++        stderr: mockStderr as unknown as NodeJS.WriteStream,
++      })
++      manager.redirectToStderr()
++
++      // when
++      manager.restore()
++      mockStdout.write("restored message")
++
++      // then
++      expect(mockStdout.writes).toEqual(["restored message"])
++      expect(mockStderr.writes).toHaveLength(0)
++    })
++  })
++
++  describe("emitResult", () => {
++    it("writes valid JSON to stdout", () => {
++      // given
++      const result: RunResult = {
++        sessionId: "test-session",
++        success: true,
++        durationMs: 1234,
++        messageCount: 42,
++        summary: "Test summary",
++      }
++      const manager = createJsonOutputManager({
++        stdout: mockStdout as unknown as NodeJS.WriteStream,
++        stderr: mockStderr as unknown as NodeJS.WriteStream,
++      })
++
++      // when
++      manager.emitResult(result)
++
++      // then
++      expect(mockStdout.writes).toHaveLength(1)
++      const emitted = mockStdout.writes[0]!
++      expect(() => JSON.parse(emitted)).not.toThrow()
++    })
++
++    it("output matches RunResult schema", () => {
++      // given
++      const result: RunResult = {
++        sessionId: "test-session",
++        success: true,
++        durationMs: 1234,
++        messageCount: 42,
++        summary: "Test summary",
++      }
++      const manager = createJsonOutputManager({
++        stdout: mockStdout as unknown as NodeJS.WriteStream,
++        stderr: mockStderr as unknown as NodeJS.WriteStream,
++      })
++
++      // when
++      manager.emitResult(result)
++
++      // then
++      const emitted = mockStdout.writes[0]!
++      const parsed = JSON.parse(emitted) as RunResult
++      expect(parsed).toEqual(result)
++      expect(parsed.sessionId).toBe("test-session")
++      expect(parsed.success).toBe(true)
++      expect(parsed.durationMs).toBe(1234)
++      expect(parsed.messageCount).toBe(42)
++      expect(parsed.summary).toBe("Test summary")
++    })
++
++    it("restores stdout even if redirect was active", () => {
++      // given
++      const result: RunResult = {
++        sessionId: "test-session",
++        success: true,
++        durationMs: 100,
++        messageCount: 1,
++        summary: "Test",
++      }
++      const manager = createJsonOutputManager({
++        stdout: mockStdout as unknown as NodeJS.WriteStream,
++        stderr: mockStderr as unknown as NodeJS.WriteStream,
++      })
++      manager.redirectToStderr()
++
++      // when
++      manager.emitResult(result)
++
++      // then
++      expect(mockStdout.writes).toHaveLength(1)
++      expect(mockStdout.writes[0]!).toBe(JSON.stringify(result) + "\n")
++
++      mockStdout.write("after emit")
++      expect(mockStdout.writes).toHaveLength(2)
++      expect(mockStderr.writes).toHaveLength(0)
++    })
++  })
++
++  describe("multiple redirects and restores", () => {
++    it("work correctly", () => {
++      // given
++      const manager = createJsonOutputManager({
++        stdout: mockStdout as unknown as NodeJS.WriteStream,
++        stderr: mockStderr as unknown as NodeJS.WriteStream,
++      })
++
++      // when
++      manager.redirectToStderr()
++      mockStdout.write("first redirect")
++
++      manager.redirectToStderr()
++      mockStdout.write("second redirect")
++
++      manager.restore()
++      mockStdout.write("after restore")
++
++      // then
++      expect(mockStdout.writes).toEqual(["after restore"])
++      expect(mockStderr.writes).toEqual(["first redirect", "second redirect"])
++    })
++  })
++})
+diff --git a/src/cli/run/json-output.ts b/src/cli/run/json-output.ts
+new file mode 100644
+index 00000000..8ec58314
+--- /dev/null
++++ b/src/cli/run/json-output.ts
+@@ -0,0 +1,42 @@
++import type { RunResult } from "./types"
++
++export interface JsonOutputManager {
++  redirectToStderr: () => void
++  restore: () => void
++  emitResult: (result: RunResult) => void
++}
++
++interface JsonOutputManagerOptions {
++  stdout?: NodeJS.WriteStream
++  stderr?: NodeJS.WriteStream
++}
++
++export function createJsonOutputManager(
++  options: JsonOutputManagerOptions = {}
++): JsonOutputManager {
++  const stdout = options.stdout ?? process.stdout
++  const stderr = options.stderr ?? process.stderr
++
++  const originalWrite = stdout.write.bind(stdout)
++
++  function redirectToStderr(): void {
++    stdout.write = function (chunk: string): boolean {
++      return stderr.write(chunk)
++    }
++  }
++
++  function restore(): void {
++    stdout.write = originalWrite
++  }
++
++  function emitResult(result: RunResult): void {
++    restore()
++    originalWrite(JSON.stringify(result) + "\n")
++  }
++
++  return {
++    redirectToStderr,
++    restore,
++    emitResult,
++  }
++}
+diff --git a/src/cli/run/on-complete-hook.test.ts b/src/cli/run/on-complete-hook.test.ts
+new file mode 100644
+index 00000000..ec28f428
+--- /dev/null
++++ b/src/cli/run/on-complete-hook.test.ts
+@@ -0,0 +1,177 @@
++import { describe, it, expect, spyOn, beforeEach } from "bun:test"
++import { executeOnCompleteHook } from "./on-complete-hook"
++
++describe("executeOnCompleteHook", () => {
++  function createProc(exitCode: number) {
++    return {
++      exited: Promise.resolve(exitCode),
++      exitCode,
++    } as unknown as ReturnType<typeof Bun.spawn>
++  }
++
++  beforeEach(() => {
++    spyOn(console, "error").mockImplementation(() => {})
++  })
++
++  it("executes command with correct env vars", async () => {
++    // given
++    const spawnSpy = spyOn(Bun, "spawn").mockReturnValue(createProc(0))
++
++    try {
++      // when
++      await executeOnCompleteHook({
++        command: "echo test",
++        sessionId: "session-123",
++        exitCode: 0,
++        durationMs: 5000,
++        messageCount: 10,
++      })
++
++      // then
++      expect(spawnSpy).toHaveBeenCalledTimes(1)
++      const [args, options] = spawnSpy.mock.calls[0] as Parameters<typeof Bun.spawn>
++
++      expect(args).toEqual(["sh", "-c", "echo test"])
++      expect(options?.env?.SESSION_ID).toBe("session-123")
++      expect(options?.env?.EXIT_CODE).toBe("0")
++      expect(options?.env?.DURATION_MS).toBe("5000")
++      expect(options?.env?.MESSAGE_COUNT).toBe("10")
++      expect(options?.stdout).toBe("inherit")
++      expect(options?.stderr).toBe("inherit")
++    } finally {
++      spawnSpy.mockRestore()
++    }
++  })
++
++  it("env var values are strings", async () => {
++    // given
++    const spawnSpy = spyOn(Bun, "spawn").mockReturnValue(createProc(0))
++
++    try {
++      // when
++      await executeOnCompleteHook({
++        command: "echo test",
++        sessionId: "session-123",
++        exitCode: 1,
++        durationMs: 12345,
++        messageCount: 42,
++      })
++
++      // then
++      const [_, options] = spawnSpy.mock.calls[0] as Parameters<typeof Bun.spawn>
++
++      expect(options?.env?.EXIT_CODE).toBe("1")
++      expect(options?.env?.EXIT_CODE).toBeTypeOf("string")
++      expect(options?.env?.DURATION_MS).toBe("12345")
++      expect(options?.env?.DURATION_MS).toBeTypeOf("string")
++      expect(options?.env?.MESSAGE_COUNT).toBe("42")
++      expect(options?.env?.MESSAGE_COUNT).toBeTypeOf("string")
++    } finally {
++      spawnSpy.mockRestore()
++    }
++  })
++
++  it("empty command string is no-op", async () => {
++    // given
++    const spawnSpy = spyOn(Bun, "spawn").mockReturnValue(createProc(0))
++
++    try {
++      // when
++      await executeOnCompleteHook({
++        command: "",
++        sessionId: "session-123",
++        exitCode: 0,
++        durationMs: 5000,
++        messageCount: 10,
++      })
++
++      // then
++      expect(spawnSpy).not.toHaveBeenCalled()
++    } finally {
++      spawnSpy.mockRestore()
++    }
++  })
++
++  it("whitespace-only command is no-op", async () => {
++    // given
++    const spawnSpy = spyOn(Bun, "spawn").mockReturnValue(createProc(0))
++
++    try {
++      // when
++      await executeOnCompleteHook({
++        command: "   ",
++        sessionId: "session-123",
++        exitCode: 0,
++        durationMs: 5000,
++        messageCount: 10,
++      })
++
++      // then
++      expect(spawnSpy).not.toHaveBeenCalled()
++    } finally {
++      spawnSpy.mockRestore()
++    }
++  })
++
++  it("command failure logs warning but does not throw", async () => {
++    // given
++    const consoleErrorSpy = spyOn(console, "error").mockImplementation(() => {})
++    const spawnSpy = spyOn(Bun, "spawn").mockReturnValue(createProc(1))
++
++    try {
++      // when
++      await expect(
++        executeOnCompleteHook({
++          command: "false",
++          sessionId: "session-123",
++          exitCode: 0,
++          durationMs: 5000,
++          messageCount: 10,
++        })
++      ).resolves.toBeUndefined()
++
++      // then
++      expect(consoleErrorSpy).toHaveBeenCalled()
++      const warningCall = consoleErrorSpy.mock.calls.find(
++        (call) => typeof call[0] === "string" && call[0].includes("Warning: on-complete hook exited with code 1")
++      )
++      expect(warningCall).toBeDefined()
++    } finally {
++      spawnSpy.mockRestore()
++      consoleErrorSpy.mockRestore()
++    }
++  })
++
++  it("spawn error logs warning but does not throw", async () => {
++    // given
++    const consoleErrorSpy = spyOn(console, "error").mockImplementation(() => {})
++    const spawnError = new Error("Command not found")
++    const spawnSpy = spyOn(Bun, "spawn").mockImplementation(() => {
++      throw spawnError
++    })
++
++    try {
++      // when
++      await expect(
++        executeOnCompleteHook({
++          command: "nonexistent-command",
++          sessionId: "session-123",
++          exitCode: 0,
++          durationMs: 5000,
++          messageCount: 10,
++        })
++      ).resolves.toBeUndefined()
++
++      // then
++      expect(consoleErrorSpy).toHaveBeenCalled()
++      const errorCalls = consoleErrorSpy.mock.calls.filter((call) => {
++        const firstArg = call[0]
++        return typeof firstArg === "string" && (firstArg.includes("Warning") || firstArg.toLowerCase().includes("error"))
++      })
++      expect(errorCalls.length).toBeGreaterThan(0)
++    } finally {
++      spawnSpy.mockRestore()
++      consoleErrorSpy.mockRestore()
++    }
++  })
++})
+diff --git a/src/cli/run/on-complete-hook.ts b/src/cli/run/on-complete-hook.ts
+new file mode 100644
+index 00000000..30c58543
+--- /dev/null
++++ b/src/cli/run/on-complete-hook.ts
+@@ -0,0 +1,42 @@
++import pc from "picocolors"
++
++export async function executeOnCompleteHook(options: {
++  command: string
++  sessionId: string
++  exitCode: number
++  durationMs: number
++  messageCount: number
++}): Promise<void> {
++  const { command, sessionId, exitCode, durationMs, messageCount } = options
++
++  const trimmedCommand = command.trim()
++  if (!trimmedCommand) {
++    return
++  }
++
++  console.error(pc.dim(`Running on-complete hook: ${trimmedCommand}`))
++
++  try {
++    const proc = Bun.spawn(["sh", "-c", trimmedCommand], {
++      env: {
++        ...process.env,
++        SESSION_ID: sessionId,
++        EXIT_CODE: String(exitCode),
++        DURATION_MS: String(durationMs),
++        MESSAGE_COUNT: String(messageCount),
++      },
++      stdout: "inherit",
++      stderr: "inherit",
++    })
++
++    const hookExitCode = await proc.exited
++
++    if (hookExitCode !== 0) {
++      console.error(
++        pc.yellow(`Warning: on-complete hook exited with code ${hookExitCode}`)
++      )
++    }
++  } catch (error) {
++    console.error(pc.yellow(`Warning: Failed to execute on-complete hook: ${error instanceof Error ? error.message : String(error)}`))
++  }
++}
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index c9c2527c..f1d9dd91 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -1,101 +1,37 @@
+-import { createOpencode } from "@opencode-ai/sdk"
+ import pc from "picocolors"
+ import type { RunOptions, RunContext } from "./types"
+ import { checkCompletionConditions } from "./completion"
+ import { createEventState, processEvents, serializeError } from "./events"
+-import type { OhMyOpenCodeConfig } from "../../config"
+ import { loadPluginConfig } from "../../plugin-config"
+-import { getAvailableServerPort, DEFAULT_SERVER_PORT } from "../../shared/port-utils"
++import { createServerConnection } from "./server-connection"
++import { resolveSession } from "./session-resolver"
++import { createJsonOutputManager } from "./json-output"
++import { executeOnCompleteHook } from "./on-complete-hook"
++import { resolveRunAgent } from "./agent-resolver"
++
++export { resolveRunAgent }
+ 
+ const POLL_INTERVAL_MS = 500
+ const DEFAULT_TIMEOUT_MS = 0
+-const SESSION_CREATE_MAX_RETRIES = 3
+-const SESSION_CREATE_RETRY_DELAY_MS = 1000
+-const CORE_AGENT_ORDER = ["sisyphus", "hephaestus", "prometheus", "atlas"] as const
+-const DEFAULT_AGENT = "sisyphus"
+-
+-type EnvVars = Record<string, string | undefined>
+-
+-const normalizeAgentName = (agent?: string): string | undefined => {
+-  if (!agent) return undefined
+-  const trimmed = agent.trim()
+-  if (!trimmed) return undefined
+-  const lowered = trimmed.toLowerCase()
+-  const coreMatch = CORE_AGENT_ORDER.find((name) => name.toLowerCase() === lowered)
+-  return coreMatch ?? trimmed
+-}
+-
+-const isAgentDisabled = (agent: string, config: OhMyOpenCodeConfig): boolean => {
+-  const lowered = agent.toLowerCase()
+-  if (lowered === "sisyphus" && config.sisyphus_agent?.disabled === true) {
+-    return true
+-  }
+-  return (config.disabled_agents ?? []).some(
+-    (disabled) => disabled.toLowerCase() === lowered
+-  )
+-}
+-
+-const pickFallbackAgent = (config: OhMyOpenCodeConfig): string => {
+-  for (const agent of CORE_AGENT_ORDER) {
+-    if (!isAgentDisabled(agent, config)) {
+-      return agent
+-    }
+-  }
+-  return DEFAULT_AGENT
+-}
+-
+-export const resolveRunAgent = (
+-  options: RunOptions,
+-  pluginConfig: OhMyOpenCodeConfig,
+-  env: EnvVars = process.env
+-): string => {
+-  const cliAgent = normalizeAgentName(options.agent)
+-  const envAgent = normalizeAgentName(env.OPENCODE_DEFAULT_AGENT)
+-  const configAgent = normalizeAgentName(pluginConfig.default_run_agent)
+-  const resolved = cliAgent ?? envAgent ?? configAgent ?? DEFAULT_AGENT
+-  const normalized = normalizeAgentName(resolved) ?? DEFAULT_AGENT
+-
+-  if (isAgentDisabled(normalized, pluginConfig)) {
+-    const fallback = pickFallbackAgent(pluginConfig)
+-    const fallbackDisabled = isAgentDisabled(fallback, pluginConfig)
+-    if (fallbackDisabled) {
+-      console.log(
+-        pc.yellow(
+-          `Requested agent "${normalized}" is disabled and no enabled core agent was found. Proceeding with "${fallback}".`
+-        )
+-      )
+-      return fallback
+-    }
+-    console.log(
+-      pc.yellow(
+-        `Requested agent "${normalized}" is disabled. Falling back to "${fallback}".`
+-      )
+-    )
+-    return fallback
+-  }
+-
+-  return normalized
+-}
+ 
+ export async function run(options: RunOptions): Promise<number> {
+-  // Set CLI run mode environment variable before any config loading
+-  // This signals to config-handler to deny Question tool (no TUI to answer)
+   process.env.OPENCODE_CLI_RUN_MODE = "true"
+ 
++  const startTime = Date.now()
+   const {
+     message,
+     directory = process.cwd(),
+     timeout = DEFAULT_TIMEOUT_MS,
+   } = options
+-  const pluginConfig = loadPluginConfig(directory, { command: "run" })
+-  const resolvedAgent = resolveRunAgent(options, pluginConfig)
+ 
+-  console.log(pc.cyan("Starting opencode server (auto port selection enabled)..."))
++  const jsonManager = options.json ? createJsonOutputManager() : null
++  if (jsonManager) jsonManager.redirectToStderr()
+ 
++  const pluginConfig = loadPluginConfig(directory, { command: "run" })
++  const resolvedAgent = resolveRunAgent(options, pluginConfig)
+   const abortController = new AbortController()
+   let timeoutId: ReturnType<typeof setTimeout> | null = null
+ 
+-  // timeout=0 means no timeout (run until completion)
+   if (timeout > 0) {
+     timeoutId = setTimeout(() => {
+       console.log(pc.yellow("\nTimeout reached. Aborting..."))
+@@ -104,29 +40,15 @@ export async function run(options: RunOptions): Promise<number> {
+   }
+ 
+   try {
+-    const envPort = process.env.OPENCODE_SERVER_PORT
+-      ? parseInt(process.env.OPENCODE_SERVER_PORT, 10)
+-      : undefined
+-    const serverHostname = process.env.OPENCODE_SERVER_HOSTNAME || "127.0.0.1"
+-    const preferredPort = envPort && !isNaN(envPort) ? envPort : DEFAULT_SERVER_PORT
+-
+-    const { port: serverPort, wasAutoSelected } = await getAvailableServerPort(preferredPort, serverHostname)
+-
+-    if (wasAutoSelected) {
+-      console.log(pc.yellow(`Port ${preferredPort} is busy, using port ${serverPort} instead`))
+-    } else {
+-      console.log(pc.dim(`Using port ${serverPort}`))
+-    }
+-
+-    const { client, server } = await createOpencode({
++    const { client, cleanup: serverCleanup } = await createServerConnection({
++      port: options.port,
++      attach: options.attach,
+       signal: abortController.signal,
+-      port: serverPort,
+-      hostname: serverHostname,
+     })
+ 
+     const cleanup = () => {
+       if (timeoutId) clearTimeout(timeoutId)
+-      server.close()
++      serverCleanup()
+     }
+ 
+     process.on("SIGINT", () => {
+@@ -136,61 +58,14 @@ export async function run(options: RunOptions): Promise<number> {
+     })
+ 
+     try {
+-      // Retry session creation with exponential backoff
+-      // Server might not be fully ready even after "listening" message
+-      let sessionID: string | undefined
+-      let lastError: unknown
+-
+-      for (let attempt = 1; attempt <= SESSION_CREATE_MAX_RETRIES; attempt++) {
+-        const sessionRes = await client.session.create({
+-          body: { title: "oh-my-opencode run" },
+-        })
+-
+-        if (sessionRes.error) {
+-          lastError = sessionRes.error
+-          console.error(pc.yellow(`Session create attempt ${attempt}/${SESSION_CREATE_MAX_RETRIES} failed:`))
+-          console.error(pc.dim(`  Error: ${serializeError(sessionRes.error)}`))
+-
+-          if (attempt < SESSION_CREATE_MAX_RETRIES) {
+-            const delay = SESSION_CREATE_RETRY_DELAY_MS * attempt
+-            console.log(pc.dim(`  Retrying in ${delay}ms...`))
+-            await new Promise((resolve) => setTimeout(resolve, delay))
+-            continue
+-          }
+-        }
+-
+-        sessionID = sessionRes.data?.id
+-        if (sessionID) {
+-          break
+-        }
+-
+-        // No error but also no session ID - unexpected response
+-        lastError = new Error(`Unexpected response: ${JSON.stringify(sessionRes, null, 2)}`)
+-        console.error(pc.yellow(`Session create attempt ${attempt}/${SESSION_CREATE_MAX_RETRIES}: No session ID returned`))
+-
+-        if (attempt < SESSION_CREATE_MAX_RETRIES) {
+-          const delay = SESSION_CREATE_RETRY_DELAY_MS * attempt
+-          console.log(pc.dim(`  Retrying in ${delay}ms...`))
+-          await new Promise((resolve) => setTimeout(resolve, delay))
+-        }
+-      }
+-
+-      if (!sessionID) {
+-        console.error(pc.red("Failed to create session after all retries"))
+-        console.error(pc.dim(`Last error: ${serializeError(lastError)}`))
+-        cleanup()
+-        return 1
+-      }
++      const sessionID = await resolveSession({
++        client,
++        sessionId: options.sessionId,
++      })
+ 
+       console.log(pc.dim(`Session: ${sessionID}`))
+ 
+-      const ctx: RunContext = {
+-        client,
+-        sessionID,
+-        directory,
+-        abortController,
+-      }
+-
++      const ctx: RunContext = { client, sessionID, directory, abortController }
+       const events = await client.event.subscribe()
+       const eventState = createEventState()
+       const eventProcessor = processEvents(ctx, events.stream, eventState)
+@@ -206,47 +81,41 @@ export async function run(options: RunOptions): Promise<number> {
+       })
+ 
+       console.log(pc.dim("Waiting for completion...\n"))
++      const exitCode = await pollForCompletion(ctx, eventState, abortController)
+ 
+-      while (!abortController.signal.aborted) {
+-        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+-
+-        if (!eventState.mainSessionIdle) {
+-          continue
+-        }
++      await eventProcessor.catch(() => {})
++      cleanup()
+ 
+-        // Check if session errored - exit with failure if so
+-        if (eventState.mainSessionError) {
+-          console.error(pc.red(`\n\nSession ended with error: ${eventState.lastError}`))
+-          console.error(pc.yellow("Check if todos were completed before the error."))
+-          cleanup()
+-          process.exit(1)
+-        }
++      const durationMs = Date.now() - startTime
+ 
+-        // Guard against premature completion: don't check completion until the
+-        // session has produced meaningful work (text output, tool call, or tool result).
+-        // Without this, a session that goes busy->idle before the LLM responds
+-        // would exit immediately because 0 todos + 0 children = "complete".
+-        if (!eventState.hasReceivedMeaningfulWork) {
+-          continue
+-        }
++      if (options.onComplete) {
++        await executeOnCompleteHook({
++          command: options.onComplete,
++          sessionId: sessionID,
++          exitCode,
++          durationMs,
++          messageCount: eventState.messageCount,
++        })
++      }
+ 
+-        const shouldExit = await checkCompletionConditions(ctx)
+-        if (shouldExit) {
+-          console.log(pc.green("\n\nAll tasks completed."))
+-          cleanup()
+-          process.exit(0)
+-        }
++      if (jsonManager) {
++        jsonManager.emitResult({
++          sessionId: sessionID,
++          success: exitCode === 0,
++          durationMs,
++          messageCount: eventState.messageCount,
++          summary: eventState.lastPartText.slice(0, 200) || "Run completed",
++        })
+       }
+ 
+-      await eventProcessor.catch(() => {})
+-      cleanup()
+-      return 130
++      return exitCode
+     } catch (err) {
+       cleanup()
+       throw err
+     }
+   } catch (err) {
+     if (timeoutId) clearTimeout(timeoutId)
++    if (jsonManager) jsonManager.restore()
+     if (err instanceof Error && err.name === "AbortError") {
+       return 130
+     }
+@@ -254,3 +123,31 @@ export async function run(options: RunOptions): Promise<number> {
+     return 1
+   }
+ }
++
++async function pollForCompletion(
++  ctx: RunContext,
++  eventState: ReturnType<typeof createEventState>,
++  abortController: AbortController
++): Promise<number> {
++  while (!abortController.signal.aborted) {
++    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
++
++    if (!eventState.mainSessionIdle) continue
++
++    if (eventState.mainSessionError) {
++      console.error(pc.red(`\n\nSession ended with error: ${eventState.lastError}`))
++      console.error(pc.yellow("Check if todos were completed before the error."))
++      return 1
++    }
++
++    if (!eventState.hasReceivedMeaningfulWork) continue
++
++    const shouldExit = await checkCompletionConditions(ctx)
++    if (shouldExit) {
++      console.log(pc.green("\n\nAll tasks completed."))
++      return 0
++    }
++  }
++
++  return 130
++}
+diff --git a/src/cli/run/server-connection.test.ts b/src/cli/run/server-connection.test.ts
+new file mode 100644
+index 00000000..5a4e8842
+--- /dev/null
++++ b/src/cli/run/server-connection.test.ts
+@@ -0,0 +1,146 @@
++import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
++
++const mockServerClose = mock(() => {})
++const mockCreateOpencode = mock(() =>
++  Promise.resolve({
++    client: { session: {} },
++    server: { url: "http://127.0.0.1:4096", close: mockServerClose },
++  })
++)
++const mockCreateOpencodeClient = mock(() => ({ session: {} }))
++const mockIsPortAvailable = mock(() => Promise.resolve(true))
++const mockGetAvailableServerPort = mock(() => Promise.resolve({ port: 4096, wasAutoSelected: false }))
++const mockConsoleLog = mock(() => {})
++
++mock.module("@opencode-ai/sdk", () => ({
++  createOpencode: mockCreateOpencode,
++  createOpencodeClient: mockCreateOpencodeClient,
++}))
++
++mock.module("../../shared/port-utils", () => ({
++  isPortAvailable: mockIsPortAvailable,
++  getAvailableServerPort: mockGetAvailableServerPort,
++  DEFAULT_SERVER_PORT: 4096,
++}))
++
++const { createServerConnection } = await import("./server-connection")
++
++describe("createServerConnection", () => {
++  beforeEach(() => {
++    mockCreateOpencode.mockClear()
++    mockCreateOpencodeClient.mockClear()
++    mockIsPortAvailable.mockClear()
++    mockGetAvailableServerPort.mockClear()
++    mockServerClose.mockClear()
++    mockConsoleLog.mockClear()
++    globalThis.console = { ...console, log: mockConsoleLog } as typeof console
++  })
++
++  it("attach mode returns client with no-op cleanup", async () => {
++    // given
++    const signal = new AbortController().signal
++    const attachUrl = "http://localhost:8080"
++
++    // when
++    const result = await createServerConnection({ attach: attachUrl, signal })
++
++    // then
++    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({ baseUrl: attachUrl })
++    expect(result.client).toBeDefined()
++    expect(result.cleanup).toBeDefined()
++    result.cleanup()
++    expect(mockServerClose).not.toHaveBeenCalled()
++  })
++
++  it("explicit port starts server when port is available", async () => {
++    // given
++    const signal = new AbortController().signal
++    const port = 8080
++    mockIsPortAvailable.mockResolvedValueOnce(true)
++
++    // when
++    const result = await createServerConnection({ port, signal })
++
++    // then
++    expect(mockIsPortAvailable).toHaveBeenCalledWith(8080, "127.0.0.1")
++    expect(mockCreateOpencode).toHaveBeenCalledWith({ signal, port: 8080, hostname: "127.0.0.1" })
++    expect(mockCreateOpencodeClient).not.toHaveBeenCalled()
++    expect(result.client).toBeDefined()
++    expect(result.cleanup).toBeDefined()
++    result.cleanup()
++    expect(mockServerClose).toHaveBeenCalled()
++  })
++
++  it("explicit port attaches when port is occupied", async () => {
++    // given
++    const signal = new AbortController().signal
++    const port = 8080
++    mockIsPortAvailable.mockResolvedValueOnce(false)
++
++    // when
++    const result = await createServerConnection({ port, signal })
++
++    // then
++    expect(mockIsPortAvailable).toHaveBeenCalledWith(8080, "127.0.0.1")
++    expect(mockCreateOpencode).not.toHaveBeenCalled()
++    expect(mockCreateOpencodeClient).toHaveBeenCalledWith({ baseUrl: "http://127.0.0.1:8080" })
++    expect(result.client).toBeDefined()
++    expect(result.cleanup).toBeDefined()
++    result.cleanup()
++    expect(mockServerClose).not.toHaveBeenCalled()
++  })
++
++  it("auto mode uses getAvailableServerPort", async () => {
++    // given
++    const signal = new AbortController().signal
++    mockGetAvailableServerPort.mockResolvedValueOnce({ port: 4100, wasAutoSelected: true })
++
++    // when
++    const result = await createServerConnection({ signal })
++
++    // then
++    expect(mockGetAvailableServerPort).toHaveBeenCalledWith(4096, "127.0.0.1")
++    expect(mockCreateOpencode).toHaveBeenCalledWith({ signal, port: 4100, hostname: "127.0.0.1" })
++    expect(mockCreateOpencodeClient).not.toHaveBeenCalled()
++    expect(result.client).toBeDefined()
++    expect(result.cleanup).toBeDefined()
++    result.cleanup()
++    expect(mockServerClose).toHaveBeenCalled()
++  })
++
++  it("invalid port throws error", async () => {
++    // given
++    const signal = new AbortController().signal
++
++    // when & then
++    await expect(createServerConnection({ port: 0, signal })).rejects.toThrow("Port must be between 1 and 65535")
++    await expect(createServerConnection({ port: -1, signal })).rejects.toThrow("Port must be between 1 and 65535")
++    await expect(createServerConnection({ port: 99999, signal })).rejects.toThrow("Port must be between 1 and 65535")
++  })
++
++  it("cleanup calls server.close for owned server", async () => {
++    // given
++    const signal = new AbortController().signal
++    mockIsPortAvailable.mockResolvedValueOnce(true)
++
++    // when
++    const result = await createServerConnection({ port: 8080, signal })
++    result.cleanup()
++
++    // then
++    expect(mockServerClose).toHaveBeenCalledTimes(1)
++  })
++
++  it("cleanup is no-op for attached server", async () => {
++    // given
++    const signal = new AbortController().signal
++    const attachUrl = "http://localhost:8080"
++
++    // when
++    const result = await createServerConnection({ attach: attachUrl, signal })
++    result.cleanup()
++
++    // then
++    expect(mockServerClose).not.toHaveBeenCalled()
++  })
++})
+diff --git a/src/cli/run/server-connection.ts b/src/cli/run/server-connection.ts
+new file mode 100644
+index 00000000..55b63b74
+--- /dev/null
++++ b/src/cli/run/server-connection.ts
+@@ -0,0 +1,47 @@
++import { createOpencode, createOpencodeClient } from "@opencode-ai/sdk"
++import pc from "picocolors"
++import type { ServerConnection } from "./types"
++import { getAvailableServerPort, isPortAvailable, DEFAULT_SERVER_PORT } from "../../shared/port-utils"
++
++export async function createServerConnection(options: {
++  port?: number
++  attach?: string
++  signal: AbortSignal
++}): Promise<ServerConnection> {
++  const { port, attach, signal } = options
++
++  if (attach !== undefined) {
++    console.log(pc.dim("Attaching to existing server at"), pc.cyan(attach))
++    const client = createOpencodeClient({ baseUrl: attach })
++    return { client, cleanup: () => {} }
++  }
++
++  if (port !== undefined) {
++    if (port < 1 || port > 65535) {
++      throw new Error("Port must be between 1 and 65535")
++    }
++
++    const available = await isPortAvailable(port, "127.0.0.1")
++
++    if (available) {
++      console.log(pc.dim("Starting server on port"), pc.cyan(port.toString()))
++      const { client, server } = await createOpencode({ signal, port, hostname: "127.0.0.1" })
++      console.log(pc.dim("Server listening at"), pc.cyan(server.url))
++      return { client, cleanup: () => server.close() }
++    }
++
++    console.log(pc.dim("Port"), pc.cyan(port.toString()), pc.dim("is occupied, attaching to existing server"))
++    const client = createOpencodeClient({ baseUrl: `http://127.0.0.1:${port}` })
++    return { client, cleanup: () => {} }
++  }
++
++  const { port: selectedPort, wasAutoSelected } = await getAvailableServerPort(DEFAULT_SERVER_PORT, "127.0.0.1")
++  if (wasAutoSelected) {
++    console.log(pc.dim("Auto-selected port"), pc.cyan(selectedPort.toString()))
++  } else {
++    console.log(pc.dim("Starting server on port"), pc.cyan(selectedPort.toString()))
++  }
++  const { client, server } = await createOpencode({ signal, port: selectedPort, hostname: "127.0.0.1" })
++  console.log(pc.dim("Server listening at"), pc.cyan(server.url))
++  return { client, cleanup: () => server.close() }
++}
+diff --git a/src/cli/run/session-resolver.test.ts b/src/cli/run/session-resolver.test.ts
+new file mode 100644
+index 00000000..ca7d9f65
+--- /dev/null
++++ b/src/cli/run/session-resolver.test.ts
+@@ -0,0 +1,140 @@
++import { describe, it, expect, beforeEach, mock, spyOn } from "bun:test"
++import { resolveSession } from "./session-resolver"
++import type { OpencodeClient } from "./types"
++
++const createMockClient = (overrides: {
++  getResult?: { error?: unknown; data?: { id: string } }
++  createResults?: Array<{ error?: unknown; data?: { id: string } }>
++} = {}): OpencodeClient => {
++  const { getResult, createResults = [] } = overrides
++  let createCallIndex = 0
++  return {
++    session: {
++      get: mock((opts: { path: { id: string } }) =>
++        Promise.resolve(getResult ?? { data: { id: opts.path.id } })
++      ),
++      create: mock(() => {
++        const result =
++          createResults[createCallIndex] ?? { data: { id: "new-session-id" } }
++        createCallIndex++
++        return Promise.resolve(result)
++      }),
++    },
++  } as unknown as OpencodeClient
++}
++
++describe("resolveSession", () => {
++  beforeEach(() => {
++    spyOn(console, "log").mockImplementation(() => {})
++    spyOn(console, "error").mockImplementation(() => {})
++  })
++
++  it("returns provided session ID when session exists", async () => {
++    // given
++    const sessionId = "existing-session-id"
++    const mockClient = createMockClient({
++      getResult: { data: { id: sessionId } },
++    })
++
++    // when
++    const result = await resolveSession({ client: mockClient, sessionId })
++
++    // then
++    expect(result).toBe(sessionId)
++    expect(mockClient.session.get).toHaveBeenCalledWith({
++      path: { id: sessionId },
++    })
++    expect(mockClient.session.create).not.toHaveBeenCalled()
++  })
++
++  it("throws error when provided session ID not found", async () => {
++    // given
++    const sessionId = "non-existent-session-id"
++    const mockClient = createMockClient({
++      getResult: { error: { message: "Session not found" } },
++    })
++
++    // when
++    const result = resolveSession({ client: mockClient, sessionId })
++
++    // then
++    await expect(result).rejects.toThrow(`Session not found: ${sessionId}`)
++    expect(mockClient.session.get).toHaveBeenCalledWith({
++      path: { id: sessionId },
++    })
++    expect(mockClient.session.create).not.toHaveBeenCalled()
++  })
++
++  it("creates new session when no session ID provided", async () => {
++    // given
++    const mockClient = createMockClient({
++      createResults: [{ data: { id: "new-session-id" } }],
++    })
++
++    // when
++    const result = await resolveSession({ client: mockClient })
++
++    // then
++    expect(result).toBe("new-session-id")
++    expect(mockClient.session.create).toHaveBeenCalledWith({
++      body: { title: "oh-my-opencode run" },
++    })
++    expect(mockClient.session.get).not.toHaveBeenCalled()
++  })
++
++  it("retries session creation on failure", async () => {
++    // given
++    const mockClient = createMockClient({
++      createResults: [
++        { error: { message: "Network error" } },
++        { data: { id: "retried-session-id" } },
++      ],
++    })
++
++    // when
++    const result = await resolveSession({ client: mockClient })
++
++    // then
++    expect(result).toBe("retried-session-id")
++    expect(mockClient.session.create).toHaveBeenCalledTimes(2)
++    expect(mockClient.session.create).toHaveBeenCalledWith({
++      body: { title: "oh-my-opencode run" },
++    })
++  })
++
++  it("throws after all retries exhausted", async () => {
++    // given
++    const mockClient = createMockClient({
++      createResults: [
++        { error: { message: "Error 1" } },
++        { error: { message: "Error 2" } },
++        { error: { message: "Error 3" } },
++      ],
++    })
++
++    // when
++    const result = resolveSession({ client: mockClient })
++
++    // then
++    await expect(result).rejects.toThrow("Failed to create session after all retries")
++    expect(mockClient.session.create).toHaveBeenCalledTimes(3)
++  })
++
++  it("session creation returns no ID", async () => {
++    // given
++    const mockClient = createMockClient({
++      createResults: [
++        { data: undefined },
++        { data: undefined },
++        { data: undefined },
++      ],
++    })
++
++    // when
++    const result = resolveSession({ client: mockClient })
++
++    // then
++    await expect(result).rejects.toThrow("Failed to create session after all retries")
++    expect(mockClient.session.create).toHaveBeenCalledTimes(3)
++  })
++})
+diff --git a/src/cli/run/session-resolver.ts b/src/cli/run/session-resolver.ts
+new file mode 100644
+index 00000000..31bd5a2c
+--- /dev/null
++++ b/src/cli/run/session-resolver.ts
+@@ -0,0 +1,64 @@
++import pc from "picocolors"
++import type { OpencodeClient } from "./types"
++import { serializeError } from "./events"
++
++const SESSION_CREATE_MAX_RETRIES = 3
++const SESSION_CREATE_RETRY_DELAY_MS = 1000
++
++export async function resolveSession(options: {
++  client: OpencodeClient
++  sessionId?: string
++}): Promise<string> {
++  const { client, sessionId } = options
++
++  if (sessionId) {
++    const res = await client.session.get({ path: { id: sessionId } })
++    if (res.error || !res.data) {
++      throw new Error(`Session not found: ${sessionId}`)
++    }
++    return sessionId
++  }
++
++  let lastError: unknown
++  for (let attempt = 1; attempt <= SESSION_CREATE_MAX_RETRIES; attempt++) {
++    const res = await client.session.create({
++      body: { title: "oh-my-opencode run" },
++    })
++
++    if (res.error) {
++      lastError = res.error
++      console.error(
++        pc.yellow(`Session create attempt ${attempt}/${SESSION_CREATE_MAX_RETRIES} failed:`)
++      )
++      console.error(pc.dim(`  Error: ${serializeError(res.error)}`))
++
++      if (attempt < SESSION_CREATE_MAX_RETRIES) {
++        const delay = SESSION_CREATE_RETRY_DELAY_MS * attempt
++        console.log(pc.dim(`  Retrying in ${delay}ms...`))
++        await new Promise((resolve) => setTimeout(resolve, delay))
++      }
++      continue
++    }
++
++    if (res.data?.id) {
++      return res.data.id
++    }
++
++    lastError = new Error(
++      `Unexpected response: ${JSON.stringify(res, null, 2)}`
++    )
++    console.error(
++      pc.yellow(
++        `Session create attempt ${attempt}/${SESSION_CREATE_MAX_RETRIES}: No session ID returned`
++      )
++    )
++
++    if (attempt < SESSION_CREATE_MAX_RETRIES) {
++      const delay = SESSION_CREATE_RETRY_DELAY_MS * attempt
++      console.log(pc.dim(`  Retrying in ${delay}ms...`))
++      await new Promise((resolve) => setTimeout(resolve, delay))
++    }
++  }
++
++  throw new Error("Failed to create session after all retries")
++}
+diff --git a/src/cli/run/types.ts b/src/cli/run/types.ts
+index e2386158..0e032d95 100644
+--- a/src/cli/run/types.ts
++++ b/src/cli/run/types.ts
+@@ -1,10 +1,29 @@
+ import type { OpencodeClient } from "@opencode-ai/sdk"
++export type { OpencodeClient }
+ 
+ export interface RunOptions {
+   message: string
+   agent?: string
+   directory?: string
+   timeout?: number
++  port?: number
++  attach?: string
++  onComplete?: string
++  json?: boolean
++  sessionId?: string
++}
++
++export interface ServerConnection {
++  client: OpencodeClient
++  cleanup: () => void
++}
++
++export interface RunResult {
++  sessionId: string
++  success: boolean
++  durationMs: number
++  messageCount: number
++  summary: string
+ }
+ 
+ export interface RunContext {
+-- 
+2.39.2
+

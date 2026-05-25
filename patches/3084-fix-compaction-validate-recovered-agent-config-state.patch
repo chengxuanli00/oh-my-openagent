@@ -1,0 +1,772 @@
+From e99e638e45fa4912548216dee9ce446fe27fa0a2 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 11 Mar 2026 18:23:59 +0900
+Subject: [PATCH 3084/5749] fix(compaction): validate recovered agent config
+ state
+
+Retry compaction recovery when model or tool state is still incomplete, and treat reasoning or tool-only assistant progress as valid output so no-text tail recovery does not misfire.
+---
+ .../compaction-context-prompt.ts              |  56 ++++
+ src/hooks/compaction-context-injector/hook.ts | 148 +++------
+ .../recovery-prompt-config.ts                 |  76 +++++
+ .../recovery.test.ts                          | 294 ++++++++++++++++++
+ .../tail-monitor.ts                           |  52 ++++
+ 5 files changed, 522 insertions(+), 104 deletions(-)
+ create mode 100644 src/hooks/compaction-context-injector/compaction-context-prompt.ts
+ create mode 100644 src/hooks/compaction-context-injector/recovery-prompt-config.ts
+ create mode 100644 src/hooks/compaction-context-injector/recovery.test.ts
+ create mode 100644 src/hooks/compaction-context-injector/tail-monitor.ts
+
+diff --git a/src/hooks/compaction-context-injector/compaction-context-prompt.ts b/src/hooks/compaction-context-injector/compaction-context-prompt.ts
+new file mode 100644
+index 00000000..11bc2574
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/compaction-context-prompt.ts
+@@ -0,0 +1,56 @@
++import {
++  createSystemDirective,
++  SystemDirectiveTypes,
++} from "../../shared/system-directive"
++
++export const COMPACTION_CONTEXT_PROMPT = `${createSystemDirective(SystemDirectiveTypes.COMPACTION_CONTEXT)}
++
++When summarizing this session, you MUST include the following sections in your summary:
++
++## 1. User Requests (As-Is)
++- List all original user requests exactly as they were stated
++- Preserve the user's exact wording and intent
++
++## 2. Final Goal
++- What the user ultimately wanted to achieve
++- The end result or deliverable expected
++
++## 3. Work Completed
++- What has been done so far
++- Files created/modified
++- Features implemented
++- Problems solved
++
++## 4. Remaining Tasks
++- What still needs to be done
++- Pending items from the original request
++- Follow-up tasks identified during the work
++
++## 5. Active Working Context (For Seamless Continuation)
++- **Files**: Paths of files currently being edited or frequently referenced
++- **Code in Progress**: Key code snippets, function signatures, or data structures under active development
++- **External References**: Documentation URLs, library APIs, or external resources being consulted
++- **State & Variables**: Important variable names, configuration values, or runtime state relevant to ongoing work
++
++## 6. Explicit Constraints (Verbatim Only)
++- Include ONLY constraints explicitly stated by the user or in existing AGENTS.md context
++- Quote constraints verbatim (do not paraphrase)
++- Do NOT invent, add, or modify constraints
++- If no explicit constraints exist, write "None"
++
++## 7. Agent Verification State (Critical for Reviewers)
++- **Current Agent**: What agent is running (momus, oracle, etc.)
++- **Verification Progress**: Files already verified/validated
++- **Pending Verifications**: Files still needing verification
++- **Previous Rejections**: If reviewer agent, what was rejected and why
++- **Acceptance Status**: Current state of review process
++
++This section is CRITICAL for reviewer agents (momus, oracle) to maintain continuity.
++
++## 8. Delegated Agent Sessions
++- List ALL background agent tasks spawned during this session
++- For each: agent name, category, status, description, and **session_id**
++- **RESUME, DON'T RESTART.** Each listed session retains full context. After compaction, use \`session_id\` to continue existing agent sessions instead of spawning new ones. This saves tokens, preserves learned context, and prevents duplicate work.
++
++This context is critical for maintaining continuity after compaction.
++`
+diff --git a/src/hooks/compaction-context-injector/hook.ts b/src/hooks/compaction-context-injector/hook.ts
+index 406846c3..81857e12 100644
+--- a/src/hooks/compaction-context-injector/hook.ts
++++ b/src/hooks/compaction-context-injector/hook.ts
+@@ -9,14 +9,21 @@ import { createInternalAgentTextPart } from "../../shared/internal-initiator-mar
+ import { log } from "../../shared/logger"
+ import { setSessionModel } from "../../shared/session-model-state"
+ import { setSessionTools } from "../../shared/session-tools-store"
++import { COMPACTION_CONTEXT_PROMPT } from "./compaction-context-prompt"
+ import {
+-  createSystemDirective,
+-  SystemDirectiveTypes,
+-} from "../../shared/system-directive"
++  createExpectedRecoveryPromptConfig,
++  isPromptConfigRecovered,
++} from "./recovery-prompt-config"
+ import {
+   resolveLatestSessionPromptConfig,
+   resolveSessionPromptConfig,
+ } from "./session-prompt-config-resolver"
++import {
++  finalizeTrackedAssistantMessage,
++  shouldTreatAssistantPartAsOutput,
++  trackAssistantOutput,
++  type TailMonitorState,
++} from "./tail-monitor"
+ 
+ const HOOK_NAME = "compaction-context-injector"
+ const AGENT_RECOVERY_PROMPT = "[restore checkpointed session agent configuration after compaction]"
+@@ -44,14 +51,6 @@ type CompactionContextClient = {
+   directory: string
+ }
+ 
+-type TailMonitorState = {
+-  currentMessageID?: string
+-  currentHasText: boolean
+-  consecutiveNoTextMessages: number
+-  lastCompactedAt?: number
+-  lastRecoveryAt?: number
+-}
+-
+ export interface CompactionContextInjector {
+   capture: (sessionID: string) => Promise<void>
+   inject: (sessionID?: string) => string
+@@ -67,81 +66,6 @@ function resolveSessionID(props?: Record<string, unknown>): string | undefined {
+     (props?.info as { id?: string } | undefined)?.id) as string | undefined
+ }
+ 
+-function finalizeTrackedAssistantMessage(state: TailMonitorState): number {
+-  if (!state.currentMessageID) {
+-    return state.consecutiveNoTextMessages
+-  }
+-
+-  state.consecutiveNoTextMessages = state.currentHasText
+-    ? 0
+-    : state.consecutiveNoTextMessages + 1
+-  state.currentMessageID = undefined
+-  state.currentHasText = false
+-
+-  return state.consecutiveNoTextMessages
+-}
+-
+-function trackAssistantText(state: TailMonitorState, messageID?: string): void {
+-  if (messageID && !state.currentMessageID) {
+-    state.currentMessageID = messageID
+-  }
+-
+-  state.currentHasText = true
+-  state.consecutiveNoTextMessages = 0
+-}
+-
+-const COMPACTION_CONTEXT_PROMPT = `${createSystemDirective(SystemDirectiveTypes.COMPACTION_CONTEXT)}
+-
+-When summarizing this session, you MUST include the following sections in your summary:
+-
+-## 1. User Requests (As-Is)
+-- List all original user requests exactly as they were stated
+-- Preserve the user's exact wording and intent
+-
+-## 2. Final Goal
+-- What the user ultimately wanted to achieve
+-- The end result or deliverable expected
+-
+-## 3. Work Completed
+-- What has been done so far
+-- Files created/modified
+-- Features implemented
+-- Problems solved
+-
+-## 4. Remaining Tasks
+-- What still needs to be done
+-- Pending items from the original request
+-- Follow-up tasks identified during the work
+-
+-## 5. Active Working Context (For Seamless Continuation)
+-- **Files**: Paths of files currently being edited or frequently referenced
+-- **Code in Progress**: Key code snippets, function signatures, or data structures under active development
+-- **External References**: Documentation URLs, library APIs, or external resources being consulted
+-- **State & Variables**: Important variable names, configuration values, or runtime state relevant to ongoing work
+-
+-## 6. Explicit Constraints (Verbatim Only)
+-- Include ONLY constraints explicitly stated by the user or in existing AGENTS.md context
+-- Quote constraints verbatim (do not paraphrase)
+-- Do NOT invent, add, or modify constraints
+-- If no explicit constraints exist, write "None"
+-
+-## 7. Agent Verification State (Critical for Reviewers)
+-- **Current Agent**: What agent is running (momus, oracle, etc.)
+-- **Verification Progress**: Files already verified/validated
+-- **Pending Verifications**: Files still needing verification
+-- **Previous Rejections**: If reviewer agent, what was rejected and why
+-- **Acceptance Status**: Current state of review process
+-
+-This section is CRITICAL for reviewer agents (momus, oracle) to maintain continuity.
+-
+-## 8. Delegated Agent Sessions
+-- List ALL background agent tasks spawned during this session
+-- For each: agent name, category, status, description, and **session_id**
+-- **RESUME, DON'T RESTART.** Each listed session retains full context. After compaction, use \`session_id\` to continue existing agent sessions instead of spawning new ones. This saves tokens, preserves learned context, and prevents duplicate work.
+-
+-This context is critical for maintaining continuity after compaction.
+-`
+-
+ export function createCompactionContextInjector(options?: {
+   ctx?: CompactionContextClient
+   backgroundManager?: BackgroundManager
+@@ -157,7 +81,7 @@ export function createCompactionContextInjector(options?: {
+     }
+ 
+     const created: TailMonitorState = {
+-      currentHasText: false,
++      currentHasOutput: false,
+       consecutiveNoTextMessages: 0,
+     }
+     tailStates.set(sessionID, created)
+@@ -176,6 +100,10 @@ export function createCompactionContextInjector(options?: {
+     if (!checkpoint?.agent) {
+       return false
+     }
++    const checkpointWithAgent = {
++      ...checkpoint,
++      agent: checkpoint.agent,
++    }
+ 
+     const tailState = getTailState(sessionID)
+     const now = Date.now()
+@@ -183,28 +111,27 @@ export function createCompactionContextInjector(options?: {
+       return false
+     }
+ 
++    const currentPromptConfig = await resolveSessionPromptConfig(ctx, sessionID)
++    const expectedPromptConfig = createExpectedRecoveryPromptConfig(
++      checkpointWithAgent,
++      currentPromptConfig,
++    )
++    const model = expectedPromptConfig.model
++    const tools = expectedPromptConfig.tools
++
+     if (reason === "session.compacted") {
+       const latestPromptConfig = await resolveLatestSessionPromptConfig(ctx, sessionID)
+-      const latestAgentMatchesCheckpoint =
+-        typeof latestPromptConfig.agent === "string" &&
+-        latestPromptConfig.agent.toLowerCase() === checkpoint.agent.toLowerCase() &&
+-        !isCompactionAgent(latestPromptConfig.agent)
+-
+-      if (latestAgentMatchesCheckpoint && latestPromptConfig.model) {
++      if (isPromptConfigRecovered(latestPromptConfig, expectedPromptConfig)) {
+         return false
+       }
+     }
+ 
+-    const currentPromptConfig = await resolveSessionPromptConfig(ctx, sessionID)
+-    const model = checkpoint.model ?? currentPromptConfig.model
+-    const tools = checkpoint.tools ?? currentPromptConfig.tools
+-
+     try {
+       await ctx.client.session.promptAsync({
+         path: { id: sessionID },
+         body: {
+           noReply: true,
+-          agent: checkpoint.agent,
++          agent: expectedPromptConfig.agent,
+           ...(model ? { model } : {}),
+           ...(tools ? { tools } : {}),
+           parts: [createInternalAgentTextPart(AGENT_RECOVERY_PROMPT)],
+@@ -212,7 +139,20 @@ export function createCompactionContextInjector(options?: {
+         query: { directory: ctx.directory },
+       })
+ 
+-      updateSessionAgent(sessionID, checkpoint.agent)
++      const recoveredPromptConfig = await resolveLatestSessionPromptConfig(ctx, sessionID)
++      if (!isPromptConfigRecovered(recoveredPromptConfig, expectedPromptConfig)) {
++        log(`[${HOOK_NAME}] Re-injected agent config but recovery is still incomplete`, {
++          sessionID,
++          reason,
++          agent: expectedPromptConfig.agent,
++          model,
++          hasTools: !!tools,
++          recoveredPromptConfig,
++        })
++        return false
++      }
++
++      updateSessionAgent(sessionID, expectedPromptConfig.agent)
+       if (model) {
+         setSessionModel(sessionID, model)
+       }
+@@ -226,7 +166,7 @@ export function createCompactionContextInjector(options?: {
+       log(`[${HOOK_NAME}] Re-injected checkpointed agent config`, {
+         sessionID,
+         reason,
+-        agent: checkpoint.agent,
++        agent: expectedPromptConfig.agent,
+         model,
+       })
+ 
+@@ -352,7 +292,7 @@ export function createCompactionContextInjector(options?: {
+ 
+       if (tailState.currentMessageID !== info.id) {
+         tailState.currentMessageID = info.id
+-        tailState.currentHasText = false
++        tailState.currentHasOutput = false
+       }
+       return
+     }
+@@ -367,7 +307,7 @@ export function createCompactionContextInjector(options?: {
+         return
+       }
+ 
+-      trackAssistantText(getTailState(sessionID), messageID)
++      trackAssistantOutput(getTailState(sessionID), messageID)
+       return
+     }
+ 
+@@ -379,11 +319,11 @@ export function createCompactionContextInjector(options?: {
+         text?: string
+       } | undefined
+ 
+-      if (!part?.sessionID || part.type !== "text" || !part.text?.trim()) {
++      if (!part?.sessionID || !shouldTreatAssistantPartAsOutput(part)) {
+         return
+       }
+ 
+-      trackAssistantText(getTailState(part.sessionID), part.messageID)
++      trackAssistantOutput(getTailState(part.sessionID), part.messageID)
+     }
+   }
+ 
+diff --git a/src/hooks/compaction-context-injector/recovery-prompt-config.ts b/src/hooks/compaction-context-injector/recovery-prompt-config.ts
+new file mode 100644
+index 00000000..f0f8480c
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/recovery-prompt-config.ts
+@@ -0,0 +1,76 @@
++import type { CompactionAgentConfigCheckpoint } from "../../shared/compaction-agent-config-checkpoint"
++
++export type RecoveryPromptConfig = CompactionAgentConfigCheckpoint & {
++  agent: string
++}
++
++function isCompactionAgent(agent: string | undefined): boolean {
++  return agent?.trim().toLowerCase() === "compaction"
++}
++
++function matchesExpectedModel(
++  actualModel: CompactionAgentConfigCheckpoint["model"],
++  expectedModel: CompactionAgentConfigCheckpoint["model"],
++): boolean {
++  if (!expectedModel) {
++    return true
++  }
++
++  return (
++    actualModel?.providerID === expectedModel.providerID &&
++    actualModel.modelID === expectedModel.modelID
++  )
++}
++
++function matchesExpectedTools(
++  actualTools: CompactionAgentConfigCheckpoint["tools"],
++  expectedTools: CompactionAgentConfigCheckpoint["tools"],
++): boolean {
++  if (!expectedTools) {
++    return true
++  }
++
++  if (!actualTools) {
++    return false
++  }
++
++  const expectedEntries = Object.entries(expectedTools)
++  if (expectedEntries.length !== Object.keys(actualTools).length) {
++    return false
++  }
++
++  return expectedEntries.every(
++    ([toolName, isAllowed]) => actualTools[toolName] === isAllowed,
++  )
++}
++
++export function createExpectedRecoveryPromptConfig(
++  checkpoint: Pick<RecoveryPromptConfig, "agent"> & CompactionAgentConfigCheckpoint,
++  currentPromptConfig: CompactionAgentConfigCheckpoint,
++): RecoveryPromptConfig {
++  const model = checkpoint.model ?? currentPromptConfig.model
++  const tools = checkpoint.tools ?? currentPromptConfig.tools
++
++  return {
++    agent: checkpoint.agent,
++    ...(model ? { model } : {}),
++    ...(tools ? { tools } : {}),
++  }
++}
++
++export function isPromptConfigRecovered(
++  actualPromptConfig: CompactionAgentConfigCheckpoint,
++  expectedPromptConfig: RecoveryPromptConfig,
++): boolean {
++  const actualAgent = actualPromptConfig.agent
++  const agentMatches =
++    typeof actualAgent === "string" &&
++    !isCompactionAgent(actualAgent) &&
++    actualAgent.toLowerCase() === expectedPromptConfig.agent.toLowerCase()
++
++  return (
++    agentMatches &&
++    matchesExpectedModel(actualPromptConfig.model, expectedPromptConfig.model) &&
++    matchesExpectedTools(actualPromptConfig.tools, expectedPromptConfig.tools)
++  )
++}
+diff --git a/src/hooks/compaction-context-injector/recovery.test.ts b/src/hooks/compaction-context-injector/recovery.test.ts
+new file mode 100644
+index 00000000..5d2f8850
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/recovery.test.ts
+@@ -0,0 +1,294 @@
++/// <reference path="../../../bun-test.d.ts" />
++
++import { describe, expect, it } from "bun:test"
++import { createCompactionContextInjector } from "./index"
++
++type SessionMessageResponse = Array<{
++  info?: Record<string, unknown>
++}>
++
++type PromptAsyncInput = {
++  path: { id: string }
++  body: {
++    noReply?: boolean
++    agent?: string
++    model?: { providerID: string; modelID: string }
++    tools?: Record<string, boolean>
++    parts: Array<{ type: "text"; text: string }>
++  }
++  query?: { directory: string }
++}
++
++function createPromptAsyncRecorder(): {
++  calls: PromptAsyncInput[]
++  promptAsync: (input: PromptAsyncInput) => Promise<Record<string, never>>
++} {
++  const calls: PromptAsyncInput[] = []
++
++  return {
++    calls,
++    promptAsync: async (input: PromptAsyncInput) => {
++      calls.push(input)
++      return {}
++    },
++  }
++}
++
++function createMockContext(
++  messageResponses: SessionMessageResponse[],
++  promptAsync: (input: PromptAsyncInput) => Promise<Record<string, never>>,
++) {
++  let callIndex = 0
++
++  return {
++    client: {
++      session: {
++        messages: async () => {
++          const response =
++            messageResponses[Math.min(callIndex, messageResponses.length - 1)] ?? []
++          callIndex += 1
++          return { data: response }
++        },
++        promptAsync,
++      },
++    },
++    directory: "/tmp/test",
++  }
++}
++
++function createAssistantMessageUpdatedEvent(sessionID: string, messageID: string) {
++  return {
++    event: {
++      type: "message.updated",
++      properties: {
++        info: {
++          id: messageID,
++          role: "assistant",
++          sessionID,
++        },
++      },
++    },
++  } as const
++}
++
++function createMeaningfulPartUpdatedEvent(
++  sessionID: string,
++  messageID: string,
++  type: "reasoning" | "tool_use",
++) {
++  return {
++    event: {
++      type: "message.part.updated",
++      properties: {
++        part: {
++          messageID,
++          sessionID,
++          type,
++          ...(type === "reasoning" ? { text: "thinking" } : {}),
++        },
++      },
++    },
++  } as const
++}
++
++describe("createCompactionContextInjector recovery", () => {
++  it("re-injects after compaction when agent and model match but tools are missing", async () => {
++    //#given
++    const promptAsyncRecorder = createPromptAsyncRecorder()
++    const ctx = createMockContext(
++      [
++        [
++          {
++            info: {
++              role: "user",
++              agent: "atlas",
++              model: { providerID: "openai", modelID: "gpt-5" },
++              tools: { bash: true },
++            },
++          },
++        ],
++        [
++          {
++            info: {
++              role: "user",
++              agent: "atlas",
++              model: { providerID: "openai", modelID: "gpt-5" },
++            },
++          },
++        ],
++        [
++          {
++            info: {
++              role: "user",
++              agent: "atlas",
++              model: { providerID: "openai", modelID: "gpt-5" },
++            },
++          },
++        ],
++        [
++          {
++            info: {
++              role: "user",
++              agent: "atlas",
++              model: { providerID: "openai", modelID: "gpt-5" },
++              tools: { bash: true },
++            },
++          },
++        ],
++      ],
++      promptAsyncRecorder.promptAsync,
++    )
++    const injector = createCompactionContextInjector({ ctx })
++
++    //#when
++    await injector.capture("ses_missing_tools")
++    await injector.event({
++      event: { type: "session.compacted", properties: { sessionID: "ses_missing_tools" } },
++    })
++
++    //#then
++    expect(promptAsyncRecorder.calls.length).toBe(1)
++    expect(promptAsyncRecorder.calls[0]?.body.agent).toBe("atlas")
++    expect(promptAsyncRecorder.calls[0]?.body.model).toEqual({
++      providerID: "openai",
++      modelID: "gpt-5",
++    })
++    expect(promptAsyncRecorder.calls[0]?.body.tools).toEqual({ bash: true })
++  })
++
++  it("retries recovery when the recovered prompt config still mismatches expected model or tools", async () => {
++    //#given
++    const promptAsyncRecorder = createPromptAsyncRecorder()
++    const mismatchResponse = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-4.1" },
++        },
++      },
++    ]
++    const ctx = createMockContext(
++      [
++        [
++          {
++            info: {
++              role: "user",
++              agent: "atlas",
++              model: { providerID: "openai", modelID: "gpt-5" },
++              tools: { bash: true },
++            },
++          },
++        ],
++        mismatchResponse,
++        mismatchResponse,
++        mismatchResponse,
++        mismatchResponse,
++        mismatchResponse,
++        mismatchResponse,
++      ],
++      promptAsyncRecorder.promptAsync,
++    )
++    const injector = createCompactionContextInjector({ ctx })
++
++    //#when
++    await injector.capture("ses_retry_incomplete_recovery")
++    await injector.event({
++      event: {
++        type: "session.compacted",
++        properties: { sessionID: "ses_retry_incomplete_recovery" },
++      },
++    })
++    await injector.event({
++      event: {
++        type: "session.compacted",
++        properties: { sessionID: "ses_retry_incomplete_recovery" },
++      },
++    })
++
++    //#then
++    expect(promptAsyncRecorder.calls.length).toBe(2)
++  })
++
++  it("does not treat reasoning-only assistant messages as a no-text tail", async () => {
++    //#given
++    const promptAsyncRecorder = createPromptAsyncRecorder()
++    const matchingPromptConfig = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-5" },
++          tools: { bash: true },
++        },
++      },
++    ]
++    const ctx = createMockContext(
++      [matchingPromptConfig, matchingPromptConfig, matchingPromptConfig],
++      promptAsyncRecorder.promptAsync,
++    )
++    const injector = createCompactionContextInjector({ ctx })
++    const sessionID = "ses_reasoning_tail"
++
++    await injector.capture(sessionID)
++    await injector.event({
++      event: { type: "session.compacted", properties: { sessionID } },
++    })
++
++    //#when
++    for (let index = 1; index <= 5; index++) {
++      const messageID = `msg_reasoning_${index}`
++      await injector.event(createAssistantMessageUpdatedEvent(sessionID, messageID))
++      await injector.event(
++        createMeaningfulPartUpdatedEvent(sessionID, messageID, "reasoning"),
++      )
++      await injector.event({
++        event: { type: "session.idle", properties: { sessionID } },
++      })
++    }
++
++    //#then
++    expect(promptAsyncRecorder.calls.length).toBe(0)
++  })
++
++  it("does not treat tool_use-only assistant messages as a no-text tail", async () => {
++    //#given
++    const promptAsyncRecorder = createPromptAsyncRecorder()
++    const matchingPromptConfig = [
++      {
++        info: {
++          role: "user",
++          agent: "atlas",
++          model: { providerID: "openai", modelID: "gpt-5" },
++          tools: { bash: true },
++        },
++      },
++    ]
++    const ctx = createMockContext(
++      [matchingPromptConfig, matchingPromptConfig, matchingPromptConfig],
++      promptAsyncRecorder.promptAsync,
++    )
++    const injector = createCompactionContextInjector({ ctx })
++    const sessionID = "ses_tool_use_tail"
++
++    await injector.capture(sessionID)
++    await injector.event({
++      event: { type: "session.compacted", properties: { sessionID } },
++    })
++
++    //#when
++    for (let index = 1; index <= 5; index++) {
++      const messageID = `msg_tool_use_${index}`
++      await injector.event(createAssistantMessageUpdatedEvent(sessionID, messageID))
++      await injector.event(
++        createMeaningfulPartUpdatedEvent(sessionID, messageID, "tool_use"),
++      )
++      await injector.event({
++        event: { type: "session.idle", properties: { sessionID } },
++      })
++    }
++
++    //#then
++    expect(promptAsyncRecorder.calls.length).toBe(0)
++  })
++})
+diff --git a/src/hooks/compaction-context-injector/tail-monitor.ts b/src/hooks/compaction-context-injector/tail-monitor.ts
+new file mode 100644
+index 00000000..c936b947
+--- /dev/null
++++ b/src/hooks/compaction-context-injector/tail-monitor.ts
+@@ -0,0 +1,52 @@
++const MEANINGFUL_ASSISTANT_PART_TYPES = new Set([
++  "reasoning",
++  "tool",
++  "tool_use",
++])
++
++export type TailMonitorState = {
++  currentMessageID?: string
++  currentHasOutput: boolean
++  consecutiveNoTextMessages: number
++  lastCompactedAt?: number
++  lastRecoveryAt?: number
++}
++
++export function finalizeTrackedAssistantMessage(
++  state: TailMonitorState,
++): number {
++  if (!state.currentMessageID) {
++    return state.consecutiveNoTextMessages
++  }
++
++  state.consecutiveNoTextMessages = state.currentHasOutput
++    ? 0
++    : state.consecutiveNoTextMessages + 1
++  state.currentMessageID = undefined
++  state.currentHasOutput = false
++
++  return state.consecutiveNoTextMessages
++}
++
++export function shouldTreatAssistantPartAsOutput(part: {
++  type?: string
++  text?: string
++}): boolean {
++  if (part.type === "text") {
++    return !!part.text?.trim()
++  }
++
++  return typeof part.type === "string" && MEANINGFUL_ASSISTANT_PART_TYPES.has(part.type)
++}
++
++export function trackAssistantOutput(
++  state: TailMonitorState,
++  messageID?: string,
++): void {
++  if (messageID && !state.currentMessageID) {
++    state.currentMessageID = messageID
++  }
++
++  state.currentHasOutput = true
++  state.consecutiveNoTextMessages = 0
++}
+-- 
+2.39.2
+

@@ -1,0 +1,238 @@
+From 5b99a87c6af7f902b3d3bb412e8aebb28d2037f4 Mon Sep 17 00:00:00 2001
+From: PeterPonyu <fuzeyu99@126.com>
+Date: Wed, 13 May 2026 23:55:52 -0400
+Subject: [PATCH 5142/5749] fix(runtime-fallback): preserve attemptCount when
+ our own abort is the cause (closes #4006)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When runtime-fallback aborts an in-flight request to swap in a fallback
+model, opencode emits session.error{isAbort:true} as a consequence. The
+existing event handler treated that as a user cancellation and called
+resetRetryState — wiping attemptCount. Every subsequent provider
+auto-retry signal then started over at attempt:1, never reaching
+max_fallback_attempts, producing an infinite retry loop firing a new
+fallback every ~2 seconds.
+
+The bug only surfaces when the configured fallback target itself
+silently fails (e.g. github-copilot quota exhausted): the original
+model keeps re-emitting retry signals, our handler keeps "fixing"
+them, the counter never advances. Reproducible on upstream/dev HEAD
+(5ffbe0e24e).
+
+Fix:
+- New `internallyAbortedSessions: Set<string>` on HookDeps tracks
+  sessions whose abort we triggered ourselves.
+- abortSessionRequest in auto-retry.ts adds the session to the set
+  when called with one of our internal sources:
+  "session.status.retry-signal", "message.updated.retry-signal",
+  "session.timeout". The "session.stop" source (user-initiated) is
+  intentionally NOT marked — that path must still wipe state.
+- handleSessionError in event-handler.ts checks the set before the
+  cancellation branch. If the session is marked, consume the flag
+  (delete it so a later user-abort still gets the reset) and skip
+  resetRetryState. The state's attemptCount is preserved, so the
+  next iteration progresses 1→2→3→... until max_fallback_attempts.
+- dispose() clears the new set alongside the other per-session maps.
+
+Tests: 3 new event-handler integration tests cover the fix
+(internal-abort preserves state, external-abort still resets,
+consecutive internal-abort cycles advance attemptCount). Existing
+tests pass: 7/7 on event-handler. Pre-existing 2 dispose-test flakes
+on the full runtime-fallback suite were verified to exist on
+upstream/dev without this patch — unrelated.
+
+bun run build: pass. bun run typecheck: pass.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/hooks/runtime-fallback/auto-retry.ts      | 10 +++
+ .../runtime-fallback/event-handler.test.ts    | 86 +++++++++++++++++++
+ src/hooks/runtime-fallback/event-handler.ts   |  8 ++
+ src/hooks/runtime-fallback/hook.ts            |  2 +
+ src/hooks/runtime-fallback/types.ts           |  8 ++
+ 5 files changed, 114 insertions(+)
+
+diff --git a/src/hooks/runtime-fallback/auto-retry.ts b/src/hooks/runtime-fallback/auto-retry.ts
+index cbb3be2b..d4aef71a 100644
+--- a/src/hooks/runtime-fallback/auto-retry.ts
++++ b/src/hooks/runtime-fallback/auto-retry.ts
+@@ -31,6 +31,16 @@ export function createAutoRetryHelpers(deps: HookDeps) {
+   } = deps
+ 
+   const abortSessionRequest = async (sessionID: string, source: string): Promise<void> => {
++    // Sources we trigger ourselves to swap in a fallback model. Marking the
++    // session lets handleSessionError tell our abort apart from a user stop
++    // so it doesn't wipe attemptCount and re-enter the retry loop.
++    if (
++      source === "session.status.retry-signal" ||
++      source === "message.updated.retry-signal" ||
++      source === "session.timeout"
++    ) {
++      deps.internallyAbortedSessions.add(sessionID)
++    }
+     try {
+       await ctx.client.session.abort({ path: { id: sessionID } })
+       log(`[${HOOK_NAME}] Aborted in-flight session request (${source})`, { sessionID })
+diff --git a/src/hooks/runtime-fallback/event-handler.test.ts b/src/hooks/runtime-fallback/event-handler.test.ts
+index a2a323ee..fe24d9da 100644
+--- a/src/hooks/runtime-fallback/event-handler.test.ts
++++ b/src/hooks/runtime-fallback/event-handler.test.ts
+@@ -39,6 +39,7 @@ function createDeps(): HookDeps {
+     sessionAwaitingFallbackResult: new Set(),
+     sessionFallbackTimeouts: new Map(),
+     sessionStatusRetryKeys: new Map(),
++    internallyAbortedSessions: new Set(),
+   }
+ }
+ 
+@@ -162,4 +163,89 @@ describe("createEventHandler", () => {
+     expect(clearCalls).toEqual([sessionID])
+     expect(abortCalls).toEqual([])
+   })
++
++  it("#given a session we aborted ourselves (internal abort flag set) #when session.error fires with isAbort #then fallback retry state is preserved (issue #4006)", async () => {
++    // given - we just called abortSessionRequest("session.status.retry-signal");
++    // opencode will emit session.error{isAbort:true} as a consequence. The
++    // handler must recognize this as our own abort and NOT wipe attemptCount,
++    // otherwise the next session.status retry signal restarts the loop at 1.
++    const sessionID = "session-internal-abort"
++    const deps = createDeps()
++    const abortCalls: string[] = []
++    const clearCalls: string[] = []
++    const state = createFallbackState("opencode-go/glm-5.1")
++    state.currentModel = "github-copilot/claude-haiku-4.5"
++    state.fallbackIndex = 0
++    state.attemptCount = 1
++    state.pendingFallbackModel = "github-copilot/claude-haiku-4.5"
++    deps.sessionStates.set(sessionID, state)
++    deps.internallyAbortedSessions.add(sessionID)
++    const handler = createEventHandler(deps, createHelpers(deps, abortCalls, clearCalls))
++
++    // when
++    await handler({ event: { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } } })
++
++    // then - state intact, attemptCount preserved
++    const preserved = deps.sessionStates.get(sessionID)
++    expect(preserved?.attemptCount).toBe(1)
++    expect(preserved?.currentModel).toBe("github-copilot/claude-haiku-4.5")
++    expect(preserved?.fallbackIndex).toBe(0)
++    // flag was consumed so a subsequent user abort still gets the reset path
++    expect(deps.internallyAbortedSessions.has(sessionID)).toBe(false)
++  })
++
++  it("#given an external abort (no internal flag) #when session.error fires with isAbort #then state is still reset as a real cancellation", async () => {
++    // given - regression guard: user-initiated abort path must continue to
++    // wipe state. Only OUR internal aborts get the preservation treatment.
++    const sessionID = "session-external-abort"
++    const deps = createDeps()
++    const abortCalls: string[] = []
++    const clearCalls: string[] = []
++    const state = createFallbackState("opencode-go/glm-5.1")
++    state.currentModel = "github-copilot/claude-haiku-4.5"
++    state.attemptCount = 1
++    deps.sessionStates.set(sessionID, state)
++    // NB: internallyAbortedSessions is empty
++    const handler = createEventHandler(deps, createHelpers(deps, abortCalls, clearCalls))
++
++    // when
++    await handler({ event: { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } } })
++
++    // then - state reset, behaviour matches pre-fix cancellation path
++    const reset = deps.sessionStates.get(sessionID)
++    expect(reset?.attemptCount).toBe(0)
++    expect(reset?.currentModel).toBe("opencode-go/glm-5.1")
++  })
++
++  it("#given two consecutive internal-abort cycles #when session.error fires each time #then attemptCount can progress past 1", async () => {
++    // given - the failure mode in issue #4006 manifested as attempt:1 looping
++    // forever because every cycle reset attemptCount. This test verifies the
++    // counter actually advances when the internal-abort flag is honored
++    // across multiple iterations.
++    const sessionID = "session-progressing-attempts"
++    const deps = createDeps()
++    const abortCalls: string[] = []
++    const clearCalls: string[] = []
++    const state = createFallbackState("opencode-go/glm-5.1")
++    state.attemptCount = 1
++    state.pendingFallbackModel = "github-copilot/claude-haiku-4.5"
++    deps.sessionStates.set(sessionID, state)
++    const handler = createEventHandler(deps, createHelpers(deps, abortCalls, clearCalls))
++
++    // iteration 1: internal abort -> session.error{isAbort:true}
++    deps.internallyAbortedSessions.add(sessionID)
++    await handler({ event: { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } } })
++    expect(deps.sessionStates.get(sessionID)?.attemptCount).toBe(1)
++
++    // simulate the next retry signal advancing the counter
++    const advanced = deps.sessionStates.get(sessionID)!
++    advanced.attemptCount = 2
++
++    // iteration 2: another internal abort
++    deps.internallyAbortedSessions.add(sessionID)
++    await handler({ event: { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } } })
++
++    // then - counter is at 2, not reset to 0
++    expect(deps.sessionStates.get(sessionID)?.attemptCount).toBe(2)
++  })
+ })
+diff --git a/src/hooks/runtime-fallback/event-handler.ts b/src/hooks/runtime-fallback/event-handler.ts
+index 70e7af5b..2ea6948c 100644
+--- a/src/hooks/runtime-fallback/event-handler.ts
++++ b/src/hooks/runtime-fallback/event-handler.ts
+@@ -138,6 +138,14 @@ export function createEventHandler(deps: HookDeps, helpers: AutoRetryHelpers) {
+     const resolvedAgent = await helpers.resolveAgentForSessionFromContext(sessionID, agent)
+ 
+     if (isAbortError(error)) {
++      // If we triggered this abort to swap in a fallback model, consume the
++      // flag and preserve state — wiping attemptCount here is what causes
++      // the infinite retry loop (issue #4006).
++      if (deps.internallyAbortedSessions.has(sessionID)) {
++        deps.internallyAbortedSessions.delete(sessionID)
++        log(`[${HOOK_NAME}] session.error matched internal abort; preserving retry state`, { sessionID, resolvedAgent })
++        return
++      }
+       cancelledSessions.add(sessionID)
+       resetRetryState(sessionID)
+       log(`[${HOOK_NAME}] session.error matched cancellation; cleared retry state`, { sessionID, resolvedAgent })
+diff --git a/src/hooks/runtime-fallback/hook.ts b/src/hooks/runtime-fallback/hook.ts
+index f3509ab0..4ecd95d9 100644
+--- a/src/hooks/runtime-fallback/hook.ts
++++ b/src/hooks/runtime-fallback/hook.ts
+@@ -33,6 +33,7 @@ export function createRuntimeFallbackHook(
+     sessionAwaitingFallbackResult: new Set(),
+     sessionFallbackTimeouts: new Map(),
+     sessionStatusRetryKeys: new Map(),
++    internallyAbortedSessions: new Set(),
+   }
+ 
+   const helpers = createAutoRetryHelpers(deps)
+@@ -81,6 +82,7 @@ export function createRuntimeFallbackHook(
+     deps.sessionAwaitingFallbackResult.clear()
+     deps.sessionFallbackTimeouts.clear()
+     deps.sessionStatusRetryKeys.clear()
++    deps.internallyAbortedSessions.clear()
+   }
+ 
+   return {
+diff --git a/src/hooks/runtime-fallback/types.ts b/src/hooks/runtime-fallback/types.ts
+index ecf18a4f..c05bfe95 100644
+--- a/src/hooks/runtime-fallback/types.ts
++++ b/src/hooks/runtime-fallback/types.ts
+@@ -74,4 +74,12 @@ export interface HookDeps {
+   sessionAwaitingFallbackResult: Set<string>
+   sessionFallbackTimeouts: Map<string, RuntimeFallbackTimeout>
+   sessionStatusRetryKeys: Map<string, string>
++  /**
++   * Sessions whose in-flight request was aborted by us (to swap in a fallback
++   * model), as opposed to a user-initiated stop. Consumed by
++   * handleSessionError so the resulting session.error{isAbort:true} does NOT
++   * reset attemptCount — that reset is what was driving the infinite retry
++   * loop (every cycle started over at attempt:1). See issue #4006.
++   */
++  internallyAbortedSessions: Set<string>
+ }
+-- 
+2.39.2
+

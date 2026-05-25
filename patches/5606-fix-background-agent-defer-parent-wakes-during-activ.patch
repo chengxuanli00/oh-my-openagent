@@ -1,0 +1,301 @@
+From a8201726ef88a3c84d8249dff4d758aab180bc2c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 21 May 2026 11:50:30 +0900
+Subject: [PATCH 5606/5749] fix(background-agent): defer parent wakes during
+ active turns
+
+Record fresh parent session message activity before parent-wake flushing so stale idle status cannot dispatch a background completion into a live reasoning turn.
+
+Add regression coverage for the Discord 4.2.3/OpenCode 1.15.5 duplicate-branch repro shape where a parent reasoning delta arrives before the background all-complete wake.
+
+Refs #4212
+
+Refs #4019
+
+Refs #3774
+
+Plan: plans/background-notification-active-turn-queue.md
+---
+ src/features/background-agent/manager.ts      |   5 +
+ .../parent-wake-active-turn-event.test.ts     | 144 ++++++++++++++++++
+ .../background-agent/parent-wake-notifier.ts  |  35 +++++
+ 3 files changed, 184 insertions(+)
+ create mode 100644 src/features/background-agent/parent-wake-active-turn-event.test.ts
+
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index a8bb986d..6090e2eb 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -142,6 +142,7 @@ const PARENT_WAKE_TOOL_CALL_DEFER_MAX_MS = 5_000
+  * env. See issue #4120.
+  */
+ const PARENT_WAKE_USER_MESSAGE_IN_PROGRESS_WINDOW_MS = 2_000
++const PARENT_WAKE_SESSION_ACTIVITY_IN_PROGRESS_WINDOW_MS = 2_000
+ 
+ interface MessagePartInfo {
+   id?: string
+@@ -309,6 +310,7 @@ export class BackgroundManager {
+         toolCallDeferMaxMs: PARENT_WAKE_TOOL_CALL_DEFER_MAX_MS,
+         failureRequeueWindowMs: PARENT_WAKE_FAILURE_REQUEUE_WINDOW_MS,
+         userMessageInProgressWindowMs: PARENT_WAKE_USER_MESSAGE_IN_PROGRESS_WINDOW_MS,
++        parentSessionActivityInProgressWindowMs: PARENT_WAKE_SESSION_ACTIVITY_IN_PROGRESS_WINDOW_MS,
+       },
+     )
+     this.registerProcessCleanup()
+@@ -1479,6 +1481,7 @@ The fallback retry session is now created and can be inspected directly.
+       const role = (info as Record<string, unknown>)["role"]
+       if (!sessionID) return
+       this.clearDispatchedParentWake(sessionID)
++      this.parentWakeNotifier.recordParentSessionActivity(sessionID)
+ 
+       if (role === "tool") {
+         this.markSessionOutputObserved(sessionID)
+@@ -1513,6 +1516,7 @@ The fallback retry session is now created and can be inspected directly.
+       const sessionID = resolveMessageEventSessionID(props)
+       if (!sessionID) return
+       this.clearDispatchedParentWake(sessionID)
++      this.parentWakeNotifier.recordParentSessionActivity(sessionID)
+ 
+       const resolved = this.resolveTaskAttemptBySession(sessionID)
+       if (!resolved?.isCurrent) return
+@@ -1621,6 +1625,7 @@ The fallback retry session is now created and can be inspected directly.
+       if (!props || typeof props !== "object") return
+       const sessionID = resolveSessionEventID(props)
+       if (sessionID) {
++        this.parentWakeNotifier.clearParentSessionActivity(sessionID)
+         void this.enqueueNotificationForParent(sessionID, () => this.flushPendingParentWake(sessionID)).catch((error) => {
+           log("[background-agent] Failed to flush pending parent wake:", { sessionID, error })
+         })
+diff --git a/src/features/background-agent/parent-wake-active-turn-event.test.ts b/src/features/background-agent/parent-wake-active-turn-event.test.ts
+new file mode 100644
+index 00000000..600a86e0
+--- /dev/null
++++ b/src/features/background-agent/parent-wake-active-turn-event.test.ts
+@@ -0,0 +1,144 @@
++import { tmpdir } from "node:os"
++import { afterEach, describe, expect, test } from "bun:test"
++import type { PluginInput } from "@opencode-ai/plugin"
++import { BackgroundManager } from "./manager"
++import type { BackgroundTask } from "./types"
++import { releaseAllPromptAsyncReservationsForTesting } from "../../hooks/shared/prompt-async-gate"
++
++type PromptAsyncCall = {
++  path: { id: string }
++  body: {
++    noReply?: boolean
++    parts?: unknown[]
++  }
++  query?: {
++    directory: string
++  }
++}
++
++type PendingParentWakeForTest = {
++  notifications: string[]
++  shouldReply: boolean
++}
++
++let managerUnderTest: BackgroundManager | undefined
++
++afterEach(() => {
++  managerUnderTest?.shutdown()
++  releaseAllPromptAsyncReservationsForTesting()
++  managerUnderTest = undefined
++})
++
++function createTask(overrides: Partial<BackgroundTask> & { id: string; parentSessionId: string }): BackgroundTask {
++  const id = overrides.id
++  const parentSessionID = overrides.parentSessionId
++  const { id: _ignoredID, parentSessionId: _ignoredParentSessionID, ...rest } = overrides
++
++  return {
++    parentMessageId: overrides.parentMessageId ?? "parent-message-id",
++    description: overrides.description ?? overrides.id,
++    prompt: overrides.prompt ?? `Prompt for ${overrides.id}`,
++    agent: overrides.agent ?? "test-agent",
++    status: overrides.status ?? "running",
++    startedAt: overrides.startedAt ?? new Date("2026-05-20T14:19:10.000Z"),
++    ...rest,
++    id,
++    parentSessionId: parentSessionID,
++  }
++}
++
++function createManager(sessionStatuses: Record<string, { type: string }>): {
++  manager: BackgroundManager
++  promptAsyncCalls: PromptAsyncCall[]
++} {
++  const promptAsyncCalls: PromptAsyncCall[] = []
++  const client = {
++    session: {
++      messages: async () => [],
++      status: async () => ({ data: sessionStatuses }),
++      prompt: async () => ({}),
++      promptAsync: async (call: PromptAsyncCall) => {
++        promptAsyncCalls.push(call)
++        return {}
++      },
++      abort: async () => ({}),
++    },
++  }
++  const ctx: PluginInput = {
++    client: client as PluginInput["client"],
++    project: {} as PluginInput["project"],
++    directory: tmpdir(),
++    worktree: tmpdir(),
++    serverUrl: new URL("http://localhost"),
++    $: {} as PluginInput["$"],
++  }
++
++  const manager = new BackgroundManager({
++    pluginContext: ctx,
++    config: undefined,
++    enableParentSessionNotifications: true,
++  })
++
++  return { manager, promptAsyncCalls }
++}
++
++function getTasks(manager: BackgroundManager): Map<string, BackgroundTask> {
++  return Reflect.get(manager, "tasks") as Map<string, BackgroundTask>
++}
++
++function getPendingByParent(manager: BackgroundManager): Map<string, Set<string>> {
++  return Reflect.get(manager, "pendingByParent") as Map<string, Set<string>>
++}
++
++function getPendingParentWakes(manager: BackgroundManager): Map<string, PendingParentWakeForTest> {
++  const parentWakeNotifier = Reflect.get(manager, "parentWakeNotifier") as {
++    getPendingParentWakes: () => Map<string, PendingParentWakeForTest>
++  }
++  return parentWakeNotifier.getPendingParentWakes()
++}
++
++async function notifyParentSessionForTest(manager: BackgroundManager, task: BackgroundTask): Promise<void> {
++  const notifyParentSession = Reflect.get(manager, "notifyParentSession") as (task: BackgroundTask) => Promise<void>
++  return notifyParentSession.call(manager, task)
++}
++
++async function flushPendingParentWakeForTest(manager: BackgroundManager, sessionID: string): Promise<void> {
++  const flushPendingParentWake = Reflect.get(manager, "flushPendingParentWake") as (sessionID: string) => Promise<void>
++  return flushPendingParentWake.call(manager, sessionID)
++}
++
++describe("BackgroundManager parent wake active turn events", () => {
++  test("#when parent reasoning delta is newer than stale idle state #then background completion does not fork a reply", async () => {
++    // given
++    const sessionStatuses: Record<string, { type: string }> = {
++      "parent-1": { type: "idle" },
++    }
++    const { manager, promptAsyncCalls } = createManager(sessionStatuses)
++    managerUnderTest = manager
++    manager.handleEvent({
++      type: "message.part.delta",
++      properties: {
++        sessionID: "parent-1",
++        field: "reasoning",
++        delta: "still thinking",
++      },
++    })
++    const task = createTask({
++      id: "task-a",
++      parentSessionId: "parent-1",
++      description: "task A",
++      status: "completed",
++      completedAt: new Date("2026-05-20T14:19:14.625Z"),
++    })
++    getTasks(manager).set(task.id, task)
++    getPendingByParent(manager).set(task.parentSessionId, new Set([task.id]))
++
++    // when
++    await notifyParentSessionForTest(manager, task)
++    await flushPendingParentWakeForTest(manager, "parent-1")
++
++    // then
++    expect(promptAsyncCalls).toHaveLength(0)
++    expect(getPendingParentWakes(manager).has("parent-1")).toBe(true)
++  })
++})
+diff --git a/src/features/background-agent/parent-wake-notifier.ts b/src/features/background-agent/parent-wake-notifier.ts
+index 1fd56896..b6b67049 100644
+--- a/src/features/background-agent/parent-wake-notifier.ts
++++ b/src/features/background-agent/parent-wake-notifier.ts
+@@ -67,6 +67,7 @@ type ParentWakeNotifierOptions = {
+    * inside OpenCode's `@parcel/watcher` TSFN callback path. See issue #4120.
+    */
+   userMessageInProgressWindowMs: number
++  parentSessionActivityInProgressWindowMs?: number
+ }
+ 
+ type ToolWaitDeferralDecision = {
+@@ -94,6 +95,7 @@ export class ParentWakeNotifier {
+   private pendingParentWakeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+   private dispatchedParentWakes: Map<string, PendingParentWake> = new Map()
+   private dispatchedParentWakeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
++  private recentParentSessionActivity: Map<string, number> = new Map()
+ 
+   constructor(
+     private readonly deps: ParentWakeNotifierDeps,
+@@ -116,6 +118,14 @@ export class ParentWakeNotifier {
+     return this.dispatchedParentWakeTimers
+   }
+ 
++  recordParentSessionActivity(sessionID: string): void {
++    this.recentParentSessionActivity.set(sessionID, Date.now())
++  }
++
++  clearParentSessionActivity(sessionID: string): void {
++    this.recentParentSessionActivity.delete(sessionID)
++  }
++
+   queuePendingParentWake(
+     sessionID: string,
+     notification: string,
+@@ -163,6 +173,14 @@ export class ParentWakeNotifier {
+       return
+     }
+ 
++    if (this.hasRecentParentSessionActivity(sessionID)) {
++      this.schedulePendingParentWakeFlush(sessionID)
++      log("[background-agent] Deferred parent wake because parent session activity is still fresh:", {
++        sessionID,
++      })
++      return
++    }
++
+     const toolWaitDecision = await this.shouldDeferParentWakeForSessionHistory(sessionID, latestWake)
+     if (toolWaitDecision.defer) {
+       this.schedulePendingParentWakeFlush(sessionID)
+@@ -324,12 +342,29 @@ export class ParentWakeNotifier {
+     this.dispatchedParentWakeTimers.clear()
+     this.pendingParentWakes.clear()
+     this.dispatchedParentWakes.clear()
++    this.recentParentSessionActivity.clear()
+   }
+ 
+   private async isSessionActive(sessionID: string): Promise<boolean> {
+     return isOpenCodeSessionActive(this.deps.client, sessionID)
+   }
+ 
++  private hasRecentParentSessionActivity(sessionID: string): boolean {
++    const windowMs = this.options.parentSessionActivityInProgressWindowMs ?? 0
++    if (windowMs <= 0) {
++      return false
++    }
++    const lastActivityAt = this.recentParentSessionActivity.get(sessionID)
++    if (lastActivityAt === undefined) {
++      return false
++    }
++    if (Date.now() - lastActivityAt <= windowMs) {
++      return true
++    }
++    this.recentParentSessionActivity.delete(sessionID)
++    return false
++  }
++
+   private resolveParentWakePromptContext(promptContext: ParentWakePromptContext): ParentWakePromptContext {
+     const resolvedAgent = resolveRegisteredAgentName(promptContext.agent)
+     return {
+-- 
+2.39.2
+

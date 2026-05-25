@@ -1,0 +1,361 @@
+From 03a450131d4500826fd7a248fc793c1e7808b73c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Mon, 15 Dec 2025 19:02:31 +0900
+Subject: [PATCH 0362/5749] refactor(hooks): improve interactive bash session
+ tracking and command parsing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Replace regex-based session extraction with quote-aware tokenizer
+- Add proper tmux global options handling (-L, -S, -f, -c, -T)
+- Add normalizeSessionName to strip :window and .pane suffixes
+- Add findSubcommand for proper subcommand detection
+- Add early error output return to avoid false state tracking
+- Fix tool-output-truncator to exclude grep/Grep from generic truncation
+- Fix todo-continuation-enforcer to clear reminded state on assistant response
+- Add proper parallel stdout/stderr reading in interactive_bash tool
+- Improve error handling with proper exit code checking
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ src/hooks/interactive-bash-session/index.ts | 153 ++++++++++++++++++--
+ src/hooks/todo-continuation-enforcer.ts     |  12 +-
+ src/hooks/tool-output-truncator.ts          |   3 +-
+ src/tools/interactive-bash/tools.ts         |  65 ++++++++-
+ 4 files changed, 207 insertions(+), 26 deletions(-)
+
+diff --git a/src/hooks/interactive-bash-session/index.ts b/src/hooks/interactive-bash-session/index.ts
+index db1bac6e..324793d4 100644
+--- a/src/hooks/interactive-bash-session/index.ts
++++ b/src/hooks/interactive-bash-session/index.ts
+@@ -27,6 +27,125 @@ interface EventInput {
+   };
+ }
+ 
++/**
++ * Quote-aware command tokenizer with escape handling
++ * Handles single/double quotes and backslash escapes
++ */
++function tokenizeCommand(cmd: string): string[] {
++  const tokens: string[] = []
++  let current = ""
++  let inQuote = false
++  let quoteChar = ""
++  let escaped = false
++
++  for (let i = 0; i < cmd.length; i++) {
++    const char = cmd[i]
++
++    if (escaped) {
++      current += char
++      escaped = false
++      continue
++    }
++
++    if (char === "\\") {
++      escaped = true
++      continue
++    }
++
++    if ((char === "'" || char === '"') && !inQuote) {
++      inQuote = true
++      quoteChar = char
++    } else if (char === quoteChar && inQuote) {
++      inQuote = false
++      quoteChar = ""
++    } else if (char === " " && !inQuote) {
++      if (current) {
++        tokens.push(current)
++        current = ""
++      }
++    } else {
++      current += char
++    }
++  }
++
++  if (current) tokens.push(current)
++  return tokens
++}
++
++/**
++ * Normalize session name by stripping :window and .pane suffixes
++ * e.g., "omo-x:1" -> "omo-x", "omo-x:1.2" -> "omo-x"
++ */
++function normalizeSessionName(name: string): string {
++  return name.split(":")[0].split(".")[0]
++}
++
++function findFlagValue(tokens: string[], flag: string): string | null {
++  for (let i = 0; i < tokens.length - 1; i++) {
++    if (tokens[i] === flag) return tokens[i + 1]
++  }
++  return null
++}
++
++/**
++ * Extract session name from tokens, considering the subCommand
++ * For new-session: prioritize -s over -t
++ * For other commands: use -t
++ */
++function extractSessionNameFromTokens(tokens: string[], subCommand: string): string | null {
++  if (subCommand === "new-session") {
++    const sFlag = findFlagValue(tokens, "-s")
++    if (sFlag) return normalizeSessionName(sFlag)
++    const tFlag = findFlagValue(tokens, "-t")
++    if (tFlag) return normalizeSessionName(tFlag)
++  } else {
++    const tFlag = findFlagValue(tokens, "-t")
++    if (tFlag) return normalizeSessionName(tFlag)
++  }
++  return null
++}
++
++/**
++ * Find the tmux subcommand from tokens, skipping global options.
++ * tmux allows global options before the subcommand:
++ * e.g., `tmux -L socket-name new-session -s omo-x`
++ * Global options with args: -L, -S, -f, -c, -T
++ * Standalone flags: -C, -v, -V, etc.
++ * Special: -- (end of options marker)
++ */
++function findSubcommand(tokens: string[]): string {
++  // Options that require an argument: -L, -S, -f, -c, -T
++  const globalOptionsWithArgs = new Set(["-L", "-S", "-f", "-c", "-T"])
++
++  let i = 0
++  while (i < tokens.length) {
++    const token = tokens[i]
++
++    // Handle end of options marker
++    if (token === "--") {
++      // Next token is the subcommand
++      return tokens[i + 1] ?? ""
++    }
++
++    if (globalOptionsWithArgs.has(token)) {
++      // Skip the option and its argument
++      i += 2
++      continue
++    }
++
++    if (token.startsWith("-")) {
++      // Skip standalone flags like -C, -v, -V
++      i++
++      continue
++    }
++
++    // Found the subcommand
++    return token
++  }
++
++  return ""
++}
++
+ export function createInteractiveBashSessionHook(_ctx: PluginInput) {
+   const sessionStates = new Map<string, InteractiveBashSessionState>();
+ 
+@@ -43,11 +162,6 @@ export function createInteractiveBashSessionHook(_ctx: PluginInput) {
+     return sessionStates.get(sessionID)!;
+   }
+ 
+-  function extractSessionNameFromFlags(tmuxCommand: string): string | null {
+-    const sessionFlagMatch = tmuxCommand.match(/(?:-s|-t)\s+(\S+)/);
+-    return sessionFlagMatch?.[1] ?? null;
+-  }
+-
+   function isOmoSession(sessionName: string | null): boolean {
+     return sessionName !== null && sessionName.startsWith(OMO_SESSION_PREFIX);
+   }
+@@ -77,23 +191,34 @@ export function createInteractiveBashSessionHook(_ctx: PluginInput) {
+       return;
+     }
+ 
+-    const tmuxCommand = (args?.tmux_command as string) ?? "";
++    if (typeof args?.tmux_command !== "string") {
++      return;
++    }
++
++    const tmuxCommand = args.tmux_command;
++    const tokens = tokenizeCommand(tmuxCommand);
++    const subCommand = findSubcommand(tokens);
+     const state = getOrCreateState(sessionID);
+     let stateChanged = false;
+ 
+-    const hasNewSession = tmuxCommand.includes("new-session");
+-    const hasKillSession = tmuxCommand.includes("kill-session");
+-    const hasKillServer = tmuxCommand.includes("kill-server");
++    const toolOutput = output?.output ?? ""
++    if (toolOutput.startsWith("Error:")) {
++      return
++    }
++
++    const isNewSession = subCommand === "new-session";
++    const isKillSession = subCommand === "kill-session";
++    const isKillServer = subCommand === "kill-server";
+ 
+-    const sessionName = extractSessionNameFromFlags(tmuxCommand);
++    const sessionName = extractSessionNameFromTokens(tokens, subCommand);
+ 
+-    if (hasNewSession && isOmoSession(sessionName)) {
++    if (isNewSession && isOmoSession(sessionName)) {
+       state.tmuxSessions.add(sessionName!);
+       stateChanged = true;
+-    } else if (hasKillSession && isOmoSession(sessionName)) {
++    } else if (isKillSession && isOmoSession(sessionName)) {
+       state.tmuxSessions.delete(sessionName!);
+       stateChanged = true;
+-    } else if (hasKillServer) {
++    } else if (isKillServer) {
+       state.tmuxSessions.clear();
+       stateChanged = true;
+     }
+@@ -103,7 +228,7 @@ export function createInteractiveBashSessionHook(_ctx: PluginInput) {
+       saveInteractiveBashSessionState(state);
+     }
+ 
+-    const isSessionOperation = hasNewSession || hasKillSession || hasKillServer;
++    const isSessionOperation = isNewSession || isKillSession || isKillServer;
+     if (isSessionOperation) {
+       const reminder = buildSessionReminderMessage(
+         Array.from(state.tmuxSessions),
+diff --git a/src/hooks/todo-continuation-enforcer.ts b/src/hooks/todo-continuation-enforcer.ts
+index bd9779f8..cb06f0d9 100644
+--- a/src/hooks/todo-continuation-enforcer.ts
++++ b/src/hooks/todo-continuation-enforcer.ts
+@@ -208,11 +208,9 @@ export function createTodoContinuationEnforcer(ctx: PluginInput): TodoContinuati
+       const info = props?.info as Record<string, unknown> | undefined
+       const sessionID = info?.sessionID as string | undefined
+       log(`[${HOOK_NAME}] message.updated received`, { sessionID, role: info?.role })
++      
+       if (sessionID && info?.role === "user") {
+-        remindedSessions.delete(sessionID)
+-        log(`[${HOOK_NAME}] Cleared remindedSessions on user message`, { sessionID })
+-        
+-        // Cancel pending continuation on user interaction
++        // Cancel pending continuation on user interaction (real user input)
+         const timer = pendingTimers.get(sessionID)
+         if (timer) {
+           clearTimeout(timer)
+@@ -220,6 +218,12 @@ export function createTodoContinuationEnforcer(ctx: PluginInput): TodoContinuati
+           log(`[${HOOK_NAME}] Cancelled pending timer on user message`, { sessionID })
+         }
+       }
++      
++      // Clear reminded state when assistant responds (allows re-remind on next idle)
++      if (sessionID && info?.role === "assistant" && remindedSessions.has(sessionID)) {
++        remindedSessions.delete(sessionID)
++        log(`[${HOOK_NAME}] Cleared remindedSessions on assistant response`, { sessionID })
++      }
+     }
+ 
+     if (event.type === "session.deleted") {
+diff --git a/src/hooks/tool-output-truncator.ts b/src/hooks/tool-output-truncator.ts
+index c3a8f089..28326c2c 100644
+--- a/src/hooks/tool-output-truncator.ts
++++ b/src/hooks/tool-output-truncator.ts
+@@ -1,9 +1,8 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { createDynamicTruncator } from "../shared/dynamic-truncator"
+ 
++// Note: "grep" and "Grep" are handled by dedicated grep-output-truncator.ts
+ const TRUNCATABLE_TOOLS = [
+-  "grep",
+-  "Grep",
+   "safe_grep",
+   "glob",
+   "Glob",
+diff --git a/src/tools/interactive-bash/tools.ts b/src/tools/interactive-bash/tools.ts
+index a7a57e0b..714db9b6 100644
+--- a/src/tools/interactive-bash/tools.ts
++++ b/src/tools/interactive-bash/tools.ts
+@@ -1,6 +1,51 @@
+ import { tool } from "@opencode-ai/plugin/tool"
+ import { DEFAULT_TIMEOUT_MS, INTERACTIVE_BASH_DESCRIPTION } from "./constants"
+ 
++/**
++ * Quote-aware command tokenizer with escape handling
++ * Handles single/double quotes and backslash escapes without external dependencies
++ */
++export function tokenizeCommand(cmd: string): string[] {
++  const tokens: string[] = []
++  let current = ""
++  let inQuote = false
++  let quoteChar = ""
++  let escaped = false
++
++  for (let i = 0; i < cmd.length; i++) {
++    const char = cmd[i]
++
++    if (escaped) {
++      current += char
++      escaped = false
++      continue
++    }
++
++    if (char === "\\") {
++      escaped = true
++      continue
++    }
++
++    if ((char === "'" || char === '"') && !inQuote) {
++      inQuote = true
++      quoteChar = char
++    } else if (char === quoteChar && inQuote) {
++      inQuote = false
++      quoteChar = ""
++    } else if (char === " " && !inQuote) {
++      if (current) {
++        tokens.push(current)
++        current = ""
++      }
++    } else {
++      current += char
++    }
++  }
++
++  if (current) tokens.push(current)
++  return tokens
++}
++
+ export const interactive_bash = tool({
+   description: INTERACTIVE_BASH_DESCRIPTION,
+   args: {
+@@ -8,7 +53,7 @@ export const interactive_bash = tool({
+   },
+   execute: async (args) => {
+     try {
+-      const parts = args.tmux_command.split(/\s+/).filter((p) => p.length > 0)
++      const parts = tokenizeCommand(args.tmux_command)
+ 
+       if (parts.length === 0) {
+         return "Error: Empty tmux command"
+@@ -27,12 +72,20 @@ export const interactive_bash = tool({
+         proc.exited.then(() => clearTimeout(id))
+       })
+ 
+-      const stdout = await Promise.race([new Response(proc.stdout).text(), timeoutPromise])
+-      const stderr = await new Response(proc.stderr).text()
+-      const exitCode = await proc.exited
++      // Read stdout and stderr in parallel to avoid race conditions
++      const [stdout, stderr, exitCode] = await Promise.race([
++        Promise.all([
++          new Response(proc.stdout).text(),
++          new Response(proc.stderr).text(),
++          proc.exited,
++        ]),
++        timeoutPromise,
++      ])
+ 
+-      if (exitCode !== 0 && stderr.trim()) {
+-        return `Error: ${stderr.trim()}`
++      // Check exitCode properly - return error even if stderr is empty
++      if (exitCode !== 0) {
++        const errorMsg = stderr.trim() || `Command failed with exit code ${exitCode}`
++        return `Error: ${errorMsg}`
+       }
+ 
+       return stdout || "(no output)"
+-- 
+2.39.2
+

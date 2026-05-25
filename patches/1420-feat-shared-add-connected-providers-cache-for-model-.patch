@@ -1,0 +1,1220 @@
+From 3a79b8761b433f9ba343472a061561cc9916e1aa Mon Sep 17 00:00:00 2001
+From: justsisyphus <code.yeon.gyu+Q@gmail.com>
+Date: Mon, 26 Jan 2026 11:53:41 +0900
+Subject: [PATCH 1420/5749] feat(shared): add connected-providers-cache for
+ model availability (#1121)
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
+
+Co-authored-by: justsisyphus <justsisyphus@users.noreply.github.com>
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/cli/doctor/checks/model-resolution.ts |   4 +-
+ src/hooks/auto-update-checker/index.ts    |  25 ++
+ src/shared/connected-providers-cache.ts   | 192 +++++++++++
+ src/shared/data-path.ts                   |  25 ++
+ src/shared/index.ts                       |   1 +
+ src/shared/model-availability.test.ts     | 395 +++++++++++++++++++++-
+ src/shared/model-availability.ts          |  95 ++++--
+ src/shared/model-resolver.ts              |  22 +-
+ src/tools/delegate-task/tools.test.ts     |  42 +--
+ src/tools/delegate-task/tools.ts          |   7 +-
+ 10 files changed, 744 insertions(+), 64 deletions(-)
+ create mode 100644 src/shared/connected-providers-cache.ts
+
+diff --git a/src/cli/doctor/checks/model-resolution.ts b/src/cli/doctor/checks/model-resolution.ts
+index 49062c64..9c6c7956 100644
+--- a/src/cli/doctor/checks/model-resolution.ts
++++ b/src/cli/doctor/checks/model-resolution.ts
+@@ -199,9 +199,11 @@ function buildDetailsArray(info: ModelResolutionInfo, available: AvailableModels
+   details.push("═══ Available Models (from cache) ═══")
+   details.push("")
+   if (available.cacheExists) {
+-    details.push(`  Providers: ${available.providers.length} (${available.providers.slice(0, 8).join(", ")}${available.providers.length > 8 ? "..." : ""})`)
++    details.push(`  Providers in cache: ${available.providers.length}`)
++    details.push(`  Sample: ${available.providers.slice(0, 6).join(", ")}${available.providers.length > 6 ? "..." : ""}`)
+     details.push(`  Total models: ${available.modelCount}`)
+     details.push(`  Cache: ~/.cache/opencode/models.json`)
++    details.push(`  ℹ Runtime: only connected providers used`)
+     details.push(`  Refresh: opencode models --refresh`)
+   } else {
+     details.push("  ⚠ Cache not found. Run 'opencode' to populate.")
+diff --git a/src/hooks/auto-update-checker/index.ts b/src/hooks/auto-update-checker/index.ts
+index 72cd5630..5222ca2f 100644
+--- a/src/hooks/auto-update-checker/index.ts
++++ b/src/hooks/auto-update-checker/index.ts
+@@ -6,6 +6,7 @@ import { log } from "../../shared/logger"
+ import { getConfigLoadErrors, clearConfigLoadErrors } from "../../shared/config-errors"
+ import { runBunInstall } from "../../cli/config-manager"
+ import { isModelCacheAvailable } from "../../shared/model-availability"
++import { hasConnectedProvidersCache, updateConnectedProvidersCache } from "../../shared/connected-providers-cache"
+ import type { AutoUpdateCheckerOptions } from "./types"
+ 
+ const SISYPHUS_SPINNER = ["·", "•", "●", "○", "◌", "◦", " "]
+@@ -77,6 +78,7 @@ export function createAutoUpdateCheckerHook(ctx: PluginInput, options: AutoUpdat
+ 
+         await showConfigErrorsIfAny(ctx)
+         await showModelCacheWarningIfNeeded(ctx)
++        await updateAndShowConnectedProvidersCacheStatus(ctx)
+ 
+         if (localDevVersion) {
+           if (showStartupToast) {
+@@ -186,6 +188,29 @@ async function showModelCacheWarningIfNeeded(ctx: PluginInput): Promise<void> {
+   log("[auto-update-checker] Model cache warning shown")
+ }
+ 
++async function updateAndShowConnectedProvidersCacheStatus(ctx: PluginInput): Promise<void> {
++  const hadCache = hasConnectedProvidersCache()
++
++  updateConnectedProvidersCache(ctx.client).catch(() => {})
++
++  if (!hadCache) {
++    await ctx.client.tui
++      .showToast({
++        body: {
++          title: "Connected Providers Cache",
++          message: "Building provider cache for first time. Restart OpenCode for full model filtering.",
++          variant: "info" as const,
++          duration: 8000,
++        },
++      })
++      .catch(() => {})
++
++    log("[auto-update-checker] Connected providers cache toast shown (first run)")
++  } else {
++    log("[auto-update-checker] Connected providers cache exists, updating in background")
++  }
++}
++
+ async function showConfigErrorsIfAny(ctx: PluginInput): Promise<void> {
+   const errors = getConfigLoadErrors()
+   if (errors.length === 0) return
+diff --git a/src/shared/connected-providers-cache.ts b/src/shared/connected-providers-cache.ts
+new file mode 100644
+index 00000000..c7a91ffb
+--- /dev/null
++++ b/src/shared/connected-providers-cache.ts
+@@ -0,0 +1,192 @@
++import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
++import { join } from "path"
++import { log } from "./logger"
++import { getOmoOpenCodeCacheDir } from "./data-path"
++
++const CONNECTED_PROVIDERS_CACHE_FILE = "connected-providers.json"
++const PROVIDER_MODELS_CACHE_FILE = "provider-models.json"
++
++interface ConnectedProvidersCache {
++	connected: string[]
++	updatedAt: string
++}
++
++interface ProviderModelsCache {
++	models: Record<string, string[]>
++	connected: string[]
++	updatedAt: string
++}
++
++function getCacheFilePath(filename: string): string {
++	return join(getOmoOpenCodeCacheDir(), filename)
++}
++
++function ensureCacheDir(): void {
++	const cacheDir = getOmoOpenCodeCacheDir()
++	if (!existsSync(cacheDir)) {
++		mkdirSync(cacheDir, { recursive: true })
++	}
++}
++
++/**
++ * Read the connected providers cache.
++ * Returns the list of connected provider IDs, or null if cache doesn't exist.
++ */
++export function readConnectedProvidersCache(): string[] | null {
++	const cacheFile = getCacheFilePath(CONNECTED_PROVIDERS_CACHE_FILE)
++
++	if (!existsSync(cacheFile)) {
++		log("[connected-providers-cache] Cache file not found", { cacheFile })
++		return null
++	}
++
++	try {
++		const content = readFileSync(cacheFile, "utf-8")
++		const data = JSON.parse(content) as ConnectedProvidersCache
++		log("[connected-providers-cache] Read cache", { count: data.connected.length, updatedAt: data.updatedAt })
++		return data.connected
++	} catch (err) {
++		log("[connected-providers-cache] Error reading cache", { error: String(err) })
++		return null
++	}
++}
++
++/**
++ * Check if connected providers cache exists.
++ */
++export function hasConnectedProvidersCache(): boolean {
++	const cacheFile = getCacheFilePath(CONNECTED_PROVIDERS_CACHE_FILE)
++	return existsSync(cacheFile)
++}
++
++/**
++ * Write the connected providers cache.
++ */
++function writeConnectedProvidersCache(connected: string[]): void {
++	ensureCacheDir()
++	const cacheFile = getCacheFilePath(CONNECTED_PROVIDERS_CACHE_FILE)
++
++	const data: ConnectedProvidersCache = {
++		connected,
++		updatedAt: new Date().toISOString(),
++	}
++
++	try {
++		writeFileSync(cacheFile, JSON.stringify(data, null, 2))
++		log("[connected-providers-cache] Cache written", { count: connected.length })
++	} catch (err) {
++		log("[connected-providers-cache] Error writing cache", { error: String(err) })
++	}
++}
++
++/**
++ * Read the provider-models cache.
++ * Returns the cache data, or null if cache doesn't exist.
++ */
++export function readProviderModelsCache(): ProviderModelsCache | null {
++	const cacheFile = getCacheFilePath(PROVIDER_MODELS_CACHE_FILE)
++
++	if (!existsSync(cacheFile)) {
++		log("[connected-providers-cache] Provider-models cache file not found", { cacheFile })
++		return null
++	}
++
++	try {
++		const content = readFileSync(cacheFile, "utf-8")
++		const data = JSON.parse(content) as ProviderModelsCache
++		log("[connected-providers-cache] Read provider-models cache", { 
++			providerCount: Object.keys(data.models).length, 
++			updatedAt: data.updatedAt 
++		})
++		return data
++	} catch (err) {
++		log("[connected-providers-cache] Error reading provider-models cache", { error: String(err) })
++		return null
++	}
++}
++
++/**
++ * Check if provider-models cache exists.
++ */
++export function hasProviderModelsCache(): boolean {
++	const cacheFile = getCacheFilePath(PROVIDER_MODELS_CACHE_FILE)
++	return existsSync(cacheFile)
++}
++
++/**
++ * Write the provider-models cache.
++ */
++export function writeProviderModelsCache(data: { models: Record<string, string[]>; connected: string[] }): void {
++	ensureCacheDir()
++	const cacheFile = getCacheFilePath(PROVIDER_MODELS_CACHE_FILE)
++
++	const cacheData: ProviderModelsCache = {
++		...data,
++		updatedAt: new Date().toISOString(),
++	}
++
++	try {
++		writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2))
++		log("[connected-providers-cache] Provider-models cache written", { 
++			providerCount: Object.keys(data.models).length 
++		})
++	} catch (err) {
++		log("[connected-providers-cache] Error writing provider-models cache", { error: String(err) })
++	}
++}
++
++/**
++ * Update the connected providers cache by fetching from the client.
++ * Also updates the provider-models cache with model lists per provider.
++ */
++export async function updateConnectedProvidersCache(client: {
++	provider?: {
++		list?: () => Promise<{ data?: { connected?: string[] } }>
++	}
++	model?: {
++		list?: () => Promise<{ data?: Array<{ id: string; provider: string }> }>
++	}
++}): Promise<void> {
++	if (!client?.provider?.list) {
++		log("[connected-providers-cache] client.provider.list not available")
++		return
++	}
++
++	try {
++		const result = await client.provider.list()
++		const connected = result.data?.connected ?? []
++		log("[connected-providers-cache] Fetched connected providers", { count: connected.length, providers: connected })
++
++		writeConnectedProvidersCache(connected)
++
++		// Also update provider-models cache if model.list is available
++		if (client.model?.list) {
++			try {
++				const modelsResult = await client.model.list()
++				const models = modelsResult.data ?? []
++
++				const modelsByProvider: Record<string, string[]> = {}
++				for (const model of models) {
++					if (!modelsByProvider[model.provider]) {
++						modelsByProvider[model.provider] = []
++					}
++					modelsByProvider[model.provider].push(model.id)
++				}
++
++				writeProviderModelsCache({
++					models: modelsByProvider,
++					connected,
++				})
++
++				log("[connected-providers-cache] Provider-models cache updated", {
++					providerCount: Object.keys(modelsByProvider).length,
++					totalModels: models.length,
++				})
++			} catch (modelErr) {
++				log("[connected-providers-cache] Error fetching models", { error: String(modelErr) })
++			}
++		}
++	} catch (err) {
++		log("[connected-providers-cache] Error updating cache", { error: String(err) })
++	}
++}
+diff --git a/src/shared/data-path.ts b/src/shared/data-path.ts
+index 3e1cdee5..28aa9a07 100644
+--- a/src/shared/data-path.ts
++++ b/src/shared/data-path.ts
+@@ -20,3 +20,28 @@ export function getDataDir(): string {
+ export function getOpenCodeStorageDir(): string {
+   return path.join(getDataDir(), "opencode", "storage")
+ }
++
++/**
++ * Returns the user-level cache directory.
++ * Matches OpenCode's behavior via xdg-basedir:
++ * - All platforms: XDG_CACHE_HOME or ~/.cache
++ */
++export function getCacheDir(): string {
++  return process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache")
++}
++
++/**
++ * Returns the oh-my-opencode cache directory.
++ * All platforms: ~/.cache/oh-my-opencode
++ */
++export function getOmoOpenCodeCacheDir(): string {
++  return path.join(getCacheDir(), "oh-my-opencode")
++}
++
++/**
++ * Returns the OpenCode cache directory (for reading OpenCode's cache).
++ * All platforms: ~/.cache/opencode
++ */
++export function getOpenCodeCacheDir(): string {
++  return path.join(getCacheDir(), "opencode")
++}
+diff --git a/src/shared/index.ts b/src/shared/index.ts
+index 97b40822..d9105ec4 100644
+--- a/src/shared/index.ts
++++ b/src/shared/index.ts
+@@ -28,6 +28,7 @@ export * from "./agent-tool-restrictions"
+ export * from "./model-requirements"
+ export * from "./model-resolver"
+ export * from "./model-availability"
++export * from "./connected-providers-cache"
+ export * from "./case-insensitive"
+ export * from "./session-utils"
+ export * from "./tmux"
+diff --git a/src/shared/model-availability.test.ts b/src/shared/model-availability.test.ts
+index 65dfe45d..f636e638 100644
+--- a/src/shared/model-availability.test.ts
++++ b/src/shared/model-availability.test.ts
+@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test"
+ import { mkdtempSync, writeFileSync, rmSync } from "fs"
+ import { tmpdir } from "os"
+ import { join } from "path"
+-import { fetchAvailableModels, fuzzyMatchModel, __resetModelCache } from "./model-availability"
++import { fetchAvailableModels, fuzzyMatchModel, getConnectedProviders, __resetModelCache } from "./model-availability"
+ 
+ describe("fetchAvailableModels", () => {
+   let tempDir: string
+@@ -30,14 +30,16 @@ describe("fetchAvailableModels", () => {
+     writeFileSync(join(cacheDir, "models.json"), JSON.stringify(data))
+   }
+ 
+-  it("#given cache file with models #when fetchAvailableModels called #then returns Set of model IDs", async () => {
++  it("#given cache file with models #when fetchAvailableModels called with connectedProviders #then returns Set of model IDs", async () => {
+     writeModelsCache({
+       openai: { id: "openai", models: { "gpt-5.2": { id: "gpt-5.2" } } },
+       anthropic: { id: "anthropic", models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
+       google: { id: "google", models: { "gemini-3-pro": { id: "gemini-3-pro" } } },
+     })
+ 
+-    const result = await fetchAvailableModels()
++    const result = await fetchAvailableModels(undefined, {
++      connectedProviders: ["openai", "anthropic", "google"]
++    })
+ 
+     expect(result).toBeInstanceOf(Set)
+     expect(result.size).toBe(3)
+@@ -46,36 +48,47 @@ describe("fetchAvailableModels", () => {
+     expect(result.has("google/gemini-3-pro")).toBe(true)
+   })
+ 
+-  it("#given cache file not found #when fetchAvailableModels called #then returns empty Set", async () => {
++  it("#given connectedProviders unknown #when fetchAvailableModels called without options #then returns empty Set", async () => {
++    writeModelsCache({
++      openai: { id: "openai", models: { "gpt-5.2": { id: "gpt-5.2" } } },
++    })
++
+     const result = await fetchAvailableModels()
+ 
+     expect(result).toBeInstanceOf(Set)
+     expect(result.size).toBe(0)
+   })
+ 
+-  it("#given cache read twice #when second call made #then uses cached result", async () => {
++  it("#given cache file not found #when fetchAvailableModels called with connectedProviders #then returns empty Set", async () => {
++    const result = await fetchAvailableModels(undefined, { connectedProviders: ["openai"] })
++
++    expect(result).toBeInstanceOf(Set)
++    expect(result.size).toBe(0)
++  })
++
++  it("#given cache read twice #when second call made with same providers #then reads fresh each time", async () => {
+     writeModelsCache({
+       openai: { id: "openai", models: { "gpt-5.2": { id: "gpt-5.2" } } },
+       anthropic: { id: "anthropic", models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
+     })
+ 
+-    const result1 = await fetchAvailableModels()
+-    const result2 = await fetchAvailableModels()
++    const result1 = await fetchAvailableModels(undefined, { connectedProviders: ["openai"] })
++    const result2 = await fetchAvailableModels(undefined, { connectedProviders: ["openai"] })
+ 
+-    expect(result1).toEqual(result2)
++    expect(result1.size).toBe(result2.size)
+     expect(result1.has("openai/gpt-5.2")).toBe(true)
+   })
+ 
+-  it("#given empty providers in cache #when fetchAvailableModels called #then returns empty Set", async () => {
++  it("#given empty providers in cache #when fetchAvailableModels called with connectedProviders #then returns empty Set", async () => {
+     writeModelsCache({})
+ 
+-    const result = await fetchAvailableModels()
++    const result = await fetchAvailableModels(undefined, { connectedProviders: ["openai"] })
+ 
+     expect(result).toBeInstanceOf(Set)
+     expect(result.size).toBe(0)
+   })
+ 
+-  it("#given cache file with various providers #when fetchAvailableModels called #then extracts all IDs correctly", async () => {
++  it("#given cache file with various providers #when fetchAvailableModels called with all providers #then extracts all IDs correctly", async () => {
+     writeModelsCache({
+       openai: { id: "openai", models: { "gpt-5.2-codex": { id: "gpt-5.2-codex" } } },
+       anthropic: { id: "anthropic", models: { "claude-sonnet-4-5": { id: "claude-sonnet-4-5" } } },
+@@ -83,7 +96,9 @@ describe("fetchAvailableModels", () => {
+       opencode: { id: "opencode", models: { "gpt-5-nano": { id: "gpt-5-nano" } } },
+     })
+ 
+-    const result = await fetchAvailableModels()
++    const result = await fetchAvailableModels(undefined, {
++      connectedProviders: ["openai", "anthropic", "google", "opencode"]
++    })
+ 
+     expect(result.size).toBe(4)
+     expect(result.has("openai/gpt-5.2-codex")).toBe(true)
+@@ -239,3 +254,359 @@ describe("fuzzyMatchModel", () => {
+ 		expect(result).toBeNull()
+ 	})
+ })
++
++describe("getConnectedProviders", () => {
++	//#given SDK client with connected providers
++	//#when provider.list returns data
++	//#then returns connected array
++	it("should return connected providers from SDK", async () => {
++		const mockClient = {
++			provider: {
++				list: async () => ({
++					data: { connected: ["anthropic", "opencode", "google"] }
++				})
++			}
++		}
++
++		const result = await getConnectedProviders(mockClient)
++
++		expect(result).toEqual(["anthropic", "opencode", "google"])
++	})
++
++	//#given SDK client
++	//#when provider.list throws error
++	//#then returns empty array
++	it("should return empty array on SDK error", async () => {
++		const mockClient = {
++			provider: {
++				list: async () => { throw new Error("Network error") }
++			}
++		}
++
++		const result = await getConnectedProviders(mockClient)
++
++		expect(result).toEqual([])
++	})
++
++	//#given SDK client with empty connected array
++	//#when provider.list returns empty
++	//#then returns empty array
++	it("should return empty array when no providers connected", async () => {
++		const mockClient = {
++			provider: {
++				list: async () => ({ data: { connected: [] } })
++			}
++		}
++
++		const result = await getConnectedProviders(mockClient)
++
++		expect(result).toEqual([])
++	})
++
++	//#given SDK client without provider.list method
++	//#when getConnectedProviders called
++	//#then returns empty array
++	it("should return empty array when client.provider.list not available", async () => {
++		const mockClient = {}
++
++		const result = await getConnectedProviders(mockClient)
++
++		expect(result).toEqual([])
++	})
++
++	//#given null client
++	//#when getConnectedProviders called
++	//#then returns empty array
++	it("should return empty array for null client", async () => {
++		const result = await getConnectedProviders(null)
++
++		expect(result).toEqual([])
++	})
++
++	//#given SDK client with missing data.connected
++	//#when provider.list returns without connected field
++	//#then returns empty array
++	it("should return empty array when data.connected is undefined", async () => {
++		const mockClient = {
++			provider: {
++				list: async () => ({ data: {} })
++			}
++		}
++
++		const result = await getConnectedProviders(mockClient)
++
++		expect(result).toEqual([])
++	})
++})
++
++describe("fetchAvailableModels with connected providers filtering", () => {
++	let tempDir: string
++	let originalXdgCache: string | undefined
++
++	beforeEach(() => {
++		__resetModelCache()
++		tempDir = mkdtempSync(join(tmpdir(), "opencode-test-"))
++		originalXdgCache = process.env.XDG_CACHE_HOME
++		process.env.XDG_CACHE_HOME = tempDir
++	})
++
++	afterEach(() => {
++		if (originalXdgCache !== undefined) {
++			process.env.XDG_CACHE_HOME = originalXdgCache
++		} else {
++			delete process.env.XDG_CACHE_HOME
++		}
++		rmSync(tempDir, { recursive: true, force: true })
++	})
++
++	function writeModelsCache(data: Record<string, any>) {
++		const cacheDir = join(tempDir, "opencode")
++		require("fs").mkdirSync(cacheDir, { recursive: true })
++		writeFileSync(join(cacheDir, "models.json"), JSON.stringify(data))
++	}
++
++	//#given cache with multiple providers
++	//#when connectedProviders specifies one provider
++	//#then only returns models from that provider
++	it("should filter models by connected providers", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++			anthropic: { models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
++			google: { models: { "gemini-3-pro": { id: "gemini-3-pro" } } },
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: ["anthropic"]
++		})
++
++		expect(result.size).toBe(1)
++		expect(result.has("anthropic/claude-opus-4-5")).toBe(true)
++		expect(result.has("openai/gpt-5.2")).toBe(false)
++		expect(result.has("google/gemini-3-pro")).toBe(false)
++	})
++
++	//#given cache with multiple providers
++	//#when connectedProviders specifies multiple providers
++	//#then returns models from all specified providers
++	it("should filter models by multiple connected providers", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++			anthropic: { models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
++			google: { models: { "gemini-3-pro": { id: "gemini-3-pro" } } },
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: ["anthropic", "google"]
++		})
++
++		expect(result.size).toBe(2)
++		expect(result.has("anthropic/claude-opus-4-5")).toBe(true)
++		expect(result.has("google/gemini-3-pro")).toBe(true)
++		expect(result.has("openai/gpt-5.2")).toBe(false)
++	})
++
++	//#given cache with models
++	//#when connectedProviders is empty array
++	//#then returns empty set
++	it("should return empty set when connectedProviders is empty", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++			anthropic: { models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: []
++		})
++
++		expect(result.size).toBe(0)
++	})
++
++	//#given cache with models
++	//#when connectedProviders is undefined (no options)
++	//#then returns empty set (triggers fallback in resolver)
++	it("should return empty set when connectedProviders not specified", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++			anthropic: { models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
++		})
++
++		const result = await fetchAvailableModels()
++
++		expect(result.size).toBe(0)
++	})
++
++	//#given cache with models
++	//#when connectedProviders contains provider not in cache
++	//#then returns empty set for that provider
++	it("should handle provider not in cache gracefully", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: ["azure"]
++		})
++
++		expect(result.size).toBe(0)
++	})
++
++	//#given cache with models and mixed connected providers
++	//#when some providers exist in cache and some don't
++	//#then returns models only from matching providers
++	it("should return models from providers that exist in both cache and connected list", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++			anthropic: { models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: ["anthropic", "azure", "unknown"]
++		})
++
++		expect(result.size).toBe(1)
++		expect(result.has("anthropic/claude-opus-4-5")).toBe(true)
++	})
++
++	//#given filtered fetch
++	//#when called twice with different filters
++	//#then does NOT use cache (dynamic per-session)
++	it("should not cache filtered results", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++			anthropic: { models: { "claude-opus-4-5": { id: "claude-opus-4-5" } } },
++		})
++
++		// First call with anthropic
++		const result1 = await fetchAvailableModels(undefined, {
++			connectedProviders: ["anthropic"]
++		})
++		expect(result1.size).toBe(1)
++
++		// Second call with openai - should work, not cached
++		const result2 = await fetchAvailableModels(undefined, {
++			connectedProviders: ["openai"]
++		})
++		expect(result2.size).toBe(1)
++		expect(result2.has("openai/gpt-5.2")).toBe(true)
++	})
++
++	//#given connectedProviders unknown
++	//#when called twice without connectedProviders
++	//#then always returns empty set (triggers fallback)
++	it("should return empty set when connectedProviders unknown", async () => {
++		writeModelsCache({
++			openai: { models: { "gpt-5.2": { id: "gpt-5.2" } } },
++		})
++
++		const result1 = await fetchAvailableModels()
++		const result2 = await fetchAvailableModels()
++
++		expect(result1.size).toBe(0)
++		expect(result2.size).toBe(0)
++	})
++})
++
++describe("fetchAvailableModels with provider-models cache (whitelist-filtered)", () => {
++	let tempDir: string
++	let originalXdgCache: string | undefined
++
++	beforeEach(() => {
++		__resetModelCache()
++		tempDir = mkdtempSync(join(tmpdir(), "opencode-test-"))
++		originalXdgCache = process.env.XDG_CACHE_HOME
++		process.env.XDG_CACHE_HOME = tempDir
++	})
++
++	afterEach(() => {
++		if (originalXdgCache !== undefined) {
++			process.env.XDG_CACHE_HOME = originalXdgCache
++		} else {
++			delete process.env.XDG_CACHE_HOME
++		}
++		rmSync(tempDir, { recursive: true, force: true })
++	})
++
++	function writeProviderModelsCache(data: { models: Record<string, string[]>; connected: string[] }) {
++		const cacheDir = join(tempDir, "oh-my-opencode")
++		require("fs").mkdirSync(cacheDir, { recursive: true })
++		writeFileSync(join(cacheDir, "provider-models.json"), JSON.stringify({
++			...data,
++			updatedAt: new Date().toISOString()
++		}))
++	}
++
++	function writeModelsCache(data: Record<string, any>) {
++		const cacheDir = join(tempDir, "opencode")
++		require("fs").mkdirSync(cacheDir, { recursive: true })
++		writeFileSync(join(cacheDir, "models.json"), JSON.stringify(data))
++	}
++
++	//#given provider-models cache exists (whitelist-filtered)
++	//#when fetchAvailableModels called
++	//#then uses provider-models cache instead of models.json
++	it("should prefer provider-models cache over models.json", async () => {
++		writeProviderModelsCache({
++			models: {
++				opencode: ["big-pickle", "gpt-5-nano"],
++				anthropic: ["claude-opus-4-5"]
++			},
++			connected: ["opencode", "anthropic"]
++		})
++		writeModelsCache({
++			opencode: { models: { "big-pickle": {}, "gpt-5-nano": {}, "gpt-5.2": {} } },
++			anthropic: { models: { "claude-opus-4-5": {}, "claude-sonnet-4-5": {} } }
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: ["opencode", "anthropic"]
++		})
++
++		expect(result.size).toBe(3)
++		expect(result.has("opencode/big-pickle")).toBe(true)
++		expect(result.has("opencode/gpt-5-nano")).toBe(true)
++		expect(result.has("anthropic/claude-opus-4-5")).toBe(true)
++		expect(result.has("opencode/gpt-5.2")).toBe(false)
++		expect(result.has("anthropic/claude-sonnet-4-5")).toBe(false)
++	})
++
++	//#given only models.json exists (no provider-models cache)
++	//#when fetchAvailableModels called
++	//#then falls back to models.json (no whitelist filtering)
++	it("should fallback to models.json when provider-models cache not found", async () => {
++		writeModelsCache({
++			opencode: { models: { "big-pickle": {}, "gpt-5-nano": {}, "gpt-5.2": {} } },
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: ["opencode"]
++		})
++
++		expect(result.size).toBe(3)
++		expect(result.has("opencode/big-pickle")).toBe(true)
++		expect(result.has("opencode/gpt-5-nano")).toBe(true)
++		expect(result.has("opencode/gpt-5.2")).toBe(true)
++	})
++
++	//#given provider-models cache with whitelist
++	//#when connectedProviders filters to subset
++	//#then only returns models from connected providers
++	it("should filter by connectedProviders even with provider-models cache", async () => {
++		writeProviderModelsCache({
++			models: {
++				opencode: ["big-pickle"],
++				anthropic: ["claude-opus-4-5"],
++				google: ["gemini-3-pro"]
++			},
++			connected: ["opencode", "anthropic", "google"]
++		})
++
++		const result = await fetchAvailableModels(undefined, {
++			connectedProviders: ["opencode"]
++		})
++
++		expect(result.size).toBe(1)
++		expect(result.has("opencode/big-pickle")).toBe(true)
++		expect(result.has("anthropic/claude-opus-4-5")).toBe(false)
++		expect(result.has("google/gemini-3-pro")).toBe(false)
++	})
++})
+diff --git a/src/shared/model-availability.ts b/src/shared/model-availability.ts
+index 7abc1d3c..3795aecb 100644
+--- a/src/shared/model-availability.ts
++++ b/src/shared/model-availability.ts
+@@ -1,12 +1,8 @@
+-/**
+- * Fuzzy matching utility for model names
+- * Supports substring matching with provider filtering and priority-based selection
+- */
+-
+ import { existsSync, readFileSync } from "fs"
+-import { homedir } from "os"
+ import { join } from "path"
+ import { log } from "./logger"
++import { getOpenCodeCacheDir } from "./data-path"
++import { readProviderModelsCache, hasProviderModelsCache } from "./connected-providers-cache"
+ 
+ /**
+  * Fuzzy match a target model name against available models
+@@ -91,29 +87,69 @@ export function fuzzyMatchModel(
+ 	return result
+ }
+ 
+-let cachedModels: Set<string> | null = null
++export async function getConnectedProviders(client: any): Promise<string[]> {
++	if (!client?.provider?.list) {
++		log("[getConnectedProviders] client.provider.list not available")
++		return []
++	}
+ 
+-function getOpenCodeCacheDir(): string {
+-	const xdgCache = process.env.XDG_CACHE_HOME
+-	if (xdgCache) return join(xdgCache, "opencode")
+-	return join(homedir(), ".cache", "opencode")
++	try {
++		const result = await client.provider.list()
++		const connected = result.data?.connected ?? []
++		log("[getConnectedProviders] connected providers", { count: connected.length, providers: connected })
++		return connected
++	} catch (err) {
++		log("[getConnectedProviders] SDK error", { error: String(err) })
++		return []
++	}
+ }
+ 
+-export async function fetchAvailableModels(_client?: any): Promise<Set<string>> {
+-	log("[fetchAvailableModels] CALLED")
+-	
+-	if (cachedModels !== null) {
+-		log("[fetchAvailableModels] returning cached models", { count: cachedModels.size, models: Array.from(cachedModels).slice(0, 20) })
+-		return cachedModels
++export async function fetchAvailableModels(
++	_client?: any,
++	options?: { connectedProviders?: string[] | null }
++): Promise<Set<string>> {
++	const connectedProvidersUnknown = options?.connectedProviders === null || options?.connectedProviders === undefined
++
++	log("[fetchAvailableModels] CALLED", { 
++		connectedProvidersUnknown,
++		connectedProviders: options?.connectedProviders 
++	})
++
++	if (connectedProvidersUnknown) {
++		log("[fetchAvailableModels] connected providers unknown, returning empty set for fallback resolution")
++		return new Set<string>()
+ 	}
+ 
++	const connectedProviders = options!.connectedProviders!
++	const connectedSet = new Set(connectedProviders)
+ 	const modelSet = new Set<string>()
+-	const cacheFile = join(getOpenCodeCacheDir(), "models.json")
+ 
+-	log("[fetchAvailableModels] reading cache file", { cacheFile })
++	const providerModelsCache = readProviderModelsCache()
++	if (providerModelsCache) {
++		log("[fetchAvailableModels] using provider-models cache (whitelist-filtered)")
++		
++		for (const [providerId, modelIds] of Object.entries(providerModelsCache.models)) {
++			if (!connectedSet.has(providerId)) {
++				continue
++			}
++			for (const modelId of modelIds) {
++				modelSet.add(`${providerId}/${modelId}`)
++			}
++		}
++
++		log("[fetchAvailableModels] parsed from provider-models cache", {
++			count: modelSet.size,
++			connectedProviders: connectedProviders.slice(0, 5)
++		})
++
++		return modelSet
++	}
++
++	log("[fetchAvailableModels] provider-models cache not found, falling back to models.json")
++	const cacheFile = join(getOpenCodeCacheDir(), "models.json")
+ 
+ 	if (!existsSync(cacheFile)) {
+-		log("[fetchAvailableModels] cache file not found, returning empty set")
++		log("[fetchAvailableModels] models.json cache file not found, returning empty set")
+ 		return modelSet
+ 	}
+ 
+@@ -122,9 +158,13 @@ export async function fetchAvailableModels(_client?: any): Promise<Set<string>>
+ 		const data = JSON.parse(content) as Record<string, { id?: string; models?: Record<string, { id?: string }> }>
+ 
+ 		const providerIds = Object.keys(data)
+-		log("[fetchAvailableModels] providers found", { count: providerIds.length, providers: providerIds.slice(0, 10) })
++		log("[fetchAvailableModels] providers found in models.json", { count: providerIds.length, providers: providerIds.slice(0, 10) })
+ 
+ 		for (const providerId of providerIds) {
++			if (!connectedSet.has(providerId)) {
++				continue
++			}
++
+ 			const provider = data[providerId]
+ 			const models = provider?.models
+ 			if (!models || typeof models !== "object") continue
+@@ -134,9 +174,11 @@ export async function fetchAvailableModels(_client?: any): Promise<Set<string>>
+ 			}
+ 		}
+ 
+-		log("[fetchAvailableModels] parsed models", { count: modelSet.size, models: Array.from(modelSet).slice(0, 20) })
++		log("[fetchAvailableModels] parsed models from models.json (NO whitelist filtering)", {
++			count: modelSet.size,
++			connectedProviders: connectedProviders.slice(0, 5)
++		})
+ 
+-		cachedModels = modelSet
+ 		return modelSet
+ 	} catch (err) {
+ 		log("[fetchAvailableModels] error", { error: String(err) })
+@@ -144,11 +186,12 @@ export async function fetchAvailableModels(_client?: any): Promise<Set<string>>
+ 	}
+ }
+ 
+-export function __resetModelCache(): void {
+-	cachedModels = null
+-}
++export function __resetModelCache(): void {}
+ 
+ export function isModelCacheAvailable(): boolean {
++	if (hasProviderModelsCache()) {
++		return true
++	}
+ 	const cacheFile = join(getOpenCodeCacheDir(), "models.json")
+ 	return existsSync(cacheFile)
+ }
+diff --git a/src/shared/model-resolver.ts b/src/shared/model-resolver.ts
+index 89d35f8e..11a59788 100644
+--- a/src/shared/model-resolver.ts
++++ b/src/shared/model-resolver.ts
+@@ -1,6 +1,7 @@
+ import { log } from "./logger"
+ import { fuzzyMatchModel } from "./model-availability"
+ import type { FallbackEntry } from "./model-requirements"
++import { readConnectedProvidersCache } from "./connected-providers-cache"
+ 
+ export type ModelResolutionInput = {
+ 	userModel?: string
+@@ -53,12 +54,28 @@ export function resolveModelWithFallback(
+ 
+ 	// Step 2: Provider fallback chain (with availability check)
+ 	if (fallbackChain && fallbackChain.length > 0) {
+-		// If availableModels is empty (no cache), use first fallback entry directly without availability check
+ 		if (availableModels.size === 0) {
++			const connectedProviders = readConnectedProvidersCache()
++			const connectedSet = connectedProviders ? new Set(connectedProviders) : null
++
++			for (const entry of fallbackChain) {
++				for (const provider of entry.providers) {
++					if (connectedSet === null || connectedSet.has(provider)) {
++						const model = `${provider}/${entry.model}`
++						log("Model resolved via fallback chain (no model cache, using connected provider)", { 
++							provider, 
++							model: entry.model, 
++							variant: entry.variant,
++							hasConnectedCache: connectedSet !== null
++						})
++						return { model, source: "provider-fallback", variant: entry.variant }
++					}
++				}
++			}
+ 			const firstEntry = fallbackChain[0]
+ 			const firstProvider = firstEntry.providers[0]
+ 			const model = `${firstProvider}/${firstEntry.model}`
+-			log("Model resolved via fallback chain (no cache, using first entry)", { provider: firstProvider, model: firstEntry.model, variant: firstEntry.variant })
++			log("Model resolved via fallback chain (no cache at all, using first entry)", { provider: firstProvider, model: firstEntry.model, variant: firstEntry.variant })
+ 			return { model, source: "provider-fallback", variant: firstEntry.variant }
+ 		}
+ 
+@@ -72,7 +89,6 @@ export function resolveModelWithFallback(
+ 				}
+ 			}
+ 		}
+-		// No match found in fallback chain - fall through to system default
+ 		log("No available model found in fallback chain, falling through to system default")
+ 	}
+ 
+diff --git a/src/tools/delegate-task/tools.test.ts b/src/tools/delegate-task/tools.test.ts
+index 7f52cf74..081856e6 100644
+--- a/src/tools/delegate-task/tools.test.ts
++++ b/src/tools/delegate-task/tools.test.ts
+@@ -101,7 +101,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -316,7 +316,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+ 
+@@ -378,7 +378,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+ 
+@@ -436,7 +436,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+ 
+@@ -485,7 +485,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -525,7 +525,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -574,7 +574,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -640,7 +640,7 @@ describe("sisyphus-task", () => {
+     const toolContext = {
+       sessionID: "parent-session",
+       messageID: "parent-message",
+-      agent: "Sisyphus",
++      agent: "sisyphus",
+       abort: new AbortController().signal,
+     }
+     
+@@ -695,7 +695,7 @@ describe("sisyphus-task", () => {
+     const toolContext = {
+       sessionID: "parent-session",
+       messageID: "parent-message",
+-      agent: "Sisyphus",
++      agent: "sisyphus",
+       abort: new AbortController().signal,
+     }
+     
+@@ -750,7 +750,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -810,7 +810,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -863,7 +863,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -918,7 +918,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent",
+         messageID: "msg",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal
+       }
+ 
+@@ -983,7 +983,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -1041,7 +1041,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -1102,7 +1102,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -1167,7 +1167,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -1232,7 +1232,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -1302,7 +1302,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+       
+@@ -1359,7 +1359,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+ 
+@@ -1409,7 +1409,7 @@ describe("sisyphus-task", () => {
+       const toolContext = {
+         sessionID: "parent-session",
+         messageID: "parent-message",
+-        agent: "Sisyphus",
++        agent: "sisyphus",
+         abort: new AbortController().signal,
+       }
+ 
+diff --git a/src/tools/delegate-task/tools.ts b/src/tools/delegate-task/tools.ts
+index 574cd6b9..ffabede8 100644
+--- a/src/tools/delegate-task/tools.ts
++++ b/src/tools/delegate-task/tools.ts
+@@ -13,6 +13,7 @@ import type { ModelFallbackInfo } from "../../features/task-toast-manager/types"
+ import { subagentSessions, getSessionAgent } from "../../features/claude-code-session-state"
+ import { log, getAgentToolRestrictions, resolveModel, getOpenCodeConfigPaths, findByNameCaseInsensitive, equalsIgnoreCase } from "../../shared"
+ import { fetchAvailableModels } from "../../shared/model-availability"
++import { readConnectedProvidersCache } from "../../shared/connected-providers-cache"
+ import { resolveModelWithFallback } from "../../shared/model-resolver"
+ import { CATEGORY_MODEL_REQUIREMENTS } from "../../shared/model-requirements"
+ 
+@@ -500,7 +501,10 @@ To continue this session: session_id="${args.session_id}"`
+            )
+          }
+ 
+-         const availableModels = await fetchAvailableModels(client)
++          const connectedProviders = readConnectedProvidersCache()
++          const availableModels = await fetchAvailableModels(client, {
++            connectedProviders: connectedProviders ?? undefined
++          })
+ 
+          const resolved = resolveCategoryConfig(args.category, {
+            userCategories,
+@@ -845,6 +849,7 @@ To continue this session: session_id="${task.sessionID}"`
+         const sessionID = createResult.data.id
+         syncSessionID = sessionID
+         subagentSessions.add(sessionID)
++
+         taskId = `sync_${sessionID.slice(0, 8)}`
+         const startTime = new Date()
+ 
+-- 
+2.39.2
+

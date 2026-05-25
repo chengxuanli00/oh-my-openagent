@@ -1,0 +1,492 @@
+From 4c4efc416aeebd067fbec6c67322ef6dea9efa01 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 2 Apr 2026 13:32:23 +0900
+Subject: [PATCH 3691/5749] fix(grep): enable ripgrep auto-download when not
+ found in PATH
+
+The auto-download mechanism for ripgrep existed but was never called.
+When 'rg' wasn't in PATH, the grep tool silently fell back to GNU grep,
+which wastes ~10% token budget due to noisy results.
+
+Changes:
+1. Wired up resolveGrepCliWithAutoInstall() in the CLI resolution path
+2. When 'rg' is not found in PATH, auto-downloads ripgrep v14.1.1
+3. Caches the downloaded binary in OpenCode data directory
+4. Falls back to GNU grep only if auto-download fails (with warning)
+
+Fixes #3003
+---
+ src/tools/grep/cli.ts            |  23 +++--
+ src/tools/grep/constants.test.ts | 166 +++++++++++++++++++++++++++++++
+ src/tools/grep/constants.ts      |  18 +++-
+ src/tools/grep/tools.test.ts     | 139 ++++++++++++++++++++++++++
+ src/tools/grep/tools.ts          |   6 +-
+ 5 files changed, 339 insertions(+), 13 deletions(-)
+ create mode 100644 src/tools/grep/constants.test.ts
+ create mode 100644 src/tools/grep/tools.test.ts
+
+diff --git a/src/tools/grep/cli.ts b/src/tools/grep/cli.ts
+index c44bda37..1a6cd89d 100644
+--- a/src/tools/grep/cli.ts
++++ b/src/tools/grep/cli.ts
+@@ -1,6 +1,7 @@
+ import { spawn } from "bun"
+ import {
+   resolveGrepCli,
++  type ResolvedCli,
+   type GrepBackend,
+   DEFAULT_MAX_DEPTH,
+   DEFAULT_MAX_FILESIZE,
+@@ -148,17 +149,17 @@ function parseCountOutput(output: string): CountResult[] {
+   return results
+ }
+ 
+-export async function runRg(options: GrepOptions): Promise<GrepResult> {
++export async function runRg(options: GrepOptions, resolvedCli?: ResolvedCli): Promise<GrepResult> {
+   await rgSemaphore.acquire()
+   try {
+-    return await runRgInternal(options)
++    return await runRgInternal(options, resolvedCli)
+   } finally {
+     rgSemaphore.release()
+   }
+ }
+ 
+-async function runRgInternal(options: GrepOptions): Promise<GrepResult> {
+-  const cli = resolveGrepCli()
++async function runRgInternal(options: GrepOptions, resolvedCli?: ResolvedCli): Promise<GrepResult> {
++  const cli = resolvedCli ?? resolveGrepCli()
+   const args = buildArgs(options, cli.backend)
+   const timeout = Math.min(options.timeout ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
+ 
+@@ -224,17 +225,23 @@ async function runRgInternal(options: GrepOptions): Promise<GrepResult> {
+   }
+ }
+ 
+-export async function runRgCount(options: Omit<GrepOptions, "context">): Promise<CountResult[]> {
++export async function runRgCount(
++  options: Omit<GrepOptions, "context">,
++  resolvedCli?: ResolvedCli
++): Promise<CountResult[]> {
+   await rgSemaphore.acquire()
+   try {
+-    return await runRgCountInternal(options)
++    return await runRgCountInternal(options, resolvedCli)
+   } finally {
+     rgSemaphore.release()
+   }
+ }
+ 
+-async function runRgCountInternal(options: Omit<GrepOptions, "context">): Promise<CountResult[]> {
+-  const cli = resolveGrepCli()
++async function runRgCountInternal(
++  options: Omit<GrepOptions, "context">,
++  resolvedCli?: ResolvedCli
++): Promise<CountResult[]> {
++  const cli = resolvedCli ?? resolveGrepCli()
+   const args = buildArgs({ ...options, context: 0 }, cli.backend)
+ 
+   if (cli.backend === "rg") {
+diff --git a/src/tools/grep/constants.test.ts b/src/tools/grep/constants.test.ts
+new file mode 100644
+index 00000000..717398e0
+--- /dev/null
++++ b/src/tools/grep/constants.test.ts
+@@ -0,0 +1,166 @@
++import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
++
++type SpawnResult = {
++  status: number | null
++  stdout: string
++}
++
++describe("grep constants", () => {
++  let originalPlatform: NodeJS.Platform
++
++  beforeEach(() => {
++    originalPlatform = process.platform
++    mock.restore()
++  })
++
++  afterEach(() => {
++    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true })
++    mock.restore()
++  })
++
++  function mockPlatform(platform: NodeJS.Platform): void {
++    Object.defineProperty(process, "platform", { value: platform, configurable: true })
++  }
++
++  function createSpawnSyncMock(paths: { rg?: string; grep?: string }) {
++    return mock((_command: string, args: string[]): SpawnResult => {
++      const binaryName = args[0]
++
++      if (binaryName === "rg" && paths.rg) {
++        return { status: 0, stdout: `${paths.rg}\n` }
++      }
++
++      if (binaryName === "grep" && paths.grep) {
++        return { status: 0, stdout: `${paths.grep}\n` }
++      }
++
++      return { status: 1, stdout: "" }
++    })
++  }
++
++  async function importConstantsModule(tag: string) {
++    return import(new URL(`./constants.ts?${tag}`, import.meta.url).href)
++  }
++
++  test("#given only GNU grep is available #when auto-install succeeds #then it caches the downloaded ripgrep path", async () => {
++    // given
++    const spawnSyncMock = createSpawnSyncMock({ grep: "/usr/bin/grep" })
++    const existsSyncMock = mock(() => false)
++    const downloadAndInstallRipgrepMock = mock(async () => "/tmp/oh-my-opencode/bin/rg")
++    const getInstalledRipgrepPathMock = mock(() => null)
++    const logMock = mock(() => {})
++
++    mock.module("node:child_process", () => ({ spawnSync: spawnSyncMock }))
++    mock.module("node:fs", () => ({ existsSync: existsSyncMock }))
++    mock.module("./downloader", () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module("./downloader.ts", () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module(new URL("./downloader.ts", import.meta.url).href, () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module("../../shared/logger", () => ({ log: logMock }))
++    mock.module("../../shared/logger.ts", () => ({ log: logMock }))
++    mock.module(new URL("../../shared/logger.ts", import.meta.url).href, () => ({ log: logMock }))
++
++    const { resolveGrepCliWithAutoInstall } = await importConstantsModule("grep-cache-success")
++
++    // when
++    const firstResult = await resolveGrepCliWithAutoInstall()
++    const secondResult = await resolveGrepCliWithAutoInstall()
++
++    // then
++    expect(firstResult).toEqual({ path: "/tmp/oh-my-opencode/bin/rg", backend: "rg" })
++    expect(secondResult).toEqual({ path: "/tmp/oh-my-opencode/bin/rg", backend: "rg" })
++    expect(downloadAndInstallRipgrepMock).toHaveBeenCalledTimes(1)
++    expect(logMock).not.toHaveBeenCalled()
++  })
++
++  test("#given Windows resolves to placeholder rg #when auto-install succeeds #then it still downloads ripgrep", async () => {
++    // given
++    mockPlatform("win32")
++
++    const spawnSyncMock = createSpawnSyncMock({})
++    const existsSyncMock = mock(() => false)
++    const downloadAndInstallRipgrepMock = mock(async () => "C:/Users/test/.cache/oh-my-opencode/bin/rg.exe")
++    const getInstalledRipgrepPathMock = mock(() => null)
++    const logMock = mock(() => {})
++
++    mock.module("node:child_process", () => ({ spawnSync: spawnSyncMock }))
++    mock.module("node:fs", () => ({ existsSync: existsSyncMock }))
++    mock.module("./downloader", () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module("./downloader.ts", () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module(new URL("./downloader.ts", import.meta.url).href, () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module("../../shared/logger", () => ({ log: logMock }))
++    mock.module("../../shared/logger.ts", () => ({ log: logMock }))
++    mock.module(new URL("../../shared/logger.ts", import.meta.url).href, () => ({ log: logMock }))
++
++    const { resolveGrepCliWithAutoInstall } = await importConstantsModule("grep-win32-placeholder")
++
++    // when
++    const result = await resolveGrepCliWithAutoInstall()
++
++    // then
++    expect(result).toEqual({ path: "C:/Users/test/.cache/oh-my-opencode/bin/rg.exe", backend: "rg" })
++    expect(downloadAndInstallRipgrepMock).toHaveBeenCalledTimes(1)
++    expect(logMock).not.toHaveBeenCalled()
++  })
++
++  test("#given only GNU grep is available #when auto-install fails #then it logs and falls back to GNU grep", async () => {
++    // given
++    const spawnSyncMock = createSpawnSyncMock({ grep: "/usr/bin/grep" })
++    const existsSyncMock = mock(() => false)
++    const downloadAndInstallRipgrepMock = mock(async () => {
++      throw new Error("network down")
++    })
++    const getInstalledRipgrepPathMock = mock(() => null)
++    const logMock = mock(() => {})
++
++    mock.module("node:child_process", () => ({ spawnSync: spawnSyncMock }))
++    mock.module("node:fs", () => ({ existsSync: existsSyncMock }))
++    mock.module("./downloader", () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module("./downloader.ts", () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module(new URL("./downloader.ts", import.meta.url).href, () => ({
++      downloadAndInstallRipgrep: downloadAndInstallRipgrepMock,
++      getInstalledRipgrepPath: getInstalledRipgrepPathMock,
++    }))
++    mock.module("../../shared/logger", () => ({ log: logMock }))
++    mock.module("../../shared/logger.ts", () => ({ log: logMock }))
++    mock.module(new URL("../../shared/logger.ts", import.meta.url).href, () => ({ log: logMock }))
++
++    const { resolveGrepCliWithAutoInstall } = await importConstantsModule("grep-grep-fallback")
++
++    // when
++    const result = await resolveGrepCliWithAutoInstall()
++
++    // then
++    expect(result).toEqual({ path: "/usr/bin/grep", backend: "grep" })
++    expect(logMock).toHaveBeenCalledWith(
++      "[oh-my-opencode] Failed to auto-install ripgrep. Falling back to GNU grep.",
++      {
++        error: "network down",
++        grep_path: "/usr/bin/grep",
++      }
++    )
++  })
++})
+diff --git a/src/tools/grep/constants.ts b/src/tools/grep/constants.ts
+index 524fddd4..f4128432 100644
+--- a/src/tools/grep/constants.ts
++++ b/src/tools/grep/constants.ts
+@@ -3,10 +3,11 @@ import { join, dirname } from "node:path"
+ import { spawnSync } from "node:child_process"
+ import { getInstalledRipgrepPath, downloadAndInstallRipgrep } from "./downloader"
+ import { getDataDir } from "../../shared/data-path"
++import { log } from "../../shared/logger"
+ 
+ export type GrepBackend = "rg" | "grep"
+ 
+-interface ResolvedCli {
++export interface ResolvedCli {
+   path: string
+   backend: GrepBackend
+ }
+@@ -89,7 +90,7 @@ export function resolveGrepCli(): ResolvedCli {
+ export async function resolveGrepCliWithAutoInstall(): Promise<ResolvedCli> {
+   const current = resolveGrepCli()
+ 
+-  if (current.backend === "rg") {
++  if (current.backend === "rg" && current.path !== "rg") {
+     return current
+   }
+ 
+@@ -103,7 +104,18 @@ export async function resolveGrepCliWithAutoInstall(): Promise<ResolvedCli> {
+     const rgPath = await downloadAndInstallRipgrep()
+     cachedCli = { path: rgPath, backend: "rg" }
+     return cachedCli
+-  } catch {
++  } catch (error) {
++    if (current.backend === "grep") {
++      log("[oh-my-opencode] Failed to auto-install ripgrep. Falling back to GNU grep.", {
++        error: error instanceof Error ? error.message : String(error),
++        grep_path: current.path,
++      })
++    } else {
++      log("[oh-my-opencode] Failed to auto-install ripgrep and GNU grep was not found.", {
++        error: error instanceof Error ? error.message : String(error),
++      })
++    }
++
+     return current
+   }
+ }
+diff --git a/src/tools/grep/tools.test.ts b/src/tools/grep/tools.test.ts
+new file mode 100644
+index 00000000..1404672b
+--- /dev/null
++++ b/src/tools/grep/tools.test.ts
+@@ -0,0 +1,139 @@
++import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
++import type { PluginInput } from "@opencode-ai/plugin"
++import type { ToolContext } from "@opencode-ai/plugin/tool"
++
++const projectDir = "/private/tmp/work-3003"
++
++const mockCtx = { directory: projectDir } as PluginInput
++
++const mockContext: ToolContext = {
++  sessionID: "test-session",
++  messageID: "test-message",
++  agent: "test-agent",
++  directory: projectDir,
++  worktree: projectDir,
++  abort: new AbortController().signal,
++  metadata: () => {},
++  ask: async () => {},
++}
++
++describe("grep tools", () => {
++  beforeEach(() => {
++    mock.restore()
++  })
++
++  afterEach(() => {
++    mock.restore()
++  })
++
++  async function importToolsModule(tag: string) {
++    return import(new URL(`./tools.ts?${tag}`, import.meta.url).href)
++  }
++
++  test("#given content mode #when grep executes #then it resolves the CLI with auto-install before runRg", async () => {
++    // given
++    const cli = { path: "/tmp/oh-my-opencode/bin/rg", backend: "rg" as const }
++    const resolveGrepCliWithAutoInstallMock = mock(async () => cli)
++    const runRgMock = mock(async () => ({
++      matches: [{ file: "src/tools/grep/tools.ts", line: 12, text: "resolveGrepCliWithAutoInstall" }],
++      totalMatches: 1,
++      filesSearched: 1,
++      truncated: false,
++    }))
++    const runRgCountMock = mock(async () => [])
++    const formatGrepResultMock = mock(() => "formatted grep result")
++    const formatCountResultMock = mock(() => "formatted count result")
++
++    mock.module("./constants", () => ({ resolveGrepCliWithAutoInstall: resolveGrepCliWithAutoInstallMock }))
++    mock.module("./constants.ts", () => ({ resolveGrepCliWithAutoInstall: resolveGrepCliWithAutoInstallMock }))
++    mock.module(new URL("./constants.ts", import.meta.url).href, () => ({ resolveGrepCliWithAutoInstall: resolveGrepCliWithAutoInstallMock }))
++    mock.module("./cli", () => ({ runRg: runRgMock, runRgCount: runRgCountMock }))
++    mock.module("./cli.ts", () => ({ runRg: runRgMock, runRgCount: runRgCountMock }))
++    mock.module(new URL("./cli.ts", import.meta.url).href, () => ({ runRg: runRgMock, runRgCount: runRgCountMock }))
++    mock.module("./result-formatter", () => ({
++      formatGrepResult: formatGrepResultMock,
++      formatCountResult: formatCountResultMock,
++    }))
++    mock.module("./result-formatter.ts", () => ({
++      formatGrepResult: formatGrepResultMock,
++      formatCountResult: formatCountResultMock,
++    }))
++    mock.module(new URL("./result-formatter.ts", import.meta.url).href, () => ({
++      formatGrepResult: formatGrepResultMock,
++      formatCountResult: formatCountResultMock,
++    }))
++
++    const { createGrepTools } = await importToolsModule("grep-tools-content")
++    const { grep } = createGrepTools(mockCtx)
++
++    // when
++    const result = await grep.execute({ pattern: "resolveGrepCliWithAutoInstall" }, mockContext)
++
++    // then
++    expect(result).toBe("formatted grep result")
++    expect(resolveGrepCliWithAutoInstallMock).toHaveBeenCalledTimes(1)
++    expect(runRgMock).toHaveBeenCalledWith(
++      {
++        pattern: "resolveGrepCliWithAutoInstall",
++        paths: [projectDir],
++        globs: undefined,
++        context: 0,
++        outputMode: "files_with_matches",
++        headLimit: 0,
++      },
++      cli
++    )
++  })
++
++  test("#given count mode #when grep executes #then it resolves the CLI with auto-install before runRgCount", async () => {
++    // given
++    const cli = { path: "/tmp/oh-my-opencode/bin/rg", backend: "rg" as const }
++    const resolveGrepCliWithAutoInstallMock = mock(async () => cli)
++    const runRgMock = mock(async () => ({
++      matches: [],
++      totalMatches: 0,
++      filesSearched: 0,
++      truncated: false,
++    }))
++    const runRgCountMock = mock(async () => [{ file: "src/tools/grep/tools.ts", count: 2 }])
++    const formatGrepResultMock = mock(() => "formatted grep result")
++    const formatCountResultMock = mock(() => "formatted count result")
++
++    mock.module("./constants", () => ({ resolveGrepCliWithAutoInstall: resolveGrepCliWithAutoInstallMock }))
++    mock.module("./constants.ts", () => ({ resolveGrepCliWithAutoInstall: resolveGrepCliWithAutoInstallMock }))
++    mock.module(new URL("./constants.ts", import.meta.url).href, () => ({ resolveGrepCliWithAutoInstall: resolveGrepCliWithAutoInstallMock }))
++    mock.module("./cli", () => ({ runRg: runRgMock, runRgCount: runRgCountMock }))
++    mock.module("./cli.ts", () => ({ runRg: runRgMock, runRgCount: runRgCountMock }))
++    mock.module(new URL("./cli.ts", import.meta.url).href, () => ({ runRg: runRgMock, runRgCount: runRgCountMock }))
++    mock.module("./result-formatter", () => ({
++      formatGrepResult: formatGrepResultMock,
++      formatCountResult: formatCountResultMock,
++    }))
++    mock.module("./result-formatter.ts", () => ({
++      formatGrepResult: formatGrepResultMock,
++      formatCountResult: formatCountResultMock,
++    }))
++    mock.module(new URL("./result-formatter.ts", import.meta.url).href, () => ({
++      formatGrepResult: formatGrepResultMock,
++      formatCountResult: formatCountResultMock,
++    }))
++
++    const { createGrepTools } = await importToolsModule("grep-tools-count")
++    const { grep } = createGrepTools(mockCtx)
++
++    // when
++    const result = await grep.execute({ pattern: "resolveGrepCliWithAutoInstall", output_mode: "count" }, mockContext)
++
++    // then
++    expect(result).toBe("formatted count result")
++    expect(resolveGrepCliWithAutoInstallMock).toHaveBeenCalledTimes(1)
++    expect(runRgCountMock).toHaveBeenCalledWith(
++      {
++        pattern: "resolveGrepCliWithAutoInstall",
++        paths: [projectDir],
++        globs: undefined,
++      },
++      cli
++    )
++  })
++})
+diff --git a/src/tools/grep/tools.ts b/src/tools/grep/tools.ts
+index b00c4754..eaf8a397 100644
+--- a/src/tools/grep/tools.ts
++++ b/src/tools/grep/tools.ts
+@@ -2,6 +2,7 @@ import { resolve } from "node:path"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+ import { runRg, runRgCount } from "./cli"
++import { resolveGrepCliWithAutoInstall } from "./constants"
+ import { formatGrepResult, formatCountResult } from "./result-formatter"
+ 
+ export function createGrepTools(ctx: PluginInput): Record<string, ToolDefinition> {
+@@ -42,13 +43,14 @@ export function createGrepTools(ctx: PluginInput): Record<string, ToolDefinition
+         const paths = [searchPath]
+         const outputMode = args.output_mode ?? "files_with_matches"
+         const headLimit = args.head_limit ?? 0
++        const cli = await resolveGrepCliWithAutoInstall()
+ 
+         if (outputMode === "count") {
+           const results = await runRgCount({
+             pattern: args.pattern,
+             paths,
+             globs,
+-          })
++          }, cli)
+           const limited = headLimit > 0 ? results.slice(0, headLimit) : results
+           return formatCountResult(limited)
+         }
+@@ -60,7 +62,7 @@ export function createGrepTools(ctx: PluginInput): Record<string, ToolDefinition
+           context: 0,
+           outputMode,
+           headLimit,
+-        })
++        }, cli)
+ 
+         return formatGrepResult(result)
+       } catch (e) {
+-- 
+2.39.2
+

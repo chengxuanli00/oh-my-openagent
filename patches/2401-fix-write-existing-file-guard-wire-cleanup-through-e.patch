@@ -1,0 +1,451 @@
+From 73d9e1f84799d69424bc929999f0d018b724c16b Mon Sep 17 00:00:00 2001
+From: gustavosmendes <87918773+gustavosmendes@users.noreply.github.com>
+Date: Wed, 18 Feb 2026 16:48:48 -0300
+Subject: [PATCH 2401/5749] fix(write-existing-file-guard): wire cleanup
+ through event dispatcher
+
+Forward session.deleted events to write-existing-file-guard so per-session read permissions are actually cleared in runtime.
+
+Add plugin-level regression test to ensure event forwarding remains wired, alongside the expanded guard behavior and unit coverage.
+---
+ src/hooks/write-existing-file-guard/hook.ts   |  60 +++++-
+ .../write-existing-file-guard/index.test.ts   | 173 +++++++++++++++++-
+ src/plugin/event.test.ts                      |  52 ++++++
+ src/plugin/event.ts                           |   1 +
+ 4 files changed, 280 insertions(+), 6 deletions(-)
+
+diff --git a/src/hooks/write-existing-file-guard/hook.ts b/src/hooks/write-existing-file-guard/hook.ts
+index 9b3aee2c..550a2899 100644
+--- a/src/hooks/write-existing-file-guard/hook.ts
++++ b/src/hooks/write-existing-file-guard/hook.ts
+@@ -1,7 +1,7 @@
+ import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+ 
+ import { existsSync, realpathSync } from "fs"
+-import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from "path"
++import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "path"
+ 
+ import { log } from "../../shared"
+ 
+@@ -13,9 +13,11 @@ type GuardArgs = {
+ }
+ 
+ const MAX_TRACKED_SESSIONS = 256
++export const MAX_TRACKED_PATHS_PER_SESSION = 1024
++const OUTSIDE_SESSION_MESSAGE = "Path must be inside session directory."
+ 
+ function asRecord(value: unknown): Record<string, unknown> | undefined {
+-  if (!value || typeof value !== "object") {
++  if (!value || typeof value !== "object" || Array.isArray(value)) {
+     return undefined
+   }
+ 
+@@ -30,6 +32,11 @@ function resolveInputPath(ctx: PluginInput, inputPath: string): string {
+   return normalize(isAbsolute(inputPath) ? inputPath : resolve(ctx.directory, inputPath))
+ }
+ 
++function isPathInsideDirectory(pathToCheck: string, directory: string): boolean {
++  const relativePath = relative(directory, pathToCheck)
++  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath))
++}
++
+ function toCanonicalPath(absolutePath: string): string {
+   let canonicalPath = absolutePath
+ 
+@@ -106,9 +113,25 @@ export function createWriteExistingFileGuardHook(ctx: PluginInput): Hooks {
+     return readSet
+   }
+ 
++  const trimSessionReadSet = (readSet: Set<string>): void => {
++    while (readSet.size > MAX_TRACKED_PATHS_PER_SESSION) {
++      const oldestPath = readSet.values().next().value
++      if (!oldestPath) {
++        return
++      }
++
++      readSet.delete(oldestPath)
++    }
++  }
++
+   const registerReadPermission = (sessionID: string, canonicalPath: string): void => {
+     const readSet = ensureSessionReadSet(sessionID)
++    if (readSet.has(canonicalPath)) {
++      readSet.delete(canonicalPath)
++    }
++
+     readSet.add(canonicalPath)
++    trimSessionReadSet(readSet)
+   }
+ 
+   const consumeReadPermission = (sessionID: string, canonicalPath: string): boolean => {
+@@ -128,9 +151,7 @@ export function createWriteExistingFileGuardHook(ctx: PluginInput): Hooks {
+         continue
+       }
+ 
+-      if (readSet.delete(canonicalPath)) {
+-        touchSession(sessionID)
+-      }
++      readSet.delete(canonicalPath)
+     }
+   }
+ 
+@@ -150,6 +171,20 @@ export function createWriteExistingFileGuardHook(ctx: PluginInput): Hooks {
+ 
+       const resolvedPath = resolveInputPath(ctx, filePath)
+       const canonicalPath = toCanonicalPath(resolvedPath)
++      const isInsideSessionDirectory = isPathInsideDirectory(canonicalPath, canonicalSessionRoot)
++
++      if (!isInsideSessionDirectory) {
++        if (toolName === "read") {
++          return
++        }
++
++        log("[write-existing-file-guard] Blocking write outside session directory", {
++          sessionID: input.sessionID,
++          filePath,
++          resolvedPath,
++        })
++        throw new Error(OUTSIDE_SESSION_MESSAGE)
++      }
+ 
+       if (toolName === "read") {
+         if (!existsSync(resolvedPath) || !input.sessionID) {
+@@ -163,6 +198,7 @@ export function createWriteExistingFileGuardHook(ctx: PluginInput): Hooks {
+       const overwriteEnabled = isOverwriteEnabled(args?.overwrite)
+ 
+       if (argsRecord && "overwrite" in argsRecord) {
++        // Intentionally mutate output args so overwrite bypass remains hook-only.
+         delete argsRecord.overwrite
+       }
+ 
+@@ -208,5 +244,19 @@ export function createWriteExistingFileGuardHook(ctx: PluginInput): Hooks {
+ 
+       throw new Error("File already exists. Use edit tool instead.")
+     },
++    event: async ({ event }: { event: { type: string; properties?: unknown } }) => {
++      if (event.type !== "session.deleted") {
++        return
++      }
++
++      const props = event.properties as { info?: { id?: string } } | undefined
++      const sessionID = props?.info?.id
++      if (!sessionID) {
++        return
++      }
++
++      readPermissionsBySession.delete(sessionID)
++      sessionLastAccess.delete(sessionID)
++    },
+   }
+ }
+diff --git a/src/hooks/write-existing-file-guard/index.test.ts b/src/hooks/write-existing-file-guard/index.test.ts
+index 5e41b76a..322e5198 100644
+--- a/src/hooks/write-existing-file-guard/index.test.ts
++++ b/src/hooks/write-existing-file-guard/index.test.ts
+@@ -3,9 +3,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync
+ import { tmpdir } from "node:os"
+ import { dirname, join, resolve } from "node:path"
+ 
++import { MAX_TRACKED_PATHS_PER_SESSION } from "./hook"
+ import { createWriteExistingFileGuardHook } from "./index"
+ 
+ const BLOCK_MESSAGE = "File already exists. Use edit tool instead."
++const OUTSIDE_SESSION_MESSAGE = "Path must be inside session directory."
+ 
+ type Hook = ReturnType<typeof createWriteExistingFileGuardHook>
+ 
+@@ -54,6 +56,10 @@ describe("createWriteExistingFileGuardHook", () => {
+     return output
+   }
+ 
++  const emitSessionDeleted = async (sessionID: string): Promise<void> => {
++    await hook.event?.({ event: { type: "session.deleted", properties: { info: { id: sessionID } } } })
++  }
++
+   beforeEach(() => {
+     tempDir = mkdtempSync(join(tmpdir(), "write-existing-file-guard-"))
+     hook = createWriteExistingFileGuardHook({ directory: tempDir } as never)
+@@ -111,6 +117,39 @@ describe("createWriteExistingFileGuardHook", () => {
+     ).rejects.toThrow(BLOCK_MESSAGE)
+   })
+ 
++  test("#given same-session concurrent writes #when only one read permission exists #then allows only one write", async () => {
++    const existingFile = createFile("concurrent-consume.txt")
++    const sessionID = "ses_concurrent"
++
++    await invoke({
++      tool: "read",
++      sessionID,
++      outputArgs: { filePath: existingFile },
++    })
++
++    const results = await Promise.allSettled([
++      invoke({
++        tool: "write",
++        sessionID,
++        outputArgs: { filePath: existingFile, content: "first attempt" },
++      }),
++      invoke({
++        tool: "write",
++        sessionID,
++        outputArgs: { filePath: existingFile, content: "second attempt" },
++      }),
++    ])
++
++    const successCount = results.filter((result) => result.status === "fulfilled").length
++    const failures = results.filter(
++      (result): result is PromiseRejectedResult => result.status === "rejected"
++    )
++
++    expect(successCount).toBe(1)
++    expect(failures).toHaveLength(1)
++    expect(String(failures[0]?.reason)).toContain(BLOCK_MESSAGE)
++  })
++
+   test("#given read in another session #when write executes #then blocks", async () => {
+     const existingFile = createFile("cross-session.txt")
+ 
+@@ -159,6 +198,23 @@ describe("createWriteExistingFileGuardHook", () => {
+     expect(output.args.overwrite).toBeUndefined()
+   })
+ 
++  test("#given overwrite falsy values #when write executes #then does not bypass guard", async () => {
++    const existingFile = createFile("overwrite-falsy.txt")
++
++    for (const overwrite of [false, "false"] as const) {
++      await expect(
++        invoke({
++          tool: "write",
++          outputArgs: {
++            filePath: existingFile,
++            content: "new content",
++            overwrite,
++          },
++        })
++      ).rejects.toThrow(BLOCK_MESSAGE)
++    }
++  })
++
+   test("#given two sessions read same file #when one writes #then other session is invalidated", async () => {
+     const existingFile = createFile("invalidate.txt")
+ 
+@@ -227,6 +283,41 @@ describe("createWriteExistingFileGuardHook", () => {
+     }
+   })
+ 
++  test("#given tools without file path arg #when write and read execute #then ignores safely", async () => {
++    await expect(
++      invoke({
++        tool: "write",
++        outputArgs: { content: "no path" },
++      })
++    ).resolves.toBeDefined()
++
++    await expect(
++      invoke({
++        tool: "read",
++        outputArgs: {},
++      })
++    ).resolves.toBeDefined()
++  })
++
++  test("#given non-read-write tool #when it executes #then does not grant write permission", async () => {
++    const existingFile = createFile("ignored-tool.txt")
++    const sessionID = "ses_ignored_tool"
++
++    await invoke({
++      tool: "edit",
++      sessionID,
++      outputArgs: { filePath: existingFile, oldString: "old", newString: "new" },
++    })
++
++    await expect(
++      invoke({
++        tool: "write",
++        sessionID,
++        outputArgs: { filePath: existingFile, content: "should block" },
++      })
++    ).rejects.toThrow(BLOCK_MESSAGE)
++  })
++
+   test("#given relative read and absolute write #when same session writes #then allows", async () => {
+     createFile("relative-absolute.txt")
+     const sessionID = "ses_relative_absolute"
+@@ -248,6 +339,45 @@ describe("createWriteExistingFileGuardHook", () => {
+     ).resolves.toBeDefined()
+   })
+ 
++  test("#given existing file outside session directory #when write executes #then blocks", async () => {
++    const outsideDir = mkdtempSync(join(tmpdir(), "write-existing-file-guard-outside-"))
++
++    try {
++      const outsideFile = join(outsideDir, "outside.txt")
++      writeFileSync(outsideFile, "outside")
++
++      await expect(
++        invoke({
++          tool: "write",
++          outputArgs: { filePath: outsideFile, content: "attempted overwrite" },
++        })
++      ).rejects.toThrow(OUTSIDE_SESSION_MESSAGE)
++    } finally {
++      rmSync(outsideDir, { recursive: true, force: true })
++    }
++  })
++
++  test("#given session read permission #when session deleted #then permission is cleaned up", async () => {
++    const existingFile = createFile("session-cleanup.txt")
++    const sessionID = "ses_cleanup"
++
++    await invoke({
++      tool: "read",
++      sessionID,
++      outputArgs: { filePath: existingFile },
++    })
++
++    await emitSessionDeleted(sessionID)
++
++    await expect(
++      invoke({
++        tool: "write",
++        sessionID,
++        outputArgs: { filePath: existingFile, content: "after cleanup" },
++      })
++    ).rejects.toThrow(BLOCK_MESSAGE)
++  })
++
+   test("#given case-different read path #when writing canonical path #then follows platform behavior", async () => {
+     const canonicalFile = createFile("CaseFile.txt")
+     const lowerCasePath = join(tempDir, "casefile.txt")
+@@ -281,7 +411,11 @@ describe("createWriteExistingFileGuardHook", () => {
+ 
+     try {
+       symlinkSync(targetFile, symlinkPath)
+-    } catch {
++    } catch (error) {
++      console.warn(
++        "Skipping symlink test: symlinks are not supported or cannot be created in this environment.",
++        error
++      )
+       return
+     }
+ 
+@@ -300,6 +434,43 @@ describe("createWriteExistingFileGuardHook", () => {
+     ).resolves.toBeDefined()
+   })
+ 
++  test("#given session reads beyond path cap #when writing oldest and newest #then only newest is authorized", async () => {
++    const sessionID = "ses_path_cap"
++    const oldestFile = createFile("path-cap/0.txt")
++    let newestFile = oldestFile
++
++    await invoke({
++      tool: "read",
++      sessionID,
++      outputArgs: { filePath: oldestFile },
++    })
++
++    for (let index = 1; index <= MAX_TRACKED_PATHS_PER_SESSION; index += 1) {
++      newestFile = createFile(`path-cap/${index}.txt`)
++      await invoke({
++        tool: "read",
++        sessionID,
++        outputArgs: { filePath: newestFile },
++      })
++    }
++
++    await expect(
++      invoke({
++        tool: "write",
++        sessionID,
++        outputArgs: { filePath: oldestFile, content: "stale write" },
++      })
++    ).rejects.toThrow(BLOCK_MESSAGE)
++
++    await expect(
++      invoke({
++        tool: "write",
++        sessionID,
++        outputArgs: { filePath: newestFile, content: "fresh write" },
++      })
++    ).resolves.toBeDefined()
++  })
++
+   test("#given recently active session #when lru evicts #then keeps recent session permission", async () => {
+     const existingFile = createFile("lru.txt")
+     const hotSession = "ses_hot"
+diff --git a/src/plugin/event.test.ts b/src/plugin/event.test.ts
+index 0bcf0997..8db998c4 100644
+--- a/src/plugin/event.test.ts
++++ b/src/plugin/event.test.ts
+@@ -383,3 +383,55 @@ type EventInput = { event: { type: string; properties?: Record<string, unknown>
+ 		expect(dispatchCalls[1].event.type).toBe("session.idle")
+ 	})
+ })
++
++describe("createEventHandler - event forwarding", () => {
++	it("forwards session.deleted to write-existing-file-guard hook", async () => {
++		//#given
++		const forwardedEvents: EventInput[] = []
++		const disconnectedSessions: string[] = []
++		const deletedSessions: string[] = []
++		const eventHandler = createEventHandler({
++			ctx: {} as never,
++			pluginConfig: {} as never,
++			firstMessageVariantGate: {
++				markSessionCreated: () => {},
++				clear: () => {},
++			},
++			managers: {
++				skillMcpManager: {
++					disconnectSession: async (sessionID: string) => {
++						disconnectedSessions.push(sessionID)
++					},
++				},
++				tmuxSessionManager: {
++					onSessionCreated: async () => {},
++					onSessionDeleted: async ({ sessionID }: { sessionID: string }) => {
++						deletedSessions.push(sessionID)
++					},
++				},
++			} as never,
++			hooks: {
++				writeExistingFileGuard: {
++					event: async (input: EventInput) => {
++						forwardedEvents.push(input)
++					},
++				},
++			} as never,
++		})
++		const sessionID = "ses_forward_delete_event"
++
++		//#when
++		await eventHandler({
++			event: {
++				type: "session.deleted",
++				properties: { info: { id: sessionID } },
++			},
++		})
++
++		//#then
++		expect(forwardedEvents.length).toBe(1)
++		expect(forwardedEvents[0]?.event.type).toBe("session.deleted")
++		expect(disconnectedSessions).toEqual([sessionID])
++		expect(deletedSessions).toEqual([sessionID])
++	})
++})
+diff --git a/src/plugin/event.ts b/src/plugin/event.ts
+index 3ab1cd41..ce5f5af3 100644
+--- a/src/plugin/event.ts
++++ b/src/plugin/event.ts
+@@ -48,6 +48,7 @@ export function createEventHandler(args: {
+     await Promise.resolve(hooks.ralphLoop?.event?.(input))
+     await Promise.resolve(hooks.stopContinuationGuard?.event?.(input))
+     await Promise.resolve(hooks.compactionTodoPreserver?.event?.(input))
++    await Promise.resolve(hooks.writeExistingFileGuard?.event?.(input))
+     await Promise.resolve(hooks.atlasHook?.handler?.(input))
+   }
+ 
+-- 
+2.39.2
+

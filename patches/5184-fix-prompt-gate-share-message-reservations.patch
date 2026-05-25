@@ -1,0 +1,791 @@
+From 30adce9cadf70fefd5a85749869ea86d4d5bc39c Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 15 May 2026 11:49:44 +0900
+Subject: [PATCH 5184/5749] fix(prompt-gate): share message reservations
+
+---
+ src/cli/run/runner.ts                      |  32 +++-
+ src/hooks/shared/prompt-async-gate.test.ts |  45 +++++
+ src/hooks/shared/prompt-async-gate.ts      | 112 +----------
+ src/hooks/shared/session-idle-settle.ts    |  62 +-----
+ src/shared/model-suggestion-retry.test.ts  |  36 ++++
+ src/shared/model-suggestion-retry.ts       |  68 +++++--
+ src/shared/prompt-async-gate.ts            | 207 +++++++++++++++++++++
+ src/shared/session-idle-settle.ts          |  61 ++++++
+ src/shared/session-route.ts                |  24 ++-
+ 9 files changed, 451 insertions(+), 196 deletions(-)
+ create mode 100644 src/shared/prompt-async-gate.ts
+ create mode 100644 src/shared/session-idle-settle.ts
+
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index 75e6e49d..d5971406 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -13,6 +13,7 @@ import { loadAgentProfileColors } from "./agent-profile-colors"
+ import { suppressRunInput } from "./stdin-suppression"
+ import { createTimestampedStdoutController } from "./timestamp-output"
+ import { createCliPostHog, getPostHogDistinctId } from "../../shared/posthog"
++import { promptAsyncAfterSessionIdle } from "../../shared/prompt-async-gate"
+ 
+ export { resolveRunAgent }
+ 
+@@ -109,18 +110,31 @@ export async function run(options: RunOptions): Promise<number> {
+         () => {},
+       )
+ 
+-      await client.session.promptAsync({
+-        path: { id: sessionID },
+-        body: {
+-          agent: resolvedAgent,
+-          ...(resolvedModel ? { model: resolvedModel } : {}),
+-          tools: {
+-            question: false,
++      const promptResult = await promptAsyncAfterSessionIdle({
++        client,
++        sessionID,
++        source: "cli-run",
++        settleMs: 0,
++        postDispatchHoldMs: 0,
++        input: {
++          path: { id: sessionID },
++          body: {
++            agent: resolvedAgent,
++            ...(resolvedModel ? { model: resolvedModel } : {}),
++            tools: {
++              question: false,
++            },
++            parts: [{ type: "text", text: message }],
+           },
+-          parts: [{ type: "text", text: message }],
++          query: { directory },
+         },
+-        query: { directory },
+       })
++      if (promptResult.status === "failed") {
++        throw promptResult.error
++      }
++      if (promptResult.status !== "dispatched") {
++        throw new Error(`Session ${sessionID} is not idle; promptAsync skipped by gate: ${promptResult.status}`)
++      }
+       const exitCode = await pollForCompletion(ctx, eventState, abortController)
+ 
+       abortController.abort()
+diff --git a/src/hooks/shared/prompt-async-gate.test.ts b/src/hooks/shared/prompt-async-gate.test.ts
+index 6df4a189..260db9d6 100644
+--- a/src/hooks/shared/prompt-async-gate.test.ts
++++ b/src/hooks/shared/prompt-async-gate.test.ts
+@@ -1,6 +1,7 @@
+ import { afterEach, describe, expect, test } from "bun:test"
+ 
+ import {
++  promptAfterSessionIdle,
+   promptAsyncAfterSessionIdle,
+   releaseAllPromptAsyncReservationsForTesting,
+ } from "./prompt-async-gate"
+@@ -81,4 +82,48 @@ describe("promptAsyncAfterSessionIdle", () => {
+     expect(result.status).toBe("active")
+     expect(promptCalls).toBe(0)
+   })
++
++  test("#given two internal prompt calls race for one idle session #when they dispatch concurrently #then only one prompt is accepted", async () => {
++    // given
++    let promptCalls = 0
++    let releasePrompt: (() => void) | undefined
++    const promptGate = new Promise<void>((resolve) => {
++      releasePrompt = resolve
++    })
++    const client = {
++      session: {
++        status: async () => ({ data: { ses_prompt_race: { type: "idle" } } }),
++        prompt: async () => {
++          promptCalls += 1
++          await promptGate
++        },
++      },
++    }
++
++    // when
++    const first = promptAfterSessionIdle({
++      client,
++      sessionID: "ses_prompt_race",
++      input: { path: { id: "ses_prompt_race" }, body: { parts: [] } },
++      source: "test:prompt:first",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++    await Promise.resolve()
++    const second = await promptAfterSessionIdle({
++      client,
++      sessionID: "ses_prompt_race",
++      input: { path: { id: "ses_prompt_race" }, body: { parts: [] } },
++      source: "test:prompt:second",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++    releasePrompt?.()
++    const firstResult = await first
++
++    // then
++    expect(firstResult.status).toBe("dispatched")
++    expect(second.status).toBe("reserved")
++    expect(promptCalls).toBe(1)
++  })
+ })
+diff --git a/src/hooks/shared/prompt-async-gate.ts b/src/hooks/shared/prompt-async-gate.ts
+index f037d18b..68d44ab1 100644
+--- a/src/hooks/shared/prompt-async-gate.ts
++++ b/src/hooks/shared/prompt-async-gate.ts
+@@ -1,111 +1 @@
+-import { log } from "../../shared/logger"
+-import {
+-  DEFAULT_SESSION_IDLE_SETTLE_MS,
+-  isSessionActive,
+-  settleAfterSessionIdle,
+-} from "./session-idle-settle"
+-
+-export const DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS = 250
+-
+-type PromptAsyncInput = {
+-  path?: { id?: string }
+-  body?: unknown
+-  query?: unknown
+-  signal?: unknown
+-  [key: string]: unknown
+-}
+-
+-type PromptAsyncClient<TInput> = {
+-  session?: {
+-    status?: () => Promise<unknown>
+-    promptAsync?: (input: TInput) => Promise<unknown>
+-  }
+-}
+-
+-type PromptAsyncReservation = {
+-  source: string
+-  reservedAt: number
+-  token: symbol
+-}
+-
+-export type PromptAsyncGateResult =
+-  | { status: "dispatched"; response: unknown }
+-  | { status: "active" }
+-  | { status: "reserved"; reservedBy: string }
+-  | { status: "unavailable" }
+-  | { status: "failed"; error: unknown }
+-
+-const promptAsyncReservations = new Map<string, PromptAsyncReservation>()
+-
+-export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(args: {
+-  client: PromptAsyncClient<TInput>
+-  sessionID: string
+-  input: TInput
+-  source: string
+-  settleMs?: number
+-  postDispatchHoldMs?: number
+-}): Promise<PromptAsyncGateResult> {
+-  const {
+-    client,
+-    sessionID,
+-    input,
+-    source,
+-    settleMs = DEFAULT_SESSION_IDLE_SETTLE_MS,
+-  } = args
+-  const postDispatchHoldMs = args.postDispatchHoldMs ?? (
+-    settleMs > 0 ? DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS : 0
+-  )
+-
+-  if (typeof client.session?.promptAsync !== "function") {
+-    log("[prompt-async-gate] promptAsync unavailable", { sessionID, source })
+-    return { status: "unavailable" }
+-  }
+-
+-  const existing = promptAsyncReservations.get(sessionID)
+-  if (existing) {
+-    log("[prompt-async-gate] promptAsync skipped because session is reserved", {
+-      sessionID,
+-      source,
+-      reservedBy: existing.source,
+-      reservedAgeMs: Date.now() - existing.reservedAt,
+-    })
+-    return { status: "reserved", reservedBy: existing.source }
+-  }
+-
+-  const reservation: PromptAsyncReservation = {
+-    source,
+-    reservedAt: Date.now(),
+-    token: Symbol(source),
+-  }
+-  promptAsyncReservations.set(sessionID, reservation)
+-
+-  try {
+-    const canReadStatus = typeof client.session?.status === "function"
+-    await settleAfterSessionIdle(settleMs)
+-
+-    if (canReadStatus && await isSessionActive(client, sessionID)) {
+-      log("[prompt-async-gate] promptAsync skipped because session is active", { sessionID, source })
+-      return { status: "active" }
+-    }
+-
+-    log("[prompt-async-gate] promptAsync dispatching", { sessionID, source })
+-    const response = await client.session.promptAsync(input)
+-    if (canReadStatus) {
+-      await settleAfterSessionIdle(postDispatchHoldMs)
+-    }
+-    log("[prompt-async-gate] promptAsync dispatched", { sessionID, source })
+-    return { status: "dispatched", response }
+-  } catch (error) {
+-    log("[prompt-async-gate] promptAsync failed", { sessionID, source, error: String(error) })
+-    return { status: "failed", error }
+-  } finally {
+-    const current = promptAsyncReservations.get(sessionID)
+-    if (current?.token === reservation.token) {
+-      promptAsyncReservations.delete(sessionID)
+-    }
+-  }
+-}
+-
+-export function releaseAllPromptAsyncReservationsForTesting(): void {
+-  promptAsyncReservations.clear()
+-}
++export * from "../../shared/prompt-async-gate"
+diff --git a/src/hooks/shared/session-idle-settle.ts b/src/hooks/shared/session-idle-settle.ts
+index 2fd5a2b0..6060b9e0 100644
+--- a/src/hooks/shared/session-idle-settle.ts
++++ b/src/hooks/shared/session-idle-settle.ts
+@@ -1,61 +1 @@
+-export const DEFAULT_SESSION_IDLE_SETTLE_MS = 150
+-
+-export function settleAfterSessionIdle(ms = DEFAULT_SESSION_IDLE_SETTLE_MS): Promise<void> {
+-  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve()
+-}
+-
+-type SessionStatusClient = {
+-  session?: {
+-    status?: () => Promise<unknown>
+-  }
+-}
+-
+-const ACTIVE_SESSION_STATUSES = new Set(["busy", "retry", "running"])
+-
+-function isRecord(value: unknown): value is Record<string, unknown> {
+-  return typeof value === "object" && value !== null
+-}
+-
+-function getSessionStatusPayload(response: unknown): Record<string, unknown> {
+-  if (isRecord(response) && isRecord(response.data)) {
+-    return response.data
+-  }
+-
+-  if (isRecord(response)) {
+-    return response
+-  }
+-
+-  return {}
+-}
+-
+-export function isActiveSessionStatusType(statusType: string): boolean {
+-  return ACTIVE_SESSION_STATUSES.has(statusType)
+-}
+-
+-export async function isSessionActive(client: SessionStatusClient, sessionID: string): Promise<boolean> {
+-  if (typeof client.session?.status !== "function") {
+-    return false
+-  }
+-
+-  try {
+-    const statusResult = await client.session.status()
+-    const status = getSessionStatusPayload(statusResult)[sessionID]
+-    if (!isRecord(status)) {
+-      return false
+-    }
+-
+-    const statusType = status.type
+-    return typeof statusType === "string" && isActiveSessionStatusType(statusType)
+-  } catch {
+-    return false
+-  }
+-}
+-
+-export async function shouldPromptAfterSessionIdle(
+-  client: SessionStatusClient,
+-  sessionID: string,
+-  settleMs = DEFAULT_SESSION_IDLE_SETTLE_MS,
+-): Promise<boolean> {
+-  await settleAfterSessionIdle(settleMs)
+-  return !(await isSessionActive(client, sessionID))
+-}
++export * from "../../shared/session-idle-settle"
+diff --git a/src/shared/model-suggestion-retry.test.ts b/src/shared/model-suggestion-retry.test.ts
+index e594ad6a..fb2e3248 100644
+--- a/src/shared/model-suggestion-retry.test.ts
++++ b/src/shared/model-suggestion-retry.test.ts
+@@ -230,6 +230,42 @@ describe("promptWithModelSuggestionRetry", () => {
+     expect(promptMock).toHaveBeenCalledTimes(1)
+   })
+ 
++  it("should reject concurrent promptAsync retries for the same session after one dispatch is reserved", async () => {
++    // given two callers racing to send into one session
++    let releasePrompt: (() => void) | undefined
++    const promptGate = new Promise<void>((resolve) => {
++      releasePrompt = resolve
++    })
++    const promptMock = mock(async () => {
++      await promptGate
++    })
++    const client = {
++      session: {
++        status: async () => ({ data: { "session-dup": { type: "idle" } } }),
++        promptAsync: promptMock,
++      },
++    }
++    const args = {
++      path: { id: "session-dup" },
++      body: {
++        parts: [{ type: "text", text: "hello" }],
++        model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
++      },
++    }
++
++    // when both callers try to prompt the same session before the first dispatch settles
++    const first = promptWithModelSuggestionRetry(unsafeTestValue(client), args)
++    await Promise.resolve()
++    const second = promptWithModelSuggestionRetry(unsafeTestValue(client), args)
++    releasePrompt?.()
++    const results = await Promise.allSettled([first, second])
++
++    // then only the reserved dispatch is sent to OpenCode
++    expect(promptMock).toHaveBeenCalledTimes(1)
++    expect(results[0]?.status).toBe("fulfilled")
++    expect(results[1]?.status).toBe("rejected")
++  })
++
+   it("should throw error from promptAsync directly on model-not-found error", async () => {
+     // given a client that fails with model-not-found error
+     const promptMock = mock().mockRejectedValueOnce({
+diff --git a/src/shared/model-suggestion-retry.ts b/src/shared/model-suggestion-retry.ts
+index 7047b8bb..184467e4 100644
+--- a/src/shared/model-suggestion-retry.ts
++++ b/src/shared/model-suggestion-retry.ts
+@@ -5,6 +5,7 @@ import {
+   PROMPT_TIMEOUT_MS,
+   type PromptRetryOptions,
+ } from "./prompt-timeout-context"
++import { promptAfterSessionIdle, promptAsyncAfterSessionIdle } from "./prompt-async-gate"
+ 
+ type Client = ReturnType<typeof createOpencodeClient>
+ 
+@@ -93,14 +94,25 @@ export async function promptWithModelSuggestionRetry(
+ ): Promise<void> {
+   const timeoutMs = options.timeoutMs ?? PROMPT_TIMEOUT_MS
+   const timeoutContext = createPromptTimeoutContext(args, timeoutMs)
+-  // model errors happen asynchronously server-side and cannot be caught here
+-  const promptPromise = client.session.promptAsync({
+-    ...args,
+-    signal: timeoutContext.signal,
+-  } as Parameters<typeof client.session.promptAsync>[0])
+ 
+   try {
+-    await promptPromise
++    const promptResult = await promptAsyncAfterSessionIdle({
++      client,
++      sessionID: args.path.id,
++      input: {
++        ...args,
++        signal: timeoutContext.signal,
++      } as Parameters<typeof client.session.promptAsync>[0],
++      source: "model-suggestion-retry",
++      settleMs: 0,
++      postDispatchHoldMs: 0,
++    })
++    if (promptResult.status === "failed") {
++      throw promptResult.error
++    }
++    if (promptResult.status !== "dispatched") {
++      throw new Error(`promptAsync skipped by gate: ${promptResult.status}`)
++    }
+     if (timeoutContext.wasTimedOut()) {
+       throw new Error(`promptAsync timed out after ${timeoutMs}ms`)
+     }
+@@ -124,10 +136,24 @@ export async function promptSyncWithModelSuggestionRetry(
+   try {
+     const timeoutContext = createPromptTimeoutContext(args, timeoutMs)
+     try {
+-      await client.session.prompt({
+-        ...args,
+-        signal: timeoutContext.signal,
+-      } as Parameters<typeof client.session.prompt>[0])
++      const promptResult = await promptAfterSessionIdle({
++        client,
++        sessionID: args.path.id,
++        input: {
++          ...args,
++          signal: timeoutContext.signal,
++        } as Parameters<typeof client.session.prompt>[0],
++        source: "model-suggestion-retry:sync",
++        settleMs: 0,
++        postDispatchHoldMs: 0,
++        checkStatus: false,
++      })
++      if (promptResult.status === "failed") {
++        throw promptResult.error
++      }
++      if (promptResult.status !== "dispatched") {
++        throw new Error(`prompt skipped by gate: ${promptResult.status}`)
++      }
+       if (timeoutContext.wasTimedOut()) {
+         throw new Error(`prompt timed out after ${timeoutMs}ms`)
+       }
+@@ -163,10 +189,24 @@ export async function promptSyncWithModelSuggestionRetry(
+ 
+     const timeoutContext = createPromptTimeoutContext(retryArgs, timeoutMs)
+     try {
+-      await client.session.prompt({
+-        ...retryArgs,
+-        signal: timeoutContext.signal,
+-      } as Parameters<typeof client.session.prompt>[0])
++      const promptResult = await promptAfterSessionIdle({
++        client,
++        sessionID: retryArgs.path.id,
++        input: {
++          ...retryArgs,
++          signal: timeoutContext.signal,
++        } as Parameters<typeof client.session.prompt>[0],
++        source: "model-suggestion-retry:sync-retry",
++        settleMs: 0,
++        postDispatchHoldMs: 0,
++        checkStatus: false,
++      })
++      if (promptResult.status === "failed") {
++        throw promptResult.error
++      }
++      if (promptResult.status !== "dispatched") {
++        throw new Error(`prompt skipped by gate: ${promptResult.status}`)
++      }
+       if (timeoutContext.wasTimedOut()) {
+         throw new Error(`prompt timed out after ${timeoutMs}ms`)
+       }
+diff --git a/src/shared/prompt-async-gate.ts b/src/shared/prompt-async-gate.ts
+new file mode 100644
+index 00000000..806b2178
+--- /dev/null
++++ b/src/shared/prompt-async-gate.ts
+@@ -0,0 +1,207 @@
++import { log } from "./logger"
++import {
++  DEFAULT_SESSION_IDLE_SETTLE_MS,
++  isSessionActive,
++  settleAfterSessionIdle,
++} from "./session-idle-settle"
++
++export const DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS = 250
++
++type PromptAsyncInput = {
++  path?: { id?: string }
++  body?: unknown
++  query?: unknown
++  signal?: unknown
++  [key: string]: unknown
++}
++
++type PromptAsyncClient<TInput> = {
++  session?: {
++    status?: () => Promise<unknown>
++    promptAsync?: (input: TInput) => Promise<unknown>
++  }
++}
++
++type PromptClient<TInput> = {
++  session?: {
++    status?: () => Promise<unknown>
++    prompt?: (input: TInput) => Promise<unknown>
++  }
++}
++
++type PromptAsyncReservation = {
++  source: string
++  reservedAt: number
++  token: symbol
++}
++
++export type PromptAsyncGateResult =
++  | { status: "dispatched"; response: unknown }
++  | { status: "active" }
++  | { status: "reserved"; reservedBy: string }
++  | { status: "unavailable" }
++  | { status: "failed"; error: unknown }
++
++const promptAsyncReservations = new Map<string, PromptAsyncReservation>()
++
++export async function promptAsyncAfterSessionIdle<TInput = PromptAsyncInput>(args: {
++  client: PromptAsyncClient<TInput>
++  sessionID: string
++  input: TInput
++  source: string
++  settleMs?: number
++  postDispatchHoldMs?: number
++  checkStatus?: boolean
++}): Promise<PromptAsyncGateResult> {
++  const {
++    client,
++    sessionID,
++    input,
++    source,
++    settleMs = DEFAULT_SESSION_IDLE_SETTLE_MS,
++  } = args
++  const postDispatchHoldMs = args.postDispatchHoldMs ?? (
++    settleMs > 0 ? DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS : 0
++  )
++
++  if (typeof client.session?.promptAsync !== "function") {
++    log("[prompt-async-gate] promptAsync unavailable", { sessionID, source })
++    return { status: "unavailable" }
++  }
++
++  const existing = promptAsyncReservations.get(sessionID)
++  if (existing) {
++    log("[prompt-async-gate] promptAsync skipped because session is reserved", {
++      sessionID,
++      source,
++      reservedBy: existing.source,
++      reservedAgeMs: Date.now() - existing.reservedAt,
++    })
++    return { status: "reserved", reservedBy: existing.source }
++  }
++
++  const reservation: PromptAsyncReservation = {
++    source,
++    reservedAt: Date.now(),
++    token: Symbol(source),
++  }
++  promptAsyncReservations.set(sessionID, reservation)
++
++  try {
++    const canReadStatus = args.checkStatus !== false && typeof client.session?.status === "function"
++    if (settleMs > 0) {
++      await settleAfterSessionIdle(settleMs)
++    }
++
++    if (canReadStatus && await isSessionActive(client, sessionID)) {
++      log("[prompt-async-gate] promptAsync skipped because session is active", { sessionID, source })
++      return { status: "active" }
++    }
++
++    log("[prompt-async-gate] promptAsync dispatching", { sessionID, source })
++    const response = await client.session.promptAsync(input)
++    if (canReadStatus) {
++      await settleAfterSessionIdle(postDispatchHoldMs)
++    }
++    log("[prompt-async-gate] promptAsync dispatched", { sessionID, source })
++    return { status: "dispatched", response }
++  } catch (error) {
++    log("[prompt-async-gate] promptAsync failed", { sessionID, source, error: String(error) })
++    return { status: "failed", error }
++  } finally {
++    const current = promptAsyncReservations.get(sessionID)
++    if (current?.token === reservation.token) {
++      promptAsyncReservations.delete(sessionID)
++    }
++  }
++}
++
++export async function promptAfterSessionIdle<TInput = PromptAsyncInput>(args: {
++  client: PromptClient<TInput>
++  sessionID: string
++  input: TInput
++  source: string
++  settleMs?: number
++  postDispatchHoldMs?: number
++  checkStatus?: boolean
++}): Promise<PromptAsyncGateResult> {
++  const {
++    client,
++    sessionID,
++    input,
++    source,
++    settleMs = DEFAULT_SESSION_IDLE_SETTLE_MS,
++  } = args
++  const postDispatchHoldMs = args.postDispatchHoldMs ?? (
++    settleMs > 0 ? DEFAULT_PROMPT_ASYNC_POST_DISPATCH_HOLD_MS : 0
++  )
++
++  if (typeof client.session?.prompt !== "function") {
++    log("[prompt-async-gate] prompt unavailable", { sessionID, source })
++    return { status: "unavailable" }
++  }
++
++  const existing = promptAsyncReservations.get(sessionID)
++  if (existing) {
++    log("[prompt-async-gate] prompt skipped because session is reserved", {
++      sessionID,
++      source,
++      reservedBy: existing.source,
++      reservedAgeMs: Date.now() - existing.reservedAt,
++    })
++    return { status: "reserved", reservedBy: existing.source }
++  }
++
++  const reservation: PromptAsyncReservation = {
++    source,
++    reservedAt: Date.now(),
++    token: Symbol(source),
++  }
++  promptAsyncReservations.set(sessionID, reservation)
++
++  try {
++    const canReadStatus = args.checkStatus !== false && typeof client.session?.status === "function"
++    if (settleMs > 0) {
++      await settleAfterSessionIdle(settleMs)
++    }
++
++    if (canReadStatus && await isSessionActive(client, sessionID)) {
++      log("[prompt-async-gate] prompt skipped because session is active", { sessionID, source })
++      return { status: "active" }
++    }
++
++    log("[prompt-async-gate] prompt dispatching", { sessionID, source })
++    const response = await client.session.prompt(input)
++    if (canReadStatus) {
++      await settleAfterSessionIdle(postDispatchHoldMs)
++    }
++    log("[prompt-async-gate] prompt dispatched", { sessionID, source })
++    return { status: "dispatched", response }
++  } catch (error) {
++    log("[prompt-async-gate] prompt failed", { sessionID, source, error: String(error) })
++    return { status: "failed", error }
++  } finally {
++    const current = promptAsyncReservations.get(sessionID)
++    if (current?.token === reservation.token) {
++      promptAsyncReservations.delete(sessionID)
++    }
++  }
++}
++
++export function releaseAllPromptAsyncReservationsForTesting(): void {
++  promptAsyncReservations.clear()
++}
++
++export function releasePromptAsyncReservation(sessionID: string, source: string): void {
++  const existing = promptAsyncReservations.get(sessionID)
++  if (!existing) {
++    return
++  }
++
++  promptAsyncReservations.delete(sessionID)
++  log("[prompt-async-gate] promptAsync reservation released", {
++    sessionID,
++    source,
++    reservedBy: existing.source,
++  })
++}
+diff --git a/src/shared/session-idle-settle.ts b/src/shared/session-idle-settle.ts
+new file mode 100644
+index 00000000..2fd5a2b0
+--- /dev/null
++++ b/src/shared/session-idle-settle.ts
+@@ -0,0 +1,61 @@
++export const DEFAULT_SESSION_IDLE_SETTLE_MS = 150
++
++export function settleAfterSessionIdle(ms = DEFAULT_SESSION_IDLE_SETTLE_MS): Promise<void> {
++  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve()
++}
++
++type SessionStatusClient = {
++  session?: {
++    status?: () => Promise<unknown>
++  }
++}
++
++const ACTIVE_SESSION_STATUSES = new Set(["busy", "retry", "running"])
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null
++}
++
++function getSessionStatusPayload(response: unknown): Record<string, unknown> {
++  if (isRecord(response) && isRecord(response.data)) {
++    return response.data
++  }
++
++  if (isRecord(response)) {
++    return response
++  }
++
++  return {}
++}
++
++export function isActiveSessionStatusType(statusType: string): boolean {
++  return ACTIVE_SESSION_STATUSES.has(statusType)
++}
++
++export async function isSessionActive(client: SessionStatusClient, sessionID: string): Promise<boolean> {
++  if (typeof client.session?.status !== "function") {
++    return false
++  }
++
++  try {
++    const statusResult = await client.session.status()
++    const status = getSessionStatusPayload(statusResult)[sessionID]
++    if (!isRecord(status)) {
++      return false
++    }
++
++    const statusType = status.type
++    return typeof statusType === "string" && isActiveSessionStatusType(statusType)
++  } catch {
++    return false
++  }
++}
++
++export async function shouldPromptAfterSessionIdle(
++  client: SessionStatusClient,
++  sessionID: string,
++  settleMs = DEFAULT_SESSION_IDLE_SETTLE_MS,
++): Promise<boolean> {
++  await settleAfterSessionIdle(settleMs)
++  return !(await isSessionActive(client, sessionID))
++}
+diff --git a/src/shared/session-route.ts b/src/shared/session-route.ts
+index 53901cf2..e6e5428d 100644
+--- a/src/shared/session-route.ts
++++ b/src/shared/session-route.ts
+@@ -3,6 +3,7 @@ import {
+   promptSyncWithModelSuggestionRetry,
+   promptWithModelSuggestionRetry,
+ } from "./model-suggestion-retry"
++import { promptAsyncAfterSessionIdle } from "./prompt-async-gate"
+ 
+ type OpencodeClient = PluginInput["client"]
+ 
+@@ -52,7 +53,28 @@ export function promptAsyncInDirectory(
+   args: PromptAsyncArgs,
+   directory: string,
+ ): Promise<unknown> {
+-  return client.session.promptAsync(routeSessionPrompt(args, directory))
++  const routedArgs = routeSessionPrompt(args, directory)
++  const sessionID = routedArgs.path?.id
++  if (!sessionID) {
++    return client.session.promptAsync(routedArgs)
++  }
++
++  return promptAsyncAfterSessionIdle({
++    client,
++    sessionID,
++    input: routedArgs,
++    source: "session-route",
++    settleMs: 0,
++    postDispatchHoldMs: 0,
++  }).then((result) => {
++    if (result.status === "failed") {
++      throw result.error
++    }
++    if (result.status !== "dispatched") {
++      throw new Error(`promptAsync skipped by gate: ${result.status}`)
++    }
++    return result.response
++  })
+ }
+ 
+ export function promptWithRetryInDirectory(
+-- 
+2.39.2
+

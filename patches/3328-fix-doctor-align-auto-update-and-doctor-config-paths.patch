@@ -1,0 +1,507 @@
+From e9887dd82f22b8b885e305ea827df2d93cfa63f3 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 17 Mar 2026 15:56:02 +0900
+Subject: [PATCH 3328/5749] fix(doctor): align auto-update and doctor config
+ paths
+
+---
+ src/cli/config-manager/bun-install.ts         |   2 +
+ .../hook/background-update-check.ts           |  37 ++-
+ .../hook/workspace-resolution.test.ts         | 223 ++++++++++++++++++
+ .../delegate-task/category-resolver.test.ts   |  19 +-
+ src/tools/delegate-task/category-resolver.ts  |   7 +-
+ .../delegate-task/model-selection.test.ts     |  17 +-
+ src/tools/delegate-task/model-selection.ts    |   4 +-
+ 7 files changed, 288 insertions(+), 21 deletions(-)
+ create mode 100644 src/hooks/auto-update-checker/hook/workspace-resolution.test.ts
+
+diff --git a/src/cli/config-manager/bun-install.ts b/src/cli/config-manager/bun-install.ts
+index 32b9d033..f5e03995 100644
+--- a/src/cli/config-manager/bun-install.ts
++++ b/src/cli/config-manager/bun-install.ts
+@@ -11,6 +11,8 @@ type BunInstallOutputMode = "inherit" | "pipe"
+ 
+ interface RunBunInstallOptions {
+   outputMode?: BunInstallOutputMode
++  /** Workspace directory to install to. Defaults to cache dir if not provided. */
++  workspaceDir?: string
+ }
+ 
+ interface BunInstallOutput {
+diff --git a/src/hooks/auto-update-checker/hook/background-update-check.ts b/src/hooks/auto-update-checker/hook/background-update-check.ts
+index 0875c23a..d2cc97db 100644
+--- a/src/hooks/auto-update-checker/hook/background-update-check.ts
++++ b/src/hooks/auto-update-checker/hook/background-update-check.ts
+@@ -1,6 +1,9 @@
+ import type { PluginInput } from "@opencode-ai/plugin"
++import { existsSync } from "node:fs"
++import { join } from "node:path"
+ import { runBunInstallWithDetails } from "../../../cli/config-manager"
+ import { log } from "../../../shared/logger"
++import { getOpenCodeCacheDir, getOpenCodeConfigPaths } from "../../../shared"
+ import { invalidatePackage } from "../cache"
+ import { PACKAGE_NAME } from "../constants"
+ import { extractChannel } from "../version-channel"
+@@ -11,9 +14,36 @@ function getPinnedVersionToastMessage(latestVersion: string): string {
+   return `Update available: ${latestVersion} (version pinned, update manually)`
+ }
+ 
+-async function runBunInstallSafe(): Promise<boolean> {
++/**
++ * Resolves the active install workspace.
++ * Same logic as doctor check: prefer config-dir if installed, fall back to cache-dir.
++ */
++function resolveActiveInstallWorkspace(): string {
++  const configPaths = getOpenCodeConfigPaths({ binary: "opencode" })
++  const cacheDir = getOpenCodeCacheDir()
++
++  const configInstallPath = join(configPaths.configDir, "node_modules", PACKAGE_NAME, "package.json")
++  const cacheInstallPath = join(cacheDir, "node_modules", PACKAGE_NAME, "package.json")
++
++  // Prefer config-dir if installed there, otherwise fall back to cache-dir
++  if (existsSync(configInstallPath)) {
++    log(`[auto-update-checker] Active workspace: config-dir (${configPaths.configDir})`)
++    return configPaths.configDir
++  }
++
++  if (existsSync(cacheInstallPath)) {
++    log(`[auto-update-checker] Active workspace: cache-dir (${cacheDir})`)
++    return cacheDir
++  }
++
++  // Default to config-dir if neither exists (matches doctor behavior)
++  log(`[auto-update-checker] Active workspace: config-dir (default, no install detected)`)
++  return configPaths.configDir
++}
++
++async function runBunInstallSafe(workspaceDir: string): Promise<boolean> {
+   try {
+-    const result = await runBunInstallWithDetails({ outputMode: "pipe" })
++    const result = await runBunInstallWithDetails({ outputMode: "pipe", workspaceDir })
+     if (!result.success && result.error) {
+       log("[auto-update-checker] bun install error:", result.error)
+     }
+@@ -82,7 +112,8 @@ export async function runBackgroundUpdateCheck(
+ 
+   invalidatePackage(PACKAGE_NAME)
+ 
+-  const installSuccess = await runBunInstallSafe()
++  const activeWorkspace = resolveActiveInstallWorkspace()
++  const installSuccess = await runBunInstallSafe(activeWorkspace)
+ 
+   if (installSuccess) {
+     await showAutoUpdatedToast(ctx, currentVersion, latestVersion)
+diff --git a/src/hooks/auto-update-checker/hook/workspace-resolution.test.ts b/src/hooks/auto-update-checker/hook/workspace-resolution.test.ts
+new file mode 100644
+index 00000000..79f374bd
+--- /dev/null
++++ b/src/hooks/auto-update-checker/hook/workspace-resolution.test.ts
+@@ -0,0 +1,223 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
++import { join } from "node:path"
++
++type PluginEntry = {
++  entry: string
++  isPinned: boolean
++  pinnedVersion: string | null
++  configPath: string
++}
++
++type ToastMessageGetter = (isUpdate: boolean, version?: string) => string
++
++function createPluginEntry(overrides?: Partial<PluginEntry>): PluginEntry {
++  return {
++    entry: "oh-my-opencode@3.4.0",
++    isPinned: false,
++    pinnedVersion: null,
++    configPath: "/test/opencode.json",
++    ...overrides,
++  }
++}
++
++const TEST_DIR = join(import.meta.dir, "__test-workspace-resolution__")
++const TEST_CACHE_DIR = join(TEST_DIR, "cache")
++const TEST_CONFIG_DIR = join(TEST_DIR, "config")
++
++const mockFindPluginEntry = mock((_directory: string): PluginEntry | null => createPluginEntry())
++const mockGetCachedVersion = mock((): string | null => "3.4.0")
++const mockGetLatestVersion = mock(async (): Promise<string | null> => "3.5.0")
++const mockExtractChannel = mock(() => "latest")
++const mockInvalidatePackage = mock(() => {})
++const mockShowUpdateAvailableToast = mock(
++  async (_ctx: PluginInput, _latestVersion: string, _getToastMessage: ToastMessageGetter): Promise<void> => {}
++)
++const mockShowAutoUpdatedToast = mock(
++  async (_ctx: PluginInput, _fromVersion: string, _toVersion: string): Promise<void> => {}
++)
++const mockSyncCachePackageJsonToIntent = mock(() => ({ synced: true, error: null }))
++
++const mockRunBunInstallWithDetails = mock(
++  async (opts?: { outputMode?: string; workspaceDir?: string }) => {
++    return { success: true }
++  }
++)
++
++mock.module("../checker", () => ({
++  findPluginEntry: mockFindPluginEntry,
++  getCachedVersion: mockGetCachedVersion,
++  getLatestVersion: mockGetLatestVersion,
++  revertPinnedVersion: mock(() => false),
++  syncCachePackageJsonToIntent: mockSyncCachePackageJsonToIntent,
++}))
++mock.module("../version-channel", () => ({ extractChannel: mockExtractChannel }))
++mock.module("../cache", () => ({ invalidatePackage: mockInvalidatePackage }))
++mock.module("../../../cli/config-manager", () => ({
++  runBunInstallWithDetails: mockRunBunInstallWithDetails,
++}))
++mock.module("./update-toasts", () => ({
++  showUpdateAvailableToast: mockShowUpdateAvailableToast,
++  showAutoUpdatedToast: mockShowAutoUpdatedToast,
++}))
++mock.module("../../../shared/logger", () => ({ log: () => {} }))
++mock.module("../../../shared", () => ({
++  getOpenCodeCacheDir: () => TEST_CACHE_DIR,
++  getOpenCodeConfigPaths: () => ({
++    configDir: TEST_CONFIG_DIR,
++    configJson: join(TEST_CONFIG_DIR, "opencode.json"),
++    configJsonc: join(TEST_CONFIG_DIR, "opencode.jsonc"),
++    packageJson: join(TEST_CONFIG_DIR, "package.json"),
++    omoConfig: join(TEST_CONFIG_DIR, "oh-my-opencode.json"),
++  }),
++  getOpenCodeConfigDir: () => TEST_CONFIG_DIR,
++}))
++
++// Mock constants BEFORE importing the module
++const ORIGINAL_PACKAGE_NAME = "oh-my-opencode"
++mock.module("../constants", () => ({
++  PACKAGE_NAME: ORIGINAL_PACKAGE_NAME,
++  CACHE_DIR: TEST_CACHE_DIR,
++  USER_CONFIG_DIR: TEST_CONFIG_DIR,
++}))
++
++// Need to mock getOpenCodeCacheDir and getOpenCodeConfigPaths before importing the module
++mock.module("../../../shared/data-path", () => ({
++  getDataDir: () => join(TEST_DIR, "data"),
++  getOpenCodeStorageDir: () => join(TEST_DIR, "data", "opencode", "storage"),
++  getCacheDir: () => TEST_DIR,
++  getOmoOpenCodeCacheDir: () => join(TEST_DIR, "oh-my-opencode"),
++  getOpenCodeCacheDir: () => TEST_CACHE_DIR,
++}))
++mock.module("../../../shared/opencode-config-dir", () => ({
++  getOpenCodeConfigDir: () => TEST_CONFIG_DIR,
++  getOpenCodeConfigPaths: () => ({
++    configDir: TEST_CONFIG_DIR,
++    configJson: join(TEST_CONFIG_DIR, "opencode.json"),
++    configJsonc: join(TEST_CONFIG_DIR, "opencode.jsonc"),
++    packageJson: join(TEST_CONFIG_DIR, "package.json"),
++    omoConfig: join(TEST_CONFIG_DIR, "oh-my-opencode.json"),
++  }),
++}))
++
++const modulePath = "./background-update-check?test"
++const { runBackgroundUpdateCheck } = await import(modulePath)
++
++describe("workspace resolution", () => {
++  const mockCtx = { directory: "/test" } as PluginInput
++  const getToastMessage: ToastMessageGetter = (isUpdate, version) =>
++    isUpdate ? `Update to ${version}` : "Up to date"
++
++  beforeEach(() => {
++    // Setup test directories
++    if (existsSync(TEST_DIR)) {
++      rmSync(TEST_DIR, { recursive: true, force: true })
++    }
++    mkdirSync(TEST_DIR, { recursive: true })
++
++    mockFindPluginEntry.mockReset()
++    mockGetCachedVersion.mockReset()
++    mockGetLatestVersion.mockReset()
++    mockExtractChannel.mockReset()
++    mockInvalidatePackage.mockReset()
++    mockRunBunInstallWithDetails.mockReset()
++    mockShowUpdateAvailableToast.mockReset()
++    mockShowAutoUpdatedToast.mockReset()
++
++    mockFindPluginEntry.mockReturnValue(createPluginEntry())
++    mockGetCachedVersion.mockReturnValue("3.4.0")
++    mockGetLatestVersion.mockResolvedValue("3.5.0")
++    mockExtractChannel.mockReturnValue("latest")
++    // Note: Don't use mockResolvedValue here - it overrides the function that captures args
++    mockSyncCachePackageJsonToIntent.mockReturnValue({ synced: true, error: null })
++  })
++
++  afterEach(() => {
++    if (existsSync(TEST_DIR)) {
++      rmSync(TEST_DIR, { recursive: true, force: true })
++    }
++  })
++
++  describe("#given config-dir install exists but cache-dir does not", () => {
++    it("installs to config-dir, not cache-dir", async () => {
++      //#given - config-dir has installation, cache-dir does not
++      mkdirSync(join(TEST_CONFIG_DIR, "node_modules", "oh-my-opencode"), { recursive: true })
++      writeFileSync(
++        join(TEST_CONFIG_DIR, "package.json"),
++        JSON.stringify({ dependencies: { "oh-my-opencode": "3.4.0" } }, null, 2)
++      )
++      writeFileSync(
++        join(TEST_CONFIG_DIR, "node_modules", "oh-my-opencode", "package.json"),
++        JSON.stringify({ name: "oh-my-opencode", version: "3.4.0" }, null, 2)
++      )
++
++      // cache-dir should NOT exist
++      expect(existsSync(TEST_CACHE_DIR)).toBe(false)
++
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++
++      //#then - install should be called with config-dir
++      const mockCalls = mockRunBunInstallWithDetails.mock.calls
++      expect(mockCalls[0][0]?.workspaceDir).toBe(TEST_CONFIG_DIR)
++    })
++  })
++
++  describe("#given both config-dir and cache-dir exist", () => {
++    it("prefers config-dir over cache-dir", async () => {
++      //#given - both directories have installations
++      mkdirSync(join(TEST_CONFIG_DIR, "node_modules", "oh-my-opencode"), { recursive: true })
++      writeFileSync(
++        join(TEST_CONFIG_DIR, "package.json"),
++        JSON.stringify({ dependencies: { "oh-my-opencode": "3.4.0" } }, null, 2)
++      )
++      writeFileSync(
++        join(TEST_CONFIG_DIR, "node_modules", "oh-my-opencode", "package.json"),
++        JSON.stringify({ name: "oh-my-opencode", version: "3.4.0" }, null, 2)
++      )
++
++      mkdirSync(join(TEST_CACHE_DIR, "node_modules", "oh-my-opencode"), { recursive: true })
++      writeFileSync(
++        join(TEST_CACHE_DIR, "package.json"),
++        JSON.stringify({ dependencies: { "oh-my-opencode": "3.4.0" } }, null, 2)
++      )
++      writeFileSync(
++        join(TEST_CACHE_DIR, "node_modules", "oh-my-opencode", "package.json"),
++        JSON.stringify({ name: "oh-my-opencode", version: "3.4.0" }, null, 2)
++      )
++
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++
++      //#then - install should prefer config-dir
++      const mockCalls2 = mockRunBunInstallWithDetails.mock.calls
++      expect(mockCalls2[0][0]?.workspaceDir).toBe(TEST_CONFIG_DIR)
++    })
++  })
++
++  describe("#given only cache-dir install exists", () => {
++    it("falls back to cache-dir", async () => {
++      //#given - only cache-dir has installation
++      mkdirSync(join(TEST_CACHE_DIR, "node_modules", "oh-my-opencode"), { recursive: true })
++      writeFileSync(
++        join(TEST_CACHE_DIR, "package.json"),
++        JSON.stringify({ dependencies: { "oh-my-opencode": "3.4.0" } }, null, 2)
++      )
++      writeFileSync(
++        join(TEST_CACHE_DIR, "node_modules", "oh-my-opencode", "package.json"),
++        JSON.stringify({ name: "oh-my-opencode", version: "3.4.0" }, null, 2)
++      )
++
++      // config-dir should NOT exist
++      expect(existsSync(TEST_CONFIG_DIR)).toBe(false)
++
++      //#when
++      await runBackgroundUpdateCheck(mockCtx, true, getToastMessage)
++
++      //#then - install should fall back to cache-dir
++      const mockCalls3 = mockRunBunInstallWithDetails.mock.calls
++      expect(mockCalls3[0][0]?.workspaceDir).toBe(TEST_CACHE_DIR)
++    })
++  })
++})
+diff --git a/src/tools/delegate-task/category-resolver.test.ts b/src/tools/delegate-task/category-resolver.test.ts
+index 2257978f..3c912473 100644
+--- a/src/tools/delegate-task/category-resolver.test.ts
++++ b/src/tools/delegate-task/category-resolver.test.ts
+@@ -7,16 +7,22 @@ import * as connectedProvidersCache from "../../shared/connected-providers-cache
+ describe("resolveCategoryExecution", () => {
+ 	let connectedProvidersSpy: ReturnType<typeof spyOn> | undefined
+ 	let providerModelsSpy: ReturnType<typeof spyOn> | undefined
++	let hasConnectedProvidersSpy: ReturnType<typeof spyOn> | undefined
++	let hasProviderModelsSpy: ReturnType<typeof spyOn> | undefined
+ 
+ 	beforeEach(() => {
+ 		mock.restore()
+ 		connectedProvidersSpy = spyOn(connectedProvidersCache, "readConnectedProvidersCache").mockReturnValue(null)
+ 		providerModelsSpy = spyOn(connectedProvidersCache, "readProviderModelsCache").mockReturnValue(null)
++		hasConnectedProvidersSpy = spyOn(connectedProvidersCache, "hasConnectedProvidersCache").mockReturnValue(false)
++		hasProviderModelsSpy = spyOn(connectedProvidersCache, "hasProviderModelsCache").mockReturnValue(false)
+ 	})
+ 
+ 	afterEach(() => {
+ 		connectedProvidersSpy?.mockRestore()
+ 		providerModelsSpy?.mockRestore()
++		hasConnectedProvidersSpy?.mockRestore()
++		hasProviderModelsSpy?.mockRestore()
+ 	})
+ 
+ 	const createMockExecutorContext = (): ExecutorContext => ({
+@@ -27,7 +33,7 @@ describe("resolveCategoryExecution", () => {
+ 		sisyphusJuniorModel: undefined,
+ 	})
+ 
+-	test("returns clear error when category exists but required model is not available", async () => {
++	test("returns unpinned resolution when category cache is not ready on first run", async () => {
+ 		//#given
+ 		const args = {
+ 			category: "deep",
+@@ -39,6 +45,9 @@ describe("resolveCategoryExecution", () => {
+ 			enableSkillTools: false,
+ 		}
+ 		const executorCtx = createMockExecutorContext()
++		executorCtx.userCategories = {
++			deep: {},
++		}
+ 		const inheritedModel = undefined
+ 		const systemDefaultModel = "anthropic/claude-sonnet-4-6"
+ 
+@@ -46,10 +55,10 @@ describe("resolveCategoryExecution", () => {
+ 		const result = await resolveCategoryExecution(args, executorCtx, inheritedModel, systemDefaultModel)
+ 
+ 		//#then
+-		expect(result.error).toBeDefined()
+-		expect(result.error).toContain("deep")
+-		expect(result.error).toMatch(/model.*not.*available|requires.*model/i)
+-		expect(result.error).not.toContain("Unknown category")
++		expect(result.error).toBeUndefined()
++		expect(result.actualModel).toBeUndefined()
++		expect(result.categoryModel).toBeUndefined()
++		expect(result.agentToUse).toBeDefined()
+ 	})
+ 
+ 	test("returns 'unknown category' error for truly unknown categories", async () => {
+diff --git a/src/tools/delegate-task/category-resolver.ts b/src/tools/delegate-task/category-resolver.ts
+index 362a3fac..b6c31164 100644
+--- a/src/tools/delegate-task/category-resolver.ts
++++ b/src/tools/delegate-task/category-resolver.ts
+@@ -85,6 +85,7 @@ Available categories: ${allCategoryNames}`,
+   let actualModel: string | undefined
+   let modelInfo: ModelFallbackInfo | undefined
+   let categoryModel: { providerID: string; modelID: string; variant?: string } | undefined
++  let isModelResolutionSkipped = false
+ 
+   const overrideModel = sisyphusJuniorModel
+   const explicitCategoryModel = userCategories?.[args.category!]?.model
+@@ -109,7 +110,9 @@ Available categories: ${allCategoryNames}`,
+       systemDefaultModel,
+     })
+ 
+-    if (resolution) {
++    if (resolution && "skipped" in resolution) {
++      isModelResolutionSkipped = true
++    } else if (resolution) {
+       const { model: resolvedModel, variant: resolvedVariant } = resolution
+       actualModel = resolvedModel
+ 
+@@ -156,7 +159,7 @@ Available categories: ${allCategoryNames}`,
+   }
+   const categoryPromptAppend = resolved.promptAppend || undefined
+ 
+-  if (!categoryModel && !actualModel) {
++  if (!categoryModel && !actualModel && !isModelResolutionSkipped) {
+     const categoryNames = Object.keys(enabledCategories)
+     return {
+       agentToUse: "",
+diff --git a/src/tools/delegate-task/model-selection.test.ts b/src/tools/delegate-task/model-selection.test.ts
+index 18d0d5f8..2f9b9c19 100644
+--- a/src/tools/delegate-task/model-selection.test.ts
++++ b/src/tools/delegate-task/model-selection.test.ts
+@@ -1,4 +1,5 @@
+-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
++declare const require: (name: string) => any
++const { afterEach, beforeEach, describe, expect, mock, spyOn, test } = require("bun:test")
+ import { resolveModelForDelegateTask } from "./model-selection"
+ import * as connectedProvidersCache from "../../shared/connected-providers-cache"
+ 
+@@ -22,7 +23,7 @@ describe("resolveModelForDelegateTask", () => {
+ 		})
+ 
+ 		describe("#when availableModels is empty and no user model override", () => {
+-			test("#then returns undefined to let OpenCode use system default", () => {
++			test("#then returns skipped sentinel to leave model unpinned", () => {
+ 				const result = resolveModelForDelegateTask({
+ 					categoryDefaultModel: "anthropic/claude-sonnet-4-6",
+ 					fallbackChain: [
+@@ -32,7 +33,7 @@ describe("resolveModelForDelegateTask", () => {
+ 					systemDefaultModel: "anthropic/claude-sonnet-4-6",
+ 				})
+ 
+-				expect(result).toBeUndefined()
++				expect(result).toEqual({ skipped: true })
+ 			})
+ 		})
+ 
+@@ -53,7 +54,7 @@ describe("resolveModelForDelegateTask", () => {
+ 		})
+ 
+ 		describe("#when user set fallback_models but no cache exists", () => {
+-			test("#then returns undefined (skip fallback resolution without cache)", () => {
++			test("#then returns skipped sentinel (skip fallback resolution without cache)", () => {
+ 				const result = resolveModelForDelegateTask({
+ 					userFallbackModels: ["openai/gpt-5.4", "google/gemini-3.1-pro"],
+ 					categoryDefaultModel: "anthropic/claude-sonnet-4-6",
+@@ -63,7 +64,7 @@ describe("resolveModelForDelegateTask", () => {
+ 					availableModels: new Set(),
+ 				})
+ 
+-				expect(result).toBeUndefined()
++				expect(result).toEqual({ skipped: true })
+ 			})
+ 		})
+ 	})
+@@ -85,8 +86,7 @@ describe("resolveModelForDelegateTask", () => {
+ 					systemDefaultModel: "anthropic/claude-sonnet-4-6",
+ 				})
+ 
+-				expect(result).toBeDefined()
+-				expect(result!.model).toBe("anthropic/claude-sonnet-4-6")
++				expect(result).toEqual({ model: "anthropic/claude-sonnet-4-6" })
+ 			})
+ 		})
+ 
+@@ -100,8 +100,7 @@ describe("resolveModelForDelegateTask", () => {
+ 					availableModels: new Set(["anthropic/claude-sonnet-4-6"]),
+ 				})
+ 
+-				expect(result).toBeDefined()
+-				expect(result!.model).toBe("anthropic/claude-sonnet-4-6")
++				expect(result).toEqual({ model: "anthropic/claude-sonnet-4-6" })
+ 			})
+ 		})
+ 
+diff --git a/src/tools/delegate-task/model-selection.ts b/src/tools/delegate-task/model-selection.ts
+index 6beb2419..14b069ad 100644
+--- a/src/tools/delegate-task/model-selection.ts
++++ b/src/tools/delegate-task/model-selection.ts
+@@ -51,7 +51,7 @@ export function resolveModelForDelegateTask(input: {
+   fallbackChain?: FallbackEntry[]
+   availableModels: Set<string>
+   systemDefaultModel?: string
+-}): { model: string; variant?: string } | undefined {
++}): { model: string; variant?: string } | { skipped: true } | undefined {
+   const userModel = normalizeModel(input.userModel)
+   if (userModel) {
+     return { model: userModel }
+@@ -60,7 +60,7 @@ export function resolveModelForDelegateTask(input: {
+   // Before provider cache is created (first run), skip model resolution entirely.
+   // OpenCode will use its system default model when no model is specified in the prompt.
+   if (input.availableModels.size === 0 && !hasProviderModelsCache() && !hasConnectedProvidersCache()) {
+-    return undefined
++    return { skipped: true }
+   }
+ 
+   const categoryDefault = normalizeModel(input.categoryDefaultModel)
+-- 
+2.39.2
+

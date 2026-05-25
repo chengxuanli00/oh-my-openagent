@@ -1,0 +1,176 @@
+From 2c7ded24333ede90097f1ab2910c4bafb82ca5b5 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 17 Mar 2026 15:17:34 +0900
+Subject: [PATCH 3324/5749] fix(background-agent): defer task cleanup while
+ siblings running
+
+---
+ src/features/background-agent/constants.ts    |  1 +
+ src/features/background-agent/manager.ts      | 35 +++++++++++++------
+ .../task-completion-cleanup.test.ts           | 30 ++++++++++++----
+ src/features/background-agent/task-poller.ts  |  3 +-
+ 4 files changed, 50 insertions(+), 19 deletions(-)
+
+diff --git a/src/features/background-agent/constants.ts b/src/features/background-agent/constants.ts
+index bfd4b7ee..0fbde296 100644
+--- a/src/features/background-agent/constants.ts
++++ b/src/features/background-agent/constants.ts
+@@ -2,6 +2,7 @@ import type { PluginInput } from "@opencode-ai/plugin"
+ import type { BackgroundTask, LaunchInput } from "./types"
+ 
+ export const TASK_TTL_MS = 30 * 60 * 1000
++export const TERMINAL_TASK_TTL_MS = 30 * 60 * 1000
+ export const MIN_STABILITY_TIME_MS = 10 * 1000
+ export const DEFAULT_STALE_TIMEOUT_MS = 180_000
+ export const DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS = 1_800_000
+diff --git a/src/features/background-agent/manager.ts b/src/features/background-agent/manager.ts
+index 0947b2d1..469f096d 100644
+--- a/src/features/background-agent/manager.ts
++++ b/src/features/background-agent/manager.ts
+@@ -27,6 +27,7 @@ import {
+ import {
+   POLLING_INTERVAL_MS,
+   TASK_CLEANUP_DELAY_MS,
++  TASK_TTL_MS,
+ } from "./constants"
+ 
+ import { subagentSessions } from "../claude-code-session-state"
+@@ -100,6 +101,8 @@ export interface SubagentSessionCreatedEvent {
+ 
+ export type OnSubagentSessionCreated = (event: SubagentSessionCreatedEvent) => Promise<void>
+ 
++const MAX_TASK_REMOVAL_RESCHEDULES = 6
++
+ export class BackgroundManager {
+ 
+ 
+@@ -1188,7 +1191,7 @@ export class BackgroundManager {
+     this.completedTaskSummaries.delete(parentSessionID)
+   }
+ 
+-  private scheduleTaskRemoval(taskId: string): void {
++  private scheduleTaskRemoval(taskId: string, rescheduleCount = 0): void {
+     const existingTimer = this.completionTimers.get(taskId)
+     if (existingTimer) {
+       clearTimeout(existingTimer)
+@@ -1198,17 +1201,29 @@ export class BackgroundManager {
+     const timer = setTimeout(() => {
+       this.completionTimers.delete(taskId)
+       const task = this.tasks.get(taskId)
+-      if (task) {
+-        this.clearNotificationsForTask(taskId)
+-        this.tasks.delete(taskId)
+-        this.clearTaskHistoryWhenParentTasksGone(task.parentSessionID)
+-        if (task.sessionID) {
+-          subagentSessions.delete(task.sessionID)
+-          SessionCategoryRegistry.remove(task.sessionID)
++      if (!task) return
++
++      if (task.parentSessionID) {
++        const siblings = this.getTasksByParentSession(task.parentSessionID)
++        const runningOrPendingSiblings = siblings.filter(
++          sibling => sibling.id !== taskId && (sibling.status === "running" || sibling.status === "pending"),
++        )
++        const completedAtTimestamp = task.completedAt?.getTime()
++        const reachedTaskTtl = completedAtTimestamp !== undefined && (Date.now() - completedAtTimestamp) >= TASK_TTL_MS
++        if (runningOrPendingSiblings.length > 0 && rescheduleCount < MAX_TASK_REMOVAL_RESCHEDULES && !reachedTaskTtl) {
++          this.scheduleTaskRemoval(taskId, rescheduleCount + 1)
++          return
+         }
+-        log("[background-agent] Removed completed task from memory:", taskId)
+-        this.clearTaskHistoryWhenParentTasksGone(task?.parentSessionID)
+       }
++
++      this.clearNotificationsForTask(taskId)
++      this.tasks.delete(taskId)
++      this.clearTaskHistoryWhenParentTasksGone(task.parentSessionID)
++      if (task.sessionID) {
++        subagentSessions.delete(task.sessionID)
++        SessionCategoryRegistry.remove(task.sessionID)
++      }
++      log("[background-agent] Removed completed task from memory:", taskId)
+     }, TASK_CLEANUP_DELAY_MS)
+ 
+     this.completionTimers.set(taskId, timer)
+diff --git a/src/features/background-agent/task-completion-cleanup.test.ts b/src/features/background-agent/task-completion-cleanup.test.ts
+index 77c42d6f..419faf29 100644
+--- a/src/features/background-agent/task-completion-cleanup.test.ts
++++ b/src/features/background-agent/task-completion-cleanup.test.ts
+@@ -1,6 +1,5 @@
+-declare const require: (name: string) => any
+-const { describe, test, expect, afterEach } = require("bun:test")
+ import { tmpdir } from "node:os"
++import { afterEach, describe, expect, test } from "bun:test"
+ import type { PluginInput } from "@opencode-ai/plugin"
+ import { TASK_CLEANUP_DELAY_MS } from "./constants"
+ import { BackgroundManager } from "./manager"
+@@ -157,17 +156,19 @@ function getRequiredTimer(manager: BackgroundManager, taskID: string): ReturnTyp
+ }
+ 
+ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+-  describe("#given 2 tasks for same parent and task A completed", () => {
+-    test("#when task B is still running #then task A is cleaned up from this.tasks after delay even though task B is not done", async () => {
++  describe("#given 3 tasks for same parent and task A completed first", () => {
++    test("#when siblings are still running or pending #then task A remains until siblings also complete", async () => {
+       // given
+       const { manager } = createManager(false)
+       managerUnderTest = manager
+       fakeTimers = installFakeTimers()
+-      const taskA = createTask({ id: "task-a", parentSessionID: "parent-1", description: "task A", status: "completed", completedAt: new Date("2026-03-11T00:01:00.000Z") })
++      const taskA = createTask({ id: "task-a", parentSessionID: "parent-1", description: "task A", status: "completed", completedAt: new Date() })
+       const taskB = createTask({ id: "task-b", parentSessionID: "parent-1", description: "task B", status: "running" })
++      const taskC = createTask({ id: "task-c", parentSessionID: "parent-1", description: "task C", status: "pending" })
+       getTasks(manager).set(taskA.id, taskA)
+       getTasks(manager).set(taskB.id, taskB)
+-      getPendingByParent(manager).set(taskA.parentSessionID, new Set([taskA.id, taskB.id]))
++      getTasks(manager).set(taskC.id, taskC)
++      getPendingByParent(manager).set(taskA.parentSessionID, new Set([taskA.id, taskB.id, taskC.id]))
+ 
+       // when
+       await notifyParentSessionForTest(manager, taskA)
+@@ -177,8 +178,23 @@ describe("BackgroundManager.notifyParentSession cleanup scheduling", () => {
+ 
+       // then
+       expect(fakeTimers.getDelay(taskATimer)).toBeUndefined()
+-      expect(getTasks(manager).has(taskA.id)).toBe(false)
++      expect(getTasks(manager).has(taskA.id)).toBe(true)
+       expect(getTasks(manager).get(taskB.id)).toBe(taskB)
++      expect(getTasks(manager).get(taskC.id)).toBe(taskC)
++
++      // when
++      taskB.status = "completed"
++      taskB.completedAt = new Date()
++      taskC.status = "completed"
++      taskC.completedAt = new Date()
++      await notifyParentSessionForTest(manager, taskB)
++      await notifyParentSessionForTest(manager, taskC)
++      const rescheduledTaskATimer = getRequiredTimer(manager, taskA.id)
++      expect(fakeTimers.getDelay(rescheduledTaskATimer)).toBe(TASK_CLEANUP_DELAY_MS)
++      fakeTimers.run(rescheduledTaskATimer)
++
++      // then
++      expect(getTasks(manager).has(taskA.id)).toBe(false)
+     })
+   })
+ 
+diff --git a/src/features/background-agent/task-poller.ts b/src/features/background-agent/task-poller.ts
+index a62d3b44..9b17e626 100644
+--- a/src/features/background-agent/task-poller.ts
++++ b/src/features/background-agent/task-poller.ts
+@@ -9,12 +9,11 @@ import {
+   DEFAULT_MESSAGE_STALENESS_TIMEOUT_MS,
+   DEFAULT_STALE_TIMEOUT_MS,
+   MIN_RUNTIME_BEFORE_STALE_MS,
++  TERMINAL_TASK_TTL_MS,
+   TASK_TTL_MS,
+ } from "./constants"
+ import { removeTaskToastTracking } from "./remove-task-toast-tracking"
+ 
+-const TERMINAL_TASK_TTL_MS = 30 * 60 * 1000
+-
+ const TERMINAL_TASK_STATUSES = new Set<BackgroundTask["status"]>([
+   "completed",
+   "error",
+-- 
+2.39.2
+

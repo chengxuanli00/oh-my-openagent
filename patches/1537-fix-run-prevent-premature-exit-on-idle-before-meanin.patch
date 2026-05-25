@@ -1,0 +1,238 @@
+From 5f0b6d49f5a048c1f59d46b4ce24864b58b8d5e1 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Fri, 30 Jan 2026 09:10:24 +0900
+Subject: [PATCH 1537/5749] fix(run): prevent premature exit on idle before
+ meaningful work (#1263)
+
+The run command's completion check had a race condition: when a session
+transitions busy->idle before the LLM generates any output (empty
+response or API delay), checkCompletionConditions() returns true because
+0 incomplete todos + 0 busy children = complete. This caused the runner
+to exit with 'All tasks completed' before any work was done.
+
+Fix:
+- Add hasReceivedMeaningfulWork flag to EventState
+- Set flag on: assistant text content, tool execution, or message update
+  with actual content (all scoped to main session only)
+- Guard completion check in runner poll loop: skip if no meaningful work
+  has been observed yet
+
+This ensures the runner waits until the session has produced at least one
+observable output before considering completion conditions.
+
+Adds 6 new test cases covering the race condition scenarios.
+---
+ src/cli/run/events.test.ts | 117 +++++++++++++++++++++++++++++++++++++
+ src/cli/run/events.ts      |   6 ++
+ src/cli/run/runner.ts      |   8 +++
+ 3 files changed, 131 insertions(+)
+
+diff --git a/src/cli/run/events.test.ts b/src/cli/run/events.test.ts
+index 1ba48ca5..ecd82435 100644
+--- a/src/cli/run/events.test.ts
++++ b/src/cli/run/events.test.ts
+@@ -82,6 +82,7 @@ describe("createEventState", () => {
+     expect(state.lastOutput).toBe("")
+     expect(state.lastPartText).toBe("")
+     expect(state.currentTool).toBe(null)
++    expect(state.hasReceivedMeaningfulWork).toBe(false)
+   })
+ })
+ 
+@@ -126,6 +127,121 @@ describe("event handling", () => {
+     expect(state.mainSessionIdle).toBe(false)
+   })
+ 
++  it("hasReceivedMeaningfulWork is false initially after session.idle", async () => {
++    // #given - session goes idle without any assistant output (race condition scenario)
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "session.idle",
++      properties: { sessionID: "my-session" },
++    }
++
++    const events = toAsyncIterable([payload])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then - idle but no meaningful work yet
++    expect(state.mainSessionIdle).toBe(true)
++    expect(state.hasReceivedMeaningfulWork).toBe(false)
++  })
++
++  it("message.updated with assistant content sets hasReceivedMeaningfulWork", async () => {
++    // #given
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "message.updated",
++      properties: {
++        info: { sessionID: "my-session", role: "assistant" },
++        content: "Hello, I will fix this bug.",
++      },
++    }
++
++    const events = toAsyncIterable([payload])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++  })
++
++  it("message.updated with empty assistant content does not set hasReceivedMeaningfulWork", async () => {
++    // #given - empty assistant message (race condition: message created but no content yet)
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "message.updated",
++      properties: {
++        info: { sessionID: "my-session", role: "assistant" },
++        content: "",
++      },
++    }
++
++    const events = toAsyncIterable([payload])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then - empty content should not count as meaningful work
++    expect(state.hasReceivedMeaningfulWork).toBe(false)
++  })
++
++  it("tool.execute sets hasReceivedMeaningfulWork", async () => {
++    // #given
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "tool.execute",
++      properties: {
++        sessionID: "my-session",
++        name: "read_file",
++        input: { filePath: "/src/index.ts" },
++      },
++    }
++
++    const events = toAsyncIterable([payload])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then
++    expect(state.hasReceivedMeaningfulWork).toBe(true)
++  })
++
++  it("tool.execute from different session does not set hasReceivedMeaningfulWork", async () => {
++    // #given
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "tool.execute",
++      properties: {
++        sessionID: "other-session",
++        name: "read_file",
++        input: { filePath: "/src/index.ts" },
++      },
++    }
++
++    const events = toAsyncIterable([payload])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then - different session's tool call shouldn't count
++    expect(state.hasReceivedMeaningfulWork).toBe(false)
++  })
++
+   it("session.status with busy type sets mainSessionIdle to false", async () => {
+     // #given
+     const ctx = createMockContext("my-session")
+@@ -136,6 +252,7 @@ describe("event handling", () => {
+       lastOutput: "",
+       lastPartText: "",
+       currentTool: null,
++      hasReceivedMeaningfulWork: false,
+     }
+ 
+     const payload: EventPayload = {
+diff --git a/src/cli/run/events.ts b/src/cli/run/events.ts
+index fb7cfe0d..e8d34260 100644
+--- a/src/cli/run/events.ts
++++ b/src/cli/run/events.ts
+@@ -63,6 +63,8 @@ export interface EventState {
+   lastOutput: string
+   lastPartText: string
+   currentTool: string | null
++  /** Set to true when the main session has produced meaningful work (text, tool call, or tool result) */
++  hasReceivedMeaningfulWork: boolean
+ }
+ 
+ export function createEventState(): EventState {
+@@ -73,6 +75,7 @@ export function createEventState(): EventState {
+     lastOutput: "",
+     lastPartText: "",
+     currentTool: null,
++    hasReceivedMeaningfulWork: false,
+   }
+ }
+ 
+@@ -241,6 +244,7 @@ function handleMessagePartUpdated(
+     const newText = part.text.slice(state.lastPartText.length)
+     if (newText) {
+       process.stdout.write(newText)
++      state.hasReceivedMeaningfulWork = true
+     }
+     state.lastPartText = part.text
+   }
+@@ -267,6 +271,7 @@ function handleMessageUpdated(
+     }
+   }
+   state.lastOutput = content
++  state.hasReceivedMeaningfulWork = true
+ }
+ 
+ function handleToolExecute(
+@@ -296,6 +301,7 @@ function handleToolExecute(
+     }
+   }
+ 
++  state.hasReceivedMeaningfulWork = true
+   process.stdout.write(`\n${pc.cyan(">")} ${pc.bold(toolName)}${inputPreview}\n`)
+ }
+ 
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+index 91666660..11fe026e 100644
+--- a/src/cli/run/runner.ts
++++ b/src/cli/run/runner.ts
+@@ -143,6 +143,14 @@ export async function run(options: RunOptions): Promise<number> {
+           process.exit(1)
+         }
+ 
++        // Guard against premature completion: don't check completion until the
++        // session has produced meaningful work (text output, tool call, or tool result).
++        // Without this, a session that goes busy->idle before the LLM responds
++        // would exit immediately because 0 todos + 0 children = "complete".
++        if (!eventState.hasReceivedMeaningfulWork) {
++          continue
++        }
++
+         const shouldExit = await checkCompletionConditions(ctx)
+         if (shouldExit) {
+           console.log(pc.green("\n\nAll tasks completed."))
+-- 
+2.39.2
+

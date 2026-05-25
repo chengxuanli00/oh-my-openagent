@@ -1,0 +1,694 @@
+From 5c83fee61907f974f24d155e75981e88f1c89e83 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 21 Feb 2026 02:27:57 +0900
+Subject: [PATCH 2569/5749] feat(ralph-loop): add strategy option for fresh
+ context per iteration
+
+Closes #1901
+
+Add 'default_strategy' config option (default: 'continue') to control whether ralph-loop creates a new session per iteration ('reset') or keeps the same session ('continue'). The 'reset' strategy keeps the model in the smart zone by starting with fresh context for each iteration.
+
+Supports --strategy flag for per-command override.
+---
+ assets/oh-my-opencode.schema.json             | 11 ++-
+ src/config/schema/ralph-loop.ts               |  1 +
+ src/features/builtin-commands/commands.ts     |  4 +-
+ .../builtin-commands/templates/ralph-loop.ts  |  2 +-
+ src/hooks/ralph-loop/command-arguments.ts     | 27 ++++++
+ .../continuation-prompt-injector.ts           | 11 ++-
+ src/hooks/ralph-loop/index.test.ts            | 92 +++++++++++++++++++
+ .../ralph-loop/iteration-continuation.ts      | 63 +++++++++++++
+ src/hooks/ralph-loop/loop-state-controller.ts | 16 ++++
+ .../ralph-loop/ralph-loop-event-handler.ts    | 16 ++--
+ src/hooks/ralph-loop/ralph-loop-hook.ts       |  7 +-
+ .../ralph-loop/session-reset-strategy.ts      | 65 +++++++++++++
+ src/hooks/ralph-loop/storage.ts               |  4 +-
+ src/hooks/ralph-loop/types.ts                 |  1 +
+ src/plugin/chat-message.ts                    | 21 ++---
+ src/plugin/tool-execute-before.ts             | 33 +++----
+ 16 files changed, 324 insertions(+), 50 deletions(-)
+ create mode 100644 src/hooks/ralph-loop/command-arguments.ts
+ create mode 100644 src/hooks/ralph-loop/iteration-continuation.ts
+ create mode 100644 src/hooks/ralph-loop/session-reset-strategy.ts
+
+diff --git a/assets/oh-my-opencode.schema.json b/assets/oh-my-opencode.schema.json
+index edbfd36a..6371229a 100644
+--- a/assets/oh-my-opencode.schema.json
++++ b/assets/oh-my-opencode.schema.json
+@@ -3343,11 +3343,20 @@
+         },
+         "state_dir": {
+           "type": "string"
++        },
++        "default_strategy": {
++          "default": "continue",
++          "type": "string",
++          "enum": [
++            "reset",
++            "continue"
++          ]
+         }
+       },
+       "required": [
+         "enabled",
+-        "default_max_iterations"
++        "default_max_iterations",
++        "default_strategy"
+       ],
+       "additionalProperties": false
+     },
+diff --git a/src/config/schema/ralph-loop.ts b/src/config/schema/ralph-loop.ts
+index 1dbcde4f..23770f05 100644
+--- a/src/config/schema/ralph-loop.ts
++++ b/src/config/schema/ralph-loop.ts
+@@ -7,6 +7,7 @@ export const RalphLoopConfigSchema = z.object({
+   default_max_iterations: z.number().min(1).max(1000).default(100),
+   /** Custom state file directory relative to project root (default: .opencode/) */
+   state_dir: z.string().optional(),
++  default_strategy: z.enum(["reset", "continue"]).default("continue"),
+ })
+ 
+ export type RalphLoopConfig = z.infer<typeof RalphLoopConfigSchema>
+diff --git a/src/features/builtin-commands/commands.ts b/src/features/builtin-commands/commands.ts
+index aee5dc28..092c07d4 100644
+--- a/src/features/builtin-commands/commands.ts
++++ b/src/features/builtin-commands/commands.ts
+@@ -28,7 +28,7 @@ ${RALPH_LOOP_TEMPLATE}
+ <user-task>
+ $ARGUMENTS
+ </user-task>`,
+-     argumentHint: '"task description" [--completion-promise=TEXT] [--max-iterations=N]',
++     argumentHint: '"task description" [--completion-promise=TEXT] [--max-iterations=N] [--strategy=reset|continue]',
+    },
+    "ulw-loop": {
+      description: "(builtin) Start ultrawork loop - continues until completion with ultrawork mode",
+@@ -39,7 +39,7 @@ ${RALPH_LOOP_TEMPLATE}
+ <user-task>
+ $ARGUMENTS
+ </user-task>`,
+-     argumentHint: '"task description" [--completion-promise=TEXT] [--max-iterations=N]',
++     argumentHint: '"task description" [--completion-promise=TEXT] [--max-iterations=N] [--strategy=reset|continue]',
+    },
+   "cancel-ralph": {
+     description: "(builtin) Cancel active Ralph Loop",
+diff --git a/src/features/builtin-commands/templates/ralph-loop.ts b/src/features/builtin-commands/templates/ralph-loop.ts
+index de4b8ca0..9798e0f6 100644
+--- a/src/features/builtin-commands/templates/ralph-loop.ts
++++ b/src/features/builtin-commands/templates/ralph-loop.ts
+@@ -24,7 +24,7 @@ export const RALPH_LOOP_TEMPLATE = `You are starting a Ralph Loop - a self-refer
+ ## Your Task
+ 
+ Parse the arguments below and begin working on the task. The format is:
+-\`"task description" [--completion-promise=TEXT] [--max-iterations=N]\`
++\`"task description" [--completion-promise=TEXT] [--max-iterations=N] [--strategy=reset|continue]\`
+ 
+ Default completion promise is "DONE" and default max iterations is 100.`
+ 
+diff --git a/src/hooks/ralph-loop/command-arguments.ts b/src/hooks/ralph-loop/command-arguments.ts
+new file mode 100644
+index 00000000..cd84115f
+--- /dev/null
++++ b/src/hooks/ralph-loop/command-arguments.ts
+@@ -0,0 +1,27 @@
++export type RalphLoopStrategy = "reset" | "continue"
++
++export type ParsedRalphLoopArguments = {
++  prompt: string
++  maxIterations?: number
++  completionPromise?: string
++  strategy?: RalphLoopStrategy
++}
++
++const DEFAULT_PROMPT = "Complete the task as instructed"
++
++export function parseRalphLoopArguments(rawArguments: string): ParsedRalphLoopArguments {
++  const taskMatch = rawArguments.match(/^["'](.+?)["']/)
++  const prompt = taskMatch?.[1] || rawArguments.split(/\s+--/)[0]?.trim() || DEFAULT_PROMPT
++
++  const maxIterationMatch = rawArguments.match(/--max-iterations=(\d+)/i)
++  const completionPromiseMatch = rawArguments.match(/--completion-promise=["']?([^"'\s]+)["']?/i)
++  const strategyMatch = rawArguments.match(/--strategy=(reset|continue)/i)
++  const strategyValue = strategyMatch?.[1]?.toLowerCase()
++
++  return {
++    prompt,
++    maxIterations: maxIterationMatch ? Number.parseInt(maxIterationMatch[1], 10) : undefined,
++    completionPromise: completionPromiseMatch?.[1],
++    strategy: strategyValue === "reset" || strategyValue === "continue" ? strategyValue : undefined,
++  }
++}
+diff --git a/src/hooks/ralph-loop/continuation-prompt-injector.ts b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+index bfe18d83..759c75bd 100644
+--- a/src/hooks/ralph-loop/continuation-prompt-injector.ts
++++ b/src/hooks/ralph-loop/continuation-prompt-injector.ts
+@@ -19,16 +19,23 @@ type MessageInfo = {
+ 
+ export async function injectContinuationPrompt(
+ 	ctx: PluginInput,
+-	options: { sessionID: string; prompt: string; directory: string; apiTimeoutMs: number },
++	options: {
++		sessionID: string
++		prompt: string
++		directory: string
++		apiTimeoutMs: number
++		inheritFromSessionID?: string
++	},
+ ): Promise<void> {
+ 	let agent: string | undefined
+ 	let model: { providerID: string; modelID: string } | undefined
+ 	let tools: Record<string, boolean | "allow" | "deny" | "ask"> | undefined
+ 
+ 	try {
++		const sourceSessionID = options.inheritFromSessionID ?? options.sessionID
+ 		const messagesResp = await withTimeout(
+ 			ctx.client.session.messages({
+-				path: { id: options.sessionID },
++				path: { id: sourceSessionID },
+ 			}),
+ 			options.apiTimeoutMs,
+ 		)
+diff --git a/src/hooks/ralph-loop/index.test.ts b/src/hooks/ralph-loop/index.test.ts
+index 219728c4..99477322 100644
+--- a/src/hooks/ralph-loop/index.test.ts
++++ b/src/hooks/ralph-loop/index.test.ts
+@@ -6,12 +6,14 @@ import { tmpdir } from "node:os"
+ import { createRalphLoopHook } from "./index"
+ import { readState, writeState, clearState } from "./storage"
+ import type { RalphLoopState } from "./types"
++import { parseRalphLoopArguments } from "./command-arguments"
+ 
+ describe("ralph-loop", () => {
+   const TEST_DIR = join(tmpdir(), "ralph-loop-test-" + Date.now())
+   let promptCalls: Array<{ sessionID: string; text: string }>
+   let toastCalls: Array<{ title: string; message: string; variant: string }>
+   let messagesCalls: Array<{ sessionID: string }>
++  let createSessionCalls: Array<{ parentID?: string; title?: string; directory?: string }>
+   let mockSessionMessages: Array<{ info?: { role?: string }; parts?: Array<{ type: string; text?: string }> }>
+   let mockMessagesApiResponseShape: "data" | "array"
+ 
+@@ -37,6 +39,17 @@ describe("ralph-loop", () => {
+             messagesCalls.push({ sessionID: opts.path.id })
+             return mockMessagesApiResponseShape === "array" ? mockSessionMessages : { data: mockSessionMessages }
+           },
++          create: async (opts: {
++            body: { parentID?: string; title?: string }
++            query?: { directory?: string }
++          }) => {
++            createSessionCalls.push({
++              parentID: opts.body.parentID,
++              title: opts.body.title,
++              directory: opts.query?.directory,
++            })
++            return { data: { id: `new-session-${createSessionCalls.length}` } }
++          },
+         },
+         tui: {
+           showToast: async (opts: { body: { title: string; message: string; variant: string } }) => {
+@@ -57,6 +70,7 @@ describe("ralph-loop", () => {
+     promptCalls = []
+     toastCalls = []
+     messagesCalls = []
++    createSessionCalls = []
+     mockSessionMessages = []
+     mockMessagesApiResponseShape = "data"
+ 
+@@ -123,6 +137,26 @@ describe("ralph-loop", () => {
+       expect(readResult?.ultrawork).toBe(true)
+     })
+ 
++    test("should store and read strategy field", () => {
++      // given - a state object with strategy
++      const state: RalphLoopState = {
++        active: true,
++        iteration: 1,
++        max_iterations: 50,
++        completion_promise: "DONE",
++        started_at: "2025-12-30T01:00:00Z",
++        prompt: "Build a REST API",
++        strategy: "reset",
++      }
++
++      // when - write and read state
++      writeState(TEST_DIR, state)
++      const readResult = readState(TEST_DIR)
++
++      // then - strategy should be preserved
++      expect(readResult?.strategy).toBe("reset")
++    })
++
+     test("should return null for non-existent state", () => {
+       // given - no state file exists
+       // when - read state
+@@ -173,6 +207,32 @@ describe("ralph-loop", () => {
+     })
+   })
+ 
++  describe("command arguments", () => {
++    test("should parse --strategy=reset flag", () => {
++      // given - ralph-loop command arguments with reset strategy
++      const rawArguments = '"Build feature X" --strategy=reset --max-iterations=12'
++
++      // when - parse command arguments
++      const parsedArguments = parseRalphLoopArguments(rawArguments)
++
++      // then - strategy should be parsed as reset
++      expect(parsedArguments.strategy).toBe("reset")
++      expect(parsedArguments.prompt).toBe("Build feature X")
++      expect(parsedArguments.maxIterations).toBe(12)
++    })
++
++    test("should parse --strategy=continue flag", () => {
++      // given - ralph-loop command arguments with continue strategy
++      const rawArguments = '"Build feature X" --strategy=continue'
++
++      // when - parse command arguments
++      const parsedArguments = parseRalphLoopArguments(rawArguments)
++
++      // then - strategy should be parsed as continue
++      expect(parsedArguments.strategy).toBe("continue")
++    })
++  })
++
+   describe("hook", () => {
+     test("should start loop and write state", () => {
+       // given - hook instance
+@@ -445,6 +505,38 @@ describe("ralph-loop", () => {
+       expect(state?.max_iterations).toBe(200)
+     })
+ 
++    test("should default strategy to continue when not specified", () => {
++      // given - hook with no strategy option
++      const hook = createRalphLoopHook(createMockPluginInput())
++
++      // when - start loop without strategy
++      hook.startLoop("session-123", "Test task")
++
++      // then - strategy should default to continue
++      const state = hook.getState()
++      expect(state?.strategy).toBe("continue")
++    })
++
++    test("should create new session for reset strategy", async () => {
++      // given - hook with reset strategy
++      const hook = createRalphLoopHook(createMockPluginInput())
++      hook.startLoop("session-123", "Build a feature", { strategy: "reset" })
++
++      // when - session goes idle
++      await hook.event({
++        event: {
++          type: "session.idle",
++          properties: { sessionID: "session-123" },
++        },
++      })
++
++      // then - new session should be created and continuation injected there
++      expect(createSessionCalls.length).toBe(1)
++      expect(promptCalls.length).toBe(1)
++      expect(promptCalls[0].sessionID).toBe("new-session-1")
++      expect(hook.getState()?.session_id).toBe("new-session-1")
++    })
++
+     test("should not inject when no loop is active", async () => {
+       // given - no active loop
+       const hook = createRalphLoopHook(createMockPluginInput())
+diff --git a/src/hooks/ralph-loop/iteration-continuation.ts b/src/hooks/ralph-loop/iteration-continuation.ts
+new file mode 100644
+index 00000000..15fea10a
+--- /dev/null
++++ b/src/hooks/ralph-loop/iteration-continuation.ts
+@@ -0,0 +1,63 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import type { RalphLoopState } from "./types"
++import { log } from "../../shared/logger"
++import { HOOK_NAME } from "./constants"
++import { buildContinuationPrompt } from "./continuation-prompt-builder"
++import { injectContinuationPrompt } from "./continuation-prompt-injector"
++import { createIterationSession, selectSessionInTui } from "./session-reset-strategy"
++
++type ContinuationOptions = {
++  directory: string
++  apiTimeoutMs: number
++  previousSessionID: string
++  loopState: {
++    setSessionID: (sessionID: string) => RalphLoopState | null
++  }
++}
++
++export async function continueIteration(
++  ctx: PluginInput,
++  state: RalphLoopState,
++  options: ContinuationOptions,
++): Promise<void> {
++  const strategy = state.strategy ?? "continue"
++  const continuationPrompt = buildContinuationPrompt(state)
++
++  if (strategy === "reset") {
++    const newSessionID = await createIterationSession(
++      ctx,
++      options.previousSessionID,
++      options.directory,
++    )
++    if (!newSessionID) {
++      return
++    }
++
++    const boundState = options.loopState.setSessionID(newSessionID)
++    if (!boundState) {
++      log(`[${HOOK_NAME}] Failed to bind loop state to new session`, {
++        previousSessionID: options.previousSessionID,
++        newSessionID,
++      })
++      return
++    }
++
++    await injectContinuationPrompt(ctx, {
++      sessionID: newSessionID,
++      inheritFromSessionID: options.previousSessionID,
++      prompt: continuationPrompt,
++      directory: options.directory,
++      apiTimeoutMs: options.apiTimeoutMs,
++    })
++
++    await selectSessionInTui(ctx.client, newSessionID)
++    return
++  }
++
++  await injectContinuationPrompt(ctx, {
++    sessionID: options.previousSessionID,
++    prompt: continuationPrompt,
++    directory: options.directory,
++    apiTimeoutMs: options.apiTimeoutMs,
++  })
++}
+diff --git a/src/hooks/ralph-loop/loop-state-controller.ts b/src/hooks/ralph-loop/loop-state-controller.ts
+index 402f9297..ab0ad39a 100644
+--- a/src/hooks/ralph-loop/loop-state-controller.ts
++++ b/src/hooks/ralph-loop/loop-state-controller.ts
+@@ -24,6 +24,7 @@ export function createLoopStateController(options: {
+ 				maxIterations?: number
+ 				completionPromise?: string
+ 				ultrawork?: boolean
++				strategy?: "reset" | "continue"
+ 			},
+ 		): boolean {
+ 			const state: RalphLoopState = {
+@@ -37,6 +38,7 @@ export function createLoopStateController(options: {
+ 					loopOptions?.completionPromise ??
+ 					DEFAULT_COMPLETION_PROMISE,
+ 				ultrawork: loopOptions?.ultrawork,
++				strategy: loopOptions?.strategy ?? config?.default_strategy ?? "continue",
+ 				started_at: new Date().toISOString(),
+ 				prompt,
+ 				session_id: sessionID,
+@@ -77,5 +79,19 @@ export function createLoopStateController(options: {
+ 		incrementIteration(): RalphLoopState | null {
+ 			return incrementIteration(directory, stateDir)
+ 		},
++
++		setSessionID(sessionID: string): RalphLoopState | null {
++			const state = readState(directory, stateDir)
++			if (!state) {
++				return null
++			}
++
++			state.session_id = sessionID
++			if (!writeState(directory, state, stateDir)) {
++				return null
++			}
++
++			return state
++		},
+ 	}
+ }
+diff --git a/src/hooks/ralph-loop/ralph-loop-event-handler.ts b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+index 3c3d6e3e..5e0e871d 100644
+--- a/src/hooks/ralph-loop/ralph-loop-event-handler.ts
++++ b/src/hooks/ralph-loop/ralph-loop-event-handler.ts
+@@ -6,15 +6,19 @@ import {
+ 	detectCompletionInSessionMessages,
+ 	detectCompletionInTranscript,
+ } from "./completion-promise-detector"
+-import { buildContinuationPrompt } from "./continuation-prompt-builder"
+-import { injectContinuationPrompt } from "./continuation-prompt-injector"
++import { continueIteration } from "./iteration-continuation"
+ 
+ type SessionRecovery = {
+ 	isRecovering: (sessionID: string) => boolean
+ 	markRecovering: (sessionID: string) => void
+ 	clear: (sessionID: string) => void
+ }
+-type LoopStateController = { getState: () => RalphLoopState | null; clear: () => boolean; incrementIteration: () => RalphLoopState | null }
++type LoopStateController = {
++	getState: () => RalphLoopState | null
++	clear: () => boolean
++	incrementIteration: () => RalphLoopState | null
++	setSessionID: (sessionID: string) => RalphLoopState | null
++}
+ type RalphLoopEventHandlerOptions = { directory: string; apiTimeoutMs: number; getTranscriptPath: (sessionID: string) => string | undefined; checkSessionExists?: RalphLoopOptions["checkSessionExists"]; sessionRecovery: SessionRecovery; loopState: LoopStateController }
+ 
+ export function createRalphLoopEventHandler(
+@@ -128,11 +132,11 @@ export function createRalphLoopEventHandler(
+ 				.catch(() => {})
+ 
+ 			try {
+-				await injectContinuationPrompt(ctx, {
+-					sessionID,
+-					prompt: buildContinuationPrompt(newState),
++				await continueIteration(ctx, newState, {
++					previousSessionID: sessionID,
+ 					directory: options.directory,
+ 					apiTimeoutMs: options.apiTimeoutMs,
++					loopState: options.loopState,
+ 				})
+ 			} catch (err) {
+ 				log(`[${HOOK_NAME}] Failed to inject continuation`, {
+diff --git a/src/hooks/ralph-loop/ralph-loop-hook.ts b/src/hooks/ralph-loop/ralph-loop-hook.ts
+index 5180f030..6cb9d28d 100644
+--- a/src/hooks/ralph-loop/ralph-loop-hook.ts
++++ b/src/hooks/ralph-loop/ralph-loop-hook.ts
+@@ -10,7 +10,12 @@ export interface RalphLoopHook {
+   startLoop: (
+     sessionID: string,
+     prompt: string,
+-    options?: { maxIterations?: number; completionPromise?: string; ultrawork?: boolean }
++    options?: {
++      maxIterations?: number
++      completionPromise?: string
++      ultrawork?: boolean
++      strategy?: "reset" | "continue"
++    }
+   ) => boolean
+   cancelLoop: (sessionID: string) => boolean
+   getState: () => RalphLoopState | null
+diff --git a/src/hooks/ralph-loop/session-reset-strategy.ts b/src/hooks/ralph-loop/session-reset-strategy.ts
+new file mode 100644
+index 00000000..b581100b
+--- /dev/null
++++ b/src/hooks/ralph-loop/session-reset-strategy.ts
+@@ -0,0 +1,65 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { getServerBasicAuthHeader } from "../../shared/opencode-server-auth"
++import { getServerBaseUrl, log } from "../../shared"
++
++export async function createIterationSession(
++  ctx: PluginInput,
++  parentSessionID: string,
++  directory: string,
++): Promise<string | null> {
++  const createResult = await ctx.client.session.create({
++    body: {
++      parentID: parentSessionID,
++      title: "Ralph Loop Iteration",
++    },
++    query: { directory },
++  })
++
++  if (createResult.error || !createResult.data?.id) {
++    log("[ralph-loop] Failed to create iteration session", {
++      parentSessionID,
++      error: String(createResult.error ?? "No session ID returned"),
++    })
++    return null
++  }
++
++  return createResult.data.id
++}
++
++export async function selectSessionInTui(
++  client: PluginInput["client"],
++  sessionID: string,
++): Promise<boolean> {
++  const baseUrl = getServerBaseUrl(client)
++  const authorization = getServerBasicAuthHeader()
++
++  if (!baseUrl || !authorization) {
++    return false
++  }
++
++  const response = await fetch(`${baseUrl}/tui/select-session`, {
++    method: "POST",
++    headers: {
++      "Content-Type": "application/json",
++      Authorization: authorization,
++    },
++    body: JSON.stringify({ sessionID }),
++    signal: AbortSignal.timeout(5000),
++  }).catch((error: unknown) => {
++    log("[ralph-loop] Failed to select session in TUI", {
++      sessionID,
++      error: String(error),
++    })
++    return null
++  })
++
++  if (!response?.ok) {
++    log("[ralph-loop] TUI session select request failed", {
++      sessionID,
++      status: response?.status,
++    })
++    return false
++  }
++
++  return true
++}
+diff --git a/src/hooks/ralph-loop/storage.ts b/src/hooks/ralph-loop/storage.ts
+index 0929443b..fe1e44fa 100644
+--- a/src/hooks/ralph-loop/storage.ts
++++ b/src/hooks/ralph-loop/storage.ts
+@@ -49,6 +49,7 @@ export function readState(directory: string, customPath?: string): RalphLoopStat
+       prompt: body.trim(),
+       session_id: data.session_id ? stripQuotes(data.session_id) : undefined,
+       ultrawork: data.ultrawork === true || data.ultrawork === "true" ? true : undefined,
++      strategy: data.strategy === "reset" || data.strategy === "continue" ? data.strategy : undefined,
+     }
+   } catch {
+     return null
+@@ -70,13 +71,14 @@ export function writeState(
+ 
+     const sessionIdLine = state.session_id ? `session_id: "${state.session_id}"\n` : ""
+     const ultraworkLine = state.ultrawork !== undefined ? `ultrawork: ${state.ultrawork}\n` : ""
++    const strategyLine = state.strategy ? `strategy: "${state.strategy}"\n` : ""
+     const content = `---
+ active: ${state.active}
+ iteration: ${state.iteration}
+ max_iterations: ${state.max_iterations}
+ completion_promise: "${state.completion_promise}"
+ started_at: "${state.started_at}"
+-${sessionIdLine}${ultraworkLine}---
++${sessionIdLine}${ultraworkLine}${strategyLine}---
+ ${state.prompt}
+ `
+ 
+diff --git a/src/hooks/ralph-loop/types.ts b/src/hooks/ralph-loop/types.ts
+index 0c6c9d1d..bdc704f3 100644
+--- a/src/hooks/ralph-loop/types.ts
++++ b/src/hooks/ralph-loop/types.ts
+@@ -9,6 +9,7 @@ export interface RalphLoopState {
+   prompt: string
+   session_id?: string
+   ultrawork?: boolean
++  strategy?: "reset" | "continue"
+ }
+ 
+ export interface RalphLoopOptions {
+diff --git a/src/plugin/chat-message.ts b/src/plugin/chat-message.ts
+index faeb65c1..9753afd0 100644
+--- a/src/plugin/chat-message.ts
++++ b/src/plugin/chat-message.ts
+@@ -5,6 +5,7 @@ import { hasConnectedProvidersCache } from "../shared"
+ import { setSessionModel } from "../shared/session-model-state"
+ import { setSessionAgent } from "../features/claude-code-session-state"
+ import { applyUltraworkModelOverrideOnMessage } from "./ultrawork-model-override"
++import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
+ 
+ import type { CreatedHooks } from "../create-hooks"
+ 
+@@ -119,20 +120,12 @@ export function createChatMessageHandler(args: {
+       if (isRalphLoopTemplate) {
+         const taskMatch = promptText.match(/<user-task>\s*([\s\S]*?)\s*<\/user-task>/i)
+         const rawTask = taskMatch?.[1]?.trim() || ""
+-        const quotedMatch = rawTask.match(/^["'](.+?)["']/)
+-        const prompt =
+-          quotedMatch?.[1] ||
+-          rawTask.split(/\s+--/)[0]?.trim() ||
+-          "Complete the task as instructed"
+-
+-        const maxIterMatch = rawTask.match(/--max-iterations=(\d+)/i)
+-        const promiseMatch = rawTask.match(
+-          /--completion-promise=["']?([^"'\s]+)["']?/i,
+-        )
+-
+-        hooks.ralphLoop.startLoop(input.sessionID, prompt, {
+-          maxIterations: maxIterMatch ? parseInt(maxIterMatch[1], 10) : undefined,
+-          completionPromise: promiseMatch?.[1],
++        const parsedArguments = parseRalphLoopArguments(rawTask)
++
++        hooks.ralphLoop.startLoop(input.sessionID, parsedArguments.prompt, {
++          maxIterations: parsedArguments.maxIterations,
++          completionPromise: parsedArguments.completionPromise,
++          strategy: parsedArguments.strategy,
+         })
+       } else if (isCancelRalphTemplate) {
+         hooks.ralphLoop.cancelLoop(input.sessionID)
+diff --git a/src/plugin/tool-execute-before.ts b/src/plugin/tool-execute-before.ts
+index d9a06c70..fe505502 100644
+--- a/src/plugin/tool-execute-before.ts
++++ b/src/plugin/tool-execute-before.ts
+@@ -4,6 +4,7 @@ import { getMainSessionID } from "../features/claude-code-session-state"
+ import { clearBoulderState } from "../features/boulder-state"
+ import { log } from "../shared"
+ import { resolveSessionAgent } from "./session-agent-resolver"
++import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
+ 
+ import type { CreatedHooks } from "../create-hooks"
+ 
+@@ -51,36 +52,24 @@ export function createToolExecuteBeforeHandler(args: {
+ 
+       if (command === "ralph-loop" && sessionID) {
+         const rawArgs = rawName?.replace(/^\/?(ralph-loop)\s*/i, "") || ""
+-        const taskMatch = rawArgs.match(/^["'](.+?)["']/)
+-        const prompt =
+-          taskMatch?.[1] ||
+-          rawArgs.split(/\s+--/)[0]?.trim() ||
+-          "Complete the task as instructed"
++        const parsedArguments = parseRalphLoopArguments(rawArgs)
+ 
+-        const maxIterMatch = rawArgs.match(/--max-iterations=(\d+)/i)
+-        const promiseMatch = rawArgs.match(/--completion-promise=["']?([^"'\s]+)["']?/i)
+-
+-        hooks.ralphLoop.startLoop(sessionID, prompt, {
+-          maxIterations: maxIterMatch ? parseInt(maxIterMatch[1], 10) : undefined,
+-          completionPromise: promiseMatch?.[1],
++        hooks.ralphLoop.startLoop(sessionID, parsedArguments.prompt, {
++          maxIterations: parsedArguments.maxIterations,
++          completionPromise: parsedArguments.completionPromise,
++          strategy: parsedArguments.strategy,
+         })
+       } else if (command === "cancel-ralph" && sessionID) {
+         hooks.ralphLoop.cancelLoop(sessionID)
+       } else if (command === "ulw-loop" && sessionID) {
+         const rawArgs = rawName?.replace(/^\/?(ulw-loop)\s*/i, "") || ""
+-        const taskMatch = rawArgs.match(/^["'](.+?)["']/)
+-        const prompt =
+-          taskMatch?.[1] ||
+-          rawArgs.split(/\s+--/)[0]?.trim() ||
+-          "Complete the task as instructed"
+-
+-        const maxIterMatch = rawArgs.match(/--max-iterations=(\d+)/i)
+-        const promiseMatch = rawArgs.match(/--completion-promise=["']?([^"'\s]+)["']?/i)
++        const parsedArguments = parseRalphLoopArguments(rawArgs)
+ 
+-        hooks.ralphLoop.startLoop(sessionID, prompt, {
++        hooks.ralphLoop.startLoop(sessionID, parsedArguments.prompt, {
+           ultrawork: true,
+-          maxIterations: maxIterMatch ? parseInt(maxIterMatch[1], 10) : undefined,
+-          completionPromise: promiseMatch?.[1],
++          maxIterations: parsedArguments.maxIterations,
++          completionPromise: parsedArguments.completionPromise,
++          strategy: parsedArguments.strategy,
+         })
+       }
+     }
+-- 
+2.39.2
+

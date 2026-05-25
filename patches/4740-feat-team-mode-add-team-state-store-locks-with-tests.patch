@@ -1,0 +1,254 @@
+From 79fb12e254fe587b9cd96f52951e6fbcce0091af Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 28 Apr 2026 10:45:58 +0900
+Subject: [PATCH 4740/5749] feat(team-mode): add team state store locks with
+ tests
+
+---
+ .../team-mode/team-state-store/locks.test.ts  |  99 ++++++++++++++
+ .../team-mode/team-state-store/locks.ts       | 127 ++++++++++++++++++
+ 2 files changed, 226 insertions(+)
+ create mode 100644 src/features/team-mode/team-state-store/locks.test.ts
+ create mode 100644 src/features/team-mode/team-state-store/locks.ts
+
+diff --git a/src/features/team-mode/team-state-store/locks.test.ts b/src/features/team-mode/team-state-store/locks.test.ts
+new file mode 100644
+index 00000000..8664929a
+--- /dev/null
++++ b/src/features/team-mode/team-state-store/locks.test.ts
+@@ -0,0 +1,99 @@
++import { afterEach, expect, mock, test } from "bun:test"
++import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
++import { tmpdir } from "node:os"
++import { join } from "node:path"
++
++async function createTempDirectory(prefix: string): Promise<string> {
++  return await mkdtemp(join(tmpdir(), prefix))
++}
++
++afterEach(() => {
++  mock.restore()
++})
++
++test("withLock serializes concurrent work", async () => {
++  // given
++  const { withLock } = await import("./locks")
++  const rootDirectory = await createTempDirectory("locks-serialize-")
++  const lockPath = join(rootDirectory, "lock")
++  const probePath = join(rootDirectory, "probe.txt")
++  await writeFile(probePath, "ready")
++  const activeMarkers = new Set<string>()
++  const overlapObserved: string[] = []
++
++  // when
++  const first = withLock(lockPath, async () => {
++    activeMarkers.add("first")
++    await writeFile(probePath, "first-start")
++    await new Promise((resolve) => setTimeout(resolve, 75))
++    if (activeMarkers.has("second")) overlapObserved.push("first")
++    activeMarkers.delete("first")
++    return "first"
++  })
++
++  const second = withLock(lockPath, async () => {
++    activeMarkers.add("second")
++    if (activeMarkers.has("first")) overlapObserved.push("second")
++    const currentProbe = await readFile(probePath, "utf8")
++    activeMarkers.delete("second")
++    return currentProbe
++  })
++
++  const results = await Promise.all([first, second])
++
++  // then
++  expect(results[0]).toBe("first")
++  expect(results).toHaveLength(2)
++  expect(overlapObserved).toEqual([])
++  await rm(rootDirectory, { recursive: true, force: true })
++})
++
++test("atomicWrite leaves no partial file when rename fails", async () => {
++  // given
++  const fsPromises = await import("node:fs/promises")
++  const rootDirectory = await createTempDirectory("locks-atomic-")
++  const targetPath = join(rootDirectory, "target.txt")
++  await writeFile(targetPath, "old content")
++  const renameCalls: string[] = []
++
++  mock.module("node:fs/promises", () => ({
++    ...fsPromises,
++    rename: async (from: string, to: string) => {
++      renameCalls.push(`${from}->${to}`)
++      throw new Error("rename failed")
++    },
++  }))
++
++  const { atomicWrite } = await import("./locks")
++
++  // when
++  const result = atomicWrite(targetPath, "new content")
++
++  // then
++  expect(result).rejects.toThrow("rename failed")
++  expect(await readFile(targetPath, "utf8")).toBe("old content")
++  expect(renameCalls).toHaveLength(1)
++
++  const directoryEntries = await readdir(rootDirectory)
++  expect(directoryEntries.some((entry) => entry.startsWith("target.txt.tmp."))).toBe(false)
++  mock.restore()
++  await rm(rootDirectory, { recursive: true, force: true })
++})
++
++test("detects and reaps stale lock entries", async () => {
++  // given
++  const { detectStaleLock, reapStaleLock } = await import("./locks")
++  const rootDirectory = await createTempDirectory("locks-stale-")
++  const lockPath = join(rootDirectory, "lock")
++  const staleContent = `fake-owner-name\n999999999\n${Date.now() - 600_000}\n`
++  await writeFile(lockPath, staleContent)
++
++  // when
++  const staleDetected = await detectStaleLock(lockPath, 300_000)
++  await reapStaleLock(lockPath)
++
++  // then
++  expect(staleDetected).toBe(true)
++  expect(readFile(lockPath, "utf8")).rejects.toThrow()
++  await rm(rootDirectory, { recursive: true, force: true })
++})
+diff --git a/src/features/team-mode/team-state-store/locks.ts b/src/features/team-mode/team-state-store/locks.ts
+new file mode 100644
+index 00000000..4e9f3825
+--- /dev/null
++++ b/src/features/team-mode/team-state-store/locks.ts
+@@ -0,0 +1,127 @@
++import { randomUUID } from "node:crypto"
++import { open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises"
++
++type LockOptions = {
++  staleAfterMs?: number
++  ownerTag?: string
++}
++
++const LOCK_RETRY_MS = 50
++const LOCK_WAIT_TIMEOUT_MS = 4_000
++
++function delay(ms: number): Promise<void> {
++  return new Promise((resolve) => {
++    setTimeout(resolve, ms)
++  })
++}
++
++function buildOwnerContent(ownerTag: string): string {
++  return `${ownerTag}\n${process.pid}\n${Date.now()}\n`
++}
++
++function parseOwnerContent(content: string): { ownerPid: number; acquiredAtEpochMs: number } | null {
++  const lines = content.split(/\r?\n/).filter((line) => line.length > 0)
++  if (lines.length !== 3) return null
++
++  const ownerPid = Number.parseInt(lines[1] ?? "", 10)
++  const acquiredAtEpochMs = Number.parseInt(lines[2] ?? "", 10)
++  if (!Number.isInteger(ownerPid) || ownerPid <= 0) return null
++  if (!Number.isInteger(acquiredAtEpochMs) || acquiredAtEpochMs <= 0) return null
++
++  return { ownerPid, acquiredAtEpochMs }
++}
++
++function isPidAlive(pid: number): boolean {
++  try {
++    process.kill(pid, 0)
++    return true
++  } catch {
++    return false
++  }
++}
++
++async function acquireLock(lockPath: string, ownerTag: string, staleAfterMs: number): Promise<void> {
++  const startedAt = Date.now()
++  for (;;) {
++    if (Date.now() - startedAt > LOCK_WAIT_TIMEOUT_MS) {
++      throw new Error(`Timed out acquiring lock: ${lockPath}`)
++    }
++
++    try {
++      const fileHandle = await open(lockPath, "wx")
++      try {
++        await fileHandle.writeFile(buildOwnerContent(ownerTag))
++        await fileHandle.sync()
++      } finally {
++        await fileHandle.close()
++      }
++      return
++    } catch (error) {
++      const err = error as NodeJS.ErrnoException
++      if (err.code !== "EEXIST") throw error
++
++      if (await detectStaleLock(lockPath, staleAfterMs)) {
++        await reapStaleLock(lockPath)
++        continue
++      }
++
++      await delay(LOCK_RETRY_MS)
++    }
++  }
++}
++
++export async function withLock<T>(
++  lockPath: string,
++  fn: () => Promise<T>,
++  opts?: LockOptions,
++): Promise<T> {
++  const staleAfterMs = opts?.staleAfterMs ?? 300_000
++  const ownerTag = opts?.ownerTag ?? "owner"
++
++  await acquireLock(lockPath, ownerTag, staleAfterMs)
++
++  try {
++    return await fn()
++  } finally {
++    await reapStaleLock(lockPath)
++  }
++}
++
++export async function detectStaleLock(lockPath: string, staleAfterMs: number): Promise<boolean> {
++  try {
++    const content = await readFile(lockPath, "utf8")
++    const parsed = parseOwnerContent(content)
++    if (parsed === null) return false
++
++    if (isPidAlive(parsed.ownerPid)) return false
++
++    return Date.now() - parsed.acquiredAtEpochMs > staleAfterMs
++  } catch {
++    return false
++  }
++}
++
++export async function reapStaleLock(lockPath: string): Promise<void> {
++  await unlink(lockPath).catch(() => undefined)
++}
++
++export async function atomicWrite(
++  filePath: string,
++  content: string | Buffer,
++): Promise<void> {
++  const tmpPath = `${filePath}.tmp.${randomUUID()}`
++
++  try {
++    await writeFile(tmpPath, content)
++    const fileHandle = await open(tmpPath, "r")
++    try {
++      await fileHandle.sync()
++    } finally {
++      await fileHandle.close()
++    }
++    await rename(tmpPath, filePath)
++  } catch (error) {
++    await rm(tmpPath, { force: true })
++    throw error
++  }
++}
+-- 
+2.39.2
+

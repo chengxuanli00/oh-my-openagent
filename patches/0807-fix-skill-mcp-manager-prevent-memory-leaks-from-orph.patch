@@ -1,0 +1,285 @@
+From fc76ea9d93792f783653b148b18e246976056034 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Sat, 3 Jan 2026 22:15:23 +0900
+Subject: [PATCH 0807/5749] fix(skill-mcp-manager): prevent memory leaks from
+ orphaned MCP processes (#453)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* fix(skill-mcp-manager): prevent memory leaks from orphaned MCP processes
+
+- Close transport on connection failure to prevent zombie processes
+- Add process exit handlers (SIGINT/SIGTERM) for graceful cleanup
+- Use pendingConnections Map to prevent duplicate client spawns
+
+Fixes #361
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+
+* fix(ci): replace deprecated rhysd/actionlint-action with direct installation
+
+rhysd/actionlint-action repository was removed/archived.
+Use official actionlint download script instead.
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+
+* fix(skill-mcp-manager): add transport.close() and idle timeout to fix memory leaks
+
+Previously, disconnectSession() and disconnectAll() only called client.close() but NOT transport.close().
+StdioClientTransport spawns child processes for MCP servers, and without transport.close(), these
+processes remained orphaned and accumulated memory (6GB leak reported).
+
+Changes:
+- Added missing transport.close() calls in disconnectSession() and disconnectAll()
+- Added idle timeout mechanism (5-minute timeout) with lastUsedAt tracking
+- Added cleanup timer that runs every 60 seconds to remove idle clients
+- Made signal handlers (SIGINT, SIGTERM, SIGBREAK) async to properly await cleanup
+- Ensure proper cleanup order: clear from map first, then close client, then close transport
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+
+* fix(ci): pin actionlint download script to v1.7.10 for supply chain security
+
+- Pin to specific release tag instead of 'main' branch
+- Prevents potential supply chain attacks from upstream compromises
+
+🤖 GENERATED WITH ASSISTANCE OF [OhMyOpenCode](https://github.com/code-yeongyu/oh-my-opencode)
+---
+ .github/workflows/lint-workflows.yml      |   8 +-
+ src/features/skill-mcp-manager/manager.ts | 130 ++++++++++++++++++++--
+ 2 files changed, 125 insertions(+), 13 deletions(-)
+
+diff --git a/.github/workflows/lint-workflows.yml b/.github/workflows/lint-workflows.yml
+index 8f094cbc..c51a3855 100644
+--- a/.github/workflows/lint-workflows.yml
++++ b/.github/workflows/lint-workflows.yml
+@@ -14,7 +14,9 @@ jobs:
+     steps:
+       - uses: actions/checkout@v5
+ 
++      - name: Install actionlint
++        run: |
++          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.10/scripts/download-actionlint.bash)
++
+       - name: Run actionlint
+-        uses: rhysd/actionlint-action@v1
+-        with:
+-          fail-on-warning: false
++        run: ./actionlint -color -shellcheck=""
+diff --git a/src/features/skill-mcp-manager/manager.ts b/src/features/skill-mcp-manager/manager.ts
+index 8a00ef1e..a43418ff 100644
+--- a/src/features/skill-mcp-manager/manager.ts
++++ b/src/features/skill-mcp-manager/manager.ts
+@@ -9,15 +9,61 @@ interface ManagedClient {
+   client: Client
+   transport: StdioClientTransport
+   skillName: string
++  lastUsedAt: number
+ }
+ 
+ export class SkillMcpManager {
+   private clients: Map<string, ManagedClient> = new Map()
++  private pendingConnections: Map<string, Promise<Client>> = new Map()
++  private cleanupRegistered = false
++  private cleanupInterval: ReturnType<typeof setInterval> | null = null
++  private readonly IDLE_TIMEOUT = 5 * 60 * 1000
+ 
+   private getClientKey(info: SkillMcpClientInfo): string {
+     return `${info.sessionID}:${info.skillName}:${info.serverName}`
+   }
+ 
++  private registerProcessCleanup(): void {
++    if (this.cleanupRegistered) return
++    this.cleanupRegistered = true
++
++    const cleanup = async () => {
++      for (const [, managed] of this.clients) {
++        try {
++          await managed.client.close()
++        } catch {
++          // Ignore errors during cleanup
++        }
++        try {
++          await managed.transport.close()
++        } catch {
++          // Transport may already be terminated
++        }
++      }
++      this.clients.clear()
++      this.pendingConnections.clear()
++    }
++
++    // Note: 'exit' event is synchronous-only in Node.js, so we use 'beforeExit' for async cleanup
++    // However, 'beforeExit' is not emitted on explicit process.exit() calls
++    // Signal handlers are made async to properly await cleanup
++
++    process.on("SIGINT", async () => {
++      await cleanup()
++      process.exit(0)
++    })
++    process.on("SIGTERM", async () => {
++      await cleanup()
++      process.exit(0)
++    })
++    if (process.platform === "win32") {
++      process.on("SIGBREAK", async () => {
++        await cleanup()
++        process.exit(0)
++      })
++    }
++  }
++
+   async getOrCreateClient(
+     info: SkillMcpClientInfo,
+     config: ClaudeCodeMcpServer
+@@ -26,12 +72,26 @@ export class SkillMcpManager {
+     const existing = this.clients.get(key)
+ 
+     if (existing) {
++      existing.lastUsedAt = Date.now()
+       return existing.client
+     }
+ 
++    // Prevent race condition: if a connection is already in progress, wait for it
++    const pending = this.pendingConnections.get(key)
++    if (pending) {
++      return pending
++    }
++
+     const expandedConfig = expandEnvVarsInObject(config)
+-    const client = await this.createClient(info, expandedConfig)
+-    return client
++    const connectionPromise = this.createClient(info, expandedConfig)
++    this.pendingConnections.set(key, connectionPromise)
++
++    try {
++      const client = await connectionPromise
++      return client
++    } finally {
++      this.pendingConnections.delete(key)
++    }
+   }
+ 
+   private async createClient(
+@@ -65,6 +125,8 @@ export class SkillMcpManager {
+       Object.assign(mergedEnv, config.env)
+     }
+ 
++    this.registerProcessCleanup()
++
+     const transport = new StdioClientTransport({
+       command,
+       args,
+@@ -80,6 +142,12 @@ export class SkillMcpManager {
+     try {
+       await client.connect(transport)
+     } catch (error) {
++      // Close transport to prevent orphaned MCP process on connection failure
++      try {
++        await transport.close()
++      } catch {
++        // Process may already be terminated
++      }
+       const errorMessage = error instanceof Error ? error.message : String(error)
+       throw new Error(
+         `Failed to connect to MCP server "${info.serverName}".\n\n` +
+@@ -92,7 +160,8 @@ export class SkillMcpManager {
+       )
+     }
+ 
+-    this.clients.set(key, { client, transport, skillName: info.skillName })
++    this.clients.set(key, { client, transport, skillName: info.skillName, lastUsedAt: Date.now() })
++    this.startCleanupTimer()
+     return client
+   }
+ 
+@@ -102,26 +171,64 @@ export class SkillMcpManager {
+     for (const [key, managed] of this.clients.entries()) {
+       if (key.startsWith(`${sessionID}:`)) {
+         keysToRemove.push(key)
++        // Delete from map first to prevent re-entrancy during async close
++        this.clients.delete(key)
+         try {
+           await managed.client.close()
+         } catch {
+           // Ignore close errors - process may already be terminated
+         }
++        try {
++          await managed.transport.close()
++        } catch {
++          // Transport may already be terminated
++        }
+       }
+     }
+-
+-    for (const key of keysToRemove) {
+-      this.clients.delete(key)
+-    }
+   }
+ 
+   async disconnectAll(): Promise<void> {
+-    for (const [, managed] of this.clients.entries()) {
++    this.stopCleanupTimer()
++    const clients = Array.from(this.clients.values())
++    this.clients.clear()
++    for (const managed of clients) {
+       try {
+         await managed.client.close()
+       } catch { /* process may already be terminated */ }
++      try {
++        await managed.transport.close()
++      } catch { /* transport may already be terminated */ }
++    }
++  }
++
++  private startCleanupTimer(): void {
++    if (this.cleanupInterval) return
++    this.cleanupInterval = setInterval(() => {
++      this.cleanupIdleClients()
++    }, 60_000)
++    this.cleanupInterval.unref()
++  }
++
++  private stopCleanupTimer(): void {
++    if (this.cleanupInterval) {
++      clearInterval(this.cleanupInterval)
++      this.cleanupInterval = null
++    }
++  }
++
++  private async cleanupIdleClients(): Promise<void> {
++    const now = Date.now()
++    for (const [key, managed] of this.clients) {
++      if (now - managed.lastUsedAt > this.IDLE_TIMEOUT) {
++        this.clients.delete(key)
++        try {
++          await managed.client.close()
++        } catch { /* process may already be terminated */ }
++        try {
++          await managed.transport.close()
++        } catch { /* transport may already be terminated */ }
++      }
+     }
+-    this.clients.clear()
+   }
+ 
+   async listTools(
+@@ -193,10 +300,13 @@ export class SkillMcpManager {
+       const key = this.getClientKey(info)
+       const existing = this.clients.get(key)
+       if (existing) {
++        this.clients.delete(key)
+         try {
+           await existing.client.close()
+         } catch { /* process may already be terminated */ }
+-        this.clients.delete(key)
++        try {
++          await existing.transport.close()
++        } catch { /* transport may already be terminated */ }
+         return await this.getOrCreateClient(info, config)
+       }
+       throw error
+-- 
+2.39.2
+

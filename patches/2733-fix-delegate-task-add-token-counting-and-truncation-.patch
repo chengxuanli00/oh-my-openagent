@@ -1,0 +1,509 @@
+From fc1b6e491789fa6b8ea0eb2f33eca744b310f8e4 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Wed, 25 Feb 2026 14:03:47 +0900
+Subject: [PATCH 2733/5749] fix(delegate-task): add token counting and
+ truncation to prevent context overflow
+
+Fixes #1815, #1733
+---
+ src/config/schema/categories.ts               |   1 +
+ src/tools/delegate-task/category-resolver.ts  |   6 +
+ src/tools/delegate-task/prompt-builder.ts     |  52 +++++---
+ src/tools/delegate-task/skill-resolver.ts     |   9 +-
+ src/tools/delegate-task/token-limiter.test.ts | 121 ++++++++++++++++++
+ src/tools/delegate-task/token-limiter.ts      | 117 +++++++++++++++++
+ src/tools/delegate-task/tools.ts              |  10 +-
+ src/tools/delegate-task/types.ts              |   5 +
+ 8 files changed, 297 insertions(+), 24 deletions(-)
+ create mode 100644 src/tools/delegate-task/token-limiter.test.ts
+ create mode 100644 src/tools/delegate-task/token-limiter.ts
+
+diff --git a/src/config/schema/categories.ts b/src/config/schema/categories.ts
+index b1200593..47c7d6c0 100644
+--- a/src/config/schema/categories.ts
++++ b/src/config/schema/categories.ts
+@@ -20,6 +20,7 @@ export const CategoryConfigSchema = z.object({
+   textVerbosity: z.enum(["low", "medium", "high"]).optional(),
+   tools: z.record(z.string(), z.boolean()).optional(),
+   prompt_append: z.string().optional(),
++  max_prompt_tokens: z.number().int().positive().optional(),
+   /** Mark agent as unstable - forces background mode for monitoring. Auto-enabled for gemini/minimax models. */
+   is_unstable_agent: z.boolean().optional(),
+   /** Disable this category. Disabled categories are excluded from task delegation. */
+diff --git a/src/tools/delegate-task/category-resolver.ts b/src/tools/delegate-task/category-resolver.ts
+index a2f5bbd3..bc516dce 100644
+--- a/src/tools/delegate-task/category-resolver.ts
++++ b/src/tools/delegate-task/category-resolver.ts
+@@ -14,6 +14,7 @@ export interface CategoryResolutionResult {
+   agentToUse: string
+   categoryModel: { providerID: string; modelID: string; variant?: string } | undefined
+   categoryPromptAppend: string | undefined
++  maxPromptTokens?: number
+   modelInfo: ModelFallbackInfo | undefined
+   actualModel: string | undefined
+   isUnstableAgent: boolean
+@@ -51,6 +52,7 @@ export async function resolveCategoryExecution(
+         agentToUse: "",
+         categoryModel: undefined,
+         categoryPromptAppend: undefined,
++        maxPromptTokens: undefined,
+         modelInfo: undefined,
+         actualModel: undefined,
+         isUnstableAgent: false,
+@@ -68,6 +70,7 @@ Available categories: ${allCategoryNames}`,
+       agentToUse: "",
+       categoryModel: undefined,
+       categoryPromptAppend: undefined,
++      maxPromptTokens: undefined,
+       modelInfo: undefined,
+       actualModel: undefined,
+       isUnstableAgent: false,
+@@ -111,6 +114,7 @@ Available categories: ${allCategoryNames}`,
+           agentToUse: "",
+           categoryModel: undefined,
+           categoryPromptAppend: undefined,
++          maxPromptTokens: undefined,
+           modelInfo: undefined,
+           actualModel: undefined,
+           isUnstableAgent: false,
+@@ -154,6 +158,7 @@ Available categories: ${allCategoryNames}`,
+       agentToUse: "",
+       categoryModel: undefined,
+       categoryPromptAppend: undefined,
++      maxPromptTokens: undefined,
+       modelInfo: undefined,
+       actualModel: undefined,
+       isUnstableAgent: false,
+@@ -177,6 +182,7 @@ Available categories: ${categoryNames.join(", ")}`,
+     agentToUse: SISYPHUS_JUNIOR_AGENT,
+     categoryModel,
+     categoryPromptAppend,
++    maxPromptTokens: resolved.config.max_prompt_tokens,
+     modelInfo,
+     actualModel,
+     isUnstableAgent,
+diff --git a/src/tools/delegate-task/prompt-builder.ts b/src/tools/delegate-task/prompt-builder.ts
+index 51d32366..8230fed7 100644
+--- a/src/tools/delegate-task/prompt-builder.ts
++++ b/src/tools/delegate-task/prompt-builder.ts
+@@ -1,5 +1,21 @@
+ import type { BuildSystemContentInput } from "./types"
+ import { buildPlanAgentSystemPrepend, isPlanAgent } from "./constants"
++import { buildSystemContentWithTokenLimit } from "./token-limiter"
++
++const FREE_OR_LOCAL_PROMPT_TOKEN_LIMIT = 24000
++
++function usesFreeOrLocalModel(model: { providerID: string; modelID: string; variant?: string } | undefined): boolean {
++  if (!model) {
++    return false
++  }
++
++  const provider = model.providerID.toLowerCase()
++  const modelId = model.modelID.toLowerCase()
++  return provider.includes("local")
++    || provider === "ollama"
++    || provider === "lmstudio"
++    || modelId.includes("free")
++}
+ 
+ /**
+  * Build the system content to inject into the agent prompt.
+@@ -8,7 +24,11 @@ import { buildPlanAgentSystemPrepend, isPlanAgent } from "./constants"
+ export function buildSystemContent(input: BuildSystemContentInput): string | undefined {
+   const {
+     skillContent,
++    skillContents,
+     categoryPromptAppend,
++    agentsContext,
++    maxPromptTokens,
++    model,
+     agentName,
+     availableCategories,
+     availableSkills,
+@@ -18,23 +38,17 @@ export function buildSystemContent(input: BuildSystemContentInput): string | und
+     ? buildPlanAgentSystemPrepend(availableCategories, availableSkills)
+     : ""
+ 
+-  if (!skillContent && !categoryPromptAppend && !planAgentPrepend) {
+-    return undefined
+-  }
+-
+-  const parts: string[] = []
+-
+-  if (planAgentPrepend) {
+-    parts.push(planAgentPrepend)
+-  }
+-
+-  if (skillContent) {
+-    parts.push(skillContent)
+-  }
+-
+-  if (categoryPromptAppend) {
+-    parts.push(categoryPromptAppend)
+-  }
+-
+-  return parts.join("\n\n") || undefined
++  const effectiveMaxPromptTokens = maxPromptTokens
++    ?? (usesFreeOrLocalModel(model) ? FREE_OR_LOCAL_PROMPT_TOKEN_LIMIT : undefined)
++
++  return buildSystemContentWithTokenLimit(
++    {
++      skillContent,
++      skillContents,
++      categoryPromptAppend,
++      agentsContext: agentsContext ?? planAgentPrepend,
++      planAgentPrepend,
++    },
++    effectiveMaxPromptTokens
++  )
+ }
+diff --git a/src/tools/delegate-task/skill-resolver.ts b/src/tools/delegate-task/skill-resolver.ts
+index bfd58e17..e3bb89a5 100644
+--- a/src/tools/delegate-task/skill-resolver.ts
++++ b/src/tools/delegate-task/skill-resolver.ts
+@@ -5,17 +5,18 @@ import { discoverSkills } from "../../features/opencode-skill-loader"
+ export async function resolveSkillContent(
+   skills: string[],
+   options: { gitMasterConfig?: GitMasterConfig; browserProvider?: BrowserAutomationProvider, disabledSkills?: Set<string>, directory?: string }
+-): Promise<{ content: string | undefined; error: string | null }> {
++): Promise<{ content: string | undefined; contents: string[]; error: string | null }> {
+   if (skills.length === 0) {
+-    return { content: undefined, error: null }
++    return { content: undefined, contents: [], error: null }
+   }
+ 
+   const { resolved, notFound } = await resolveMultipleSkillsAsync(skills, options)
+   if (notFound.length > 0) {
+     const allSkills = await discoverSkills({ includeClaudeCodePaths: true, directory: options?.directory })
+     const available = allSkills.map(s => s.name).join(", ")
+-    return { content: undefined, error: `Skills not found: ${notFound.join(", ")}. Available: ${available}` }
++    return { content: undefined, contents: [], error: `Skills not found: ${notFound.join(", ")}. Available: ${available}` }
+   }
+ 
+-  return { content: Array.from(resolved.values()).join("\n\n"), error: null }
++  const contents = Array.from(resolved.values())
++  return { content: contents.join("\n\n"), contents, error: null }
+ }
+diff --git a/src/tools/delegate-task/token-limiter.test.ts b/src/tools/delegate-task/token-limiter.test.ts
+new file mode 100644
+index 00000000..57ba081c
+--- /dev/null
++++ b/src/tools/delegate-task/token-limiter.test.ts
+@@ -0,0 +1,121 @@
++declare const require: (name: string) => unknown
++const { describe, test, expect } = require("bun:test") as {
++  describe: (name: string, fn: () => void) => void
++  test: (name: string, fn: () => void) => void
++  expect: (value: unknown) => {
++    toBe: (expected: unknown) => void
++    toContain: (expected: string) => void
++    not: {
++      toContain: (expected: string) => void
++    }
++    toBeLessThanOrEqual: (expected: number) => void
++    toBeUndefined: () => void
++  }
++}
++
++import {
++  buildSystemContentWithTokenLimit,
++  estimateTokenCount,
++  truncateToTokenBudget,
++} from "./token-limiter"
++
++describe("token-limiter", () => {
++  test("estimateTokenCount uses 1 token per 4 chars approximation", () => {
++    // given
++    const text = "12345678"
++
++    // when
++    const result = estimateTokenCount(text)
++
++    // then
++    expect(result).toBe(2)
++  })
++
++  test("truncateToTokenBudget keeps text within requested token budget", () => {
++    // given
++    const content = "A".repeat(120)
++    const maxTokens = 10
++
++    // when
++    const result = truncateToTokenBudget(content, maxTokens)
++
++    // then
++    expect(estimateTokenCount(result)).toBeLessThanOrEqual(maxTokens)
++  })
++
++  test("buildSystemContentWithTokenLimit returns undefined when there is no content", () => {
++    // given
++    const input = {
++      skillContent: undefined,
++      skillContents: [],
++      categoryPromptAppend: undefined,
++      agentsContext: undefined,
++      planAgentPrepend: "",
++    }
++
++    // when
++    const result = buildSystemContentWithTokenLimit(input, 20)
++
++    // then
++    expect(result).toBeUndefined()
++  })
++
++  test("buildSystemContentWithTokenLimit truncates skills before category and agents context", () => {
++    // given
++    const input = {
++      skillContents: [
++        "SKILL_ALPHA:" + "a".repeat(180),
++        "SKILL_BETA:" + "b".repeat(180),
++      ],
++      categoryPromptAppend: "CATEGORY_APPEND:keep",
++      agentsContext: "AGENTS_CONTEXT:keep",
++      planAgentPrepend: "",
++    }
++
++    // when
++    const result = buildSystemContentWithTokenLimit(input, 80)
++
++    // then
++    expect(result).toContain("AGENTS_CONTEXT:keep")
++    expect(result).toContain("CATEGORY_APPEND:keep")
++    expect(result).toContain("SKILL_ALPHA:")
++    expect(estimateTokenCount(result as string)).toBeLessThanOrEqual(80)
++  })
++
++  test("buildSystemContentWithTokenLimit truncates category after skills are exhausted", () => {
++    // given
++    const input = {
++      skillContents: ["SKILL_ALPHA:" + "a".repeat(220)],
++      categoryPromptAppend: "CATEGORY_APPEND:" + "c".repeat(220),
++      agentsContext: "AGENTS_CONTEXT:keep",
++      planAgentPrepend: "",
++    }
++
++    // when
++    const result = buildSystemContentWithTokenLimit(input, 30)
++
++    // then
++    expect(result).toContain("AGENTS_CONTEXT:keep")
++    expect(result).not.toContain("SKILL_ALPHA:" + "a".repeat(80))
++    expect(estimateTokenCount(result as string)).toBeLessThanOrEqual(30)
++  })
++
++  test("buildSystemContentWithTokenLimit truncates agents context last", () => {
++    // given
++    const input = {
++      skillContents: ["SKILL_ALPHA:" + "a".repeat(220)],
++      categoryPromptAppend: "CATEGORY_APPEND:" + "c".repeat(220),
++      agentsContext: "AGENTS_CONTEXT:" + "g".repeat(220),
++      planAgentPrepend: "",
++    }
++
++    // when
++    const result = buildSystemContentWithTokenLimit(input, 10)
++
++    // then
++    expect(result).toContain("AGENTS_CONTEXT:")
++    expect(result).not.toContain("SKILL_ALPHA:")
++    expect(result).not.toContain("CATEGORY_APPEND:")
++    expect(estimateTokenCount(result as string)).toBeLessThanOrEqual(10)
++  })
++})
+diff --git a/src/tools/delegate-task/token-limiter.ts b/src/tools/delegate-task/token-limiter.ts
+new file mode 100644
+index 00000000..2ed6543c
+--- /dev/null
++++ b/src/tools/delegate-task/token-limiter.ts
+@@ -0,0 +1,117 @@
++import type { BuildSystemContentInput } from "./types"
++
++const CHARACTERS_PER_TOKEN = 4
++
++export function estimateTokenCount(text: string): number {
++  if (!text) {
++    return 0
++  }
++
++  return Math.ceil(text.length / CHARACTERS_PER_TOKEN)
++}
++
++export function truncateToTokenBudget(content: string, maxTokens: number): string {
++  if (!content || maxTokens <= 0) {
++    return ""
++  }
++
++  const maxCharacters = maxTokens * CHARACTERS_PER_TOKEN
++  if (content.length <= maxCharacters) {
++    return content
++  }
++
++  return content.slice(0, maxCharacters)
++}
++
++function joinSystemParts(parts: string[]): string | undefined {
++  const filtered = parts.filter((part) => part.trim().length > 0)
++  if (filtered.length === 0) {
++    return undefined
++  }
++
++  return filtered.join("\n\n")
++}
++
++function reduceSegmentToFitBudget(content: string, overflowTokens: number): string {
++  if (overflowTokens <= 0 || !content) {
++    return content
++  }
++
++  const currentTokens = estimateTokenCount(content)
++  const nextBudget = Math.max(0, currentTokens - overflowTokens)
++  return truncateToTokenBudget(content, nextBudget)
++}
++
++export function buildSystemContentWithTokenLimit(
++  input: BuildSystemContentInput,
++  maxTokens: number | undefined
++): string | undefined {
++  const skillParts = input.skillContents?.length
++    ? [...input.skillContents]
++    : input.skillContent
++      ? [input.skillContent]
++      : []
++  const categoryPromptAppend = input.categoryPromptAppend ?? ""
++  const agentsContext = input.agentsContext ?? input.planAgentPrepend ?? ""
++
++  if (maxTokens === undefined) {
++    return joinSystemParts([agentsContext, ...skillParts, categoryPromptAppend])
++  }
++
++  let nextSkills = [...skillParts]
++  let nextCategoryPromptAppend = categoryPromptAppend
++  let nextAgentsContext = agentsContext
++
++  const buildCurrentContent = (): string | undefined =>
++    joinSystemParts([nextAgentsContext, ...nextSkills, nextCategoryPromptAppend])
++
++  let systemContent = buildCurrentContent()
++  if (!systemContent) {
++    return undefined
++  }
++
++  let overflowTokens = estimateTokenCount(systemContent) - maxTokens
++
++  if (overflowTokens > 0) {
++    for (let index = 0; index < nextSkills.length && overflowTokens > 0; index += 1) {
++      const skill = nextSkills[index]
++      const reducedSkill = reduceSegmentToFitBudget(skill, overflowTokens)
++      nextSkills[index] = reducedSkill
++      systemContent = buildCurrentContent()
++      if (!systemContent) {
++        return undefined
++      }
++      overflowTokens = estimateTokenCount(systemContent) - maxTokens
++    }
++
++    nextSkills = nextSkills.filter((skill) => skill.trim().length > 0)
++    systemContent = buildCurrentContent()
++    if (!systemContent) {
++      return undefined
++    }
++    overflowTokens = estimateTokenCount(systemContent) - maxTokens
++  }
++
++  if (overflowTokens > 0 && nextCategoryPromptAppend) {
++    nextCategoryPromptAppend = reduceSegmentToFitBudget(nextCategoryPromptAppend, overflowTokens)
++    systemContent = buildCurrentContent()
++    if (!systemContent) {
++      return undefined
++    }
++    overflowTokens = estimateTokenCount(systemContent) - maxTokens
++  }
++
++  if (overflowTokens > 0 && nextAgentsContext) {
++    nextAgentsContext = reduceSegmentToFitBudget(nextAgentsContext, overflowTokens)
++    systemContent = buildCurrentContent()
++    if (!systemContent) {
++      return undefined
++    }
++  }
++
++  if (!systemContent) {
++    return undefined
++  }
++
++  return truncateToTokenBudget(systemContent, maxTokens)
++}
+diff --git a/src/tools/delegate-task/tools.ts b/src/tools/delegate-task/tools.ts
+index 43d1dfd5..fcd691f1 100644
+--- a/src/tools/delegate-task/tools.ts
++++ b/src/tools/delegate-task/tools.ts
+@@ -142,7 +142,7 @@ export function createDelegateTask(options: DelegateTaskToolOptions): ToolDefini
+ 
+       const runInBackground = args.run_in_background === true
+ 
+-      const { content: skillContent, error: skillError } = await resolveSkillContent(args.load_skills, {
++      const { content: skillContent, contents: skillContents, error: skillError } = await resolveSkillContent(args.load_skills, {
+         gitMasterConfig: options.gitMasterConfig,
+         browserProvider: options.browserProvider,
+         disabledSkills: options.disabledSkills,
+@@ -184,6 +184,7 @@ export function createDelegateTask(options: DelegateTaskToolOptions): ToolDefini
+       let actualModel: string | undefined
+       let isUnstableAgent = false
+       let fallbackChain: import("../../shared/model-requirements").FallbackEntry[] | undefined
++      let maxPromptTokens: number | undefined
+ 
+       if (args.category) {
+         const resolution = await resolveCategoryExecution(args, options, inheritedModel, systemDefaultModel)
+@@ -197,6 +198,7 @@ export function createDelegateTask(options: DelegateTaskToolOptions): ToolDefini
+         actualModel = resolution.actualModel
+         isUnstableAgent = resolution.isUnstableAgent
+         fallbackChain = resolution.fallbackChain
++        maxPromptTokens = resolution.maxPromptTokens
+ 
+         const isRunInBackgroundExplicitlyFalse = args.run_in_background === false || args.run_in_background === "false" as unknown as boolean
+ 
+@@ -213,8 +215,11 @@ export function createDelegateTask(options: DelegateTaskToolOptions): ToolDefini
+         if (isUnstableAgent && isRunInBackgroundExplicitlyFalse) {
+           const systemContent = buildSystemContent({
+             skillContent,
++            skillContents,
+             categoryPromptAppend,
+             agentName: agentToUse,
++            maxPromptTokens,
++            model: categoryModel,
+             availableCategories,
+             availableSkills,
+           })
+@@ -232,8 +237,11 @@ export function createDelegateTask(options: DelegateTaskToolOptions): ToolDefini
+ 
+       const systemContent = buildSystemContent({
+         skillContent,
++        skillContents,
+         categoryPromptAppend,
+         agentName: agentToUse,
++        maxPromptTokens,
++        model: categoryModel,
+         availableCategories,
+         availableSkills,
+       })
+diff --git a/src/tools/delegate-task/types.ts b/src/tools/delegate-task/types.ts
+index 13d1973a..7c749d20 100644
+--- a/src/tools/delegate-task/types.ts
++++ b/src/tools/delegate-task/types.ts
+@@ -72,7 +72,12 @@ export interface DelegateTaskToolOptions {
+ 
+ export interface BuildSystemContentInput {
+   skillContent?: string
++  skillContents?: string[]
+   categoryPromptAppend?: string
++  agentsContext?: string
++  planAgentPrepend?: string
++  maxPromptTokens?: number
++  model?: { providerID: string; modelID: string; variant?: string }
+   agentName?: string
+   availableCategories?: AvailableCategory[]
+   availableSkills?: AvailableSkill[]
+-- 
+2.39.2
+

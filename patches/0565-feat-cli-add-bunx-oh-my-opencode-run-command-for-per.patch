@@ -1,0 +1,759 @@
+From d311b74a5ab8e50c684bd17f35849f541fb488ba Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Thu, 25 Dec 2025 17:46:38 +0900
+Subject: [PATCH 0565/5749] feat(cli): add 'bunx oh-my-opencode run' command
+ for persistent agent sessions (#228)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add new 'run' command using @opencode-ai/sdk to manage agent sessions
+- Implement recursive descendant session checking (waits for ALL nested child sessions)
+- Add completion conditions: all todos done + all descendant sessions idle
+- Add SSE event processing for session state tracking
+- Fix todo-continuation-enforcer to clean up session tracking
+- Comprehensive test coverage with memory-safe test patterns
+
+Unlike 'opencode run', this command ensures the agent completes all tasks
+by recursively waiting for nested background agent sessions before exiting.
+
+🤖 Generated with assistance of OhMyOpenCode (https://github.com/code-yeongyu/oh-my-opencode)
+---
+ bun.lock                                |   1 +
+ package.json                            |   1 +
+ src/cli/index.ts                        |  29 ++++
+ src/cli/run/completion.test.ts          | 170 ++++++++++++++++++++++++
+ src/cli/run/completion.ts               |  79 +++++++++++
+ src/cli/run/events.test.ts              |  92 +++++++++++++
+ src/cli/run/events.ts                   |  85 ++++++++++++
+ src/cli/run/index.ts                    |   2 +
+ src/cli/run/runner.ts                   | 110 +++++++++++++++
+ src/cli/run/types.ts                    |  49 +++++++
+ src/hooks/todo-continuation-enforcer.ts |   3 +-
+ 11 files changed, 620 insertions(+), 1 deletion(-)
+ create mode 100644 src/cli/run/completion.test.ts
+ create mode 100644 src/cli/run/completion.ts
+ create mode 100644 src/cli/run/events.test.ts
+ create mode 100644 src/cli/run/events.ts
+ create mode 100644 src/cli/run/index.ts
+ create mode 100644 src/cli/run/runner.ts
+ create mode 100644 src/cli/run/types.ts
+
+diff --git a/bun.lock b/bun.lock
+index 9217d577..84bead3f 100644
+--- a/bun.lock
++++ b/bun.lock
+@@ -11,6 +11,7 @@
+         "@code-yeongyu/comment-checker": "^0.6.0",
+         "@openauthjs/openauth": "^0.4.3",
+         "@opencode-ai/plugin": "^1.0.162",
++        "@opencode-ai/sdk": "^1.0.162",
+         "commander": "^14.0.2",
+         "hono": "^4.10.4",
+         "picocolors": "^1.1.1",
+diff --git a/package.json b/package.json
+index 96fa6da2..0e5c1303 100644
+--- a/package.json
++++ b/package.json
+@@ -56,6 +56,7 @@
+     "@code-yeongyu/comment-checker": "^0.6.0",
+     "@openauthjs/openauth": "^0.4.3",
+     "@opencode-ai/plugin": "^1.0.162",
++    "@opencode-ai/sdk": "^1.0.162",
+     "commander": "^14.0.2",
+     "hono": "^4.10.4",
+     "picocolors": "^1.1.1",
+diff --git a/src/cli/index.ts b/src/cli/index.ts
+index f2cfb14f..edbe768e 100644
+--- a/src/cli/index.ts
++++ b/src/cli/index.ts
+@@ -1,7 +1,9 @@
+ #!/usr/bin/env bun
+ import { Command } from "commander"
+ import { install } from "./install"
++import { run } from "./run"
+ import type { InstallArgs } from "./types"
++import type { RunOptions } from "./run"
+ 
+ const packageJson = await import("../../package.json")
+ const VERSION = packageJson.version
+@@ -44,6 +46,33 @@ Model Providers:
+     process.exit(exitCode)
+   })
+ 
++program
++  .command("run <message>")
++  .description("Run opencode with todo/background task completion enforcement")
++  .option("-a, --agent <name>", "Agent to use (default: Sisyphus)")
++  .option("-d, --directory <path>", "Working directory")
++  .option("-t, --timeout <ms>", "Timeout in milliseconds (default: 30 minutes)", parseInt)
++  .addHelpText("after", `
++Examples:
++  $ bunx oh-my-opencode run "Fix the bug in index.ts"
++  $ bunx oh-my-opencode run --agent Sisyphus "Implement feature X"
++  $ bunx oh-my-opencode run --timeout 3600000 "Large refactoring task"
++
++Unlike 'opencode run', this command waits until:
++  - All todos are completed or cancelled
++  - All child sessions (background tasks) are idle
++`)
++  .action(async (message: string, options) => {
++    const runOptions: RunOptions = {
++      message,
++      agent: options.agent,
++      directory: options.directory,
++      timeout: options.timeout,
++    }
++    const exitCode = await run(runOptions)
++    process.exit(exitCode)
++  })
++
+ program
+   .command("version")
+   .description("Show version information")
+diff --git a/src/cli/run/completion.test.ts b/src/cli/run/completion.test.ts
+new file mode 100644
+index 00000000..5531b84d
+--- /dev/null
++++ b/src/cli/run/completion.test.ts
+@@ -0,0 +1,170 @@
++import { describe, it, expect, mock, spyOn } from "bun:test"
++import type { RunContext, Todo, ChildSession, SessionStatus } from "./types"
++
++const createMockContext = (overrides: {
++  todo?: Todo[]
++  childrenBySession?: Record<string, ChildSession[]>
++  statuses?: Record<string, SessionStatus>
++} = {}): RunContext => {
++  const {
++    todo = [],
++    childrenBySession = { "test-session": [] },
++    statuses = {},
++  } = overrides
++
++  return {
++    client: {
++      session: {
++        todo: mock(() => Promise.resolve({ data: todo })),
++        children: mock((opts: { path: { id: string } }) =>
++          Promise.resolve({ data: childrenBySession[opts.path.id] ?? [] })
++        ),
++        status: mock(() => Promise.resolve({ data: statuses })),
++      },
++    } as unknown as RunContext["client"],
++    sessionID: "test-session",
++    directory: "/test",
++    abortController: new AbortController(),
++  }
++}
++
++describe("checkCompletionConditions", () => {
++  it("returns true when no todos and no children", async () => {
++    // #given
++    spyOn(console, "log").mockImplementation(() => {})
++    const ctx = createMockContext()
++    const { checkCompletionConditions } = await import("./completion")
++
++    // #when
++    const result = await checkCompletionConditions(ctx)
++
++    // #then
++    expect(result).toBe(true)
++  })
++
++  it("returns false when incomplete todos exist", async () => {
++    // #given
++    spyOn(console, "log").mockImplementation(() => {})
++    const ctx = createMockContext({
++      todo: [
++        { id: "1", content: "Done", status: "completed", priority: "high" },
++        { id: "2", content: "WIP", status: "in_progress", priority: "high" },
++      ],
++    })
++    const { checkCompletionConditions } = await import("./completion")
++
++    // #when
++    const result = await checkCompletionConditions(ctx)
++
++    // #then
++    expect(result).toBe(false)
++  })
++
++  it("returns true when all todos completed or cancelled", async () => {
++    // #given
++    spyOn(console, "log").mockImplementation(() => {})
++    const ctx = createMockContext({
++      todo: [
++        { id: "1", content: "Done", status: "completed", priority: "high" },
++        { id: "2", content: "Skip", status: "cancelled", priority: "medium" },
++      ],
++    })
++    const { checkCompletionConditions } = await import("./completion")
++
++    // #when
++    const result = await checkCompletionConditions(ctx)
++
++    // #then
++    expect(result).toBe(true)
++  })
++
++  it("returns false when child session is busy", async () => {
++    // #given
++    spyOn(console, "log").mockImplementation(() => {})
++    const ctx = createMockContext({
++      childrenBySession: {
++        "test-session": [{ id: "child-1" }],
++        "child-1": [],
++      },
++      statuses: { "child-1": { type: "busy" } },
++    })
++    const { checkCompletionConditions } = await import("./completion")
++
++    // #when
++    const result = await checkCompletionConditions(ctx)
++
++    // #then
++    expect(result).toBe(false)
++  })
++
++  it("returns true when all children idle", async () => {
++    // #given
++    spyOn(console, "log").mockImplementation(() => {})
++    const ctx = createMockContext({
++      childrenBySession: {
++        "test-session": [{ id: "child-1" }, { id: "child-2" }],
++        "child-1": [],
++        "child-2": [],
++      },
++      statuses: {
++        "child-1": { type: "idle" },
++        "child-2": { type: "idle" },
++      },
++    })
++    const { checkCompletionConditions } = await import("./completion")
++
++    // #when
++    const result = await checkCompletionConditions(ctx)
++
++    // #then
++    expect(result).toBe(true)
++  })
++
++  it("returns false when grandchild is busy (recursive)", async () => {
++    // #given
++    spyOn(console, "log").mockImplementation(() => {})
++    const ctx = createMockContext({
++      childrenBySession: {
++        "test-session": [{ id: "child-1" }],
++        "child-1": [{ id: "grandchild-1" }],
++        "grandchild-1": [],
++      },
++      statuses: {
++        "child-1": { type: "idle" },
++        "grandchild-1": { type: "busy" },
++      },
++    })
++    const { checkCompletionConditions } = await import("./completion")
++
++    // #when
++    const result = await checkCompletionConditions(ctx)
++
++    // #then
++    expect(result).toBe(false)
++  })
++
++  it("returns true when all descendants idle (recursive)", async () => {
++    // #given
++    spyOn(console, "log").mockImplementation(() => {})
++    const ctx = createMockContext({
++      childrenBySession: {
++        "test-session": [{ id: "child-1" }],
++        "child-1": [{ id: "grandchild-1" }],
++        "grandchild-1": [{ id: "great-grandchild-1" }],
++        "great-grandchild-1": [],
++      },
++      statuses: {
++        "child-1": { type: "idle" },
++        "grandchild-1": { type: "idle" },
++        "great-grandchild-1": { type: "idle" },
++      },
++    })
++    const { checkCompletionConditions } = await import("./completion")
++
++    // #when
++    const result = await checkCompletionConditions(ctx)
++
++    // #then
++    expect(result).toBe(true)
++  })
++})
+diff --git a/src/cli/run/completion.ts b/src/cli/run/completion.ts
+new file mode 100644
+index 00000000..e921fcff
+--- /dev/null
++++ b/src/cli/run/completion.ts
+@@ -0,0 +1,79 @@
++import pc from "picocolors"
++import type { RunContext, Todo, ChildSession, SessionStatus } from "./types"
++
++export async function checkCompletionConditions(ctx: RunContext): Promise<boolean> {
++  try {
++    if (!await areAllTodosComplete(ctx)) {
++      return false
++    }
++
++    if (!await areAllChildrenIdle(ctx)) {
++      return false
++    }
++
++    return true
++  } catch {
++    // API errors are transient - silently continue polling
++    return false
++  }
++}
++
++async function areAllTodosComplete(ctx: RunContext): Promise<boolean> {
++  const todosRes = await ctx.client.session.todo({ path: { id: ctx.sessionID } })
++  const todos = (todosRes.data ?? []) as Todo[]
++
++  const incompleteTodos = todos.filter(
++    (t) => t.status !== "completed" && t.status !== "cancelled"
++  )
++
++  if (incompleteTodos.length > 0) {
++    console.log(pc.dim(`  Waiting: ${incompleteTodos.length} todos remaining`))
++    return false
++  }
++
++  return true
++}
++
++async function areAllChildrenIdle(ctx: RunContext): Promise<boolean> {
++  const allStatuses = await fetchAllStatuses(ctx)
++  return areAllDescendantsIdle(ctx, ctx.sessionID, allStatuses)
++}
++
++async function fetchAllStatuses(
++  ctx: RunContext
++): Promise<Record<string, SessionStatus>> {
++  const statusRes = await ctx.client.session.status()
++  return (statusRes.data ?? {}) as Record<string, SessionStatus>
++}
++
++async function areAllDescendantsIdle(
++  ctx: RunContext,
++  sessionID: string,
++  allStatuses: Record<string, SessionStatus>
++): Promise<boolean> {
++  const childrenRes = await ctx.client.session.children({
++    path: { id: sessionID },
++  })
++  const children = (childrenRes.data ?? []) as ChildSession[]
++
++  for (const child of children) {
++    const status = allStatuses[child.id]
++    if (status && status.type !== "idle") {
++      console.log(
++        pc.dim(`  Waiting: session ${child.id.slice(0, 8)}... is ${status.type}`)
++      )
++      return false
++    }
++
++    const descendantsIdle = await areAllDescendantsIdle(
++      ctx,
++      child.id,
++      allStatuses
++    )
++    if (!descendantsIdle) {
++      return false
++    }
++  }
++
++  return true
++}
+diff --git a/src/cli/run/events.test.ts b/src/cli/run/events.test.ts
+new file mode 100644
+index 00000000..91421a9e
+--- /dev/null
++++ b/src/cli/run/events.test.ts
+@@ -0,0 +1,92 @@
++import { describe, it, expect } from "bun:test"
++import { createEventState, type EventState } from "./events"
++import type { RunContext, EventPayload } from "./types"
++
++const createMockContext = (sessionID: string = "test-session"): RunContext => ({
++  client: {} as RunContext["client"],
++  sessionID,
++  directory: "/test",
++  abortController: new AbortController(),
++})
++
++async function* toAsyncIterable<T>(items: T[]): AsyncIterable<T> {
++  for (const item of items) {
++    yield item
++  }
++}
++
++describe("createEventState", () => {
++  it("creates initial state with mainSessionIdle false and empty lastOutput", () => {
++    // #given / #when
++    const state = createEventState()
++
++    // #then
++    expect(state.mainSessionIdle).toBe(false)
++    expect(state.lastOutput).toBe("")
++  })
++})
++
++describe("event handling", () => {
++  it("session.idle sets mainSessionIdle to true for matching session", async () => {
++    // #given
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "session.idle",
++      properties: { sessionID: "my-session" },
++    }
++
++    const events = toAsyncIterable([{ payload }])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then
++    expect(state.mainSessionIdle).toBe(true)
++  })
++
++  it("session.idle does not affect state for different session", async () => {
++    // #given
++    const ctx = createMockContext("my-session")
++    const state = createEventState()
++
++    const payload: EventPayload = {
++      type: "session.idle",
++      properties: { sessionID: "other-session" },
++    }
++
++    const events = toAsyncIterable([{ payload }])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then
++    expect(state.mainSessionIdle).toBe(false)
++  })
++
++  it("session.status with busy type sets mainSessionIdle to false", async () => {
++    // #given
++    const ctx = createMockContext("my-session")
++    const state: EventState = {
++      mainSessionIdle: true,
++      lastOutput: "",
++    }
++
++    const payload: EventPayload = {
++      type: "session.status",
++      properties: { sessionID: "my-session", status: { type: "busy" } },
++    }
++
++    const events = toAsyncIterable([{ payload }])
++    const { processEvents } = await import("./events")
++
++    // #when
++    await processEvents(ctx, events, state)
++
++    // #then
++    expect(state.mainSessionIdle).toBe(false)
++  })
++})
+diff --git a/src/cli/run/events.ts b/src/cli/run/events.ts
+new file mode 100644
+index 00000000..2cd4a944
+--- /dev/null
++++ b/src/cli/run/events.ts
+@@ -0,0 +1,85 @@
++import type {
++  RunContext,
++  EventPayload,
++  SessionIdleProps,
++  SessionStatusProps,
++  MessageUpdatedProps,
++} from "./types"
++
++export interface EventState {
++  mainSessionIdle: boolean
++  lastOutput: string
++}
++
++export function createEventState(): EventState {
++  return {
++    mainSessionIdle: false,
++    lastOutput: "",
++  }
++}
++
++export async function processEvents(
++  ctx: RunContext,
++  stream: AsyncIterable<unknown>,
++  state: EventState
++): Promise<void> {
++  for await (const event of stream) {
++    if (ctx.abortController.signal.aborted) break
++
++    try {
++      const payload = (event as { payload?: EventPayload }).payload
++      if (!payload) continue
++
++      handleSessionIdle(ctx, payload, state)
++      handleSessionStatus(ctx, payload, state)
++      handleMessageUpdated(ctx, payload, state)
++    } catch {}
++  }
++}
++
++function handleSessionIdle(
++  ctx: RunContext,
++  payload: EventPayload,
++  state: EventState
++): void {
++  if (payload.type !== "session.idle") return
++
++  const props = payload.properties as SessionIdleProps | undefined
++  if (props?.sessionID === ctx.sessionID) {
++    state.mainSessionIdle = true
++  }
++}
++
++function handleSessionStatus(
++  ctx: RunContext,
++  payload: EventPayload,
++  state: EventState
++): void {
++  if (payload.type !== "session.status") return
++
++  const props = payload.properties as SessionStatusProps | undefined
++  if (props?.sessionID === ctx.sessionID && props?.status?.type === "busy") {
++    state.mainSessionIdle = false
++  }
++}
++
++function handleMessageUpdated(
++  ctx: RunContext,
++  payload: EventPayload,
++  state: EventState
++): void {
++  if (payload.type !== "message.updated") return
++
++  const props = payload.properties as MessageUpdatedProps | undefined
++  if (props?.info?.sessionID !== ctx.sessionID) return
++  if (props?.info?.role !== "assistant") return
++
++  const content = props.content
++  if (!content || content === state.lastOutput) return
++
++  const newContent = content.slice(state.lastOutput.length)
++  if (newContent) {
++    process.stdout.write(newContent)
++  }
++  state.lastOutput = content
++}
+diff --git a/src/cli/run/index.ts b/src/cli/run/index.ts
+new file mode 100644
+index 00000000..0b0d7c9f
+--- /dev/null
++++ b/src/cli/run/index.ts
+@@ -0,0 +1,2 @@
++export { run } from "./runner"
++export type { RunOptions, RunContext } from "./types"
+diff --git a/src/cli/run/runner.ts b/src/cli/run/runner.ts
+new file mode 100644
+index 00000000..27f27db2
+--- /dev/null
++++ b/src/cli/run/runner.ts
+@@ -0,0 +1,110 @@
++import { createOpencode } from "@opencode-ai/sdk"
++import pc from "picocolors"
++import type { RunOptions, RunContext } from "./types"
++import { checkCompletionConditions } from "./completion"
++import { createEventState, processEvents } from "./events"
++
++const POLL_INTERVAL_MS = 500
++const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
++
++export async function run(options: RunOptions): Promise<number> {
++  const {
++    message,
++    agent,
++    directory = process.cwd(),
++    timeout = DEFAULT_TIMEOUT_MS,
++  } = options
++
++  console.log(pc.cyan("Starting opencode server..."))
++
++  const abortController = new AbortController()
++  const timeoutId = setTimeout(() => {
++    console.log(pc.yellow("\nTimeout reached. Aborting..."))
++    abortController.abort()
++  }, timeout)
++
++  try {
++    const { client, server } = await createOpencode({
++      signal: abortController.signal,
++    })
++
++    const cleanup = () => {
++      clearTimeout(timeoutId)
++      server.close()
++    }
++
++    process.on("SIGINT", () => {
++      console.log(pc.yellow("\nInterrupted. Shutting down..."))
++      cleanup()
++      process.exit(130)
++    })
++
++    try {
++      const sessionRes = await client.session.create({
++        body: { title: "oh-my-opencode run" },
++      })
++
++      const sessionID = sessionRes.data?.id
++      if (!sessionID) {
++        console.error(pc.red("Failed to create session"))
++        return 1
++      }
++
++      console.log(pc.dim(`Session: ${sessionID}`))
++
++      const ctx: RunContext = {
++        client,
++        sessionID,
++        directory,
++        abortController,
++      }
++
++      const events = await client.event.subscribe()
++      const eventState = createEventState()
++      const eventProcessor = processEvents(ctx, events.stream, eventState)
++
++      console.log(pc.dim("\nSending prompt..."))
++      await client.session.promptAsync({
++        path: { id: sessionID },
++        body: {
++          agent,
++          parts: [{ type: "text", text: message }],
++        },
++        query: { directory },
++      })
++
++      console.log(pc.dim("Waiting for completion...\n"))
++
++      while (!abortController.signal.aborted) {
++        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
++
++        if (!eventState.mainSessionIdle) {
++          continue
++        }
++
++        const shouldExit = await checkCompletionConditions(ctx)
++        if (shouldExit) {
++          console.log(pc.green("\n\nAll tasks completed."))
++          abortController.abort()
++          await eventProcessor.catch(() => {})
++          cleanup()
++          return 0
++        }
++      }
++
++      await eventProcessor.catch(() => {})
++      cleanup()
++      return 130
++    } catch (err) {
++      cleanup()
++      throw err
++    }
++  } catch (err) {
++    clearTimeout(timeoutId)
++    if (err instanceof Error && err.name === "AbortError") {
++      return 130
++    }
++    console.error(pc.red(`Error: ${err}`))
++    return 1
++  }
++}
+diff --git a/src/cli/run/types.ts b/src/cli/run/types.ts
+new file mode 100644
+index 00000000..cac95a2e
+--- /dev/null
++++ b/src/cli/run/types.ts
+@@ -0,0 +1,49 @@
++import type { OpencodeClient } from "@opencode-ai/sdk"
++
++export interface RunOptions {
++  message: string
++  agent?: string
++  directory?: string
++  timeout?: number
++}
++
++export interface RunContext {
++  client: OpencodeClient
++  sessionID: string
++  directory: string
++  abortController: AbortController
++}
++
++export interface Todo {
++  id: string
++  content: string
++  status: string
++  priority: string
++}
++
++export interface SessionStatus {
++  type: "idle" | "busy" | "retry"
++}
++
++export interface ChildSession {
++  id: string
++}
++
++export interface EventPayload {
++  type: string
++  properties?: Record<string, unknown>
++}
++
++export interface SessionIdleProps {
++  sessionID?: string
++}
++
++export interface SessionStatusProps {
++  sessionID?: string
++  status?: { type?: string }
++}
++
++export interface MessageUpdatedProps {
++  info?: { sessionID?: string; role?: string }
++  content?: string
++}
+diff --git a/src/hooks/todo-continuation-enforcer.ts b/src/hooks/todo-continuation-enforcer.ts
+index e1de485d..c3dca1c1 100644
+--- a/src/hooks/todo-continuation-enforcer.ts
++++ b/src/hooks/todo-continuation-enforcer.ts
+@@ -296,7 +296,8 @@ export function createTodoContinuationEnforcer(
+ 
+       if (sessionID && role === "assistant" && finish) {
+         remindedSessions.delete(sessionID)
+-        log(`[${HOOK_NAME}] Cleared reminded state on assistant finish`, { sessionID })
++        preemptivelyInjectedSessions.delete(sessionID)
++        log(`[${HOOK_NAME}] Cleared reminded/preemptive state on assistant finish`, { sessionID })
+ 
+         const isTerminalFinish = finish && !["tool-calls", "unknown"].includes(finish)
+         if (isTerminalFinish && isNonInteractive()) {
+-- 
+2.39.2
+

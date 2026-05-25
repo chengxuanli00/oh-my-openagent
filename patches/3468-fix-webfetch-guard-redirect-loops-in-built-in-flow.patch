@@ -1,0 +1,530 @@
+From af301ab29ae1035bf303a00e604108ecc5b4e701 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code.yeon.gyu@gmail.com>
+Date: Tue, 24 Mar 2026 23:58:53 +0900
+Subject: [PATCH 3468/5749] fix(webfetch): guard redirect loops in built-in
+ flow
+
+---
+ src/config/schema/hooks.ts                    |   1 +
+ src/hooks/index.ts                            |   1 +
+ .../webfetch-redirect-guard/constants.ts      |  11 ++
+ src/hooks/webfetch-redirect-guard/hook.ts     | 119 ++++++++++++
+ .../webfetch-redirect-guard/index.test.ts     | 170 ++++++++++++++++++
+ src/hooks/webfetch-redirect-guard/index.ts    |   1 +
+ .../redirect-resolution.ts                    |  89 +++++++++
+ src/plugin/hooks/create-tool-guard-hooks.ts   |   7 +
+ src/plugin/tool-execute-after.ts              |   1 +
+ src/plugin/tool-execute-before.ts             |   1 +
+ 10 files changed, 401 insertions(+)
+ create mode 100644 src/hooks/webfetch-redirect-guard/constants.ts
+ create mode 100644 src/hooks/webfetch-redirect-guard/hook.ts
+ create mode 100644 src/hooks/webfetch-redirect-guard/index.test.ts
+ create mode 100644 src/hooks/webfetch-redirect-guard/index.ts
+ create mode 100644 src/hooks/webfetch-redirect-guard/redirect-resolution.ts
+
+diff --git a/src/config/schema/hooks.ts b/src/config/schema/hooks.ts
+index 00e04404..6b0219f7 100644
+--- a/src/config/schema/hooks.ts
++++ b/src/config/schema/hooks.ts
+@@ -51,6 +51,7 @@ export const HookNameSchema = z.enum([
+   "hashline-read-enhancer",
+   "read-image-resizer",
+   "todo-description-override",
++  "webfetch-redirect-guard",
+ ])
+ 
+ export type HookName = z.infer<typeof HookNameSchema>
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index abbf79bb..8121f509 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -52,3 +52,4 @@ export { createHashlineReadEnhancerHook } from "./hashline-read-enhancer";
+ export { createJsonErrorRecoveryHook, JSON_ERROR_TOOL_EXCLUDE_LIST, JSON_ERROR_PATTERNS, JSON_ERROR_REMINDER } from "./json-error-recovery";
+ export { createReadImageResizerHook } from "./read-image-resizer"
+ export { createTodoDescriptionOverrideHook } from "./todo-description-override"
++export { createWebFetchRedirectGuardHook } from "./webfetch-redirect-guard"
+diff --git a/src/hooks/webfetch-redirect-guard/constants.ts b/src/hooks/webfetch-redirect-guard/constants.ts
+new file mode 100644
+index 00000000..9befcf24
+--- /dev/null
++++ b/src/hooks/webfetch-redirect-guard/constants.ts
+@@ -0,0 +1,11 @@
++export const DEFAULT_WEBFETCH_TIMEOUT_MS = 30_000
++export const MAX_WEBFETCH_TIMEOUT_MS = 120_000
++export const MAX_WEBFETCH_REDIRECTS = 10
++export const WEBFETCH_REDIRECT_GUARD_STALE_TIMEOUT_MS = 15 * 60 * 1000
++
++export const WEBFETCH_REDIRECT_ERROR_PATTERNS = [
++  /redirected too many times/i,
++  /too many redirects/i,
++] as const
++
++export const WEBFETCH_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+diff --git a/src/hooks/webfetch-redirect-guard/hook.ts b/src/hooks/webfetch-redirect-guard/hook.ts
+new file mode 100644
+index 00000000..aec40aa1
+--- /dev/null
++++ b/src/hooks/webfetch-redirect-guard/hook.ts
+@@ -0,0 +1,119 @@
++import type { PluginInput } from "@opencode-ai/plugin"
++import { log } from "../../shared"
++import {
++  MAX_WEBFETCH_REDIRECTS,
++  WEBFETCH_REDIRECT_ERROR_PATTERNS,
++  WEBFETCH_REDIRECT_GUARD_STALE_TIMEOUT_MS,
++} from "./constants"
++import {
++  resolveWebFetchRedirects,
++  type WebFetchFormat,
++} from "./redirect-resolution"
++
++type ToolExecuteInput = { tool: string; sessionID: string; callID: string }
++type ToolExecuteBeforeOutput = { args: Record<string, unknown> }
++type ToolExecuteAfterOutput = {
++  title: string
++  output: string
++  metadata: Record<string, unknown>
++}
++
++type PendingRedirectFailure = {
++  originalUrl: string
++  storedAt: number
++}
++
++function makeKey(sessionID: string, callID: string): string {
++  return `${sessionID}:${callID}`
++}
++
++function isWebFetchTool(toolName: string): boolean {
++  return toolName.toLowerCase() === "webfetch"
++}
++
++function getWebFetchUrl(args: Record<string, unknown>): string | undefined {
++  return typeof args.url === "string" && args.url.length > 0 ? args.url : undefined
++}
++
++function getWebFetchFormat(args: Record<string, unknown>): WebFetchFormat {
++  return args.format === "text" || args.format === "html" ? args.format : "markdown"
++}
++
++function getTimeoutSeconds(args: Record<string, unknown>): number | undefined {
++  return typeof args.timeout === "number" && Number.isFinite(args.timeout) ? args.timeout : undefined
++}
++
++function cleanupStaleEntries(pendingFailures: Map<string, PendingRedirectFailure>): void {
++  const now = Date.now()
++  for (const [key, value] of pendingFailures) {
++    if (now - value.storedAt > WEBFETCH_REDIRECT_GUARD_STALE_TIMEOUT_MS) {
++      pendingFailures.delete(key)
++    }
++  }
++}
++
++function isRedirectLoopError(output: string): boolean {
++  return WEBFETCH_REDIRECT_ERROR_PATTERNS.some((pattern) => pattern.test(output))
++}
++
++function buildRedirectLimitMessage(url?: string): string {
++  const suffix = url ? ` for ${url}` : ""
++  return `Error: WebFetch failed: exceeded maximum redirects (${MAX_WEBFETCH_REDIRECTS})${suffix}`
++}
++
++export function createWebFetchRedirectGuardHook(_ctx: PluginInput) {
++  const pendingFailures = new Map<string, PendingRedirectFailure>()
++
++  return {
++    "tool.execute.before": async (input: ToolExecuteInput, output: ToolExecuteBeforeOutput) => {
++      if (!isWebFetchTool(input.tool)) return
++
++      const url = getWebFetchUrl(output.args)
++      if (!url) return
++
++      cleanupStaleEntries(pendingFailures)
++
++      try {
++        const resolution = await resolveWebFetchRedirects({
++          url,
++          format: getWebFetchFormat(output.args),
++          timeoutSeconds: getTimeoutSeconds(output.args),
++        })
++
++        if (resolution.type === "resolved") {
++          output.args.url = resolution.url
++          return
++        }
++
++        pendingFailures.set(makeKey(input.sessionID, input.callID), {
++          originalUrl: url,
++          storedAt: Date.now(),
++        })
++      } catch (error) {
++        log("[webfetch-redirect-guard] Failed to pre-resolve redirects", {
++          sessionID: input.sessionID,
++          callID: input.callID,
++          url,
++          error,
++        })
++      }
++    },
++
++    "tool.execute.after": async (input: ToolExecuteInput, output: ToolExecuteAfterOutput) => {
++      if (!isWebFetchTool(input.tool)) return
++      if (typeof output.output !== "string") return
++
++      const key = makeKey(input.sessionID, input.callID)
++      const pendingFailure = pendingFailures.get(key)
++      if (pendingFailure) {
++        pendingFailures.delete(key)
++        output.output = buildRedirectLimitMessage(pendingFailure.originalUrl)
++        return
++      }
++
++      if (isRedirectLoopError(output.output)) {
++        output.output = buildRedirectLimitMessage()
++      }
++    },
++  }
++}
+diff --git a/src/hooks/webfetch-redirect-guard/index.test.ts b/src/hooks/webfetch-redirect-guard/index.test.ts
+new file mode 100644
+index 00000000..3d53b1f9
+--- /dev/null
++++ b/src/hooks/webfetch-redirect-guard/index.test.ts
+@@ -0,0 +1,170 @@
++import { afterEach, describe, expect, it } from "bun:test"
++import { createWebFetchRedirectGuardHook } from "./hook"
++
++const originalFetch = globalThis.fetch
++
++type FetchCall = {
++  url: string
++  init?: RequestInit
++}
++
++function createInput(tool = "webfetch") {
++  return {
++    tool,
++    sessionID: "ses_test",
++    callID: "call_test",
++  }
++}
++
++function createBeforeOutput(url: string, format: "markdown" | "text" | "html" = "markdown") {
++  return {
++    args: {
++      url,
++      format,
++    },
++  }
++}
++
++function createAfterOutput(outputText: string) {
++  return {
++    title: "WebFetch",
++    output: outputText,
++    metadata: {},
++  }
++}
++
++function getHeaderValue(headers: RequestInit["headers"], key: string): string | undefined {
++  if (!headers) return undefined
++  if (headers instanceof Headers) return headers.get(key) ?? undefined
++  if (Array.isArray(headers)) {
++    const match = headers.find(([name]) => name.toLowerCase() === key.toLowerCase())
++    return match?.[1]
++  }
++
++  const match = Object.entries(headers).find(([name]) => name.toLowerCase() === key.toLowerCase())
++  return typeof match?.[1] === "string" ? match[1] : undefined
++}
++
++function createFetchMock(
++  implementation: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
++): typeof fetch {
++  return Object.assign(implementation, {
++    preconnect: originalFetch.preconnect,
++  })
++}
++
++afterEach(() => {
++  globalThis.fetch = originalFetch
++})
++
++describe("createWebFetchRedirectGuardHook", () => {
++  describe("#given the webfetch tool", () => {
++    describe("#when the URL redirects once", () => {
++      it("#then should replace args.url with the resolved final URL", async () => {
++        const calls: FetchCall[] = []
++        globalThis.fetch = createFetchMock(async (input: RequestInfo | URL, init?: RequestInit) => {
++          calls.push({ url: String(input), init })
++
++          if (calls.length === 1) {
++            return new Response(null, {
++              status: 302,
++              headers: { Location: "https://example.com/final" },
++            })
++          }
++
++          return new Response("ok", { status: 200 })
++        })
++
++        const hook = createWebFetchRedirectGuardHook({} as never)
++        const input = createInput()
++        const output = createBeforeOutput("https://example.com/start")
++
++        await hook["tool.execute.before"](input, output)
++
++        expect(output.args.url).toBe("https://example.com/final")
++        expect(getHeaderValue(calls[0]?.init?.headers, "accept")).toContain("text/markdown")
++        expect(getHeaderValue(calls[0]?.init?.headers, "user-agent")).toContain("Mozilla/5.0")
++        expect(getHeaderValue(calls[0]?.init?.headers, "accept-language")).toBe("en-US,en;q=0.9")
++      })
++    })
++
++    describe("#when the redirect location is relative", () => {
++      it("#then should resolve the location against the current URL", async () => {
++        let callCount = 0
++        globalThis.fetch = createFetchMock(async (_input: RequestInfo | URL) => {
++          callCount += 1
++
++          if (callCount === 1) {
++            return new Response(null, {
++              status: 301,
++              headers: { Location: "/docs/final" },
++            })
++          }
++
++          return new Response("ok", { status: 200 })
++        })
++
++        const hook = createWebFetchRedirectGuardHook({} as never)
++        const input = createInput()
++        const output = createBeforeOutput("https://example.com/docs/start")
++
++        await hook["tool.execute.before"](input, output)
++
++        expect(output.args.url).toBe("https://example.com/docs/final")
++      })
++    })
++
++    describe("#when the redirect chain exceeds the limit", () => {
++      it("#then should rewrite the raw redirect-loop error to a clear message", async () => {
++        globalThis.fetch = createFetchMock(async () => {
++          return new Response(null, {
++            status: 302,
++            headers: { Location: "/loop" },
++          })
++        })
++
++        const hook = createWebFetchRedirectGuardHook({} as never)
++        const input = createInput()
++        const beforeOutput = createBeforeOutput("https://example.com/loop")
++        const afterOutput = createAfterOutput(
++          "Error: The response redirected too many times. For more information, pass `verbose: true` in the second argument to fetch()",
++        )
++
++        await hook["tool.execute.before"](input, beforeOutput)
++        await hook["tool.execute.after"](input, afterOutput)
++
++        expect(afterOutput.output).toBe(
++          "Error: WebFetch failed: exceeded maximum redirects (10) for https://example.com/loop",
++        )
++      })
++    })
++
++    describe("#when a raw redirect-loop error arrives without tracked state", () => {
++      it("#then should still normalize the message", async () => {
++        const hook = createWebFetchRedirectGuardHook({} as never)
++        const input = createInput()
++        const output = createAfterOutput("error: too many redirects")
++
++        await hook["tool.execute.after"](input, output)
++
++        expect(output.output).toBe(
++          "Error: WebFetch failed: exceeded maximum redirects (10)",
++        )
++      })
++    })
++  })
++
++  describe("#given a non-webfetch tool", () => {
++    describe("#when the hook runs", () => {
++      it("#then should leave the args untouched", async () => {
++        const hook = createWebFetchRedirectGuardHook({} as never)
++        const input = createInput("grep")
++        const output = createBeforeOutput("https://example.com/start")
++
++        await hook["tool.execute.before"](input, output)
++
++        expect(output.args.url).toBe("https://example.com/start")
++      })
++    })
++  })
++})
+diff --git a/src/hooks/webfetch-redirect-guard/index.ts b/src/hooks/webfetch-redirect-guard/index.ts
+new file mode 100644
+index 00000000..372e35f1
+--- /dev/null
++++ b/src/hooks/webfetch-redirect-guard/index.ts
+@@ -0,0 +1 @@
++export { createWebFetchRedirectGuardHook } from "./hook"
+diff --git a/src/hooks/webfetch-redirect-guard/redirect-resolution.ts b/src/hooks/webfetch-redirect-guard/redirect-resolution.ts
+new file mode 100644
+index 00000000..ca23c2a6
+--- /dev/null
++++ b/src/hooks/webfetch-redirect-guard/redirect-resolution.ts
+@@ -0,0 +1,89 @@
++import {
++  DEFAULT_WEBFETCH_TIMEOUT_MS,
++  MAX_WEBFETCH_REDIRECTS,
++  MAX_WEBFETCH_TIMEOUT_MS,
++  WEBFETCH_REDIRECT_STATUSES,
++} from "./constants"
++
++export type WebFetchFormat = "markdown" | "text" | "html"
++
++type RedirectResolutionParams = {
++  url: string
++  format: WebFetchFormat
++  timeoutSeconds?: number
++}
++
++export type RedirectResolutionResult =
++  | { type: "resolved"; url: string }
++  | { type: "exceeded"; url: string; maxRedirects: number }
++
++function buildAcceptHeader(format: WebFetchFormat): string {
++  switch (format) {
++    case "markdown":
++      return "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1"
++    case "text":
++      return "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1"
++    case "html":
++      return "text/html;q=1.0, application/xhtml+xml;q=0.9, text/plain;q=0.8, text/markdown;q=0.7, */*;q=0.1"
++  }
++}
++
++function buildWebFetchHeaders(format: WebFetchFormat): Record<string, string> {
++  return {
++    "User-Agent":
++      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
++    Accept: buildAcceptHeader(format),
++    "Accept-Language": "en-US,en;q=0.9",
++  }
++}
++
++function normalizeTimeoutMs(timeoutSeconds?: number): number {
++  if (typeof timeoutSeconds !== "number" || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
++    return DEFAULT_WEBFETCH_TIMEOUT_MS
++  }
++
++  return Math.min(timeoutSeconds * 1000, MAX_WEBFETCH_TIMEOUT_MS)
++}
++
++function resolveRedirectLocation(currentUrl: string, location: string): string {
++  return new URL(location, currentUrl).toString()
++}
++
++export async function resolveWebFetchRedirects(
++  params: RedirectResolutionParams,
++): Promise<RedirectResolutionResult> {
++  const timeoutMs = normalizeTimeoutMs(params.timeoutSeconds)
++  const signal = AbortSignal.timeout(timeoutMs)
++  const headers = buildWebFetchHeaders(params.format)
++
++  let currentUrl = params.url
++  let redirectCount = 0
++
++  while (true) {
++    const response = await fetch(currentUrl, {
++      headers,
++      redirect: "manual",
++      signal,
++    })
++
++    if (!WEBFETCH_REDIRECT_STATUSES.has(response.status)) {
++      return { type: "resolved", url: currentUrl }
++    }
++
++    const location = response.headers.get("location")
++    if (!location) {
++      return { type: "resolved", url: currentUrl }
++    }
++
++    if (redirectCount >= MAX_WEBFETCH_REDIRECTS) {
++      return {
++        type: "exceeded",
++        url: params.url,
++        maxRedirects: MAX_WEBFETCH_REDIRECTS,
++      }
++    }
++
++    currentUrl = resolveRedirectLocation(currentUrl, location)
++    redirectCount += 1
++  }
++}
+diff --git a/src/plugin/hooks/create-tool-guard-hooks.ts b/src/plugin/hooks/create-tool-guard-hooks.ts
+index 1c79f694..46f724cf 100644
+--- a/src/plugin/hooks/create-tool-guard-hooks.ts
++++ b/src/plugin/hooks/create-tool-guard-hooks.ts
+@@ -15,6 +15,7 @@ import {
+   createReadImageResizerHook,
+   createJsonErrorRecoveryHook,
+   createTodoDescriptionOverrideHook,
++  createWebFetchRedirectGuardHook,
+ } from "../../hooks"
+ import {
+   getOpenCodeVersion,
+@@ -37,6 +38,7 @@ export type ToolGuardHooks = {
+   jsonErrorRecovery: ReturnType<typeof createJsonErrorRecoveryHook> | null
+   readImageResizer: ReturnType<typeof createReadImageResizerHook> | null
+   todoDescriptionOverride: ReturnType<typeof createTodoDescriptionOverrideHook> | null
++  webfetchRedirectGuard: ReturnType<typeof createWebFetchRedirectGuardHook> | null
+ }
+ 
+ export function createToolGuardHooks(args: {
+@@ -117,6 +119,10 @@ export function createToolGuardHooks(args: {
+     ? safeHook("todo-description-override", () => createTodoDescriptionOverrideHook())
+     : null
+ 
++  const webfetchRedirectGuard = isHookEnabled("webfetch-redirect-guard")
++    ? safeHook("webfetch-redirect-guard", () => createWebFetchRedirectGuardHook(ctx))
++    : null
++
+   return {
+     commentChecker,
+     toolOutputTruncator,
+@@ -130,5 +136,6 @@ export function createToolGuardHooks(args: {
+     jsonErrorRecovery,
+     readImageResizer,
+     todoDescriptionOverride,
++    webfetchRedirectGuard,
+   }
+ }
+diff --git a/src/plugin/tool-execute-after.ts b/src/plugin/tool-execute-after.ts
+index 0cc986b7..fb1be3aa 100644
+--- a/src/plugin/tool-execute-after.ts
++++ b/src/plugin/tool-execute-after.ts
+@@ -125,6 +125,7 @@ export function createToolExecuteAfterHandler(args: {
+       await hooks.taskResumeInfo?.["tool.execute.after"]?.(input, output)
+       await hooks.readImageResizer?.["tool.execute.after"]?.(input, output)
+       await hooks.hashlineReadEnhancer?.["tool.execute.after"]?.(input, output)
++      await hooks.webfetchRedirectGuard?.["tool.execute.after"]?.(input, output)
+       await hooks.jsonErrorRecovery?.["tool.execute.after"]?.(input, output)
+     }
+ 
+diff --git a/src/plugin/tool-execute-before.ts b/src/plugin/tool-execute-before.ts
+index 5d4f2c86..e5aad89a 100644
+--- a/src/plugin/tool-execute-before.ts
++++ b/src/plugin/tool-execute-before.ts
+@@ -50,6 +50,7 @@ export function createToolExecuteBeforeHandler(args: {
+     await hooks.directoryReadmeInjector?.["tool.execute.before"]?.(input, output)
+     await hooks.rulesInjector?.["tool.execute.before"]?.(input, output)
+     await hooks.tasksTodowriteDisabler?.["tool.execute.before"]?.(input, output)
++    await hooks.webfetchRedirectGuard?.["tool.execute.before"]?.(input, output)
+     await hooks.prometheusMdOnly?.["tool.execute.before"]?.(input, output)
+     await hooks.sisyphusJuniorNotepad?.["tool.execute.before"]?.(input, output)
+     await hooks.atlasHook?.["tool.execute.before"]?.(input, output)
+-- 
+2.39.2
+

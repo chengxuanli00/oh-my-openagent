@@ -1,0 +1,417 @@
+From d17b2127f22acca5911dd8b3dd59b0e0705cdeb9 Mon Sep 17 00:00:00 2001
+From: YeonGyu-Kim <code-yeongyu@noreply.github.com>
+Date: Fri, 22 May 2026 20:40:06 +0900
+Subject: [PATCH 5680/5749] fix(tools/grep, tools/glob): use Node-safe
+ subprocess streaming (#3919)
+
+OpenCode Desktop v1.14.41+ runs OMO inside a Node.js utility process.
+The previous `new Response(proc.stdout).text()` call is Bun-/Web-API-specific
+and crashed the Desktop sidecar on Windows when grep/glob were invoked.
+
+Switch glob/grep cli to the new process-stream-reader + search-process-output
+helpers. Behavior on Bun and CLI/Linux/macOS is unchanged. ripgrep auto-download,
+PowerShell fallback, and rgSemaphore are preserved.
+
+Fixes #3919
+
+Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)
+
+Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
+---
+ src/tools/glob/cli.test.ts | 63 ++++++++++++++++++++++++++++-
+ src/tools/glob/cli.ts      | 47 +++++++++++-----------
+ src/tools/grep/cli.test.ts | 53 ++++++++++++++++++++++++
+ src/tools/grep/cli.ts      | 82 +++++++++++++++++++++-----------------
+ 4 files changed, 183 insertions(+), 62 deletions(-)
+ create mode 100644 src/tools/grep/cli.test.ts
+
+diff --git a/src/tools/glob/cli.test.ts b/src/tools/glob/cli.test.ts
+index dcc393eb..a1f8f3da 100644
+--- a/src/tools/glob/cli.test.ts
++++ b/src/tools/glob/cli.test.ts
+@@ -1,5 +1,36 @@
+-import { describe, it, expect } from "bun:test"
+-import { buildRgArgs, buildFindArgs, buildPowerShellCommand } from "./cli"
++import { describe, it, expect, mock } from "bun:test"
++import { Writable } from "node:stream"
++import type { SpawnOptions, SpawnedProcess } from "../../shared/bun-spawn-shim"
++import { buildRgArgs, buildFindArgs, buildPowerShellCommand, runRgFiles } from "./cli"
++
++function createTextStream(text: string): ReadableStream<Uint8Array> {
++  return new ReadableStream<Uint8Array>({
++    start(controller) {
++      if (text.length > 0) {
++        controller.enqueue(new TextEncoder().encode(text))
++      }
++      controller.close()
++    },
++  })
++}
++
++function createSpawnedProcess(exitCode: number, stdout = "", stderr = ""): SpawnedProcess {
++  return {
++    exitCode,
++    exited: Promise.resolve(exitCode),
++    stdout: createTextStream(stdout),
++    stderr: createTextStream(stderr),
++    stdin: new Writable({
++      write(_chunk, _encoding, callback) {
++        callback()
++      },
++    }),
++    pid: 3919,
++    kill() {},
++    ref() {},
++    unref() {},
++  }
++}
+ 
+ describe("buildRgArgs", () => {
+   // given default options (no hidden/follow specified)
+@@ -166,4 +197,32 @@ describe("buildPowerShellCommand", () => {
+     const command = args.join(" ")
+     expect(command).toContain("test''s.ts")
+   })
++
++  it("uses LiteralPath so fallback paths are not wildcard-expanded (#3919)", () => {
++    const args = buildPowerShellCommand({ pattern: "*.ts", paths: ["C:\\repo[1]"] })
++    const command = args.join(" ")
++    expect(args[0]).toBe("powershell.exe")
++    expect(command).toContain("Get-ChildItem -LiteralPath 'C:\\repo[1]'")
++  })
++})
++
++describe("runRgFiles", () => {
++  it("#given empty stdout #when rg exits successfully #then returns an empty result", async () => {
++    const spawnMock = mock((_command: string[], _options?: SpawnOptions): SpawnedProcess =>
++      createSpawnedProcess(0)
++    )
++
++    const result = await runRgFiles(
++      { pattern: "*.ts", paths: ["."], timeout: 1000 },
++      { path: "rg", backend: "rg" },
++      spawnMock
++    )
++
++    expect(result).toEqual({
++      files: [],
++      totalFiles: 0,
++      truncated: false,
++    })
++    expect(spawnMock).toHaveBeenCalled()
++  })
+ })
+diff --git a/src/tools/glob/cli.ts b/src/tools/glob/cli.ts
+index 9ba34c32..ab97493b 100644
+--- a/src/tools/glob/cli.ts
++++ b/src/tools/glob/cli.ts
+@@ -1,5 +1,5 @@
+ import { resolve } from "node:path"
+-import { spawn } from "../../shared/bun-spawn-shim"
++import { spawn, type SpawnOptions, type SpawnedProcess } from "../../shared/bun-spawn-shim"
+ import {
+   resolveGrepCli,
+   type GrepBackend,
+@@ -13,12 +13,15 @@ import {
+ import type { GlobOptions, GlobResult, FileMatch } from "./types"
+ import { stat } from "node:fs/promises"
+ import { rgSemaphore } from "../shared/semaphore"
++import { collectSearchProcessOutput } from "../shared/search-process-output"
+ 
+ export interface ResolvedCli {
+   path: string
+   backend: GrepBackend
+ }
+ 
++export type SearchProcessSpawner = (command: string[], options?: SpawnOptions) => SpawnedProcess
++
+ function buildRgArgs(options: GlobOptions): string[] {
+   const args: string[] = [
+     ...RG_FILES_FLAGS,
+@@ -65,7 +68,8 @@ function buildPowerShellCommand(options: GlobOptions): string[] {
+   const escapedPath = searchPath.replace(/'/g, "''")
+   const escapedPattern = options.pattern.replace(/'/g, "''")
+ 
+-  let psCommand = `Get-ChildItem -Path '${escapedPath}' -File -Recurse -Depth ${maxDepth - 1} -Filter '${escapedPattern}'`
++  // #3919: Keep PowerShell fallback direct-spawned and single-quote escaped, not shell-interpolated.
++  let psCommand = `Get-ChildItem -LiteralPath '${escapedPath}' -File -Recurse -Depth ${maxDepth - 1} -Filter '${escapedPattern}'`
+ 
+   if (options.hidden !== false) {
+     psCommand += " -Force"
+@@ -78,7 +82,7 @@ function buildPowerShellCommand(options: GlobOptions): string[] {
+ 
+   psCommand += " -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName"
+ 
+-  return ["powershell", "-NoProfile", "-Command", psCommand]
++  return ["powershell.exe", "-NoProfile", "-Command", psCommand]
+ }
+ 
+ async function getFileMtime(filePath: string): Promise<number> {
+@@ -94,11 +98,12 @@ export { buildRgArgs, buildFindArgs, buildPowerShellCommand }
+ 
+ export async function runRgFiles(
+   options: GlobOptions,
+-  resolvedCli?: ResolvedCli
++  resolvedCli?: ResolvedCli,
++  processSpawner: SearchProcessSpawner = spawn
+ ): Promise<GlobResult> {
+   await rgSemaphore.acquire()
+   try {
+-    return await runRgFilesInternal(options, resolvedCli)
++    return await runRgFilesInternal(options, resolvedCli, processSpawner)
+   } finally {
+     rgSemaphore.release()
+   }
+@@ -106,7 +111,8 @@ export async function runRgFiles(
+ 
+ async function runRgFilesInternal(
+   options: GlobOptions,
+-  resolvedCli?: ResolvedCli
++  resolvedCli?: ResolvedCli,
++  processSpawner: SearchProcessSpawner = spawn
+ ): Promise<GlobResult> {
+   const cli = resolvedCli ?? resolveGrepCli()
+   const timeout = Math.min(options.timeout ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
+@@ -133,24 +139,19 @@ async function runRgFilesInternal(
+     command = [cli.path, ...args]
+   }
+ 
+-  const proc = spawn(command, {
+-    stdout: "pipe",
+-    stderr: "pipe",
+-    cwd,
+-  })
+-
+-  const timeoutPromise = new Promise<never>((_, reject) => {
+-    const id = setTimeout(() => {
+-      proc.kill()
+-      reject(new Error(`Glob search timeout after ${timeout}ms`))
+-    }, timeout)
+-    proc.exited.then(() => clearTimeout(id))
+-  })
+-
+   try {
+-    const stdout = await Promise.race([new Response(proc.stdout).text(), timeoutPromise])
+-    const stderr = await new Response(proc.stderr).text()
+-    const exitCode = await proc.exited
++    const proc = processSpawner(command, {
++      stdout: "pipe",
++      stderr: "pipe",
++      cwd,
++    })
++
++    // #3919: Read stdout/stderr with Buffer concat instead of Response(stream).text().
++    const { stdout, stderr, exitCode } = await collectSearchProcessOutput(
++      proc,
++      timeout,
++      `Glob search timeout after ${timeout}ms`
++    )
+ 
+     if (exitCode > 1 && stderr.trim()) {
+       return {
+diff --git a/src/tools/grep/cli.test.ts b/src/tools/grep/cli.test.ts
+new file mode 100644
+index 00000000..a629f7a9
+--- /dev/null
++++ b/src/tools/grep/cli.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it, mock } from "bun:test"
++import { Writable } from "node:stream"
++import type { SpawnOptions, SpawnedProcess } from "../../shared/bun-spawn-shim"
++import { runRg } from "./cli"
++
++function createTextStream(text: string): ReadableStream<Uint8Array> {
++  return new ReadableStream<Uint8Array>({
++    start(controller) {
++      if (text.length > 0) {
++        controller.enqueue(new TextEncoder().encode(text))
++      }
++      controller.close()
++    },
++  })
++}
++
++function createSpawnedProcess(exited: Promise<number>, stdout = "", stderr = ""): SpawnedProcess {
++  return {
++    exitCode: null,
++    exited,
++    stdout: createTextStream(stdout),
++    stderr: createTextStream(stderr),
++    stdin: new Writable({
++      write(_chunk, _encoding, callback) {
++        callback()
++      },
++    }),
++    pid: 3919,
++    kill() {},
++    ref() {},
++    unref() {},
++  }
++}
++
++describe("runRg", () => {
++  it("#given mocked spawn rejection #when grep runs #then returns a structured error result", async () => {
++    const spawnMock = mock((_command: string[], _options?: SpawnOptions): SpawnedProcess =>
++      createSpawnedProcess(Promise.reject(new Error("spawn rejected")))
++    )
++
++    const result = await runRg(
++      { pattern: "needle", paths: ["."], timeout: 1000 },
++      { path: "rg", backend: "rg" },
++      spawnMock
++    )
++
++    expect(result.matches).toEqual([])
++    expect(result.totalMatches).toBe(0)
++    expect(result.filesSearched).toBe(0)
++    expect(result.truncated).toBe(false)
++    expect(result.error).toContain("spawn rejected")
++  })
++})
+diff --git a/src/tools/grep/cli.ts b/src/tools/grep/cli.ts
+index 4b9684c6..59a12f61 100644
+--- a/src/tools/grep/cli.ts
++++ b/src/tools/grep/cli.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "../../shared/bun-spawn-shim"
++import { spawn, type SpawnOptions, type SpawnedProcess } from "../../shared/bun-spawn-shim"
+ import {
+   resolveGrepCli,
+   type ResolvedCli,
+@@ -17,6 +17,9 @@ import {
+ } from "./constants"
+ import type { GrepOptions, GrepMatch, GrepResult, CountResult } from "./types"
+ import { rgSemaphore } from "../shared/semaphore"
++import { collectSearchProcessOutput } from "../shared/search-process-output"
++
++export type SearchProcessSpawner = (command: string[], options?: SpawnOptions) => SpawnedProcess
+ 
+ function buildRgArgs(options: GrepOptions): string[] {
+   const args: string[] = [
+@@ -154,16 +157,24 @@ function parseCountOutput(output: string): CountResult[] {
+   return results
+ }
+ 
+-export async function runRg(options: GrepOptions, resolvedCli?: ResolvedCli): Promise<GrepResult> {
++export async function runRg(
++  options: GrepOptions,
++  resolvedCli?: ResolvedCli,
++  processSpawner: SearchProcessSpawner = spawn
++): Promise<GrepResult> {
+   await rgSemaphore.acquire()
+   try {
+-    return await runRgInternal(options, resolvedCli)
++    return await runRgInternal(options, resolvedCli, processSpawner)
+   } finally {
+     rgSemaphore.release()
+   }
+ }
+ 
+-async function runRgInternal(options: GrepOptions, resolvedCli?: ResolvedCli): Promise<GrepResult> {
++async function runRgInternal(
++  options: GrepOptions,
++  resolvedCli?: ResolvedCli,
++  processSpawner: SearchProcessSpawner = spawn
++): Promise<GrepResult> {
+   const cli = resolvedCli ?? resolveGrepCli()
+   const args = buildArgs(options, cli.backend)
+   const timeout = Math.min(options.timeout ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
+@@ -176,23 +187,18 @@ async function runRgInternal(options: GrepOptions, resolvedCli?: ResolvedCli): P
+ 
+   const paths = options.paths?.length ? options.paths : ["."]
+   args.push(...paths)
+-  const proc = spawn([cli.path, ...args], {
+-    stdout: "pipe",
+-    stderr: "pipe",
+-  })
+-
+-  const timeoutPromise = new Promise<never>((_, reject) => {
+-    const id = setTimeout(() => {
+-      proc.kill()
+-      reject(new Error(`Search timeout after ${timeout}ms`))
+-    }, timeout)
+-    proc.exited.then(() => clearTimeout(id))
+-  })
+-
+   try {
+-    const stdout = await Promise.race([new Response(proc.stdout).text(), timeoutPromise])
+-    const stderr = await new Response(proc.stderr).text()
+-    const exitCode = await proc.exited
++    const proc = processSpawner([cli.path, ...args], {
++      stdout: "pipe",
++      stderr: "pipe",
++    })
++
++    // #3919: Read stdout/stderr with Buffer concat instead of Response(stream).text().
++    const { stdout, stderr, exitCode } = await collectSearchProcessOutput(
++      proc,
++      timeout,
++      `Search timeout after ${timeout}ms`
++    )
+ 
+     const truncated = stdout.length >= DEFAULT_MAX_OUTPUT_BYTES
+     const outputToProcess = truncated ? stdout.substring(0, DEFAULT_MAX_OUTPUT_BYTES) : stdout
+@@ -232,11 +238,12 @@ async function runRgInternal(options: GrepOptions, resolvedCli?: ResolvedCli): P
+ 
+ export async function runRgCount(
+   options: Omit<GrepOptions, "context">,
+-  resolvedCli?: ResolvedCli
++  resolvedCli?: ResolvedCli,
++  processSpawner: SearchProcessSpawner = spawn
+ ): Promise<CountResult[]> {
+   await rgSemaphore.acquire()
+   try {
+-    return await runRgCountInternal(options, resolvedCli)
++    return await runRgCountInternal(options, resolvedCli, processSpawner)
+   } finally {
+     rgSemaphore.release()
+   }
+@@ -244,7 +251,8 @@ export async function runRgCount(
+ 
+ async function runRgCountInternal(
+   options: Omit<GrepOptions, "context">,
+-  resolvedCli?: ResolvedCli
++  resolvedCli?: ResolvedCli,
++  processSpawner: SearchProcessSpawner = spawn
+ ): Promise<CountResult[]> {
+   const cli = resolvedCli ?? resolveGrepCli()
+   const args = buildArgs({ ...options, context: 0 }, cli.backend)
+@@ -259,21 +267,21 @@ async function runRgCountInternal(
+   args.push(...paths)
+ 
+   const timeout = Math.min(options.timeout ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
+-  const proc = spawn([cli.path, ...args], {
+-    stdout: "pipe",
+-    stderr: "pipe",
+-  })
+-
+-  const timeoutPromise = new Promise<never>((_, reject) => {
+-    const id = setTimeout(() => {
+-      proc.kill()
+-      reject(new Error(`Search timeout after ${timeout}ms`))
+-    }, timeout)
+-    proc.exited.then(() => clearTimeout(id))
+-  })
+-
+   try {
+-    const stdout = await Promise.race([new Response(proc.stdout).text(), timeoutPromise])
++    const proc = processSpawner([cli.path, ...args], {
++      stdout: "pipe",
++      stderr: "pipe",
++    })
++
++    // #3919: Count mode uses the same Node-safe stream reader as normal grep.
++    const { stdout, stderr, exitCode } = await collectSearchProcessOutput(
++      proc,
++      timeout,
++      `Search timeout after ${timeout}ms`
++    )
++    if (exitCode > 1 && stderr.trim()) {
++      throw new Error(stderr.trim())
++    }
+     return parseCountOutput(stdout)
+   } catch (e) {
+     throw new Error(`Count search failed: ${e instanceof Error ? e.message : String(e)}`)
+-- 
+2.39.2
+
